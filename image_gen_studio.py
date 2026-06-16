@@ -275,8 +275,8 @@ class ImageGenStudio(ctk.CTk):
         bot.grid_columnconfigure(0, weight=1)
 
         self.btn_bulk = ctk.CTkButton(
-            bot, text="Bulk Generation\nSettings",
-            height=46, corner_radius=8, font=F(13, "bold"),
+            bot, text="Bulk Generation Settings",
+            height=36, corner_radius=8, font=F(13, "bold"),
             fg_color=C["btn_blue"], hover_color="#0D3D6E",
             command=self._open_bulk_dialog,
         )
@@ -764,6 +764,9 @@ class ImageGenStudio(ctk.CTk):
             self._chat_log    = list(state["log"])
             self.prompt_editor.delete("0.0", "end")
             self.prompt_editor.insert("0.0", state["prompt"])
+            # Restore settings if this still was bulk-generated
+            if "bulk_settings" in state:
+                self._apply_bulk_settings(state["bulk_settings"])
             self.chat_display.configure(state="normal")
             self.chat_display.delete("0.0", "end")
             for tag, label, body in self._chat_log:
@@ -779,6 +782,25 @@ class ImageGenStudio(ctk.CTk):
         if chosen:
             self.output_dir = Path(chosen)
             self.out_dir_label.configure(text=str(self.output_dir))
+
+    # ── Bulk settings sync ────────────────────────────────────────────────────
+
+    def _apply_bulk_settings(self, bs: dict):
+        """Apply bulk-generation settings to the main frontend dropdowns/entries."""
+        if bs.get("art_style"):  self.var_style.set(bs["art_style"])
+        if bs.get("camera"):     self.var_camera.set(bs["camera"])
+        if bs.get("mood"):       self.var_mood.set(bs["mood"])
+        if bs.get("lighting"):   self.var_light.set(bs["lighting"])
+        if bs.get("color"):      self.var_color.set(bs["color"])
+        if bs.get("dof"):        self.var_dof.set(bs["dof"])
+        notes = bs.get("extra_notes", "")
+        self.extra_notes.delete(0, "end")
+        if notes:
+            self.extra_notes.insert(0, notes)
+        sys_p = bs.get("system_prompt", "")
+        if sys_p:
+            self.sys_prompt_box.delete("0.0", "end")
+            self.sys_prompt_box.insert("0.0", sys_p)
 
     # ── Reference image ───────────────────────────────────────────────────────
 
@@ -1478,8 +1500,7 @@ class BulkGenerateDialog(ctk.CTkToplevel):
             photo = ImageTk.PhotoImage(thumb)
             self.ref_preview.configure(image=photo, text="", height=thumb.height + 8)
             self.ref_preview._ref = photo
-
-            self.ref_lbl.configure(text=Path(path).name, text_color=C["text"])
+            self.ref_lbl.configure(text="")  # hide filename — thumbnail is enough
         except Exception as exc:
             messagebox.showerror("Image Error", str(exc), parent=self)
 
@@ -1497,21 +1518,28 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         self.btn_gen_prompt.configure(state="disabled", text="Generating…")
         vos      = "\n".join(f"- {s['voiceover']}" for s in self._app.stills[:12])
         settings = self._settings_block()
+        ref_desc = self.ref_desc_entry.get().strip()
         threading.Thread(target=self._prompt_worker,
-                          args=(vos, settings), daemon=True).start()
+                          args=(vos, settings, ref_desc), daemon=True).start()
 
-    def _prompt_worker(self, vos: str, settings: str):
+    def _prompt_worker(self, vos: str, settings: str, ref_desc: str = ""):
         try:
             client = OpenAI(api_key=OPENAI_API_KEY)
+            ref_note = (
+                f"\nReference image is also provided — from it, specifically incorporate: {ref_desc}"
+                if ref_desc else ""
+            )
             resp = client.chat.completions.create(
                 model=GPT_MODEL,
                 messages=[{"role": "user", "content": (
                     f"I am generating AI images for a video. "
                     f"Below are the voiceover lines (up to 12 stills):\n{vos}\n\n"
-                    f"Image settings selected:\n{settings}\n\n"
+                    f"Image settings selected:\n{settings}{ref_note}\n\n"
                     f"Write a concise system prompt (3-4 sentences) that, "
                     f"when prepended to every image generation request, ensures "
                     f"all images share the same visual style, mood, and aesthetic cohesion. "
+                    f"If reference image guidance was provided above, explicitly incorporate "
+                    f"those specific qualities into the prompt. "
                     f"Be specific about visual qualities — not narrative content. "
                     f"Return ONLY the prompt text, no labels or preamble."
                 )}],
@@ -1604,7 +1632,21 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         # Snapshot all tkinter values in main thread before handing off
         sys_txt  = self.sys_prompt_box.get("0.0", "end").strip()
         settings = self._settings_block()
-        ref_b64  = self._ref_b64
+
+        def _concrete(var):
+            v = var.get()
+            return v if v != AI_DECIDE else None
+
+        bulk_settings = {
+            "art_style":     _concrete(self.var_style),
+            "camera":        _concrete(self.var_camera),
+            "mood":          _concrete(self.var_mood),
+            "lighting":      _concrete(self.var_light),
+            "color":         _concrete(self.var_color),
+            "dof":           _concrete(self.var_dof),
+            "extra_notes":   self.extra_notes.get().strip(),
+            "system_prompt": sys_txt,
+        }
 
         prompt_map: dict[str, str] = {}
         for s in targets:
@@ -1634,11 +1676,11 @@ class BulkGenerateDialog(ctk.CTkToplevel):
 
         threading.Thread(
             target=self._bulk_worker,
-            args=(targets, prompt_map),
+            args=(targets, prompt_map, bulk_settings),
             daemon=True,
         ).start()
 
-    def _bulk_worker(self, targets: list, prompt_map: dict):
+    def _bulk_worker(self, targets: list, prompt_map: dict, bulk_settings: dict):
         try:
             client = self._app._init_nb2()
         except Exception as exc:
@@ -1684,14 +1726,27 @@ class BulkGenerateDialog(ctk.CTkToplevel):
                         self._app._pending_images[sid] = img_bytes
                         self._gen_count += 1
 
-                        def _on_gen(sid=sid, ib=img_bytes):
-                            self._app._populate_stills_list()
-                            if (self._app.selected_still
-                                    and self._app.selected_still["still_id"] == sid):
-                                self._app.current_image_bytes = ib
-                                self._app._img_data = Image.open(BytesIO(ib))
-                                self._app.btn_approve.configure(state="normal")
-                                self._app.after_idle(self._app._display_gen_image)
+                        def _on_gen(sid=sid, ib=img_bytes, p=prompt, bs=bulk_settings):
+                            app = self._app
+                            # Store settings + prompt so clicking the still later restores them
+                            app._still_states[sid] = {
+                                "history": [{"role": "assistant", "content": p}],
+                                "log":     [("gpt", "Bulk generated — prompt used:", p)],
+                                "prompt":  p,
+                                "bulk_settings": bs,
+                            }
+                            app._populate_stills_list()
+                            if app.selected_still and app.selected_still["still_id"] == sid:
+                                app.current_image_bytes = ib
+                                app._img_data = Image.open(BytesIO(ib))
+                                app.btn_approve.configure(state="normal")
+                                app.after_idle(app._display_gen_image)
+                                # Sync settings + prompt + chat to main frontend immediately
+                                app._apply_bulk_settings(bs)
+                                app.prompt_editor.delete("0.0", "end")
+                                app.prompt_editor.insert("0.0", p)
+                                app._chat_append("Bulk generated — prompt used:", p, "gpt")
+                                app.chat_history = [{"role": "assistant", "content": p}]
                             self.progress_bar.set(self._gen_count / self._total)
 
                         self.after(0, _on_gen)

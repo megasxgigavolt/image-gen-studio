@@ -1,5 +1,19 @@
 # Image Gen Studio — Changelog
 
+## [v1.3.0] — 2026-06-16 — Bulk settings sync, UI polish
+
+### Features
+- **Bulk generation syncs to main frontend**: When a still is generated in bulk, its settings, prompt, and extra notes are stored. Clicking on any bulk-generated still in the sidebar immediately restores:
+  - Image settings dropdowns (concrete values; "Let AI Decide" fields are left unchanged)
+  - System prompt box
+  - Extra notes field
+  - Prompt editor (shows the exact prompt sent to Gemini)
+  - Chat log entry: "Bulk generated — prompt used: …"
+- **Live sync for currently selected still**: If the bulk-generation loop reaches the still you're currently viewing, all of the above updates in real time as the image arrives.
+- **Auto-Generate GPT prompt respects ref_desc**: If "What to pick from this reference image?" is filled in the dialog, it is explicitly included in the GPT request so the generated system prompt reflects those specific qualities.
+- **Reference image preview only — no filename**: After browsing a reference image in the Bulk dialog, only the thumbnail is shown; the filename label is cleared.
+- **Sidebar button text**: Single-line "Bulk Generation Settings" at consistent font size.
+
 ## [v1.2.0] — 2026-06-16 — Rate-limit retry, ref-image preview, ref guidance field
 
 ### Features

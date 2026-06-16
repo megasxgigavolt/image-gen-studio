@@ -1,0 +1,30 @@
+# Credentials — NEVER commit these
+*.json
+!package.json
+.env
+*.env.*
+
+# Build outputs
+dist/
+build/
+*.spec
+
+# Runtime / user data
+generation_state.json
+settings.json
+generated_images/
+
+# Office temp files
+~$*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Old / scratch
+old/

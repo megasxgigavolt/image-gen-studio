@@ -878,26 +878,27 @@ class ImageGenStudio(ctk.CTk):
                 f'"lighting": one of {json.dumps(LIGHTING)}\n'
                 f'"color_palette": one of {json.dumps(COLOR_PALETTES)}\n'
                 f'"depth_of_field": one of {json.dumps(DEPTH_OF_FIELD)}\n'
-                f'"extra_notes": describe ALL visual qualities not captured above — '
-                f'line work style, coloring technique, texture, subject characteristics, '
-                f'composition, specific colors, pattern details, rendering method.\n'
+                f'"extra_notes": describe ONLY style-specific rendering details — '
+                f'line work technique, coloring method, texture rendering style, '
+                f'color values and palette specifics, pattern styles, shading approach. '
+                f'Do NOT mention subject matter, people, animals, objects, or scene content.\n'
                 f'"style_prompt": write 2-3 sentences as DIRECT style instructions to '
-                f'replicate this image. Be explicit about technique: e.g. '
+                f'replicate the rendering technique of this image. Be explicit: e.g. '
                 f'"Use bold black outlines with flat cell-shaded warm colors in amber and '
-                f'brown tones, detailed interior backgrounds with hatching textures on '
-                f'fabric surfaces." '
-                f'Do NOT write "capture the style of" or "mirror" or "ensure consistency". '
-                f'Describe the technique directly.\n\n'
+                f'brown tones, hatching textures on fabric surfaces, detailed linework." '
+                f'Do NOT write "capture the style of" or "mirror" or reference subject matter. '
+                f'Describe rendering technique only.\n\n'
                 f"Return ONLY valid JSON. No markdown fences, no explanation."
             )
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": (
-                        "You are a precise visual analyst. Copy option strings exactly from "
-                        "the provided lists — never invent new values. When writing style_prompt, "
-                        "describe the art style as direct instructions (e.g. 'Use bold black "
-                        "outlines...'), never as 'capture' or 'mirror' the reference."
+                        "You are a precise visual analyst focused on rendering technique. "
+                        "Copy option strings exactly from the provided lists — never invent new values. "
+                        "extra_notes must contain ONLY style/rendering details, never subject matter. "
+                        "style_prompt must describe the art technique directly ('Use bold black "
+                        "outlines...'), never 'capture' or 'mirror' the reference."
                     )},
                     {"role": "user", "content": [
                         {"type": "image_url",
@@ -1577,7 +1578,7 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         # ── Action buttons ─────────────────────────────────────────────────
         brow = ctk.CTkFrame(outer, fg_color="transparent")
         brow.grid(row=r, column=0, padx=14, pady=(0, 24), sticky="ew")
-        brow.grid_columnconfigure((0, 1, 2), weight=1)
+        brow.grid_columnconfigure((0, 1), weight=1)
         r += 1
 
         self.btn_start = ctk.CTkButton(
@@ -1585,20 +1586,26 @@ class BulkGenerateDialog(ctk.CTkToplevel):
             font=F(15, "bold"), fg_color=C["btn_green"], hover_color="#1B4D2E",
             command=self._toggle_generate,
         )
-        self.btn_start.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        self.btn_start.grid(row=0, column=0, padx=(0, 5), pady=(0, 6), sticky="ew")
 
         self.btn_approve_all = ctk.CTkButton(
             brow, text="Bulk Approve & Save", height=46, corner_radius=10,
             font=F(15, "bold"), fg_color=C["btn_brown"], hover_color="#4E342E",
             command=self._bulk_approve_all,
         )
-        self.btn_approve_all.grid(row=0, column=1, padx=5, sticky="ew")
+        self.btn_approve_all.grid(row=0, column=1, padx=(5, 0), pady=(0, 6), sticky="ew")
+
+        ctk.CTkButton(
+            brow, text="Restart from Scratch", height=46, corner_radius=10,
+            font=F(15, "bold"), fg_color=C["btn_red"], hover_color="#6B1A14",
+            command=self._restart_from_scratch,
+        ).grid(row=1, column=0, padx=(0, 5), sticky="ew")
 
         ctk.CTkButton(
             brow, text="Close", height=46, corner_radius=10,
             font=F(15, "bold"), fg_color="#888888", hover_color="#666666",
             command=self._on_close,
-        ).grid(row=0, column=2, padx=(5, 0), sticky="ew")
+        ).grid(row=1, column=1, padx=(5, 0), sticky="ew")
 
     def _section(self, parent, title: str) -> ctk.CTkFrame:
         f = ctk.CTkFrame(parent, fg_color=C["panel"], corner_radius=12,
@@ -1692,26 +1699,27 @@ class BulkGenerateDialog(ctk.CTkToplevel):
                 f'"lighting": one of {json.dumps(LIGHTING)}\n'
                 f'"color_palette": one of {json.dumps(COLOR_PALETTES)}\n'
                 f'"depth_of_field": one of {json.dumps(DEPTH_OF_FIELD)}\n'
-                f'"extra_notes": describe ALL visual qualities not captured above — '
-                f'line work style, coloring technique, texture, subject characteristics, '
-                f'composition, specific colors, pattern details, rendering method.\n'
+                f'"extra_notes": describe ONLY style-specific rendering details — '
+                f'line work technique, coloring method, texture rendering style, '
+                f'color values and palette specifics, pattern styles, shading approach. '
+                f'Do NOT mention subject matter, people, animals, objects, or scene content.\n'
                 f'"style_prompt": write 2-3 sentences as DIRECT style instructions to '
-                f'replicate this image. Be explicit about technique: e.g. '
+                f'replicate the rendering technique of this image. Be explicit: e.g. '
                 f'"Use bold black outlines with flat cell-shaded warm colors in amber and '
-                f'brown tones, detailed interior backgrounds with hatching textures on '
-                f'fabric surfaces." '
-                f'Do NOT write "capture the style of" or "mirror" or "ensure consistency". '
-                f'Describe the technique directly.\n\n'
+                f'brown tones, hatching textures on fabric surfaces, detailed linework." '
+                f'Do NOT write "capture the style of" or "mirror" or reference subject matter. '
+                f'Describe rendering technique only.\n\n'
                 f"Return ONLY valid JSON. No markdown fences, no explanation."
             )
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": (
-                        "You are a precise visual analyst. Copy option strings exactly from "
-                        "the provided lists — never invent new values. When writing style_prompt, "
-                        "describe the art style as direct instructions (e.g. 'Use bold black "
-                        "outlines...'), never as 'capture' or 'mirror' the reference."
+                        "You are a precise visual analyst focused on rendering technique. "
+                        "Copy option strings exactly from the provided lists — never invent new values. "
+                        "extra_notes must contain ONLY style/rendering details, never subject matter. "
+                        "style_prompt must describe the art technique directly ('Use bold black "
+                        "outlines...'), never 'capture' or 'mirror' the reference."
                     )},
                     {"role": "user", "content": [
                         {"type": "image_url",
@@ -1924,10 +1932,12 @@ class BulkGenerateDialog(ctk.CTkToplevel):
                                     "All stills have been approved.", parent=self)
             return
 
-        # Snapshot all tkinter values in main thread before handing off
-        sys_txt         = self.sys_prompt_box.get("0.0", "end").strip()
-        settings        = self._settings_block()
+        # Snapshot all tkinter values in main thread before handing off to thread
+        sys_txt          = self.sys_prompt_box.get("0.0", "end").strip()
+        settings         = self._settings_block()
         ref_b64_snapshot = self._ref_b64
+        ref_desc_snap    = self.ref_desc_entry.get().strip()
+        gpt_model_snap   = self.gpt_model_var.get()
 
         def _concrete(var):
             v = var.get()
@@ -1943,14 +1953,6 @@ class BulkGenerateDialog(ctk.CTkToplevel):
             "extra_notes":   self.extra_notes.get().strip(),
             "system_prompt": sys_txt,
         }
-
-        # Build per-still prompts from voiceover + settings.
-        # Style directive goes first; settings spec + voiceover context follow.
-        prompt_map: dict[str, str] = {}
-        for s in targets:
-            sid  = s["still_id"]
-            base = f"{settings}\n\nDepicted scene: {s['voiceover']}"
-            prompt_map[sid] = f"{sys_txt}\n\n{base}" if sys_txt else base
 
         self._running   = True
         self._cancel    = False
@@ -1969,14 +1971,17 @@ class BulkGenerateDialog(ctk.CTkToplevel):
 
         threading.Thread(
             target=self._bulk_worker,
-            args=(targets, prompt_map, bulk_settings, ref_b64_snapshot),
+            args=(targets, bulk_settings, sys_txt, settings,
+                  ref_b64_snapshot, ref_desc_snap, gpt_model_snap),
             daemon=True,
         ).start()
 
-    def _bulk_worker(self, targets: list, prompt_map: dict, bulk_settings: dict,
-                     ref_b64: str | None = None):
+    def _bulk_worker(self, targets: list, bulk_settings: dict,
+                     sys_txt: str, settings_block: str,
+                     ref_b64: str | None = None, ref_desc: str = "",
+                     gpt_model: str = "gpt-4o"):
         try:
-            client = self._app._init_nb2()
+            gemini_client = self._app._init_nb2()
         except Exception as exc:
             self.after(0, lambda e=str(exc): (
                 messagebox.showerror("Gemini Error",
@@ -1985,43 +1990,75 @@ class BulkGenerateDialog(ctk.CTkToplevel):
             ))
             return
 
-        # Decode reference image once if provided — sent to Gemini alongside each prompt
-        ref_img_data: bytes | None = None
-        if ref_b64:
-            try:
-                ref_img_data = base64.b64decode(ref_b64)
-            except Exception:
-                ref_img_data = None
+        gpt_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+        # Ref image thumbnail bytes for main frontend display (decoded once)
+        ref_thumb_b64 = ref_b64  # keep as b64 string; decoded in _on_gen callback
 
         for still in targets:
             if self._cancel:
                 break
-            sid    = still["still_id"]
-            prompt = prompt_map.get(sid, still["voiceover"])
-            n      = self._gen_count
+            sid = still["still_id"]
+            n   = self._gen_count
 
+            # ── Phase 1: GPT writes a unique creative prompt for this scene ──────
+            creative_prompt = None
+            if gpt_client:
+                self.after(0, lambda sid=sid, n=n: self.lbl_status.configure(
+                    text=f"Writing prompt for {sid.upper()}…  ({n} / {self._total} done)",
+                    text_color=C["accent"],
+                ))
+                try:
+                    gpt_parts: list = []
+                    if ref_b64:
+                        gpt_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{ref_b64}",
+                                          "detail": "high"},
+                        })
+                        if ref_desc:
+                            gpt_parts.append({"type": "text",
+                                "text": f"From this reference image, apply specifically: {ref_desc}"})
+                    gpt_parts.append({"type": "text", "text": (
+                        f"Write a vivid image-generation prompt for this specific scene:\n\n"
+                        f"Voiceover: \"{still['voiceover']}\"\n\n"
+                        f"Apply these image settings:\n{settings_block}\n\n"
+                        f"Rules:\n"
+                        f"- Interpret the voiceover as a visual moment — describe what we SEE\n"
+                        f"- Be specific: subject, composition, expressions, background details\n"
+                        f"- Apply every image setting naturally within the description\n"
+                        f"- Make it unique to THIS scene's narrative moment — no generic templates\n"
+                        f"- 2-4 sentences only — no labels, no preamble, just the prompt"
+                    )})
+                    gpt_msgs = []
+                    if sys_txt:
+                        gpt_msgs.append({"role": "system", "content": sys_txt})
+                    gpt_msgs.append({"role": "user", "content": gpt_parts})
+
+                    gpt_resp = gpt_client.chat.completions.create(
+                        model=gpt_model, messages=gpt_msgs, max_tokens=400)
+                    creative_prompt = gpt_resp.choices[0].message.content.strip()
+                except Exception as gpt_exc:
+                    self._errors.append(f"{sid} (GPT): {str(gpt_exc)[:80]}")
+
+            # Fallback if GPT unavailable or failed
+            if not creative_prompt:
+                base = f"{settings_block}\n\nDepicted scene: {still['voiceover']}"
+                creative_prompt = f"{sys_txt}\n\n{base}" if sys_txt else base
+
+            # ── Phase 2: Gemini generates the image (text prompt only, no image) ─
             self.after(0, lambda sid=sid, n=n: self.lbl_status.configure(
-                text=f"Generating {sid.upper()}…  ({n} / {self._total} done)",
+                text=f"Generating image for {sid.upper()}…  ({n} / {self._total} done)",
                 text_color=C["accent"],
             ))
-
-            # Build contents — include reference image so Gemini can visually match the style
-            if ref_img_data:
-                contents = [
-                    types.Part(inline_data=types.Blob(
-                        mime_type="image/png", data=ref_img_data)),
-                    types.Part(text=prompt),
-                ]
-            else:
-                contents = prompt
 
             attempt = 0
             while not self._cancel:
                 attempt += 1
                 try:
-                    response = client.models.generate_content(
+                    response = gemini_client.models.generate_content(
                         model="publishers/google/models/gemini-3.1-flash-image",
-                        contents=contents,
+                        contents=creative_prompt,
                         config=types.GenerateContentConfig(
                             response_modalities=["IMAGE"],
                             image_config=types.ImageConfig(aspect_ratio="16:9"),
@@ -2038,34 +2075,45 @@ class BulkGenerateDialog(ctk.CTkToplevel):
                         self._app._pending_images[sid] = img_bytes
                         self._gen_count += 1
 
-                        def _on_gen(sid=sid, ib=img_bytes, p=prompt, bs=bulk_settings):
+                        def _on_gen(sid=sid, ib=img_bytes, p=creative_prompt,
+                                    bs=bulk_settings, rb=ref_thumb_b64):
                             app = self._app
-                            # Store settings + prompt so clicking the still later restores them
                             app._still_states[sid] = {
                                 "history": [{"role": "assistant", "content": p}],
-                                "log":     [("gpt", "Bulk generated — prompt used:", p)],
+                                "log":     [("gpt", "Bulk-generated prompt:", p)],
                                 "prompt":  p,
                                 "bulk_settings": bs,
                             }
                             app._populate_stills_list()
+                            # Mirror ref image to main frontend on first successful gen
+                            if rb and not app.ref_image_b64:
+                                try:
+                                    ref_img = Image.open(BytesIO(base64.b64decode(rb)))
+                                    thumb = ref_img.copy()
+                                    thumb.thumbnail((308, 192), Image.LANCZOS)
+                                    photo_ref = ImageTk.PhotoImage(thumb)
+                                    app.ref_label.configure(image=photo_ref, text="")
+                                    app.ref_label._ref = photo_ref
+                                    app.ref_image_b64 = rb
+                                except Exception:
+                                    pass
                             if app.selected_still and app.selected_still["still_id"] == sid:
                                 app.current_image_bytes = ib
                                 app._img_data = Image.open(BytesIO(ib))
                                 app.btn_approve.configure(state="normal")
                                 app.after_idle(app._display_gen_image)
-                                # Sync settings + prompt + chat to main frontend immediately
                                 app._apply_bulk_settings(bs)
                                 app.prompt_editor.delete("0.0", "end")
                                 app.prompt_editor.insert("0.0", p)
-                                app._chat_append("Bulk generated — prompt used:", p, "gpt")
+                                app._chat_append("Bulk-generated prompt:", p, "gpt")
                                 app.chat_history = [{"role": "assistant", "content": p}]
                             self.progress_bar.set(self._gen_count / self._total)
 
                         self.after(0, _on_gen)
                     else:
                         self._errors.append(f"{sid}: Gemini returned no image")
-                    time.sleep(2)   # brief pause between calls to ease rate pressure
-                    break  # success or non-retryable empty response
+                    time.sleep(2)
+                    break
 
                 except Exception as exc:
                     err_str = str(exc)
@@ -2114,6 +2162,34 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         ):
             messagebox.showinfo(
                 "Error Details", "\n".join(self._errors), parent=self)
+
+    # ── Restart from scratch ──────────────────────────────────────────────────
+
+    def _restart_from_scratch(self):
+        if self._running:
+            messagebox.showwarning("Running",
+                                   "Stop generation first before restarting.", parent=self)
+            return
+        if not messagebox.askyesno(
+            "Restart from Scratch",
+            "Clear all pending (not-yet-approved) generated images and start fresh?\n\n"
+            "Already approved & saved images will NOT be affected.",
+            parent=self,
+        ):
+            return
+        app = self._app
+        app._pending_images.clear()
+        for sid in list(app._still_states.keys()):
+            if "bulk_settings" in app._still_states[sid]:
+                del app._still_states[sid]
+        self._gen_count = 0
+        self.progress_bar.set(0)
+        self._refresh_status()
+        app._populate_stills_list()
+        self.lbl_status.configure(
+            text="Pending images cleared — ready for a fresh run.",
+            text_color=C["btn_green"],
+        )
 
     # ── Bulk approve ──────────────────────────────────────────────────────────
 

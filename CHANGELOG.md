@@ -1,5 +1,17 @@
 # Image Gen Studio — Changelog
 
+## [v1.6.0] — 2026-06-16 — Dynamic per-still GPT prompts, restart button, ref image sync
+
+### Features
+- **Dynamic per-still prompts in bulk generation**: For each still, GPT is called first to write a unique creative scene description from the voiceover + image settings (+ reference image if uploaded). Gemini then generates from that creative prompt — no more template "Depicted scene: …" repeated for every still. Each prompt is different, scene-specific, and has settings baked in naturally.
+- **Reference image shared with main frontend**: After the first successful bulk generation, the reference image uploaded in the dialog is automatically mirrored to the main frontend's Reference Image panel.
+- **"Restart from Scratch" button** in Bulk Generation Settings — clears all pending (not-yet-approved) images and bulk-generated still states so you can start a clean run. Does not affect already-saved/approved images.
+- **Status shows two phases per still**: "Writing prompt for S7…" → "Generating image for S7…"
+
+### Fixes
+- **Reference image NOT sent to Gemini** — only GPT-4o receives the reference image for style analysis and prompt writing. Gemini receives text only.
+- **Extract Settings extra_notes**: Now contains ONLY rendering/style details (line work, coloring technique, textures, color values). No longer includes subject matter, objects, or scene content.
+
 ## [v1.5.0] — 2026-06-16 — Style accuracy, prompt structure, inline Extract Settings
 
 ### Features

@@ -1,5 +1,19 @@
 # Image Gen Studio — Changelog
 
+## [v1.4.0] — 2026-06-16 — Extract Image Settings, GPT model selector, bulk fixes
+
+### Features
+- **"Extract Image Settings from Reference"** button — available in both the main frontend (Reference Image panel) and the Bulk Generate dialog. Sends the uploaded reference image to GPT-4o Vision with a strict JSON instruction to match each setting to the exact dropdown option strings. Populates Art Style, Camera Angle, Mood, Lighting, Color Palette, Depth of Field dropdowns, Extra Notes, and System Prompt from a single click. "What to pick from this reference" guidance is included to focus the extraction.
+- **GPT Model selector** in both the main frontend (Image Settings panel, "GPT Model:" row) and the Bulk Generate dialog (System Prompt section, next to Auto-Generate button). Color-coded tier indicator label updates on selection:
+  - ● Higher Capacity (green): `gpt-4o`, `gpt-4.1`, `gpt-5`, `gpt-5.1`, `o3`
+  - ● Higher Volume (amber): `gpt-4o-mini`, `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-5-mini`, `o4-mini`
+- All GPT calls (Suggest Prompt, Chat Refine, Auto-Generate System Prompt, Extract Settings) now use the locally selected model.
+
+### Bug fixes
+- **First-generation inconsistent art style**: bulk prompt_map now always builds `Scene: {voiceover}\n\n{settings}` from the dialog's settings, never from saved main-frontend prompts that carry conflicting old settings blocks.
+- **Bulk generation stopping early**: added 2-second pause between generations to reduce burst rate-limit hits; retry-on-429 already in place.
+- `re` module added for robust JSON extraction from model responses (handles markdown-wrapped JSON).
+
 ## [v1.3.0] — 2026-06-16 — Bulk settings sync, UI polish
 
 ### Features

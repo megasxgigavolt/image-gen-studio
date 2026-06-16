@@ -4,6 +4,7 @@ Visual plan (Excel) → GPT-4o prompt suggestion → Gemini image generation
 """
 
 import json
+import re
 import os
 import sys
 import base64
@@ -138,6 +139,12 @@ DEPTH_OF_FIELD = [
 
 AI_DECIDE = "Let AI Decide"
 
+# GPT model tiers — only multimodal/chat-capable models relevant for prompt & vision work
+HC_MODELS = ["gpt-4o", "gpt-4.1", "gpt-5", "gpt-5.1", "o3"]      # Higher Capacity
+HV_MODELS = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1-nano",
+             "gpt-5-mini", "o4-mini"]                               # Higher Volume
+ALL_GPT_MODELS = HC_MODELS + HV_MODELS
+
 _SPINNER = ["|", "/", "-", "\\"]
 
 
@@ -167,6 +174,7 @@ class ImageGenStudio(ctk.CTk):
         self._spin_idx                        = 0
         self._img_data:       Image.Image | None = None
         self._pending_images: dict            = {}
+        self.gpt_model_var:   ctk.StringVar  = ctk.StringVar(value="gpt-4o")
 
         self._check_startup_state()
         self._build_ui()
@@ -437,6 +445,18 @@ class ImageGenStudio(ctk.CTk):
             corner_radius=8, command=self._pick_output_dir,
         ).grid(row=0, column=1, padx=(10, 0))
 
+        # GPT Model selector
+        lbl(f, "GPT Model:").grid(row=7, column=0, padx=(16, 6), pady=(4, 12), sticky="w")
+        gm_row = ctk.CTkFrame(f, fg_color="transparent")
+        gm_row.grid(row=7, column=1, columnspan=3, padx=(4, 16), pady=(4, 12), sticky="ew")
+        gm_row.grid_columnconfigure(0, weight=1)
+        gm_combo = make_combo(gm_row, ALL_GPT_MODELS, self.gpt_model_var)
+        gm_combo.grid(row=0, column=0, sticky="ew")
+        gm_combo.configure(command=lambda v: self._update_tier_lbl(v, self._main_tier_lbl))
+        self._main_tier_lbl = ctk.CTkLabel(
+            gm_row, text="● Higher Capacity", font=F(12), text_color="#27643B")
+        self._main_tier_lbl.grid(row=0, column=1, padx=(10, 0))
+
     # ── Chat panel with resizable panes ───────────────────────────────────────
 
     def _build_chat_panel(self, parent):
@@ -592,7 +612,15 @@ class ImageGenStudio(ctk.CTk):
             border_color=C["divider"], border_width=1, font=F(13), height=34,
             placeholder_text="e.g. color grading, lighting style, mood, framing…",
         )
-        self.ref_desc_entry.grid(row=3, column=0, padx=16, pady=(0, 14), sticky="ew")
+        self.ref_desc_entry.grid(row=3, column=0, padx=16, pady=(0, 6), sticky="ew")
+
+        self.btn_extract = ctk.CTkButton(
+            f, text="Extract Image Settings from Reference",
+            height=32, corner_radius=8, font=F(13, "bold"),
+            fg_color=C["btn_blue"], hover_color="#0D3D6E",
+            command=self._extract_ref_settings,
+        )
+        self.btn_extract.grid(row=4, column=0, padx=16, pady=(0, 14), sticky="w")
 
     # ── Generated image preview ───────────────────────────────────────────────
 
@@ -802,6 +830,106 @@ class ImageGenStudio(ctk.CTk):
             self.sys_prompt_box.delete("0.0", "end")
             self.sys_prompt_box.insert("0.0", sys_p)
 
+    # ── GPT model tier helper ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _update_tier_lbl(model: str, lbl: ctk.CTkLabel):
+        if model in HC_MODELS:
+            lbl.configure(text="● Higher Capacity", text_color="#27643B")
+        else:
+            lbl.configure(text="● Higher Volume",   text_color="#B8860B")
+
+    # ── Reference image settings extraction ───────────────────────────────────
+
+    def _extract_ref_settings(self):
+        if not self.ref_image_b64:
+            messagebox.showwarning("No Reference Image",
+                                   "Upload a reference image first.")
+            return
+        if not OPENAI_API_KEY:
+            messagebox.showerror("API Key Missing",
+                                  "OPENAI_API_KEY not found in .env file.")
+            return
+        self.btn_extract.configure(state="disabled", text="Extracting…")
+        ref_b64  = self.ref_image_b64
+        ref_desc = self.ref_desc_entry.get().strip()
+        model    = self.gpt_model_var.get()
+        threading.Thread(target=self._extract_settings_worker,
+                          args=(ref_b64, ref_desc, model), daemon=True).start()
+
+    def _extract_settings_worker(self, ref_b64: str, ref_desc: str, model: str):
+        try:
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            focus  = f"\nPay special attention to: {ref_desc}" if ref_desc else ""
+            prompt = (
+                f"Analyze this reference image and extract precise visual settings "
+                f"for AI image generation.{focus}\n\n"
+                f"Choose the CLOSEST matching option for each setting from the exact "
+                f"strings provided (copy-paste the option string exactly):\n\n"
+                f'"art_style": one of {json.dumps(ART_STYLES)}\n'
+                f'"camera_angle": one of {json.dumps(CAMERA_ANGLES)}\n'
+                f'"mood": one of {json.dumps(MOODS)}\n'
+                f'"lighting": one of {json.dumps(LIGHTING)}\n'
+                f'"color_palette": one of {json.dumps(COLOR_PALETTES)}\n'
+                f'"depth_of_field": one of {json.dumps(DEPTH_OF_FIELD)}\n'
+                f'"extra_notes": string — any other visual qualities not covered above '
+                f'(textures, subject matter, composition details, specific colors, etc.)\n'
+                f'"style_prompt": 2-3 sentences capturing the overall aesthetic as a '
+                f'reusable style directive for AI image generation\n\n'
+                f"Return ONLY valid JSON. No markdown, no explanation."
+            )
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{ref_b64}",
+                                   "detail": "high"}},
+                    {"type": "text", "text": prompt},
+                ]}],
+                max_tokens=700,
+            )
+            raw = resp.choices[0].message.content.strip()
+            m   = re.search(r"\{.*\}", raw, re.DOTALL)
+            data = json.loads(m.group() if m else raw)
+            self.after(0, lambda: self._apply_extracted_settings(data))
+        except Exception as exc:
+            self.after(0, lambda e=str(exc): (
+                messagebox.showerror("Extraction Error", e),
+                self.btn_extract.configure(state="normal",
+                                           text="Extract Image Settings from Reference"),
+            ))
+
+    def _apply_extracted_settings(self, data: dict):
+        def try_set(var, key, options):
+            val = data.get(key, "")
+            if val in options:
+                var.set(val)
+
+        try_set(self.var_style,  "art_style",      ART_STYLES)
+        try_set(self.var_camera, "camera_angle",   CAMERA_ANGLES)
+        try_set(self.var_mood,   "mood",           MOODS)
+        try_set(self.var_light,  "lighting",       LIGHTING)
+        try_set(self.var_color,  "color_palette",  COLOR_PALETTES)
+        try_set(self.var_dof,    "depth_of_field", DEPTH_OF_FIELD)
+
+        notes = data.get("extra_notes", "").strip()
+        if notes:
+            self.extra_notes.delete(0, "end")
+            self.extra_notes.insert(0, notes)
+
+        style_p = data.get("style_prompt", "").strip()
+        if style_p:
+            self.sys_prompt_box.delete("0.0", "end")
+            self.sys_prompt_box.insert("0.0", style_p)
+
+        self.btn_extract.configure(state="normal",
+                                   text="Extract Image Settings from Reference")
+        messagebox.showinfo(
+            "Settings Extracted",
+            "Image settings have been extracted and applied to the dropdowns,\n"
+            "Extra Notes, and System Prompt."
+        )
+
     # ── Reference image ───────────────────────────────────────────────────────
 
     def _upload_reference(self):
@@ -868,13 +996,14 @@ class ImageGenStudio(ctk.CTk):
         ref_desc = self.ref_desc_entry.get().strip()
         still    = self.selected_still
         history  = list(self.chat_history)
+        model    = self.gpt_model_var.get()
         threading.Thread(
             target=self._suggestion_worker,
-            args=(still, sys_txt, settings, ref_b64, ref_desc, history),
+            args=(still, sys_txt, settings, ref_b64, ref_desc, history, model),
             daemon=True,
         ).start()
 
-    def _suggestion_worker(self, still, sys_txt, settings, ref_b64, ref_desc, history):
+    def _suggestion_worker(self, still, sys_txt, settings, ref_b64, ref_desc, history, model="gpt-4o"):
         try:
             client = OpenAI(api_key=OPENAI_API_KEY)
             parts: list = []
@@ -907,7 +1036,7 @@ class ImageGenStudio(ctk.CTk):
             messages.append({"role": "user", "content": parts})
 
             resp      = client.chat.completions.create(
-                model=GPT_MODEL, messages=messages, max_tokens=900)
+                model=model, messages=messages, max_tokens=900)
             suggested = resp.choices[0].message.content.strip()
 
             new_user = {"role": "user",
@@ -939,13 +1068,15 @@ class ImageGenStudio(ctk.CTk):
         cur_p    = self.prompt_editor.get("0.0", "end").strip()
         settings = self._settings_block()
         history  = list(self.chat_history)
+        model    = self.gpt_model_var.get()
         threading.Thread(
             target=self._chat_worker,
-            args=(msg, sys_txt, cur_p, settings, history),
+            args=(msg, sys_txt, cur_p, settings, history, model),
             daemon=True,
         ).start()
 
-    def _chat_worker(self, user_msg: str, sys_txt: str, cur_p: str, settings: str, history: list):
+    def _chat_worker(self, user_msg: str, sys_txt: str, cur_p: str, settings: str,
+                     history: list, model: str = "gpt-4o"):
         try:
             client = OpenAI(api_key=OPENAI_API_KEY)
             req = (f"Current prompt:\n\"{cur_p}\"\n\n"
@@ -959,7 +1090,7 @@ class ImageGenStudio(ctk.CTk):
             messages.append(user_entry)
 
             resp  = client.chat.completions.create(
-                model=GPT_MODEL, messages=messages, max_tokens=900)
+                model=model, messages=messages, max_tokens=900)
             reply = resp.choices[0].message.content.strip()
             asst_entry = {"role": "assistant", "content": reply}
             self.after(0, lambda: self._apply_refinement(reply, user_entry, asst_entry))
@@ -1246,11 +1377,12 @@ class BulkGenerateDialog(ctk.CTkToplevel):
 
     def __init__(self, parent: "ImageGenStudio"):
         super().__init__(parent)
-        self._app      = parent
-        self._running  = False
-        self._cancel   = False
-        self._start_ts = 0.0
+        self._app       = parent
+        self._running   = False
+        self._cancel    = False
+        self._start_ts  = 0.0
         self._gen_count = 0
+        self.gpt_model_var = ctk.StringVar(value="gpt-4o")
         self._total     = 0
         self._errors: list[str] = []
         self._ref_b64: str | None = None
@@ -1356,7 +1488,15 @@ class BulkGenerateDialog(ctk.CTkToplevel):
             border_color=C["divider"], border_width=1, font=F(13), height=34,
             placeholder_text="e.g. color grading, lighting style, mood, framing…",
         )
-        self.ref_desc_entry.grid(row=4, column=0, padx=14, pady=(0, 12), sticky="ew")
+        self.ref_desc_entry.grid(row=4, column=0, padx=14, pady=(0, 6), sticky="ew")
+
+        self.btn_extract = ctk.CTkButton(
+            rf, text="Extract Image Settings from Reference",
+            height=32, corner_radius=6, font=F(13, "bold"),
+            fg_color=C["btn_blue"], hover_color="#0D3D6E",
+            command=self._extract_ref_settings,
+        )
+        self.btn_extract.grid(row=5, column=0, padx=14, pady=(0, 12), sticky="w")
 
         # ── System Prompt ──────────────────────────────────────────────────
         pf = self._section(outer, "Style System Prompt  (applied to every still)")
@@ -1364,12 +1504,23 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         pf.grid_columnconfigure(0, weight=1)
         r += 1
 
+        gp_row = ctk.CTkFrame(pf, fg_color="transparent")
+        gp_row.grid(row=1, column=0, padx=14, pady=(4, 6), sticky="ew")
+        gp_row.grid_columnconfigure(2, weight=1)
+
         self.btn_gen_prompt = ctk.CTkButton(
-            pf, text="Auto-Generate via GPT", height=32, corner_radius=6,
+            gp_row, text="Auto-Generate via GPT", height=32, corner_radius=6,
             font=F(13, "bold"), fg_color=C["btn_blue"], hover_color="#0D3D6E",
             command=self._auto_gen_prompt,
         )
-        self.btn_gen_prompt.grid(row=1, column=0, padx=14, pady=(4, 6), sticky="w")
+        self.btn_gen_prompt.grid(row=0, column=0, padx=(0, 10))
+
+        dlg_gm_combo = make_combo(gp_row, ALL_GPT_MODELS, self.gpt_model_var, width=170)
+        dlg_gm_combo.grid(row=0, column=1)
+        dlg_gm_combo.configure(command=lambda v: self._update_tier_lbl(v, self._dlg_tier_lbl))
+        self._dlg_tier_lbl = ctk.CTkLabel(
+            gp_row, text="● Higher Capacity", font=F(12), text_color="#27643B")
+        self._dlg_tier_lbl.grid(row=0, column=2, padx=(8, 0), sticky="w")
 
         self.sys_prompt_box = ctk.CTkTextbox(
             pf, height=80, fg_color=C["input"], text_color=C["text"],
@@ -1480,6 +1631,106 @@ class BulkGenerateDialog(ctk.CTkToplevel):
             text_color=C["text_muted"],
         )
 
+    # ── GPT tier helper ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _update_tier_lbl(model: str, lbl: ctk.CTkLabel):
+        if model in HC_MODELS:
+            lbl.configure(text="● Higher Capacity", text_color="#27643B")
+        else:
+            lbl.configure(text="● Higher Volume",   text_color="#B8860B")
+
+    # ── Extract image settings from reference ─────────────────────────────────
+
+    def _extract_ref_settings(self):
+        if not self._ref_b64:
+            messagebox.showwarning("No Reference Image",
+                                   "Browse a reference image first.", parent=self)
+            return
+        if not OPENAI_API_KEY:
+            messagebox.showerror("API Key Missing",
+                                  "OPENAI_API_KEY not found in .env file.", parent=self)
+            return
+        self.btn_extract.configure(state="disabled", text="Extracting…")
+        ref_b64  = self._ref_b64
+        ref_desc = self.ref_desc_entry.get().strip()
+        model    = self.gpt_model_var.get()
+        threading.Thread(target=self._extract_settings_worker,
+                          args=(ref_b64, ref_desc, model), daemon=True).start()
+
+    def _extract_settings_worker(self, ref_b64: str, ref_desc: str, model: str):
+        try:
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            focus  = f"\nPay special attention to: {ref_desc}" if ref_desc else ""
+            prompt = (
+                f"Analyze this reference image and extract precise visual settings "
+                f"for AI image generation.{focus}\n\n"
+                f"Choose the CLOSEST matching option for each setting from the exact "
+                f"strings provided (copy the option string exactly):\n\n"
+                f'"art_style": one of {json.dumps(ART_STYLES)}\n'
+                f'"camera_angle": one of {json.dumps(CAMERA_ANGLES)}\n'
+                f'"mood": one of {json.dumps(MOODS)}\n'
+                f'"lighting": one of {json.dumps(LIGHTING)}\n'
+                f'"color_palette": one of {json.dumps(COLOR_PALETTES)}\n'
+                f'"depth_of_field": one of {json.dumps(DEPTH_OF_FIELD)}\n'
+                f'"extra_notes": any other visual qualities not covered above '
+                f'(textures, composition, specific colors, subject characteristics, etc.)\n'
+                f'"style_prompt": 2-3 sentences capturing the overall aesthetic as a '
+                f'reusable style directive for consistent AI image generation\n\n'
+                f"Return ONLY valid JSON. No markdown, no explanation."
+            )
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/png;base64,{ref_b64}",
+                                   "detail": "high"}},
+                    {"type": "text", "text": prompt},
+                ]}],
+                max_tokens=700,
+            )
+            raw  = resp.choices[0].message.content.strip()
+            m    = re.search(r"\{.*\}", raw, re.DOTALL)
+            data = json.loads(m.group() if m else raw)
+            self.after(0, lambda: self._apply_extracted_settings(data))
+        except Exception as exc:
+            self.after(0, lambda e=str(exc): (
+                messagebox.showerror("Extraction Error", e, parent=self),
+                self.btn_extract.configure(
+                    state="normal", text="Extract Image Settings from Reference"),
+            ))
+
+    def _apply_extracted_settings(self, data: dict):
+        def try_set(var, key, options):
+            val = data.get(key, "")
+            if val in options:
+                var.set(val)
+
+        try_set(self.var_style,  "art_style",      ART_STYLES)
+        try_set(self.var_camera, "camera_angle",   CAMERA_ANGLES)
+        try_set(self.var_mood,   "mood",           MOODS)
+        try_set(self.var_light,  "lighting",       LIGHTING)
+        try_set(self.var_color,  "color_palette",  COLOR_PALETTES)
+        try_set(self.var_dof,    "depth_of_field", DEPTH_OF_FIELD)
+
+        notes = data.get("extra_notes", "").strip()
+        if notes:
+            self.extra_notes.delete(0, "end")
+            self.extra_notes.insert(0, notes)
+
+        style_p = data.get("style_prompt", "").strip()
+        if style_p:
+            self.sys_prompt_box.delete("0.0", "end")
+            self.sys_prompt_box.insert("0.0", style_p)
+
+        self.btn_extract.configure(state="normal",
+                                   text="Extract Image Settings from Reference")
+        messagebox.showinfo(
+            "Settings Extracted",
+            "Image settings, Extra Notes, and Style Prompt have been applied.",
+            parent=self,
+        )
+
     # ── Reference image ───────────────────────────────────────────────────────
 
     def _browse_ref(self):
@@ -1519,10 +1770,11 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         vos      = "\n".join(f"- {s['voiceover']}" for s in self._app.stills[:12])
         settings = self._settings_block()
         ref_desc = self.ref_desc_entry.get().strip()
+        model    = self.gpt_model_var.get()
         threading.Thread(target=self._prompt_worker,
-                          args=(vos, settings, ref_desc), daemon=True).start()
+                          args=(vos, settings, ref_desc, model), daemon=True).start()
 
-    def _prompt_worker(self, vos: str, settings: str, ref_desc: str = ""):
+    def _prompt_worker(self, vos: str, settings: str, ref_desc: str = "", model: str = "gpt-4o"):
         try:
             client = OpenAI(api_key=OPENAI_API_KEY)
             ref_note = (
@@ -1530,7 +1782,7 @@ class BulkGenerateDialog(ctk.CTkToplevel):
                 if ref_desc else ""
             )
             resp = client.chat.completions.create(
-                model=GPT_MODEL,
+                model=model,
                 messages=[{"role": "user", "content": (
                     f"I am generating AI images for a video. "
                     f"Below are the voiceover lines (up to 12 stills):\n{vos}\n\n"
@@ -1648,15 +1900,12 @@ class BulkGenerateDialog(ctk.CTkToplevel):
             "system_prompt": sys_txt,
         }
 
+        # Always build from voiceover + fresh bulk settings for every still.
+        # Using saved prompts risks conflicting settings blocks from previous runs.
         prompt_map: dict[str, str] = {}
         for s in targets:
-            sid = s["still_id"]
-            saved = ""
-            if app.selected_still and app.selected_still["still_id"] == sid:
-                saved = app.prompt_editor.get("0.0", "end").strip()
-            elif sid in app._still_states:
-                saved = app._still_states[sid].get("prompt", "").strip()
-            base = f"{saved}\n\n{settings}" if saved else f"Scene: {s['voiceover']}\n\n{settings}"
+            sid  = s["still_id"]
+            base = f"Scene: {s['voiceover']}\n\n{settings}"
             prompt_map[sid] = f"{sys_txt}\n\n{base}" if sys_txt else base
 
         self._running   = True
@@ -1752,6 +2001,7 @@ class BulkGenerateDialog(ctk.CTkToplevel):
                         self.after(0, _on_gen)
                     else:
                         self._errors.append(f"{sid}: Gemini returned no image")
+                    time.sleep(2)   # brief pause between calls to ease rate pressure
                     break  # success or non-retryable empty response
 
                 except Exception as exc:

@@ -8,6 +8,7 @@ import os
 import sys
 import base64
 import threading
+import time
 from pathlib import Path
 from io import BytesIO
 
@@ -135,6 +136,8 @@ DEPTH_OF_FIELD = [
     "Custom (see Extra Notes)",
 ]
 
+AI_DECIDE = "Let AI Decide"
+
 _SPINNER = ["|", "/", "-", "\\"]
 
 
@@ -164,8 +167,6 @@ class ImageGenStudio(ctk.CTk):
         self._spin_idx                        = 0
         self._img_data:       Image.Image | None = None
         self._pending_images: dict            = {}
-        self._bulk_running:   bool            = False
-        self._bulk_cancel:    bool            = False
 
         self._check_startup_state()
         self._build_ui()
@@ -274,17 +275,25 @@ class ImageGenStudio(ctk.CTk):
         bot.grid_columnconfigure(0, weight=1)
 
         self.btn_bulk = ctk.CTkButton(
-            bot, text="Bulk Generate All",
+            bot, text="Bulk Generate…",
             height=36, corner_radius=8, font=F(13, "bold"),
             fg_color=C["btn_blue"], hover_color="#0D3D6E",
-            command=self._bulk_generate,
+            command=self._open_bulk_dialog,
         )
         self.btn_bulk.grid(row=0, column=0, sticky="ew")
+
+        self.btn_bulk_approve = ctk.CTkButton(
+            bot, text="Bulk Approve & Save All",
+            height=32, corner_radius=8, font=F(12, "bold"),
+            fg_color=C["btn_brown"], hover_color="#4E342E",
+            command=self._bulk_approve_all,
+        )
+        self.btn_bulk_approve.grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
         self.lbl_bulk_progress = ctk.CTkLabel(
             bot, text="", font=F(11), text_color=C["text_muted"],
         )
-        self.lbl_bulk_progress.grid(row=1, column=0, pady=(2, 0))
+        self.lbl_bulk_progress.grid(row=2, column=0, pady=(2, 0))
 
     # ── Right panel ───────────────────────────────────────────────────────────
 
@@ -700,8 +709,10 @@ class ImageGenStudio(ctk.CTk):
             )
             btn.grid(sticky="ew", padx=6, pady=3)
 
-        if pend_count and not self._bulk_running:
+        if pend_count:
             self.lbl_bulk_progress.configure(text=f"{pend_count} pending approval")
+        else:
+            self.lbl_bulk_progress.configure(text="")
 
     # ── Still selection ───────────────────────────────────────────────────────
 
@@ -1162,71 +1173,458 @@ class ImageGenStudio(ctk.CTk):
             pass
 
     def _on_close(self):
-        self._bulk_cancel = True
         self._save_settings()
         self.destroy()
 
-    # ── Bulk generation ───────────────────────────────────────────────────────
+    # ── Bulk helpers (sidebar) ────────────────────────────────────────────────
 
-    def _build_prompt_for_still(self, still: dict) -> str:
-        sid = still["still_id"]
-        if self.selected_still and self.selected_still["still_id"] == sid:
-            p = self.prompt_editor.get("0.0", "end").strip()
-            if p:
-                return p
-        if sid in self._still_states:
-            p = self._still_states[sid].get("prompt", "").strip()
-            if p:
-                return p
-        return f"Scene: {still['voiceover']}\n\n{self._settings_block()}"
-
-    def _bulk_generate(self):
-        if self._bulk_running:
-            self._bulk_cancel = True
-            self.btn_bulk.configure(text="Stopping…", state="disabled")
-            return
-
+    def _open_bulk_dialog(self):
         if not self.stills:
             messagebox.showwarning("No Stills", "Load a visual plan first.")
             return
+        BulkGenerateDialog(self)
 
-        completed = self.gen_state.get("completed", {})
-        targets   = [s for s in self.stills if s["still_id"] not in completed]
+    def _bulk_approve_all(self):
+        pending = dict(self._pending_images)
+        if not pending:
+            messagebox.showinfo("Nothing Pending", "No pending images to approve.")
+            return
+        n = len(pending)
+        if not messagebox.askyesno(
+            "Bulk Approve & Save All",
+            f"Save all {n} pending generated images to disk?\n\nOutput: {self.output_dir}",
+        ):
+            return
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        for sid, img_bytes in pending.items():
+            version = 1
+            while (self.output_dir / f"{sid}_v{version}.png").exists():
+                version += 1
+            out_path = self.output_dir / f"{sid}_v{version}.png"
+            out_path.write_bytes(img_bytes)
+            self.gen_state.setdefault("completed", {})[sid] = str(out_path)
+            self._pending_images.pop(sid, None)
+        self._save_state()
+        self._populate_stills_list()
+        messagebox.showinfo("Saved", f"{n} images saved to:\n{self.output_dir}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+class BulkGenerateDialog(ctk.CTkToplevel):
+# ═════════════════════════════════════════════════════════════════════════════
+    """
+    Modal popup for bulk image generation with per-run settings, ETA timer,
+    'Let AI Decide' per-setting option, system prompt, reference image, and
+    resume-from-where-left-off support.
+    """
+
+    def __init__(self, parent: "ImageGenStudio"):
+        super().__init__(parent)
+        self._app      = parent
+        self._running  = False
+        self._cancel   = False
+        self._start_ts = 0.0
+        self._gen_count = 0
+        self._total     = 0
+        self._errors: list[str] = []
+        self._ref_b64: str | None = None
+
+        self.title("Bulk Generate — Settings")
+        self.geometry("760x860")
+        self.resizable(True, True)
+        self.configure(fg_color=C["app"])
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._build_ui()
+        self._refresh_status()
+        self._check_resume()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        outer = ctk.CTkScrollableFrame(
+            self, fg_color=C["app"],
+            scrollbar_button_color=C["divider"],
+            scrollbar_button_hover_color=C["accent"],
+        )
+        outer.pack(fill="both", expand=True)
+        outer.grid_columnconfigure(0, weight=1)
+
+        r = 0
+
+        # Header
+        ctk.CTkLabel(outer, text="Bulk Generate — Settings",
+                     font=F(18, "bold"), text_color=C["accent"]).grid(
+            row=r, column=0, sticky="w", padx=20, pady=(18, 6))
+        r += 1
+
+        # ── Image Settings ─────────────────────────────────────────────────
+        sf = self._section(outer, "Image Settings")
+        sf.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 8))
+        sf.grid_columnconfigure((1, 3), weight=1)
+        r += 1
+
+        self.var_style  = ctk.StringVar(value=AI_DECIDE)
+        self.var_camera = ctk.StringVar(value=AI_DECIDE)
+        self.var_mood   = ctk.StringVar(value=AI_DECIDE)
+        self.var_light  = ctk.StringVar(value=AI_DECIDE)
+        self.var_color  = ctk.StringVar(value=AI_DECIDE)
+        self.var_dof    = ctk.StringVar(value=AI_DECIDE)
+
+        def lbl(parent, text):
+            return ctk.CTkLabel(parent, text=text, font=F(13),
+                                text_color=C["text_mid"])
+
+        def row2(r, l1, v1, opts1, l2, v2, opts2):
+            lbl(sf, l1).grid(row=r, column=0, padx=(14, 4), pady=5, sticky="w")
+            make_combo(sf, [AI_DECIDE] + opts1, v1).grid(
+                row=r, column=1, padx=(0, 12), pady=5, sticky="ew")
+            lbl(sf, l2).grid(row=r, column=2, padx=(12, 4), pady=5, sticky="w")
+            make_combo(sf, [AI_DECIDE] + opts2, v2).grid(
+                row=r, column=3, padx=(0, 14), pady=5, sticky="ew")
+
+        row2(1, "Art Style:", self.var_style, ART_STYLES,
+                "Camera Angle:", self.var_camera, CAMERA_ANGLES)
+        row2(2, "Mood:", self.var_mood, MOODS,
+                "Lighting:", self.var_light, LIGHTING)
+        row2(3, "Color Palette:", self.var_color, COLOR_PALETTES,
+                "Depth of Field:", self.var_dof, DEPTH_OF_FIELD)
+
+        lbl(sf, "Extra Notes:").grid(row=4, column=0, padx=(14, 4), pady=(4, 10), sticky="w")
+        self.extra_notes = ctk.CTkEntry(
+            sf, fg_color=C["input"], text_color=C["text"],
+            border_color=C["divider"], border_width=1, font=F(13), height=34,
+        )
+        self.extra_notes.grid(row=4, column=1, columnspan=3,
+                               padx=(0, 14), pady=(4, 10), sticky="ew")
+
+        # ── Reference Image ────────────────────────────────────────────────
+        rf = self._section(outer, "Reference Image")
+        rf.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 8))
+        rf.grid_columnconfigure(1, weight=1)
+        r += 1
+
+        ctk.CTkButton(
+            rf, text="Browse…", width=120, height=32, corner_radius=6,
+            font=F(13, "bold"), fg_color=C["btn_brown"], hover_color="#4E342E",
+            command=self._browse_ref,
+        ).grid(row=1, column=0, padx=(14, 8), pady=(4, 12))
+        self.ref_lbl = ctk.CTkLabel(
+            rf, text="No reference image", font=F(12),
+            text_color=C["text_muted"], anchor="w")
+        self.ref_lbl.grid(row=1, column=1, padx=(0, 14), pady=(4, 12), sticky="w")
+
+        # ── System Prompt ──────────────────────────────────────────────────
+        pf = self._section(outer, "Style System Prompt  (applied to every still)")
+        pf.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 8))
+        pf.grid_columnconfigure(0, weight=1)
+        r += 1
+
+        self.btn_gen_prompt = ctk.CTkButton(
+            pf, text="Auto-Generate via GPT", height=32, corner_radius=6,
+            font=F(13, "bold"), fg_color=C["btn_blue"], hover_color="#0D3D6E",
+            command=self._auto_gen_prompt,
+        )
+        self.btn_gen_prompt.grid(row=1, column=0, padx=14, pady=(4, 6), sticky="w")
+
+        self.sys_prompt_box = ctk.CTkTextbox(
+            pf, height=80, fg_color=C["input"], text_color=C["text"],
+            border_color=C["divider"], border_width=1, font=F(13),
+        )
+        self.sys_prompt_box.grid(row=2, column=0, padx=14, pady=(0, 12), sticky="ew")
+        self.sys_prompt_box.insert(
+            "0.0",
+            "Generate each image in a cohesive visual style that feels consistent "
+            "across the entire video. Maintain the same lighting tone, color grading, "
+            "and artistic approach throughout all stills.",
+        )
+
+        # ── Status + progress ──────────────────────────────────────────────
+        self.lbl_status = ctk.CTkLabel(
+            outer, text="", font=F(12), text_color=C["text_muted"], anchor="w")
+        self.lbl_status.grid(row=r, column=0, padx=20, pady=(4, 2), sticky="ew")
+        r += 1
+
+        self.progress_bar = ctk.CTkProgressBar(
+            outer, height=8, fg_color=C["divider"], progress_color=C["accent"])
+        self.progress_bar.set(0)
+        self.progress_bar.grid(row=r, column=0, padx=20, pady=(0, 2), sticky="ew")
+        r += 1
+
+        self.lbl_timer = ctk.CTkLabel(
+            outer, text="", font=F(12), text_color=C["text_muted"], anchor="w")
+        self.lbl_timer.grid(row=r, column=0, padx=20, pady=(0, 10), sticky="w")
+        r += 1
+
+        # ── Action buttons ─────────────────────────────────────────────────
+        brow = ctk.CTkFrame(outer, fg_color="transparent")
+        brow.grid(row=r, column=0, padx=14, pady=(0, 24), sticky="ew")
+        brow.grid_columnconfigure((0, 1, 2), weight=1)
+        r += 1
+
+        self.btn_start = ctk.CTkButton(
+            brow, text="Bulk Generate All", height=46, corner_radius=10,
+            font=F(15, "bold"), fg_color=C["btn_green"], hover_color="#1B4D2E",
+            command=self._toggle_generate,
+        )
+        self.btn_start.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+
+        self.btn_approve_all = ctk.CTkButton(
+            brow, text="Bulk Approve & Save", height=46, corner_radius=10,
+            font=F(15, "bold"), fg_color=C["btn_brown"], hover_color="#4E342E",
+            command=self._bulk_approve_all,
+        )
+        self.btn_approve_all.grid(row=0, column=1, padx=5, sticky="ew")
+
+        ctk.CTkButton(
+            brow, text="Close", height=46, corner_radius=10,
+            font=F(15, "bold"), fg_color="#888888", hover_color="#666666",
+            command=self._on_close,
+        ).grid(row=0, column=2, padx=(5, 0), sticky="ew")
+
+    def _section(self, parent, title: str) -> ctk.CTkFrame:
+        f = ctk.CTkFrame(parent, fg_color=C["panel"], corner_radius=12,
+                          border_width=1, border_color=C["divider"])
+        ctk.CTkLabel(f, text=title, font=F(14, "bold"),
+                     text_color=C["accent"]).grid(
+            row=0, column=0, columnspan=4, padx=14, pady=(10, 2), sticky="w")
+        return f
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _settings_block(self) -> str:
+        def fmt(label: str, var: ctk.StringVar) -> str:
+            v = var.get()
+            if v == AI_DECIDE:
+                return (f"{label}  [Choose the most visually appropriate "
+                        f"{label.rstrip(':').lower()} for this scene based on its content]")
+            return f"{label}  {v}"
+        lines = [
+            fmt("Art Style:",      self.var_style),
+            fmt("Camera Angle:",   self.var_camera),
+            fmt("Mood:",           self.var_mood),
+            fmt("Lighting:",       self.var_light),
+            fmt("Color Palette:",  self.var_color),
+            fmt("Depth of Field:", self.var_dof),
+        ]
+        notes = self.extra_notes.get().strip()
+        if notes:
+            lines.append(f"Extra Notes:  {notes}")
+        return "\n".join(lines)
+
+    def _fmt_time(self, secs: float) -> str:
+        m, s = divmod(int(secs), 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    def _refresh_status(self):
+        app       = self._app
+        completed = app.gen_state.get("completed", {})
+        pending   = app._pending_images
+        total     = len(app.stills)
+        done_n    = sum(1 for s in app.stills if s["still_id"] in completed)
+        pend_n    = sum(1 for s in app.stills
+                        if s["still_id"] in pending and s["still_id"] not in completed)
+        todo_n    = total - done_n - pend_n
+        self.lbl_status.configure(
+            text=(f"{total} stills total  •  {done_n} approved  •  "
+                  f"{pend_n} pending  •  {todo_n} not yet generated"),
+            text_color=C["text_muted"],
+        )
+
+    # ── Reference image ───────────────────────────────────────────────────────
+
+    def _browse_ref(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="Choose reference image",
+            filetypes=[("Image files", "*.png *.jpg *.jpeg *.webp *.bmp")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                self._ref_b64 = base64.b64encode(fh.read()).decode()
+            self.ref_lbl.configure(text=Path(path).name, text_color=C["text"])
+        except Exception as exc:
+            messagebox.showerror("Image Error", str(exc), parent=self)
+
+    # ── Auto-generate system prompt ───────────────────────────────────────────
+
+    def _auto_gen_prompt(self):
+        if not OPENAI_API_KEY:
+            messagebox.showerror(
+                "API Key Missing",
+                "OPENAI_API_KEY not found in .env file.", parent=self)
+            return
+        if not self._app.stills:
+            messagebox.showwarning("No Stills", "Load a visual plan first.", parent=self)
+            return
+        self.btn_gen_prompt.configure(state="disabled", text="Generating…")
+        vos      = "\n".join(f"- {s['voiceover']}" for s in self._app.stills[:12])
+        settings = self._settings_block()
+        threading.Thread(target=self._prompt_worker,
+                          args=(vos, settings), daemon=True).start()
+
+    def _prompt_worker(self, vos: str, settings: str):
+        try:
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            resp = client.chat.completions.create(
+                model=GPT_MODEL,
+                messages=[{"role": "user", "content": (
+                    f"I am generating AI images for a video. "
+                    f"Below are the voiceover lines (up to 12 stills):\n{vos}\n\n"
+                    f"Image settings selected:\n{settings}\n\n"
+                    f"Write a concise system prompt (3-4 sentences) that, "
+                    f"when prepended to every image generation request, ensures "
+                    f"all images share the same visual style, mood, and aesthetic cohesion. "
+                    f"Be specific about visual qualities — not narrative content. "
+                    f"Return ONLY the prompt text, no labels or preamble."
+                )}],
+                max_tokens=300,
+            )
+            text = resp.choices[0].message.content.strip()
+            self.after(0, lambda: self._apply_sys_prompt(text))
+        except Exception as exc:
+            self.after(0, lambda e=str(exc): (
+                messagebox.showerror("GPT Error", e, parent=self),
+                self.btn_gen_prompt.configure(
+                    state="normal", text="Auto-Generate via GPT"),
+            ))
+
+    def _apply_sys_prompt(self, text: str):
+        self.sys_prompt_box.delete("0.0", "end")
+        self.sys_prompt_box.insert("0.0", text)
+        self.btn_gen_prompt.configure(state="normal", text="Auto-Generate via GPT")
+
+    # ── Resume check ──────────────────────────────────────────────────────────
+
+    def _check_resume(self):
+        app       = self._app
+        completed = app.gen_state.get("completed", {})
+        pending   = [s for s in app.stills
+                     if s["still_id"] in app._pending_images
+                     and s["still_id"] not in completed]
+        if not pending:
+            return
+        ans = messagebox.askyesnocancel(
+            "Resume Previous Run?",
+            f"{len(pending)} stills from a previous bulk run are pending approval.\n\n"
+            f"Yes  →  Skip already-generated stills (resume)\n"
+            f"No   →  Regenerate everything (start over)\n"
+            f"Cancel  →  Do nothing",
+            parent=self,
+        )
+        if ans is False:
+            app._pending_images.clear()
+            app._populate_stills_list()
+            self._refresh_status()
+
+    # ── Timer ─────────────────────────────────────────────────────────────────
+
+    def _tick_timer(self):
+        if not self._running:
+            return
+        elapsed = time.time() - self._start_ts
+        done    = self._gen_count
+        elapsed_str = self._fmt_time(elapsed)
+        if done > 0:
+            eta_sec = (self._total - done) * (elapsed / done)
+            eta_str = self._fmt_time(eta_sec)
+        else:
+            eta_str = "—"
+        self.lbl_timer.configure(
+            text=f"Elapsed: {elapsed_str}   |   ETA: {eta_str}")
+        self.after(1000, self._tick_timer)
+
+    # ── Generation ────────────────────────────────────────────────────────────
+
+    def _toggle_generate(self):
+        if self._running:
+            self._cancel = True
+            self.btn_start.configure(text="Stopping…", state="disabled")
+            return
+
+        app       = self._app
+        completed = app.gen_state.get("completed", {})
+        targets   = [s for s in app.stills
+                     if s["still_id"] not in completed
+                     and s["still_id"] not in app._pending_images]
 
         if not targets:
-            messagebox.showinfo("All Done", "All stills are already approved.")
+            pending_n = sum(1 for s in app.stills
+                            if s["still_id"] not in completed
+                            and s["still_id"] in app._pending_images)
+            if pending_n:
+                messagebox.showinfo(
+                    "All Generated",
+                    f"All stills are already generated ({pending_n} pending approval).\n"
+                    f"Click 'Bulk Approve & Save' to save them to disk.",
+                    parent=self,
+                )
+            else:
+                messagebox.showinfo("All Done",
+                                    "All stills have been approved.", parent=self)
             return
 
-        # Build prompts NOW in main thread (safe for tkinter widget reads)
-        prompt_map = {s["still_id"]: self._build_prompt_for_still(s) for s in targets}
+        # Snapshot all tkinter values in main thread before handing off
+        sys_txt  = self.sys_prompt_box.get("0.0", "end").strip()
+        settings = self._settings_block()
+        ref_b64  = self._ref_b64
 
-        self._bulk_running = True
-        self._bulk_cancel  = False
-        self.btn_bulk.configure(
-            text="Stop Bulk Gen", state="normal",
+        prompt_map: dict[str, str] = {}
+        for s in targets:
+            sid = s["still_id"]
+            saved = ""
+            if app.selected_still and app.selected_still["still_id"] == sid:
+                saved = app.prompt_editor.get("0.0", "end").strip()
+            elif sid in app._still_states:
+                saved = app._still_states[sid].get("prompt", "").strip()
+            base = f"{saved}\n\n{settings}" if saved else f"Scene: {s['voiceover']}\n\n{settings}"
+            prompt_map[sid] = f"{sys_txt}\n\n{base}" if sys_txt else base
+
+        self._running   = True
+        self._cancel    = False
+        self._gen_count = 0
+        self._total     = len(targets)
+        self._errors    = []
+        self._start_ts  = time.time()
+
+        self.btn_start.configure(
+            text="Stop Generation", state="normal",
             fg_color=C["btn_red"], hover_color="#6B1A14",
         )
-        self.lbl_bulk_progress.configure(text=f"0 / {len(targets)} generated")
-        threading.Thread(target=self._bulk_worker, args=(targets, prompt_map), daemon=True).start()
+        self.progress_bar.set(0)
+        self.lbl_timer.configure(text="Elapsed: 00:00   |   ETA: —")
+        self._tick_timer()
+
+        threading.Thread(
+            target=self._bulk_worker,
+            args=(targets, prompt_map),
+            daemon=True,
+        ).start()
 
     def _bulk_worker(self, targets: list, prompt_map: dict):
-        total = len(targets)
         try:
-            client = self._init_nb2()
+            client = self._app._init_nb2()
         except Exception as exc:
-            self.after(0, lambda: messagebox.showerror("Bulk Error", f"Gemini init failed:\n{exc}"))
-            self.after(0, self._bulk_done)
+            self.after(0, lambda e=str(exc): (
+                messagebox.showerror("Gemini Error",
+                                     f"Failed to connect to Gemini:\n{e}", parent=self),
+                self._bulk_done(),
+            ))
             return
 
-        done = 0
         for still in targets:
-            if self._bulk_cancel:
+            if self._cancel:
                 break
             sid    = still["still_id"]
             prompt = prompt_map.get(sid, still["voiceover"])
+            n      = self._gen_count
 
-            self.after(0, lambda i=done, sid=sid: self.lbl_bulk_progress.configure(
-                text=f"Generating {sid.upper()}…  ({i}/{total} done)"
+            self.after(0, lambda sid=sid, n=n: self.lbl_status.configure(
+                text=f"Generating {sid.upper()}…  ({n} / {self._total} done)",
+                text_color=C["accent"],
             ))
 
             try:
@@ -1246,37 +1644,102 @@ class ImageGenStudio(ctk.CTk):
                             break
 
                 if img_bytes:
-                    self._pending_images[sid] = img_bytes
-                    done += 1
+                    self._app._pending_images[sid] = img_bytes
+                    self._gen_count += 1
 
-                    def _on_gen(sid=sid, img_bytes=img_bytes):
-                        self._populate_stills_list()
-                        if self.selected_still and self.selected_still["still_id"] == sid:
-                            self.current_image_bytes = img_bytes
-                            self._img_data = Image.open(BytesIO(img_bytes))
-                            self.btn_approve.configure(state="normal")
-                            self.after_idle(self._display_gen_image)
+                    def _on_gen(sid=sid, ib=img_bytes):
+                        self._app._populate_stills_list()
+                        if (self._app.selected_still
+                                and self._app.selected_still["still_id"] == sid):
+                            self._app.current_image_bytes = ib
+                            self._app._img_data = Image.open(BytesIO(ib))
+                            self._app.btn_approve.configure(state="normal")
+                            self._app.after_idle(self._app._display_gen_image)
+                        self.progress_bar.set(self._gen_count / self._total)
+
                     self.after(0, _on_gen)
+                else:
+                    self._errors.append(f"{sid}: Gemini returned no image")
 
             except Exception as exc:
-                self.after(0, lambda sid=sid, e=str(exc): self.lbl_bulk_progress.configure(
-                    text=f"Error on {sid}: {e[:60]}"
-                ))
+                self._errors.append(f"{sid}: {str(exc)[:100]}")
 
         self.after(0, self._bulk_done)
 
     def _bulk_done(self):
-        self._bulk_running = False
-        self._bulk_cancel  = False
-        n = len(self._pending_images)
-        self.btn_bulk.configure(
+        self._running = False
+        self._cancel  = False
+        done  = self._gen_count
+        errs  = len(self._errors)
+
+        self.btn_start.configure(
             text="Bulk Generate All", state="normal",
-            fg_color=C["btn_blue"], hover_color="#0D3D6E",
+            fg_color=C["btn_green"], hover_color="#1B4D2E",
         )
-        self.lbl_bulk_progress.configure(
-            text=f"{n} pending approval" if n else "Bulk generation complete"
+        self.lbl_timer.configure(text="")
+        self._refresh_status()
+        self._app._populate_stills_list()
+
+        msg = f"Done — {done} / {self._total} generated"
+        if errs:
+            msg += f"  ({errs} failed)"
+        self.lbl_status.configure(
+            text=msg,
+            text_color=C["btn_red"] if errs else C["btn_green"],
         )
-        self._populate_stills_list()
+        self.progress_bar.set(done / self._total if self._total else 0)
+
+        if errs and messagebox.askyesno(
+            "Generation Errors",
+            f"{errs} still(s) failed. Show details?",
+            parent=self,
+        ):
+            messagebox.showinfo(
+                "Error Details", "\n".join(self._errors), parent=self)
+
+    # ── Bulk approve ──────────────────────────────────────────────────────────
+
+    def _bulk_approve_all(self):
+        pending = {sid: ib for sid, ib in self._app._pending_images.items()
+                   if sid not in self._app.gen_state.get("completed", {})}
+        if not pending:
+            messagebox.showinfo("Nothing Pending",
+                                "No pending images to approve.", parent=self)
+            return
+        n = len(pending)
+        if not messagebox.askyesno(
+            "Bulk Approve & Save",
+            f"Save all {n} pending generated images to disk?\n\nOutput: {self._app.output_dir}",
+            parent=self,
+        ):
+            return
+        self._app.output_dir.mkdir(parents=True, exist_ok=True)
+        for sid, img_bytes in pending.items():
+            version = 1
+            while (self._app.output_dir / f"{sid}_v{version}.png").exists():
+                version += 1
+            out_path = self._app.output_dir / f"{sid}_v{version}.png"
+            out_path.write_bytes(img_bytes)
+            self._app.gen_state.setdefault("completed", {})[sid] = str(out_path)
+            self._app._pending_images.pop(sid, None)
+        self._app._save_state()
+        self._app._populate_stills_list()
+        self._refresh_status()
+        messagebox.showinfo(
+            "Saved", f"{n} images saved to:\n{self._app.output_dir}", parent=self)
+
+    # ── Close ─────────────────────────────────────────────────────────────────
+
+    def _on_close(self):
+        if self._running:
+            if not messagebox.askyesno(
+                "Stop Generation?",
+                "Bulk generation is running. Stop and close?",
+                parent=self,
+            ):
+                return
+            self._cancel = True
+        self.destroy()
 
 
 # ═════════════════════════════════════════════════════════════════════════════

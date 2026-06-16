@@ -1,5 +1,27 @@
 # Image Gen Studio — Changelog
 
+## [v1.1.0] — 2026-06-16 — Bulk Generate Dialog
+
+### Features
+- **New Bulk Generate popup window** — replaces the single sidebar button
+  - Full cream/brown theme matching main frontend (Segoe UI bold, `#FAF5EC` background)
+  - All image-setting dropdowns (Art Style, Camera Angle, Mood, Lighting, Color Palette, DoF, Extra Notes) each with a **"Let AI Decide"** option as the first choice — when selected, Gemini is instructed to pick the most visually appropriate value for each scene
+  - **Auto-Generate Style Prompt** button calls GPT-4o on the first 12 still voiceovers to write a cohesive system prompt; fully editable before generation
+  - **Reference image upload** — browsed image is sent as base64 alongside the system prompt
+  - No chat interface in the popup — focused on bulk settings only
+  - **Elapsed time + ETA display** — live 1-second timer showing `Elapsed: MM:SS | ETA: MM:SS`, calculated from actual per-still generation rate
+  - **Progress bar** fills as each still is generated
+  - **Stop Generation** button cancels gracefully mid-run
+  - On next open, if pending images exist from a stopped run: popup asks **"Resume?"** (skip already-generated) or **"Start Over?"** (clear pending and regenerate all)
+- **Bulk Approve & Save** available both in the popup and as a sidebar button — saves all pending images to disk in one click, auto-increments version numbers
+- **Bug fix — bulk generate skipping stills**: old code re-targeted stills already in `_pending_images`; new dialog correctly skips both `completed` and `pending` stills, offering resume-or-start-over instead
+- Per-still errors are collected and shown in a summary dialog at the end rather than silently overwriting the progress label
+
+### Changes
+- Sidebar now shows **"Bulk Generate…"** (opens dialog) + **"Bulk Approve & Save All"** buttons
+- `_bulk_running` / `_bulk_cancel` state removed from `ImageGenStudio` — all bulk state now lives in the dialog instance
+- `_populate_stills_list` no longer guards the progress label update on `_bulk_running`; label clears when no pending images remain
+
 ## [v1.0.0] — 2026-06-16 — Initial Release
 
 ### Features

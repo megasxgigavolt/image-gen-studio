@@ -1,5 +1,18 @@
 # Image Gen Studio — Changelog
 
+## [v1.5.0] — 2026-06-16 — Style accuracy, prompt structure, inline Extract Settings
+
+### Features
+- **"Comic Book / Illustration"** added to Art Style dropdown — allows accurate extraction and explicit selection of hand-drawn illustration / comic art styles.
+- **Extract Settings button** is now inline with the "What to pick" entry field (right-aligned, maroon, labelled "Extract Settings") in both the main frontend and the Bulk dialog — no separate row.
+- **Reference image sent directly to Gemini** during bulk generation — Gemini now receives the actual image alongside the text prompt so it can visually match the style, rather than relying on a textual hint.
+
+### Improvements
+- **Extraction accuracy**: GPT receives a system message enforcing exact string matching; `style_prompt` is instructed to write direct technique instructions ("Use bold black outlines…") not vague references ("capture the style of…").
+- **Auto-Generate system prompt**: Now sends the reference image to GPT (if uploaded) for visual analysis. Output is a pure visual style directive — explicitly describing art technique, line work, coloring, and palette. No more "Create a series of…" openings or "ensure consistency" vagueness.
+- **Bulk per-still prompt structure**: Changed from `Scene: {voiceover}` to `{settings}\n\nDepicted scene: {voiceover}` — style settings lead, scene content follows naturally without a boilerplate "Scene:" label.
+- **Settings block**: Removed the vague "Reference Image Guidance: From the reference image, use: …" text line — guidance now comes from the actual image being sent to Gemini directly.
+
 ## [v1.4.0] — 2026-06-16 — Extract Image Settings, GPT model selector, bulk fixes
 
 ### Features

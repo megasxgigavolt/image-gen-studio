@@ -106,6 +106,7 @@ def make_combo(parent, values, variable, width=None, **kw) -> ctk.CTkComboBox:
 ART_STYLES = [
     "Photorealistic", "Cinematic / Film Still", "Documentary",
     "Watercolor", "Oil Painting", "Digital Concept Art",
+    "Comic Book / Illustration",
     "Anime / Manga", "Pencil Sketch", "Minimalist / Flat",
     "Vintage / Retro", "Custom (see Extra Notes)",
 ]
@@ -607,20 +608,25 @@ class ImageGenStudio(ctk.CTk):
         ctk.CTkLabel(f, text="What to pick from this reference image:",
                      font=F(12), text_color=C["text_mid"]).grid(
             row=2, column=0, padx=16, pady=(0, 2), sticky="w")
+
+        desc_row = ctk.CTkFrame(f, fg_color="transparent")
+        desc_row.grid(row=3, column=0, padx=16, pady=(0, 14), sticky="ew")
+        desc_row.grid_columnconfigure(0, weight=1)
+
         self.ref_desc_entry = ctk.CTkEntry(
-            f, fg_color=C["input"], text_color=C["text"],
+            desc_row, fg_color=C["input"], text_color=C["text"],
             border_color=C["divider"], border_width=1, font=F(13), height=34,
             placeholder_text="e.g. color grading, lighting style, mood, framing…",
         )
-        self.ref_desc_entry.grid(row=3, column=0, padx=16, pady=(0, 6), sticky="ew")
+        self.ref_desc_entry.grid(row=0, column=0, sticky="ew")
 
         self.btn_extract = ctk.CTkButton(
-            f, text="Extract Image Settings from Reference",
-            height=32, corner_radius=8, font=F(13, "bold"),
-            fg_color=C["btn_blue"], hover_color="#0D3D6E",
+            desc_row, text="Extract Settings",
+            height=34, corner_radius=8, font=F(13, "bold"),
+            fg_color=C["btn_red"], hover_color="#8B1A1A",
             command=self._extract_ref_settings,
         )
-        self.btn_extract.grid(row=4, column=0, padx=16, pady=(0, 14), sticky="w")
+        self.btn_extract.grid(row=0, column=1, padx=(8, 0))
 
     # ── Generated image preview ───────────────────────────────────────────────
 
@@ -860,33 +866,47 @@ class ImageGenStudio(ctk.CTk):
     def _extract_settings_worker(self, ref_b64: str, ref_desc: str, model: str):
         try:
             client = OpenAI(api_key=OPENAI_API_KEY)
-            focus  = f"\nPay special attention to: {ref_desc}" if ref_desc else ""
-            prompt = (
-                f"Analyze this reference image and extract precise visual settings "
-                f"for AI image generation.{focus}\n\n"
-                f"Choose the CLOSEST matching option for each setting from the exact "
-                f"strings provided (copy-paste the option string exactly):\n\n"
+            focus  = f"\nPay close attention to: {ref_desc}" if ref_desc else ""
+            prompt_text = (
+                f"Analyze this image and extract its precise visual settings.{focus}\n\n"
+                f"For each key, copy the EXACT string from the list — letter for letter. "
+                f"If the image does not clearly match any option, pick 'Custom (see Extra Notes)' "
+                f"and describe the actual style in extra_notes.\n\n"
                 f'"art_style": one of {json.dumps(ART_STYLES)}\n'
                 f'"camera_angle": one of {json.dumps(CAMERA_ANGLES)}\n'
                 f'"mood": one of {json.dumps(MOODS)}\n'
                 f'"lighting": one of {json.dumps(LIGHTING)}\n'
                 f'"color_palette": one of {json.dumps(COLOR_PALETTES)}\n'
                 f'"depth_of_field": one of {json.dumps(DEPTH_OF_FIELD)}\n'
-                f'"extra_notes": string — any other visual qualities not covered above '
-                f'(textures, subject matter, composition details, specific colors, etc.)\n'
-                f'"style_prompt": 2-3 sentences capturing the overall aesthetic as a '
-                f'reusable style directive for AI image generation\n\n'
-                f"Return ONLY valid JSON. No markdown, no explanation."
+                f'"extra_notes": describe ALL visual qualities not captured above — '
+                f'line work style, coloring technique, texture, subject characteristics, '
+                f'composition, specific colors, pattern details, rendering method.\n'
+                f'"style_prompt": write 2-3 sentences as DIRECT style instructions to '
+                f'replicate this image. Be explicit about technique: e.g. '
+                f'"Use bold black outlines with flat cell-shaded warm colors in amber and '
+                f'brown tones, detailed interior backgrounds with hatching textures on '
+                f'fabric surfaces." '
+                f'Do NOT write "capture the style of" or "mirror" or "ensure consistency". '
+                f'Describe the technique directly.\n\n'
+                f"Return ONLY valid JSON. No markdown fences, no explanation."
             )
             resp = client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": [
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/png;base64,{ref_b64}",
-                                   "detail": "high"}},
-                    {"type": "text", "text": prompt},
-                ]}],
-                max_tokens=700,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a precise visual analyst. Copy option strings exactly from "
+                        "the provided lists — never invent new values. When writing style_prompt, "
+                        "describe the art style as direct instructions (e.g. 'Use bold black "
+                        "outlines...'), never as 'capture' or 'mirror' the reference."
+                    )},
+                    {"role": "user", "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{ref_b64}",
+                                       "detail": "high"}},
+                        {"type": "text", "text": prompt_text},
+                    ]},
+                ],
+                max_tokens=800,
             )
             raw = resp.choices[0].message.content.strip()
             m   = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -895,8 +915,7 @@ class ImageGenStudio(ctk.CTk):
         except Exception as exc:
             self.after(0, lambda e=str(exc): (
                 messagebox.showerror("Extraction Error", e),
-                self.btn_extract.configure(state="normal",
-                                           text="Extract Image Settings from Reference"),
+                self.btn_extract.configure(state="normal", text="Extract Settings"),
             ))
 
     def _apply_extracted_settings(self, data: dict):
@@ -922,8 +941,7 @@ class ImageGenStudio(ctk.CTk):
             self.sys_prompt_box.delete("0.0", "end")
             self.sys_prompt_box.insert("0.0", style_p)
 
-        self.btn_extract.configure(state="normal",
-                                   text="Extract Image Settings from Reference")
+        self.btn_extract.configure(state="normal", text="Extract Settings")
         messagebox.showinfo(
             "Settings Extracted",
             "Image settings have been extracted and applied to the dropdowns,\n"
@@ -1483,20 +1501,25 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         ctk.CTkLabel(rf, text="What to pick from this reference image:",
                      font=F(13), text_color=C["text_mid"]).grid(
             row=3, column=0, padx=14, pady=(6, 2), sticky="w")
+
+        dlg_desc_row = ctk.CTkFrame(rf, fg_color="transparent")
+        dlg_desc_row.grid(row=4, column=0, padx=14, pady=(0, 12), sticky="ew")
+        dlg_desc_row.grid_columnconfigure(0, weight=1)
+
         self.ref_desc_entry = ctk.CTkEntry(
-            rf, fg_color=C["input"], text_color=C["text"],
+            dlg_desc_row, fg_color=C["input"], text_color=C["text"],
             border_color=C["divider"], border_width=1, font=F(13), height=34,
             placeholder_text="e.g. color grading, lighting style, mood, framing…",
         )
-        self.ref_desc_entry.grid(row=4, column=0, padx=14, pady=(0, 6), sticky="ew")
+        self.ref_desc_entry.grid(row=0, column=0, sticky="ew")
 
         self.btn_extract = ctk.CTkButton(
-            rf, text="Extract Image Settings from Reference",
-            height=32, corner_radius=6, font=F(13, "bold"),
-            fg_color=C["btn_blue"], hover_color="#0D3D6E",
+            dlg_desc_row, text="Extract Settings",
+            height=34, corner_radius=6, font=F(13, "bold"),
+            fg_color=C["btn_red"], hover_color="#8B1A1A",
             command=self._extract_ref_settings,
         )
-        self.btn_extract.grid(row=5, column=0, padx=14, pady=(0, 12), sticky="w")
+        self.btn_extract.grid(row=0, column=1, padx=(8, 0))
 
         # ── System Prompt ──────────────────────────────────────────────────
         pf = self._section(outer, "Style System Prompt  (applied to every still)")
@@ -1605,10 +1628,6 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         notes = self.extra_notes.get().strip()
         if notes:
             lines.append(f"Extra Notes:  {notes}")
-        if self._ref_b64:
-            ref_desc = self.ref_desc_entry.get().strip()
-            guidance = ref_desc if ref_desc else "visual style and aesthetic"
-            lines.append(f"Reference Image Guidance:  From the reference image, use: {guidance}")
         return "\n".join(lines)
 
     def _fmt_time(self, secs: float) -> str:
@@ -1661,33 +1680,47 @@ class BulkGenerateDialog(ctk.CTkToplevel):
     def _extract_settings_worker(self, ref_b64: str, ref_desc: str, model: str):
         try:
             client = OpenAI(api_key=OPENAI_API_KEY)
-            focus  = f"\nPay special attention to: {ref_desc}" if ref_desc else ""
-            prompt = (
-                f"Analyze this reference image and extract precise visual settings "
-                f"for AI image generation.{focus}\n\n"
-                f"Choose the CLOSEST matching option for each setting from the exact "
-                f"strings provided (copy the option string exactly):\n\n"
+            focus  = f"\nPay close attention to: {ref_desc}" if ref_desc else ""
+            prompt_text = (
+                f"Analyze this image and extract its precise visual settings.{focus}\n\n"
+                f"For each key, copy the EXACT string from the list — letter for letter. "
+                f"If the image does not clearly match any option, pick 'Custom (see Extra Notes)' "
+                f"and describe the actual style in extra_notes.\n\n"
                 f'"art_style": one of {json.dumps(ART_STYLES)}\n'
                 f'"camera_angle": one of {json.dumps(CAMERA_ANGLES)}\n'
                 f'"mood": one of {json.dumps(MOODS)}\n'
                 f'"lighting": one of {json.dumps(LIGHTING)}\n'
                 f'"color_palette": one of {json.dumps(COLOR_PALETTES)}\n'
                 f'"depth_of_field": one of {json.dumps(DEPTH_OF_FIELD)}\n'
-                f'"extra_notes": any other visual qualities not covered above '
-                f'(textures, composition, specific colors, subject characteristics, etc.)\n'
-                f'"style_prompt": 2-3 sentences capturing the overall aesthetic as a '
-                f'reusable style directive for consistent AI image generation\n\n'
-                f"Return ONLY valid JSON. No markdown, no explanation."
+                f'"extra_notes": describe ALL visual qualities not captured above — '
+                f'line work style, coloring technique, texture, subject characteristics, '
+                f'composition, specific colors, pattern details, rendering method.\n'
+                f'"style_prompt": write 2-3 sentences as DIRECT style instructions to '
+                f'replicate this image. Be explicit about technique: e.g. '
+                f'"Use bold black outlines with flat cell-shaded warm colors in amber and '
+                f'brown tones, detailed interior backgrounds with hatching textures on '
+                f'fabric surfaces." '
+                f'Do NOT write "capture the style of" or "mirror" or "ensure consistency". '
+                f'Describe the technique directly.\n\n'
+                f"Return ONLY valid JSON. No markdown fences, no explanation."
             )
             resp = client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": [
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/png;base64,{ref_b64}",
-                                   "detail": "high"}},
-                    {"type": "text", "text": prompt},
-                ]}],
-                max_tokens=700,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a precise visual analyst. Copy option strings exactly from "
+                        "the provided lists — never invent new values. When writing style_prompt, "
+                        "describe the art style as direct instructions (e.g. 'Use bold black "
+                        "outlines...'), never as 'capture' or 'mirror' the reference."
+                    )},
+                    {"role": "user", "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{ref_b64}",
+                                       "detail": "high"}},
+                        {"type": "text", "text": prompt_text},
+                    ]},
+                ],
+                max_tokens=800,
             )
             raw  = resp.choices[0].message.content.strip()
             m    = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -1696,8 +1729,7 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         except Exception as exc:
             self.after(0, lambda e=str(exc): (
                 messagebox.showerror("Extraction Error", e, parent=self),
-                self.btn_extract.configure(
-                    state="normal", text="Extract Image Settings from Reference"),
+                self.btn_extract.configure(state="normal", text="Extract Settings"),
             ))
 
     def _apply_extracted_settings(self, data: dict):
@@ -1723,8 +1755,7 @@ class BulkGenerateDialog(ctk.CTkToplevel):
             self.sys_prompt_box.delete("0.0", "end")
             self.sys_prompt_box.insert("0.0", style_p)
 
-        self.btn_extract.configure(state="normal",
-                                   text="Extract Image Settings from Reference")
+        self.btn_extract.configure(state="normal", text="Extract Settings")
         messagebox.showinfo(
             "Settings Extracted",
             "Image settings, Extra Notes, and Style Prompt have been applied.",
@@ -1769,33 +1800,45 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         self.btn_gen_prompt.configure(state="disabled", text="Generating…")
         vos      = "\n".join(f"- {s['voiceover']}" for s in self._app.stills[:12])
         settings = self._settings_block()
+        ref_b64  = self._ref_b64
         ref_desc = self.ref_desc_entry.get().strip()
         model    = self.gpt_model_var.get()
         threading.Thread(target=self._prompt_worker,
-                          args=(vos, settings, ref_desc, model), daemon=True).start()
+                          args=(vos, settings, ref_b64, ref_desc, model), daemon=True).start()
 
-    def _prompt_worker(self, vos: str, settings: str, ref_desc: str = "", model: str = "gpt-4o"):
+    def _prompt_worker(self, vos: str, settings: str, ref_b64: str | None = None,
+                       ref_desc: str = "", model: str = "gpt-4o"):
         try:
             client = OpenAI(api_key=OPENAI_API_KEY)
-            ref_note = (
-                f"\nReference image is also provided — from it, specifically incorporate: {ref_desc}"
-                if ref_desc else ""
-            )
+            user_parts: list = []
+            if ref_b64:
+                user_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{ref_b64}", "detail": "high"},
+                })
+                focus = (f"From this reference image, extract and describe specifically: {ref_desc}"
+                         if ref_desc else
+                         "Analyze this reference image's art style and rendering technique.")
+                user_parts.append({"type": "text", "text": focus})
+            user_parts.append({"type": "text", "text": (
+                f"I am generating AI images for a video. Voiceover lines (up to 12 stills):\n{vos}\n\n"
+                f"Image settings:\n{settings}\n\n"
+                f"Write a visual style directive (2-3 sentences) that will be prepended to "
+                f"every image generation request.\n"
+                f"Rules:\n"
+                f"- Describe HOW the images should look: art style, rendering technique, "
+                f"line work, coloring method, color palette, lighting approach.\n"
+                f"- Be EXPLICIT: say 'Use bold black outlines with flat cell-shaded warm colors' "
+                f"— NOT 'ensure consistency' or 'capture the reference style'.\n"
+                f"- Do NOT start with 'Create a series of' or 'Generate images of'.\n"
+                f"- Do NOT reference 'the reference image' in your output — "
+                f"incorporate its qualities directly as style instructions.\n"
+                f"- Return ONLY the directive text, no labels, no preamble."
+            )})
             resp = client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": (
-                    f"I am generating AI images for a video. "
-                    f"Below are the voiceover lines (up to 12 stills):\n{vos}\n\n"
-                    f"Image settings selected:\n{settings}{ref_note}\n\n"
-                    f"Write a concise system prompt (3-4 sentences) that, "
-                    f"when prepended to every image generation request, ensures "
-                    f"all images share the same visual style, mood, and aesthetic cohesion. "
-                    f"If reference image guidance was provided above, explicitly incorporate "
-                    f"those specific qualities into the prompt. "
-                    f"Be specific about visual qualities — not narrative content. "
-                    f"Return ONLY the prompt text, no labels or preamble."
-                )}],
-                max_tokens=300,
+                messages=[{"role": "user", "content": user_parts}],
+                max_tokens=350,
             )
             text = resp.choices[0].message.content.strip()
             self.after(0, lambda: self._apply_sys_prompt(text))
@@ -1882,8 +1925,9 @@ class BulkGenerateDialog(ctk.CTkToplevel):
             return
 
         # Snapshot all tkinter values in main thread before handing off
-        sys_txt  = self.sys_prompt_box.get("0.0", "end").strip()
-        settings = self._settings_block()
+        sys_txt         = self.sys_prompt_box.get("0.0", "end").strip()
+        settings        = self._settings_block()
+        ref_b64_snapshot = self._ref_b64
 
         def _concrete(var):
             v = var.get()
@@ -1900,12 +1944,12 @@ class BulkGenerateDialog(ctk.CTkToplevel):
             "system_prompt": sys_txt,
         }
 
-        # Always build from voiceover + fresh bulk settings for every still.
-        # Using saved prompts risks conflicting settings blocks from previous runs.
+        # Build per-still prompts from voiceover + settings.
+        # Style directive goes first; settings spec + voiceover context follow.
         prompt_map: dict[str, str] = {}
         for s in targets:
             sid  = s["still_id"]
-            base = f"Scene: {s['voiceover']}\n\n{settings}"
+            base = f"{settings}\n\nDepicted scene: {s['voiceover']}"
             prompt_map[sid] = f"{sys_txt}\n\n{base}" if sys_txt else base
 
         self._running   = True
@@ -1925,11 +1969,12 @@ class BulkGenerateDialog(ctk.CTkToplevel):
 
         threading.Thread(
             target=self._bulk_worker,
-            args=(targets, prompt_map, bulk_settings),
+            args=(targets, prompt_map, bulk_settings, ref_b64_snapshot),
             daemon=True,
         ).start()
 
-    def _bulk_worker(self, targets: list, prompt_map: dict, bulk_settings: dict):
+    def _bulk_worker(self, targets: list, prompt_map: dict, bulk_settings: dict,
+                     ref_b64: str | None = None):
         try:
             client = self._app._init_nb2()
         except Exception as exc:
@@ -1939,6 +1984,14 @@ class BulkGenerateDialog(ctk.CTkToplevel):
                 self._bulk_done(),
             ))
             return
+
+        # Decode reference image once if provided — sent to Gemini alongside each prompt
+        ref_img_data: bytes | None = None
+        if ref_b64:
+            try:
+                ref_img_data = base64.b64decode(ref_b64)
+            except Exception:
+                ref_img_data = None
 
         for still in targets:
             if self._cancel:
@@ -1952,13 +2005,23 @@ class BulkGenerateDialog(ctk.CTkToplevel):
                 text_color=C["accent"],
             ))
 
+            # Build contents — include reference image so Gemini can visually match the style
+            if ref_img_data:
+                contents = [
+                    types.Part(inline_data=types.Blob(
+                        mime_type="image/png", data=ref_img_data)),
+                    types.Part(text=prompt),
+                ]
+            else:
+                contents = prompt
+
             attempt = 0
             while not self._cancel:
                 attempt += 1
                 try:
                     response = client.models.generate_content(
                         model="publishers/google/models/gemini-3.1-flash-image",
-                        contents=prompt,
+                        contents=contents,
                         config=types.GenerateContentConfig(
                             response_modalities=["IMAGE"],
                             image_config=types.ImageConfig(aspect_ratio="16:9"),

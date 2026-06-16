@@ -1,5 +1,17 @@
 # Image Gen Studio — Changelog
 
+## [v1.2.0] — 2026-06-16 — Rate-limit retry, ref-image preview, ref guidance field
+
+### Features
+- **429 / RESOURCE_EXHAUSTED retry**: Bulk generation now retries indefinitely on rate-limit errors. Shows a live countdown ("Rate limited on S7 (attempt 2) — retrying in 8s…") and checks the cancel flag every second so Stop still works immediately.
+- **Reference image preview in Bulk dialog**: After browsing an image, a thumbnail preview (max 700×160) is shown inside the Reference Image section — no more guessing from the filename alone.
+- **"What to pick from this reference image?" field** — mandatory guidance textbox added in both:
+  - Main frontend (below the reference image preview panel)
+  - Bulk Generate dialog (inside the Reference Image section)
+  - When filled and a reference image is uploaded, the guidance text is included in every generated prompt: `"From the reference image, use: <guidance>"`
+  - In the main frontend, GPT-4o receives the field value alongside the image: `"From it, use: <guidance>"`
+- **Sidebar: single "Bulk Generation / Settings" button** — replaces the two separate "Bulk Generate…" and "Bulk Approve & Save All" buttons. One click opens the full dialog which already contains Bulk Approve & Save.
+
 ## [v1.1.0] — 2026-06-16 — Bulk Generate Dialog
 
 ### Features

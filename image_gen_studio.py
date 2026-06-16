@@ -275,25 +275,17 @@ class ImageGenStudio(ctk.CTk):
         bot.grid_columnconfigure(0, weight=1)
 
         self.btn_bulk = ctk.CTkButton(
-            bot, text="Bulk Generate…",
-            height=36, corner_radius=8, font=F(13, "bold"),
+            bot, text="Bulk Generation\nSettings",
+            height=46, corner_radius=8, font=F(13, "bold"),
             fg_color=C["btn_blue"], hover_color="#0D3D6E",
             command=self._open_bulk_dialog,
         )
         self.btn_bulk.grid(row=0, column=0, sticky="ew")
 
-        self.btn_bulk_approve = ctk.CTkButton(
-            bot, text="Bulk Approve & Save All",
-            height=32, corner_radius=8, font=F(12, "bold"),
-            fg_color=C["btn_brown"], hover_color="#4E342E",
-            command=self._bulk_approve_all,
-        )
-        self.btn_bulk_approve.grid(row=1, column=0, sticky="ew", pady=(4, 0))
-
         self.lbl_bulk_progress = ctk.CTkLabel(
             bot, text="", font=F(11), text_color=C["text_muted"],
         )
-        self.lbl_bulk_progress.grid(row=2, column=0, pady=(2, 0))
+        self.lbl_bulk_progress.grid(row=1, column=0, pady=(2, 0))
 
     # ── Right panel ───────────────────────────────────────────────────────────
 
@@ -586,11 +578,21 @@ class ImageGenStudio(ctk.CTk):
 
         self.ref_label = ctk.CTkLabel(
             f,
-            text="No reference image\nUpload to send visual context to GPT-4o\n(does not affect Gemini generation)",
-            text_color=C["text_muted"], height=178,
+            text="No reference image\nUpload to send visual context to GPT-4o",
+            text_color=C["text_muted"], height=140,
             font=F(13),
         )
-        self.ref_label.grid(row=1, column=0, padx=16, pady=(0, 14), sticky="ew")
+        self.ref_label.grid(row=1, column=0, padx=16, pady=(0, 6), sticky="ew")
+
+        ctk.CTkLabel(f, text="What to pick from this reference image:",
+                     font=F(12), text_color=C["text_mid"]).grid(
+            row=2, column=0, padx=16, pady=(0, 2), sticky="w")
+        self.ref_desc_entry = ctk.CTkEntry(
+            f, fg_color=C["input"], text_color=C["text"],
+            border_color=C["divider"], border_width=1, font=F(13), height=34,
+            placeholder_text="e.g. color grading, lighting style, mood, framing…",
+        )
+        self.ref_desc_entry.grid(row=3, column=0, padx=16, pady=(0, 14), sticky="ew")
 
     # ── Generated image preview ───────────────────────────────────────────────
 
@@ -841,15 +843,16 @@ class ImageGenStudio(ctk.CTk):
         sys_txt  = self.sys_prompt_box.get("0.0", "end").strip()
         settings = self._settings_block()
         ref_b64  = self.ref_image_b64
+        ref_desc = self.ref_desc_entry.get().strip()
         still    = self.selected_still
         history  = list(self.chat_history)
         threading.Thread(
             target=self._suggestion_worker,
-            args=(still, sys_txt, settings, ref_b64, history),
+            args=(still, sys_txt, settings, ref_b64, ref_desc, history),
             daemon=True,
         ).start()
 
-    def _suggestion_worker(self, still, sys_txt, settings, ref_b64, history):
+    def _suggestion_worker(self, still, sys_txt, settings, ref_b64, ref_desc, history):
         try:
             client = OpenAI(api_key=OPENAI_API_KEY)
             parts: list = []
@@ -857,8 +860,9 @@ class ImageGenStudio(ctk.CTk):
             if ref_b64:
                 parts.append({"type": "image_url",
                                "image_url": {"url": f"data:image/png;base64,{ref_b64}"}})
+                guidance = ref_desc if ref_desc else "visual style and aesthetic"
                 parts.append({"type": "text",
-                               "text": "The above image is a reference for the visual style and aesthetic."})
+                               "text": f"The above image is a reference. From it, use: {guidance}"})
 
             parts.append({"type": "text", "text": (
                 f"Write an image-generation prompt for this still:\n\n"
@@ -1302,18 +1306,35 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         # ── Reference Image ────────────────────────────────────────────────
         rf = self._section(outer, "Reference Image")
         rf.grid(row=r, column=0, sticky="ew", padx=12, pady=(0, 8))
-        rf.grid_columnconfigure(1, weight=1)
+        rf.grid_columnconfigure(0, weight=1)
         r += 1
 
+        br = ctk.CTkFrame(rf, fg_color="transparent")
+        br.grid(row=1, column=0, padx=14, pady=(4, 4), sticky="ew")
+        br.grid_columnconfigure(1, weight=1)
         ctk.CTkButton(
-            rf, text="Browse…", width=120, height=32, corner_radius=6,
+            br, text="Browse…", width=120, height=32, corner_radius=6,
             font=F(13, "bold"), fg_color=C["btn_brown"], hover_color="#4E342E",
             command=self._browse_ref,
-        ).grid(row=1, column=0, padx=(14, 8), pady=(4, 12))
+        ).grid(row=0, column=0, padx=(0, 10))
         self.ref_lbl = ctk.CTkLabel(
-            rf, text="No reference image", font=F(12),
+            br, text="No reference image", font=F(12),
             text_color=C["text_muted"], anchor="w")
-        self.ref_lbl.grid(row=1, column=1, padx=(0, 14), pady=(4, 12), sticky="w")
+        self.ref_lbl.grid(row=0, column=1, sticky="w")
+
+        self.ref_preview = ctk.CTkLabel(
+            rf, text="", height=0, fg_color="transparent")
+        self.ref_preview.grid(row=2, column=0, padx=14, pady=0, sticky="ew")
+
+        ctk.CTkLabel(rf, text="What to pick from this reference image:",
+                     font=F(13), text_color=C["text_mid"]).grid(
+            row=3, column=0, padx=14, pady=(6, 2), sticky="w")
+        self.ref_desc_entry = ctk.CTkEntry(
+            rf, fg_color=C["input"], text_color=C["text"],
+            border_color=C["divider"], border_width=1, font=F(13), height=34,
+            placeholder_text="e.g. color grading, lighting style, mood, framing…",
+        )
+        self.ref_desc_entry.grid(row=4, column=0, padx=14, pady=(0, 12), sticky="ew")
 
         # ── System Prompt ──────────────────────────────────────────────────
         pf = self._section(outer, "Style System Prompt  (applied to every still)")
@@ -1411,6 +1432,10 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         notes = self.extra_notes.get().strip()
         if notes:
             lines.append(f"Extra Notes:  {notes}")
+        if self._ref_b64:
+            ref_desc = self.ref_desc_entry.get().strip()
+            guidance = ref_desc if ref_desc else "visual style and aesthetic"
+            lines.append(f"Reference Image Guidance:  From the reference image, use: {guidance}")
         return "\n".join(lines)
 
     def _fmt_time(self, secs: float) -> str:
@@ -1443,8 +1468,17 @@ class BulkGenerateDialog(ctk.CTkToplevel):
         if not path:
             return
         try:
-            with open(path, "rb") as fh:
-                self._ref_b64 = base64.b64encode(fh.read()).decode()
+            img = Image.open(path)
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            self._ref_b64 = base64.b64encode(buf.getvalue()).decode()
+
+            thumb = img.copy()
+            thumb.thumbnail((700, 160), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(thumb)
+            self.ref_preview.configure(image=photo, text="", height=thumb.height + 8)
+            self.ref_preview._ref = photo
+
             self.ref_lbl.configure(text=Path(path).name, text_color=C["text"])
         except Exception as exc:
             messagebox.showerror("Image Error", str(exc), parent=self)
@@ -1627,42 +1661,58 @@ class BulkGenerateDialog(ctk.CTkToplevel):
                 text_color=C["accent"],
             ))
 
-            try:
-                response = client.models.generate_content(
-                    model="publishers/google/models/gemini-3.1-flash-image",
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_modalities=["IMAGE"],
-                        image_config=types.ImageConfig(aspect_ratio="16:9"),
-                    ),
-                )
-                img_bytes = None
-                if response.candidates and response.candidates[0].content.parts:
-                    for part in response.candidates[0].content.parts:
-                        if part.inline_data and part.inline_data.data:
-                            img_bytes = part.inline_data.data
-                            break
+            attempt = 0
+            while not self._cancel:
+                attempt += 1
+                try:
+                    response = client.models.generate_content(
+                        model="publishers/google/models/gemini-3.1-flash-image",
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_modalities=["IMAGE"],
+                            image_config=types.ImageConfig(aspect_ratio="16:9"),
+                        ),
+                    )
+                    img_bytes = None
+                    if response.candidates and response.candidates[0].content.parts:
+                        for part in response.candidates[0].content.parts:
+                            if part.inline_data and part.inline_data.data:
+                                img_bytes = part.inline_data.data
+                                break
 
-                if img_bytes:
-                    self._app._pending_images[sid] = img_bytes
-                    self._gen_count += 1
+                    if img_bytes:
+                        self._app._pending_images[sid] = img_bytes
+                        self._gen_count += 1
 
-                    def _on_gen(sid=sid, ib=img_bytes):
-                        self._app._populate_stills_list()
-                        if (self._app.selected_still
-                                and self._app.selected_still["still_id"] == sid):
-                            self._app.current_image_bytes = ib
-                            self._app._img_data = Image.open(BytesIO(ib))
-                            self._app.btn_approve.configure(state="normal")
-                            self._app.after_idle(self._app._display_gen_image)
-                        self.progress_bar.set(self._gen_count / self._total)
+                        def _on_gen(sid=sid, ib=img_bytes):
+                            self._app._populate_stills_list()
+                            if (self._app.selected_still
+                                    and self._app.selected_still["still_id"] == sid):
+                                self._app.current_image_bytes = ib
+                                self._app._img_data = Image.open(BytesIO(ib))
+                                self._app.btn_approve.configure(state="normal")
+                                self._app.after_idle(self._app._display_gen_image)
+                            self.progress_bar.set(self._gen_count / self._total)
 
-                    self.after(0, _on_gen)
-                else:
-                    self._errors.append(f"{sid}: Gemini returned no image")
+                        self.after(0, _on_gen)
+                    else:
+                        self._errors.append(f"{sid}: Gemini returned no image")
+                    break  # success or non-retryable empty response
 
-            except Exception as exc:
-                self._errors.append(f"{sid}: {str(exc)[:100]}")
+                except Exception as exc:
+                    err_str = str(exc)
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        for countdown in range(10, 0, -1):
+                            if self._cancel:
+                                break
+                            self.after(0, lambda s=sid, c=countdown, a=attempt: self.lbl_status.configure(
+                                text=f"Rate limited on {s.upper()} (attempt {a}) — retrying in {c}s…",
+                                text_color=C["accent"],
+                            ))
+                            time.sleep(1)
+                    else:
+                        self._errors.append(f"{sid}: {err_str[:100]}")
+                        break
 
         self.after(0, self._bulk_done)
 

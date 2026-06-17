@@ -312,6 +312,7 @@ class ImageGenStudio(ctk.CTk):
         self._spin_idx                        = 0
         self._img_data:       Image.Image | None = None
         self._pending_images: dict            = {}
+        self._image_versions: dict            = {}
         self.gpt_model_var:   ctk.StringVar  = ctk.StringVar(value="gpt-4o")
 
         self._check_startup_state()
@@ -707,6 +708,15 @@ class ImageGenStudio(ctk.CTk):
         )
         self.btn_generate.pack(side="left", padx=(10, 0))
 
+        self.btn_edit_image = ctk.CTkButton(
+            btn_row, text="Edit Current Image",
+            width=178, height=42, corner_radius=8,
+            font=F(14, "bold"), fg_color=C["btn_red"], hover_color="#8B1A1A",
+            command=self._edit_current_image,
+            state="disabled",
+        )
+        self.btn_edit_image.pack(side="left", padx=(10, 0))
+
     # ── Reference image panel ─────────────────────────────────────────────────
 
     def _build_reference_panel(self, parent):
@@ -919,11 +929,13 @@ class ImageGenStudio(ctk.CTk):
         self.current_image_bytes = None
         self._clear_preview()
         self.btn_approve.configure(state="disabled")
+        self.btn_edit_image.configure(state="disabled")
 
         if new_id in self._pending_images:
             self.current_image_bytes = self._pending_images[new_id]
             self._img_data = Image.open(BytesIO(self.current_image_bytes))
             self.btn_approve.configure(state="normal")
+            self.btn_edit_image.configure(state="normal")
             self.after_idle(self._display_gen_image)
 
         if new_id not in self._still_states:
@@ -1223,6 +1235,11 @@ class ImageGenStudio(ctk.CTk):
             return
         self.chat_input.delete(0, "end")
         self._chat_append("You:", msg, "user")
+
+        if self.current_image_bytes and self._looks_like_image_edit(msg):
+            self._edit_current_image(msg)
+            return
+
         self.btn_suggest.configure(state="disabled", text="⏳  Thinking…")
         # Snapshot all widget values in main thread before handing to background
         sys_txt  = self.sys_prompt_box.get("0.0", "end").strip()
@@ -1268,6 +1285,15 @@ class ImageGenStudio(ctk.CTk):
     def _gpt_error(self, msg: str):
         self.btn_suggest.configure(state="normal", text="✦  Suggest Prompt")
         messagebox.showerror("GPT-4o Error", msg)
+
+    def _looks_like_image_edit(self, msg: str) -> bool:
+        edit_terms = (
+            "remove", "erase", "delete", "replace", "change", "fix", "adjust",
+            "make ", "turn ", "add ", "move", "inpaint", "edit", "clean up",
+            "retouch", "darker", "brighter", "lighter", "warmer", "cooler",
+        )
+        text = f" {msg.lower()} "
+        return any(term in text for term in edit_terms)
 
     def _reset_chat(self):
         if messagebox.askyesno("Reset Chat",
@@ -1368,6 +1394,7 @@ class ImageGenStudio(ctk.CTk):
         if hasattr(self.gen_preview, "_ref"):
             self.gen_preview._ref = None
         self.btn_generate.configure(state="disabled", text="▶  Generating…")
+        self.btn_edit_image.configure(state="disabled")
         self.btn_approve.configure(state="disabled")
         self._start_spinner()
         threading.Thread(target=self._gen_worker, args=(gemini_prompt,), daemon=True).start()
@@ -1400,9 +1427,135 @@ class ImageGenStudio(ctk.CTk):
             _logger.error(f"[NB2] Gemini error: {exc}")
             self.after(0, lambda: self._gen_error(str(exc)))
 
+    def _edit_current_image(self, instruction: str | None = None):
+        if not self.selected_still:
+            messagebox.showwarning("No Still", "Select a still first.")
+            return
+        if not self.current_image_bytes:
+            messagebox.showwarning(
+                "No Image",
+                "Generate or select a pending image before editing it.",
+            )
+            return
+        if self._generating:
+            return
+
+        if instruction is None:
+            instruction = self.chat_input.get().strip()
+            if instruction:
+                self.chat_input.delete(0, "end")
+                self._chat_append("You:", instruction, "user")
+        if not instruction:
+            instruction = self.prompt_editor.get("0.0", "end").strip()
+        if not instruction:
+            messagebox.showwarning(
+                "Empty Edit Instruction",
+                "Describe what to change in the current image first.",
+            )
+            return
+
+        prompt = self._build_image_edit_prompt(instruction)
+        source_bytes = self.current_image_bytes
+        sid = self.selected_still["still_id"]
+        _logger.info(
+            f"[EDIT] Start — still={sid} | instruction_len={len(instruction)} | "
+            f"source_bytes={len(source_bytes)}"
+        )
+        _logger.debug(f"[EDIT] Prompt:\n{prompt}")
+
+        self._generating = True
+        self.gen_preview.configure(image="", text="")
+        if hasattr(self.gen_preview, "_ref"):
+            self.gen_preview._ref = None
+        self.btn_generate.configure(state="disabled")
+        self.btn_edit_image.configure(state="disabled", text="Editing…")
+        self.btn_approve.configure(state="disabled")
+        self._start_spinner()
+        threading.Thread(
+            target=self._edit_worker,
+            args=(source_bytes, prompt, instruction),
+            daemon=True,
+        ).start()
+
+    def _build_image_edit_prompt(self, instruction: str) -> str:
+        settings = self._settings_block()
+        sys_p = self.sys_prompt_box.get("0.0", "end").strip()
+        cur_p = self.prompt_editor.get("0.0", "end").strip()
+        parts = [
+            "Edit the provided image according to the user request.",
+            "Use the input image as the visual source of truth.",
+            "Preserve the camera angle, composition, lighting, colors, subject identity, "
+            "background, and every unrelated detail as much as possible.",
+            "Only modify pixels needed for the requested change. Do not recreate or "
+            "recompose the full image. Do not add text, captions, or watermarks.",
+        ]
+        if sys_p:
+            parts.append(f"Existing style directive:\n{sys_p}")
+        if cur_p:
+            parts.append(f"Original/generated prompt context:\n{cur_p}")
+        if settings:
+            parts.append(f"Original image settings to preserve:\n{settings}")
+        parts.append(f"User edit request:\n{instruction}")
+        return "\n\n".join(parts)
+
+    def _edit_worker(self, source_bytes: bytes, prompt: str, instruction: str):
+        _logger.info(f"[NB2-EDIT] Gemini edit call — prompt_len={len(prompt)}")
+        try:
+            client = self._init_nb2()
+            response = client.models.generate_content(
+                model="publishers/google/models/gemini-3.1-flash-image",
+                contents=[
+                    types.Part.from_bytes(data=source_bytes, mime_type="image/png"),
+                    prompt,
+                ],
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE"],
+                    image_config=types.ImageConfig(aspect_ratio="16:9"),
+                ),
+            )
+            img_bytes = None
+            if response.candidates and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    if part.inline_data and part.inline_data.data:
+                        img_bytes = part.inline_data.data
+                        break
+            if img_bytes is None:
+                raise ValueError("Model returned no edited image data.")
+            _logger.info(f"[NB2-EDIT] Edited image received — {len(img_bytes)} bytes")
+            self.after(0, lambda: self._show_edited(img_bytes, instruction, prompt))
+        except Exception as exc:
+            _logger.error(f"[NB2-EDIT] Gemini edit error: {exc}")
+            self.after(0, lambda: self._gen_error(str(exc)))
+
+    def _show_edited(self, img_bytes: bytes, instruction: str, edit_prompt: str):
+        self._show_generated(img_bytes)
+        if self.selected_still:
+            sid = self.selected_still["still_id"]
+            versions = self._image_versions.setdefault(sid, [])
+            versions.append({
+                "kind": "edit",
+                "instruction": instruction,
+                "prompt": edit_prompt,
+                "bytes": len(img_bytes),
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        user_entry = {"role": "user", "content": f"[Image edit] {instruction}"}
+        asst_entry = {
+            "role": "assistant",
+            "content": "Edited the current image using the previous image as visual context.",
+        }
+        self.chat_history.append(user_entry)
+        self.chat_history.append(asst_entry)
+        self._chat_append(
+            "System:",
+            "Edited current image from the existing pixels. Review the preview, then approve or edit again.",
+            "sys",
+        )
+
     def _show_generated(self, img_bytes: bytes):
         self._generating = False
         self.btn_generate.configure(state="normal", text="Generate Image")
+        self.btn_edit_image.configure(state="normal", text="Edit Current Image")
         try:
             if self.selected_still:
                 sid = self.selected_still["still_id"]
@@ -1434,6 +1587,10 @@ class ImageGenStudio(ctk.CTk):
     def _gen_error(self, msg: str):
         self._generating = False
         self.btn_generate.configure(state="normal", text="Generate Image")
+        self.btn_edit_image.configure(
+            state=("normal" if self.current_image_bytes else "disabled"),
+            text="Edit Current Image",
+        )
         old_ref = getattr(self.gen_preview, "_ref", None)
         self.gen_preview.configure(
             image="",
@@ -1471,6 +1628,7 @@ class ImageGenStudio(ctk.CTk):
         self.gen_preview._ref = None
         del old_ref
         self.btn_approve.configure(state="disabled")
+        self.btn_edit_image.configure(state="disabled")
         self.status_lbl.configure(text=f"  ✅ Saved: {filename}")
         self._chat_append("System:", f"✅ Image approved — saved as {filename}", "sys")
         self._populate_stills_list()
@@ -1533,6 +1691,7 @@ class ImageGenStudio(ctk.CTk):
             fg=C["text_muted"], font=("Segoe UI", 13),
         )
         self.gen_preview._ref = None
+        self.btn_edit_image.configure(state="disabled")
         del old  # safe to GC now — widget no longer references the old image
 
     def _show_bulk_loading(self, sid: str):
@@ -1547,6 +1706,7 @@ class ImageGenStudio(ctk.CTk):
             self.gen_preview._ref = None
             del old
             self.btn_approve.configure(state="disabled")
+            self.btn_edit_image.configure(state="disabled")
 
     # ── Bulk helpers (sidebar) ────────────────────────────────────────────────
 

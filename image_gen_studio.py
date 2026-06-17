@@ -94,6 +94,7 @@ C = {
     "btn_green":    "#27643B",
     "btn_red":      "#A8372A",
     "btn_brown":    "#5D4037",
+    "btn_settings": "#1E4D72",
     "still_todo":   "#EBE4FA",
     "still_todo_t": "#3B1A78",
     "still_done":   "#D5EDDB",
@@ -164,6 +165,23 @@ DEPTH_OF_FIELD = [
 
 AI_DECIDE = "Let AI Decide"
 
+# ── Advanced image setting lists (all include "Let AI Decide" + "N/A") ───────
+_ADV = [AI_DECIDE, "N/A"]
+SHOT_TYPES      = _ADV + ["Close-Up", "Extreme Close-Up", "Medium Shot", "Wide Shot", "Long Shot"]
+LENS_TYPES      = _ADV + ["Wide-Angle", "Telephoto", "Macro", "Fisheye"]
+FOCUS_TYPES     = _ADV + ["Sharp Focus", "Soft Focus", "Selective Focus"]
+EXPOSURE_MODES  = _ADV + ["Balanced", "Underexposed", "Overexposed"]
+MOTION_MODES    = _ADV + ["Still / Frozen", "Motion Blur", "Freeze Frame", "Long Exposure"]
+LIGHT_SOURCES   = _ADV + ["Natural Light", "Artificial / Neon", "Studio Light", "Practical Lamp", "Mixed"]
+LIGHT_DIRS      = _ADV + ["Front Lit", "Back Lit / Rim", "Side Lit", "Top Lit", "Under Lit"]
+LIGHT_QUALITIES = _ADV + ["Soft Light", "Hard Light", "Diffused Light", "Point Source"]
+CONTRAST_LEVELS = _ADV + ["High Contrast", "Low Contrast", "Normal Contrast"]
+SHADOW_TYPES    = _ADV + ["Sharp Shadows", "Soft Shadows", "No Shadows"]
+LIGHTING_STYLES = _ADV + ["Cinematic", "Dramatic", "Flat Lighting", "Volumetric", "Rembrandt", "Three-Point"]
+COLOR_TEMPS     = _ADV + ["Warm Light", "Cool Light", "Neutral Light", "Mixed Temperature"]
+FRAMING_RULES   = _ADV + ["Rule of Thirds", "Centered / Symmetrical", "Golden Ratio", "Diagonal", "Frame Within Frame"]
+COMP_DEPTHS     = _ADV + ["Foreground Emphasis", "Midground Emphasis", "Background Emphasis", "Full Layered Depth"]
+
 # GPT model tiers — only multimodal/chat-capable models relevant for prompt & vision work
 HC_MODELS = ["gpt-4o", "gpt-4.1", "gpt-5", "gpt-5.1", "o3"]      # Higher Capacity
 HV_MODELS = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1-nano",
@@ -175,15 +193,26 @@ _SPINNER = ["|", "/", "-", "\\"]
 def _build_extraction_prompt(ref_desc: str) -> tuple[str, str]:
     """Return (system_msg, user_text) for the style-extraction GPT call.
 
-    Produces 8 JSON fields:
-      art_style, camera_angle, mood, lighting, color_palette, depth_of_field,
-      extra_notes, style_prompt, main_subject
+    Produces 17 JSON fields covering basic + advanced image settings plus
+    style_prompt and main_subject.
     """
-    subject_focus = (
-        f"The user specifically wants to extract: '{ref_desc}'. "
-        f"For 'main_subject', focus entirely on describing '{ref_desc}' with maximum precision."
-        if ref_desc else ""
-    )
+    if ref_desc:
+        focus_instruction = (
+            f"⚠ EXTRACTION FOCUS: The user specified '{ref_desc}'. "
+            f"Analyse ONLY '{ref_desc}' in this image. "
+            f"Every JSON field — art style, lighting, color palette, advanced settings, "
+            f"extra_notes, style_prompt, main_subject — must reflect ONLY how '{ref_desc}' "
+            f"is rendered and presented. "
+            f"Completely IGNORE other elements: backgrounds, text overlays, hands, other objects, "
+            f"or any scene content unrelated to '{ref_desc}'. "
+            f"Treat '{ref_desc}' as the entire visual universe for this extraction."
+        )
+    else:
+        focus_instruction = (
+            "Extract every visual detail from the ENTIRE image — art technique, composition, "
+            "lighting, colour palette, texture, background complexity, and all subject details."
+        )
+
     system_msg = (
         "You are an elite visual analyst whose output will be fed verbatim into AI image generation prompts. "
         "Extract technical rendering details so precisely that another AI reproduces the EXACT same visual without seeing the original. "
@@ -198,7 +227,7 @@ def _build_extraction_prompt(ref_desc: str) -> tuple[str, str]:
         "    NEVER use 'always depict' or 'include in every image' — it is conditional on scene context."
     )
     user_text = (
-        f"Perform a deep visual style and subject analysis of this image. {subject_focus}\n\n"
+        f"Perform a deep visual style analysis of this image. {focus_instruction}\n\n"
         f"Return a JSON object with EXACTLY these keys:\n\n"
 
         f'"art_style": one of {json.dumps(ART_STYLES)}\n'
@@ -250,7 +279,17 @@ def _build_extraction_prompt(ref_desc: str) -> tuple[str, str]:
         f'and large amber eyes with black slit pupils." '
         f'Do NOT use vague terms.\n\n'
 
-        f"Return ONLY valid JSON with those 8 keys. No markdown fences, no extra text."
+        f'"shot_type": one of {json.dumps(SHOT_TYPES[2:])}\n'
+        f'"light_source": one of {json.dumps(LIGHT_SOURCES[2:])}\n'
+        f'"light_direction": one of {json.dumps(LIGHT_DIRS[2:])}\n'
+        f'"light_quality": one of {json.dumps(LIGHT_QUALITIES[2:])}\n'
+        f'"contrast_level": one of {json.dumps(CONTRAST_LEVELS[2:])}\n'
+        f'"shadow_type": one of {json.dumps(SHADOW_TYPES[2:])}\n'
+        f'"lighting_style": one of {json.dumps(LIGHTING_STYLES[2:])}\n'
+        f'"color_temperature": one of {json.dumps(COLOR_TEMPS[2:])}\n'
+        f'"framing_rule": one of {json.dumps(FRAMING_RULES[2:])}\n\n'
+
+        f"Return ONLY valid JSON with ALL keys listed above. No markdown fences, no extra text."
     )
     return system_msg, user_text
 
@@ -286,6 +325,26 @@ def _gpt_call(client: "OpenAI", model: str, messages: list, max_tokens: int = 90
     return client.chat.completions.create(**kwargs)
 
 
+class _NotesProxy:
+    """Proxy that gives extra_notes a CTkEntry-compatible interface (.get/.delete/.insert)
+    while backing the value with a StringVar so the Image Settings popup can bind to it."""
+    def __init__(self):
+        self._var = ctk.StringVar()
+
+    def get(self) -> str:
+        return self._var.get()
+
+    def delete(self, start, end):
+        self._var.set("")
+
+    def insert(self, pos, text: str):
+        self._var.set(text)
+
+    @property
+    def var(self) -> ctk.StringVar:
+        return self._var
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 class ImageGenStudio(ctk.CTk):
 # ═════════════════════════════════════════════════════════════════════════════
@@ -305,6 +364,7 @@ class ImageGenStudio(ctk.CTk):
         self._still_states:       dict        = {}
         self.current_image_bytes: bytes | None = None
         self.ref_image_b64:       str | None  = None
+        self._creative_mode:      bool        = False
         self.output_dir:          Path        = BASE_DIR / "generated_images"
         self.gen_state:           dict        = {}
         self._nb2_client                      = None
@@ -319,6 +379,7 @@ class ImageGenStudio(ctk.CTk):
         self._build_ui()
         self._load_settings()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(400, self._prebuild_image_settings)  # pre-build so first click is instant
 
     # ── State ─────────────────────────────────────────────────────────────────
 
@@ -509,67 +570,107 @@ class ImageGenStudio(ctk.CTk):
         )
         self.lbl_vo.grid(row=0, column=1, sticky="ew")
 
-    # ── Image Settings ────────────────────────────────────────────────────────
-
     def _build_settings_panel(self, parent):
-        f = ctk.CTkFrame(parent, fg_color=C["panel"], corner_radius=12,
-                          border_width=1, border_color=C["divider"])
-        f.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        f.grid_columnconfigure((1, 3), weight=1)
+        # ── Create all image setting vars (no widgets — managed via popup) ────
+        self.var_style  = ctk.StringVar(value=AI_DECIDE)
+        self.var_camera = ctk.StringVar(value=AI_DECIDE)
+        self.var_mood   = ctk.StringVar(value=AI_DECIDE)
+        self.var_light  = ctk.StringVar(value=AI_DECIDE)
+        self.var_color  = ctk.StringVar(value=AI_DECIDE)
+        self.var_dof    = ctk.StringVar(value=AI_DECIDE)
+        # Advanced
+        self.var_shot_type      = ctk.StringVar(value=AI_DECIDE)
+        self.var_lens_type      = ctk.StringVar(value=AI_DECIDE)
+        self.var_focus_type     = ctk.StringVar(value=AI_DECIDE)
+        self.var_exposure       = ctk.StringVar(value=AI_DECIDE)
+        self.var_motion         = ctk.StringVar(value=AI_DECIDE)
+        self.var_light_source   = ctk.StringVar(value=AI_DECIDE)
+        self.var_light_dir      = ctk.StringVar(value=AI_DECIDE)
+        self.var_light_quality  = ctk.StringVar(value=AI_DECIDE)
+        self.var_contrast       = ctk.StringVar(value=AI_DECIDE)
+        self.var_shadow_type    = ctk.StringVar(value=AI_DECIDE)
+        self.var_lighting_style = ctk.StringVar(value=AI_DECIDE)
+        self.var_color_temp     = ctk.StringVar(value=AI_DECIDE)
+        self.var_framing        = ctk.StringVar(value=AI_DECIDE)
+        self.var_comp_depth     = ctk.StringVar(value=AI_DECIDE)
+        # Extra notes — proxy so save/load/bulk-sync still use .get/.delete/.insert
+        self.extra_notes = _NotesProxy()
 
-        ctk.CTkLabel(f, text="Image Settings", font=F(15, "bold"),
+        # Update status label whenever a basic setting changes
+        for _v in (self.var_style, self.var_camera, self.var_mood,
+                   self.var_light, self.var_color, self.var_dof):
+            _v.trace_add("write", lambda *_: self._refresh_settings_status())
+
+        # Outer container — both cards live here, occupying row=0 of parent
+        wrap = ctk.CTkFrame(parent, fg_color="transparent")
+        wrap.grid(row=0, column=0, sticky="ew")
+        wrap.grid_columnconfigure(0, weight=1)
+
+        # ── Section A: Image Settings button (its own card) ───────────────────
+        img_card = ctk.CTkFrame(wrap, fg_color=C["panel"], corner_radius=12,
+                                border_width=1, border_color=C["divider"])
+        img_card.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        img_card.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(img_card, text="Image Settings", font=F(15, "bold"),
                      text_color=C["accent"]).grid(
-            row=0, column=0, columnspan=4, padx=16, pady=(12, 8), sticky="w"
-        )
+            row=0, column=0, columnspan=2, padx=16, pady=(12, 8), sticky="w")
 
-        def lbl(parent, text):
-            return ctk.CTkLabel(parent, text=text, font=F(13, "bold"),
+        btn_row = ctk.CTkFrame(img_card, fg_color="transparent")
+        btn_row.grid(row=1, column=0, columnspan=2, padx=16, pady=(0, 14), sticky="ew")
+        btn_row.grid_columnconfigure(2, weight=1)
+
+        ctk.CTkButton(
+            btn_row, text="⚙  Open Image Settings",
+            height=40, corner_radius=10, width=190,
+            font=F(14, "bold"), fg_color=C["btn_settings"], hover_color="#14374F",
+            command=self._open_image_settings,
+        ).grid(row=0, column=0, padx=(0, 10))
+
+        self._btn_creative = ctk.CTkButton(
+            btn_row, text="✦  Creative Mode",
+            height=40, corner_radius=10, width=160,
+            font=F(14, "bold"), fg_color=C["chip_bg"], hover_color=C["divider"],
+            text_color=C["text_muted"], border_width=1, border_color=C["divider"],
+            command=self._toggle_creative_mode,
+        )
+        self._btn_creative.grid(row=0, column=1, padx=(0, 10))
+
+        self._settings_status_lbl = ctk.CTkLabel(
+            btn_row, text="All: Let AI Decide",
+            font=F(12), text_color=C["text_muted"], anchor="w",
+        )
+        self._settings_status_lbl.grid(row=0, column=2, sticky="ew")
+
+        # ── Section B: System Prompt (its own card) ───────────────────────────
+        f = ctk.CTkFrame(wrap, fg_color=C["panel"], corner_radius=12,
+                         border_width=1, border_color=C["divider"])
+        f.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        f.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(f, text="System Prompt", font=F(15, "bold"),
+                     text_color=C["accent"]).grid(
+            row=0, column=0, columnspan=2, padx=16, pady=(12, 6), sticky="w")
+
+        def lbl(text):
+            return ctk.CTkLabel(f, text=text, font=F(13, "bold"),
                                 text_color=C["text_mid"])
 
-        def srow(r, t1, v1, o1, t2, v2, o2):
-            lbl(f, t1).grid(row=r, column=0, padx=(16, 6), pady=5, sticky="w")
-            make_combo(f, o1, v1).grid(row=r, column=1, padx=4, pady=5, sticky="ew")
-            lbl(f, t2).grid(row=r, column=2, padx=(10, 6), pady=5, sticky="w")
-            make_combo(f, o2, v2).grid(row=r, column=3, padx=(4, 16), pady=5, sticky="ew")
-
-        self.var_style  = ctk.StringVar(value=ART_STYLES[0])
-        self.var_camera = ctk.StringVar(value=CAMERA_ANGLES[0])
-        self.var_mood   = ctk.StringVar(value=MOODS[0])
-        self.var_light  = ctk.StringVar(value=LIGHTING[0])
-        self.var_color  = ctk.StringVar(value=COLOR_PALETTES[0])
-        self.var_dof    = ctk.StringVar(value=DEPTH_OF_FIELD[0])
-
-        srow(1, "Art Style:",      self.var_style,  ART_STYLES,    "Camera Angle:",    self.var_camera, CAMERA_ANGLES)
-        srow(2, "Mood:",           self.var_mood,   MOODS,         "Lighting:",        self.var_light,  LIGHTING)
-        srow(3, "Color Palette:",  self.var_color,  COLOR_PALETTES, "Depth of Field:", self.var_dof,    DEPTH_OF_FIELD)
-
-        # Extra notes
-        lbl(f, "Extra Notes:").grid(row=4, column=0, padx=(16, 6), pady=(6, 4), sticky="w")
-        self.extra_notes = ctk.CTkEntry(
-            f, fg_color=C["input"], text_color=C["text"],
-            border_color=C["divider"], border_width=1,
-            placeholder_text="Additional style notes or custom overrides…",
-            placeholder_text_color=C["text_muted"],
-            font=F(13), height=36,
-        )
-        self.extra_notes.grid(row=4, column=1, columnspan=3, padx=(4, 16), pady=(6, 4), sticky="ew")
-
-        # System prompt
-        lbl(f, "System Prompt:").grid(row=5, column=0, padx=(16, 6), pady=(4, 4), sticky="nw")
         self.sys_prompt_box = ctk.CTkTextbox(
-            f, height=48, fg_color=C["input"], text_color=C["text"],
+            f, height=72, fg_color=C["input"], text_color=C["text"],
             border_color=C["divider"], border_width=1, font=F(13),
         )
-        self.sys_prompt_box.grid(row=5, column=1, columnspan=3, padx=(4, 16), pady=(4, 4), sticky="ew")
+        self.sys_prompt_box.grid(row=1, column=0, columnspan=2,
+                                  padx=16, pady=(0, 8), sticky="ew")
         self.sys_prompt_box.insert(
             "0.0",
             "You are an expert visual storyteller crafting image-generation prompts for a YouTube video about cats.",
         )
 
         # Output folder
-        lbl(f, "Save Images To:").grid(row=6, column=0, padx=(16, 6), pady=(4, 12), sticky="w")
+        lbl("Save Images To:").grid(row=2, column=0, padx=(16, 6), pady=(4, 10), sticky="w")
         out_row = ctk.CTkFrame(f, fg_color="transparent")
-        out_row.grid(row=6, column=1, columnspan=3, padx=(4, 16), pady=(4, 12), sticky="ew")
+        out_row.grid(row=2, column=1, padx=(4, 16), pady=(4, 10), sticky="ew")
         out_row.grid_columnconfigure(0, weight=1)
 
         self.out_dir_label = ctk.CTkLabel(
@@ -585,9 +686,9 @@ class ImageGenStudio(ctk.CTk):
         ).grid(row=0, column=1, padx=(10, 0))
 
         # GPT Model selector
-        lbl(f, "GPT Model:").grid(row=7, column=0, padx=(16, 6), pady=(4, 12), sticky="w")
+        lbl("GPT Model:").grid(row=3, column=0, padx=(16, 6), pady=(4, 12), sticky="w")
         gm_row = ctk.CTkFrame(f, fg_color="transparent")
-        gm_row.grid(row=7, column=1, columnspan=3, padx=(4, 16), pady=(4, 12), sticky="ew")
+        gm_row.grid(row=3, column=1, padx=(4, 16), pady=(4, 12), sticky="ew")
         gm_row.grid_columnconfigure(0, weight=1)
         gm_combo = make_combo(gm_row, ALL_GPT_MODELS, self.gpt_model_var)
         gm_combo.grid(row=0, column=0, sticky="ew")
@@ -595,6 +696,130 @@ class ImageGenStudio(ctk.CTk):
         self._main_tier_lbl = ctk.CTkLabel(
             gm_row, text="● Higher Capacity", font=F(12), text_color="#27643B")
         self._main_tier_lbl.grid(row=0, column=1, padx=(10, 0))
+
+    def _refresh_settings_status(self):
+        active = [v.get() for v in (self.var_style, self.var_camera, self.var_mood,
+                                     self.var_light, self.var_color, self.var_dof)
+                  if v.get() not in (AI_DECIDE, "N/A", "")]
+        if not hasattr(self, "_settings_status_lbl"):
+            return
+        if active:
+            summary = " · ".join(active[:3]) + ("…" if len(active) > 3 else "")
+            self._settings_status_lbl.configure(text=summary, text_color=C["accent"])
+        else:
+            self._settings_status_lbl.configure(text="All: Let AI Decide",
+                                                  text_color=C["text_muted"])
+
+    def _open_image_settings(self):
+        if hasattr(self, "_img_settings_dlg") and self._img_settings_dlg.winfo_exists():
+            self._img_settings_dlg.deiconify()
+            self._img_settings_dlg.lift()
+            self._img_settings_dlg.focus()
+            return
+        self._img_settings_dlg = ImageSettingsDialog(self)
+
+    def _toggle_creative_mode(self):
+        self._creative_mode = not self._creative_mode
+        if self._creative_mode:
+            self._btn_creative.configure(
+                fg_color=C["accent"], hover_color="#1A4D70",
+                text_color="white", border_color=C["accent"],
+                text="✦  Creative Mode  ON",
+            )
+        else:
+            self._btn_creative.configure(
+                fg_color=C["chip_bg"], hover_color=C["divider"],
+                text_color=C["text_muted"], border_color=C["divider"],
+                text="✦  Creative Mode",
+            )
+
+    def _get_creative_settings(self, voiceover: str, ctx_stills: list,
+                               model: str) -> str:
+        """GPT decides which image settings to activate for this specific voiceover moment.
+        Returns a formatted settings block string (only non-AI_DECIDE values)."""
+        try:
+            client = OpenAI(api_key=OPENAI_API_KEY)
+            ctx_lines = "\n".join(
+                f"  [{s['still_id']}]{'  ← THIS STILL' if s.get('voiceover') == voiceover else ''}: "
+                f"\"{s.get('voiceover', '')}\""
+                for s in ctx_stills
+            )
+            options_block = (
+                f"mood:              {json.dumps(MOODS)}\n"
+                f"lighting:          {json.dumps(LIGHTING)}\n"
+                f"color_palette:     {json.dumps(COLOR_PALETTES)}\n"
+                f"depth_of_field:    {json.dumps(DEPTH_OF_FIELD)}\n"
+                f"shot_type:         {json.dumps(SHOT_TYPES[2:])}\n"
+                f"light_source:      {json.dumps(LIGHT_SOURCES[2:])}\n"
+                f"light_direction:   {json.dumps(LIGHT_DIRS[2:])}\n"
+                f"light_quality:     {json.dumps(LIGHT_QUALITIES[2:])}\n"
+                f"contrast_level:    {json.dumps(CONTRAST_LEVELS[2:])}\n"
+                f"shadow_type:       {json.dumps(SHADOW_TYPES[2:])}\n"
+                f"lighting_style:    {json.dumps(LIGHTING_STYLES[2:])}\n"
+                f"color_temperature: {json.dumps(COLOR_TEMPS[2:])}\n"
+                f"framing_rule:      {json.dumps(FRAMING_RULES[2:])}\n"
+                f"comp_depth:        {json.dumps(COMP_DEPTHS[2:])}\n"
+            )
+            messages = [
+                {"role": "system", "content": (
+                    "You are a cinematographer choosing camera, lighting, and composition settings "
+                    "for a specific frame of an animated video. "
+                    "Pick settings that match the EMOTIONAL and VISUAL tone of the voiceover. "
+                    "Create variety between stills — different moments deserve different visual treatments. "
+                    "Return ONLY valid JSON with chosen keys. Values must be copied EXACTLY from the options. "
+                    "Only include 3-6 settings where a specific value clearly fits; omit the rest."
+                )},
+                {"role": "user", "content": (
+                    f"VOICEOVER FOR THIS STILL: \"{voiceover}\"\n\n"
+                    f"SURROUNDING STILLS FOR CONTEXT:\n{ctx_lines}\n\n"
+                    f"Choose settings that emotionally fit this moment and differ visually from adjacent stills.\n\n"
+                    f"AVAILABLE SETTINGS AND VALID VALUES:\n{options_block}\n"
+                    f"Return JSON with 3-6 settings. Omit settings where 'Let AI Decide' is fine."
+                )},
+            ]
+            resp = _gpt_call(client, model, messages, 300)
+            raw = resp.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw[raw.index("\n") + 1:]
+                if "```" in raw:
+                    raw = raw[:raw.rindex("```")]
+            data = json.loads(raw.strip())
+
+            _label_map = {
+                "mood": ("Mood:",            MOODS),
+                "lighting": ("Lighting:",    LIGHTING),
+                "color_palette": ("Color Palette:", COLOR_PALETTES),
+                "depth_of_field": ("Depth of Field:", DEPTH_OF_FIELD),
+                "shot_type": ("Shot Type:",  SHOT_TYPES),
+                "light_source": ("Light Source:", LIGHT_SOURCES),
+                "light_direction": ("Light Direction:", LIGHT_DIRS),
+                "light_quality": ("Light Quality:", LIGHT_QUALITIES),
+                "contrast_level": ("Contrast:", CONTRAST_LEVELS),
+                "shadow_type": ("Shadow Type:", SHADOW_TYPES),
+                "lighting_style": ("Lighting Style:", LIGHTING_STYLES),
+                "color_temperature": ("Color Temp:", COLOR_TEMPS),
+                "framing_rule": ("Framing Rule:", FRAMING_RULES),
+                "comp_depth": ("Depth Layers:", COMP_DEPTHS),
+            }
+            _skip = {AI_DECIDE, "N/A", ""}
+            lines = []
+            for key, (label, options) in _label_map.items():
+                val = data.get(key, "").strip()
+                if val and val not in _skip and val in options:
+                    lines.append(f"{label:22} {val}")
+            result = "\n".join(lines)
+            _logger.info(f"[CREATIVE] Settings for '{voiceover[:60]}': {result!r}")
+            return result
+        except Exception as exc:
+            _logger.warning(f"[CREATIVE] GPT call failed: {exc}")
+            return ""
+
+    def _prebuild_image_settings(self):
+        """Build the Image Settings dialog in the background so first click is instant."""
+        if not hasattr(self, "_img_settings_dlg") or \
+                not self._img_settings_dlg.winfo_exists():
+            self._img_settings_dlg = ImageSettingsDialog(self)
+            self._img_settings_dlg.withdraw()
 
     # ── Chat panel with resizable panes ───────────────────────────────────────
 
@@ -677,7 +902,7 @@ class ImageGenStudio(ctk.CTk):
 
         ctk.CTkLabel(
             parent_ctk,
-            text="Current Prompt  —  edit freely before generating",
+            text="Scene Description  —  edit freely before generating",
             font=F(12, "bold"), text_color=C["text_mid"],
         ).grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 4), sticky="w")
 
@@ -707,15 +932,6 @@ class ImageGenStudio(ctk.CTk):
             command=self._generate_image,
         )
         self.btn_generate.pack(side="left", padx=(10, 0))
-
-        self.btn_edit_image = ctk.CTkButton(
-            btn_row, text="Edit Current Image",
-            width=178, height=42, corner_radius=8,
-            font=F(14, "bold"), fg_color=C["btn_red"], hover_color="#8B1A1A",
-            command=self._edit_current_image,
-            state="disabled",
-        )
-        self.btn_edit_image.pack(side="left", padx=(10, 0))
 
     # ── Reference image panel ─────────────────────────────────────────────────
 
@@ -929,13 +1145,11 @@ class ImageGenStudio(ctk.CTk):
         self.current_image_bytes = None
         self._clear_preview()
         self.btn_approve.configure(state="disabled")
-        self.btn_edit_image.configure(state="disabled")
 
         if new_id in self._pending_images:
             self.current_image_bytes = self._pending_images[new_id]
             self._img_data = Image.open(BytesIO(self.current_image_bytes))
             self.btn_approve.configure(state="normal")
-            self.btn_edit_image.configure(state="normal")
             self.after_idle(self._display_gen_image)
 
         if new_id not in self._still_states:
@@ -1063,15 +1277,26 @@ class ImageGenStudio(ctk.CTk):
     def _apply_extracted_settings(self, data: dict):
         def try_set(var, key, options):
             val = data.get(key, "")
-            if val in options:
+            if val and val in options:
                 var.set(val)
 
+        # Basic settings
         try_set(self.var_style,  "art_style",      ART_STYLES)
         try_set(self.var_camera, "camera_angle",   CAMERA_ANGLES)
         try_set(self.var_mood,   "mood",           MOODS)
         try_set(self.var_light,  "lighting",       LIGHTING)
         try_set(self.var_color,  "color_palette",  COLOR_PALETTES)
         try_set(self.var_dof,    "depth_of_field", DEPTH_OF_FIELD)
+        # Advanced settings
+        try_set(self.var_shot_type,      "shot_type",        SHOT_TYPES)
+        try_set(self.var_light_source,   "light_source",     LIGHT_SOURCES)
+        try_set(self.var_light_dir,      "light_direction",  LIGHT_DIRS)
+        try_set(self.var_light_quality,  "light_quality",    LIGHT_QUALITIES)
+        try_set(self.var_contrast,       "contrast_level",   CONTRAST_LEVELS)
+        try_set(self.var_shadow_type,    "shadow_type",      SHADOW_TYPES)
+        try_set(self.var_lighting_style, "lighting_style",   LIGHTING_STYLES)
+        try_set(self.var_color_temp,     "color_temperature", COLOR_TEMPS)
+        try_set(self.var_framing,        "framing_rule",     FRAMING_RULES)
 
         notes = data.get("extra_notes", "").strip()
         if notes:
@@ -1134,17 +1359,43 @@ class ImageGenStudio(ctk.CTk):
     # ── Settings summary ──────────────────────────────────────────────────────
 
     def _settings_block(self) -> str:
-        lines = [
-            f"Art Style:       {self.var_style.get()}",
-            f"Camera Angle:    {self.var_camera.get()}",
-            f"Mood:            {self.var_mood.get()}",
-            f"Lighting:        {self.var_light.get()}",
-            f"Color Palette:   {self.var_color.get()}",
-            f"Depth of Field:  {self.var_dof.get()}",
-        ]
+        _skip = {AI_DECIDE, "N/A", ""}
+        lines = []
+
+        def add(label: str, var: ctk.StringVar):
+            v = var.get().strip()
+            if v not in _skip:
+                lines.append(f"{label:22} {v}")
+
+        # Layer 2 — Basic
+        add("Art Style:",        self.var_style)
+        add("Camera Angle:",     self.var_camera)
+        add("Mood:",             self.var_mood)
+        add("Lighting:",         self.var_light)
+        add("Color Palette:",    self.var_color)
+        add("Depth of Field:",   self.var_dof)
+        # Layer 2 — Advanced Camera
+        add("Shot Type:",        self.var_shot_type)
+        add("Lens Type:",        self.var_lens_type)
+        # Layer 2 — Advanced Lighting
+        add("Light Source:",     self.var_light_source)
+        add("Light Direction:",  self.var_light_dir)
+        add("Light Quality:",    self.var_light_quality)
+        add("Contrast:",         self.var_contrast)
+        add("Shadow Type:",      self.var_shadow_type)
+        add("Lighting Style:",   self.var_lighting_style)
+        add("Color Temp:",       self.var_color_temp)
+        # Layer 2 — Focus / Technical
+        add("Focus Type:",       self.var_focus_type)
+        add("Exposure:",         self.var_exposure)
+        add("Motion:",           self.var_motion)
+        # Layer 2 — Composition
+        add("Framing Rule:",     self.var_framing)
+        add("Depth Layers:",     self.var_comp_depth)
+
         notes = self.extra_notes.get().strip()
         if notes:
-            lines.append(f"Extra Notes:     {notes}")
+            lines.append(f"{'Extra Notes:':22} {notes}")
         return "\n".join(lines)
 
     # ── GPT-4o suggestion ─────────────────────────────────────────────────────
@@ -1161,51 +1412,93 @@ class ImageGenStudio(ctk.CTk):
                                       "OPENAI_API_KEY not found in .env file.")
             return
         self.btn_suggest.configure(state="disabled", text="⏳  Thinking…")
-        # Snapshot widget values NOW (main thread) — safe to pass to background thread
+
+        # Gather narrative context: 2 stills before + current + 2 after
+        cur_id = self.selected_still["still_id"]
+        idx = next((i for i, s in enumerate(self.stills) if s["still_id"] == cur_id), 0)
+        ctx_stills = self.stills[max(0, idx - 2): idx + 3]
+
+        # Snapshot all widget values in main thread before handing to background thread
         sys_txt  = self.sys_prompt_box.get("0.0", "end").strip()
         settings = self._settings_block()
-        ref_b64  = self.ref_image_b64
-        ref_desc = self.ref_desc_entry.get().strip()
         still    = self.selected_still
         history  = list(self.chat_history)
         model    = self.gpt_model_var.get()
         threading.Thread(
             target=self._suggestion_worker,
-            args=(still, sys_txt, settings, ref_b64, ref_desc, history, model),
+            args=(still, ctx_stills, sys_txt, settings, history, model),
             daemon=True,
         ).start()
 
-    def _suggestion_worker(self, still, sys_txt, settings, ref_b64, ref_desc, history, model="gpt-4o"):
+    def _suggestion_worker(self, still, ctx_stills, sys_txt, settings,
+                           history, model="gpt-4o"):
         try:
             client = OpenAI(api_key=OPENAI_API_KEY)
+
+            # Build the narrative context block (surrounding voiceovers)
+            context_lines = []
+            for cs in ctx_stills:
+                marker = "  ← CURRENT STILL" if cs["still_id"] == still["still_id"] else ""
+                context_lines.append(
+                    f"  [{cs['still_id']}]{marker}: \"{cs['voiceover']}\""
+                )
+            context_block = "\n".join(context_lines)
+            settings_block = settings if settings else "Let AI Decide all settings"
+
             parts: list = []
 
-            if ref_b64:
-                parts.append({"type": "image_url",
-                               "image_url": {"url": f"data:image/png;base64,{ref_b64}"}})
-                guidance = ref_desc if ref_desc else "visual style and aesthetic"
-                parts.append({"type": "text",
-                               "text": f"The above image is a reference. From it, use: {guidance}"})
+            # NOTE: ref_b64 is intentionally NOT sent here.
+            # The reference image's style is already captured in sys_txt (System Prompt)
+            # via Extract Settings. Sending the image to this call would cause GPT to
+            # copy the reference image's composition, subjects, and text into every scene.
 
+            # Scene description task (Layer 3)
+            style_context = (
+                f"VISUAL STYLE GUIDE (rendering technique only — governs HOW things look, "
+                f"not WHAT appears in the scene):\n{sys_txt}\n\n"
+                if sys_txt else ""
+            )
             parts.append({"type": "text", "text": (
-                f"Write an image-generation prompt for this still:\n\n"
-                f"VOICEOVER:\n\"{still['voiceover']}\"\n\n"
-                f"STILL INFO:\n"
-                f"  Timestamp : {still['start']} → {still['end']}\n"
-                f"  On-screen : {still['duration']} seconds\n\n"
-                f"IMAGE SETTINGS:\n{settings}\n\n"
-                f"Rules:\n"
-                f"  • VISUALLY INTERPRET the voiceover — describe what the viewer SEES, "
-                f"not what is being narrated. Derive a scene from it; do NOT copy it verbatim.\n"
-                f"  • Explicitly mention EVERY setting in the prompt naturally "
-                f"(camera angle, art style, mood, lighting, color palette, depth of field).\n"
-                f"  • Compose for 16:9 aspect ratio\n"
-                f"  • Be specific about subject, composition, lighting, atmosphere\n"
-                f"  • NO text, words, or captions inside the image\n\n"
-                f"Respond with ONLY the prompt text — no preamble, no explanations."
+                f"{style_context}"
+                f"Write the SCENE DESCRIPTION for this video still.\n\n"
+                f"NARRATIVE CONTEXT — surrounding stills (read to understand the story arc):\n"
+                f"{context_block}\n\n"
+                f"IMAGE SETTINGS (applied separately at generation — do NOT repeat these):\n"
+                f"{settings_block}\n\n"
+                f"YOUR TASK: Write a rich, visually UNIQUE scene description for the CURRENT STILL.\n\n"
+                f"VARIETY IS MANDATORY: Each still must feel visually distinct from its neighbours. "
+                f"Do NOT reuse the same environment, background, or spatial setup as surrounding stills "
+                f"unless the story explicitly demands it. Vary viewpoint, lighting conditions, "
+                f"background setting, and foreground elements aggressively.\n\n"
+                f"Cover ALL of the following:\n"
+                f"  Subject    → who/what is the primary focus (describe appearance, posture, expression)\n"
+                f"  Action     → what is physically happening — motion, gesture, interaction\n"
+                f"  People     → if the voiceover implies any human presence (a hand, a person, a crowd), "
+                f"describe them specifically and place them spatially in the scene\n"
+                f"  Background → name specific objects and surfaces: type of wall (brick / plaster / wood panelling), "
+                f"floor material (tile / hardwood / carpet), furniture pieces, shelves, windows, plants, art on walls, "
+                f"items in the distance, colour of paint — be precise, not generic\n"
+                f"  Foreground → props, textures, or objects closest to the viewer creating visual depth\n"
+                f"  Atmosphere → light source direction, colour temperature (golden morning / cool night / overcast), "
+                f"time of day, emotional mood\n\n"
+                f"RULES:\n"
+                f"  ✗ No floating text, captions, signs, logos, or UI elements in the image\n"
+                f"  ✗ Do NOT mention art style, camera technique, or rendering settings\n"
+                f"  ✓ Include humans, hands, or people whenever the voiceover implies their presence\n"
+                f"  ✓ Every background detail should be specific ('rough exposed brick wall' not 'a wall')\n"
+                f"  ✓ Compose for 16:9 — describe what occupies left third, centre, right third, and the depth layers\n\n"
+                f"Write 5-7 vivid, specific sentences. Background detail must match subject detail in richness. "
+                f"Output ONLY the scene description — no labels, no headers, no preamble."
             )})
 
-            messages = [{"role": "system", "content": sys_txt}]
+            messages = [
+                {"role": "system", "content": (
+                    "You are a professional scene director writing highly detailed, visually distinct "
+                    "image descriptions for individual frames of an animated video. "
+                    "Your descriptions must be specific enough that every frame looks different. "
+                    "Humans appear in scenes whenever the narrative calls for them."
+                )}
+            ]
             messages.extend(history)
             messages.append({"role": "user", "content": parts})
 
@@ -1213,7 +1506,7 @@ class ImageGenStudio(ctk.CTk):
             suggested = resp.choices[0].message.content.strip()
 
             new_user = {"role": "user",
-                "content": f"[Suggest for {still['still_id']}: '{still['voiceover'][:60]}…']"}
+                "content": f"[Layer 3 for {still['still_id']}: '{still['voiceover'][:60]}…']"}
             new_asst = {"role": "assistant", "content": suggested}
             self.after(0, lambda: self._apply_suggestion(suggested, new_user, new_asst))
         except Exception as exc:
@@ -1368,24 +1661,21 @@ class ImageGenStudio(ctk.CTk):
         if self._generating:
             return
 
-        # Build Gemini prompt: style directive + settings footer + scene prompt
-        sys_p    = self.sys_prompt_box.get("0.0", "end").strip()
-        settings = self._settings_block()   # art style, camera, mood, lighting, colour, dof
-        parts    = []
-        if sys_p:
-            parts.append(sys_p)
-        parts.append(prompt)
-        if settings:
-            parts.append(f"APPLY THESE STYLE SETTINGS EXACTLY:\n{settings}")
-        gemini_prompt = "\n\n".join(parts)
+        # Snapshot all main-thread values before handing off to worker
+        sys_p      = self.sys_prompt_box.get("0.0", "end").strip()
+        settings   = self._settings_block()        # user-locked settings (AI_DECIDE already filtered)
+        voiceover  = self.selected_still.get("voiceover", "")
+        cur_id     = self.selected_still["still_id"]
+        idx        = next((i for i, s in enumerate(self.stills)
+                           if s["still_id"] == cur_id), 0)
+        ctx_stills = self.stills[max(0, idx - 2): idx + 3]
+        model      = self.gpt_model_var.get()
 
-        sid = self.selected_still["still_id"]
+        sid = cur_id
         _logger.info(
-            f"[SINGLE-GEN] Start — still={sid} | "
-            f"sys_p_len={len(sys_p)} | prompt_len={len(prompt)} | "
-            f"gemini_total_len={len(gemini_prompt)}"
+            f"[SINGLE-GEN] Start — still={sid} | creative={self._creative_mode} | "
+            f"sys_p_len={len(sys_p)} | prompt_len={len(prompt)}"
         )
-        _logger.debug(f"[SINGLE-GEN] Full Gemini prompt:\n{gemini_prompt}")
 
         self._generating = True
         self._img_data = None
@@ -1394,12 +1684,35 @@ class ImageGenStudio(ctk.CTk):
         if hasattr(self.gen_preview, "_ref"):
             self.gen_preview._ref = None
         self.btn_generate.configure(state="disabled", text="▶  Generating…")
-        self.btn_edit_image.configure(state="disabled")
         self.btn_approve.configure(state="disabled")
         self._start_spinner()
-        threading.Thread(target=self._gen_worker, args=(gemini_prompt,), daemon=True).start()
+        threading.Thread(
+            target=self._gen_worker,
+            args=(sys_p, prompt, settings, voiceover, ctx_stills, model),
+            daemon=True,
+        ).start()
 
-    def _gen_worker(self, prompt: str):
+    def _gen_worker(self, sys_p: str, user_prompt: str, settings: str,
+                    voiceover: str, ctx_stills: list, model: str):
+        # If creative mode is on, get per-still settings from GPT and merge them in
+        creative_block = ""
+        if self._creative_mode and voiceover:
+            creative_block = self._get_creative_settings(voiceover, ctx_stills, model)
+
+        # Assemble full Gemini prompt (3-layer + optional creative override)
+        parts = []
+        if sys_p:
+            parts.append(sys_p)
+        parts.append(user_prompt)
+        if settings:
+            parts.append(f"APPLY THESE IMAGE SETTINGS EXACTLY:\n{settings}")
+        if creative_block:
+            parts.append(
+                f"CREATIVE SETTINGS FOR THIS FRAME (apply for any settings not listed above):\n"
+                f"{creative_block}"
+            )
+        prompt = "\n\n".join(parts)
+
         _logger.info(f"[NB2] Single-still Gemini call — prompt_len={len(prompt)}")
         _logger.debug(f"[NB2] Full prompt:\n{prompt}")
         try:
@@ -1468,7 +1781,6 @@ class ImageGenStudio(ctk.CTk):
         if hasattr(self.gen_preview, "_ref"):
             self.gen_preview._ref = None
         self.btn_generate.configure(state="disabled")
-        self.btn_edit_image.configure(state="disabled", text="Editing…")
         self.btn_approve.configure(state="disabled")
         self._start_spinner()
         threading.Thread(
@@ -1555,7 +1867,6 @@ class ImageGenStudio(ctk.CTk):
     def _show_generated(self, img_bytes: bytes):
         self._generating = False
         self.btn_generate.configure(state="normal", text="Generate Image")
-        self.btn_edit_image.configure(state="normal", text="Edit Current Image")
         try:
             if self.selected_still:
                 sid = self.selected_still["still_id"]
@@ -1587,10 +1898,6 @@ class ImageGenStudio(ctk.CTk):
     def _gen_error(self, msg: str):
         self._generating = False
         self.btn_generate.configure(state="normal", text="Generate Image")
-        self.btn_edit_image.configure(
-            state=("normal" if self.current_image_bytes else "disabled"),
-            text="Edit Current Image",
-        )
         old_ref = getattr(self.gen_preview, "_ref", None)
         self.gen_preview.configure(
             image="",
@@ -1628,7 +1935,6 @@ class ImageGenStudio(ctk.CTk):
         self.gen_preview._ref = None
         del old_ref
         self.btn_approve.configure(state="disabled")
-        self.btn_edit_image.configure(state="disabled")
         self.status_lbl.configure(text=f"  ✅ Saved: {filename}")
         self._chat_append("System:", f"✅ Image approved — saved as {filename}", "sys")
         self._populate_stills_list()
@@ -1641,12 +1947,29 @@ class ImageGenStudio(ctk.CTk):
             return
         try:
             d = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            if "art_style"     in d: self.var_style.set(d["art_style"])
-            if "camera"        in d: self.var_camera.set(d["camera"])
-            if "mood"          in d: self.var_mood.set(d["mood"])
-            if "lighting"      in d: self.var_light.set(d["lighting"])
-            if "color"         in d: self.var_color.set(d["color"])
-            if "dof"           in d: self.var_dof.set(d["dof"])
+            # Basic settings
+            if "art_style"      in d: self.var_style.set(d["art_style"])
+            if "camera"         in d: self.var_camera.set(d["camera"])
+            if "mood"           in d: self.var_mood.set(d["mood"])
+            if "lighting"       in d: self.var_light.set(d["lighting"])
+            if "color"          in d: self.var_color.set(d["color"])
+            if "dof"            in d: self.var_dof.set(d["dof"])
+            # Advanced settings
+            if "shot_type"      in d: self.var_shot_type.set(d["shot_type"])
+            if "lens_type"      in d: self.var_lens_type.set(d["lens_type"])
+            if "focus_type"     in d: self.var_focus_type.set(d["focus_type"])
+            if "exposure"       in d: self.var_exposure.set(d["exposure"])
+            if "motion"         in d: self.var_motion.set(d["motion"])
+            if "light_source"   in d: self.var_light_source.set(d["light_source"])
+            if "light_dir"      in d: self.var_light_dir.set(d["light_dir"])
+            if "light_quality"  in d: self.var_light_quality.set(d["light_quality"])
+            if "contrast"       in d: self.var_contrast.set(d["contrast"])
+            if "shadow_type"    in d: self.var_shadow_type.set(d["shadow_type"])
+            if "lighting_style" in d: self.var_lighting_style.set(d["lighting_style"])
+            if "color_temp"     in d: self.var_color_temp.set(d["color_temp"])
+            if "framing"        in d: self.var_framing.set(d["framing"])
+            if "comp_depth"     in d: self.var_comp_depth.set(d["comp_depth"])
+            # Extra notes
             if "extra_notes"   in d:
                 self.extra_notes.delete(0, "end")
                 self.extra_notes.insert(0, d["extra_notes"])
@@ -1663,15 +1986,31 @@ class ImageGenStudio(ctk.CTk):
     def _save_settings(self):
         try:
             d = {
-                "art_style":     self.var_style.get(),
-                "camera":        self.var_camera.get(),
-                "mood":          self.var_mood.get(),
-                "lighting":      self.var_light.get(),
-                "color":         self.var_color.get(),
-                "dof":           self.var_dof.get(),
-                "extra_notes":   self.extra_notes.get().strip(),
-                "system_prompt": self.sys_prompt_box.get("0.0", "end").strip(),
-                "output_dir":    str(self.output_dir),
+                # Basic
+                "art_style":      self.var_style.get(),
+                "camera":         self.var_camera.get(),
+                "mood":           self.var_mood.get(),
+                "lighting":       self.var_light.get(),
+                "color":          self.var_color.get(),
+                "dof":            self.var_dof.get(),
+                # Advanced
+                "shot_type":      self.var_shot_type.get(),
+                "lens_type":      self.var_lens_type.get(),
+                "focus_type":     self.var_focus_type.get(),
+                "exposure":       self.var_exposure.get(),
+                "motion":         self.var_motion.get(),
+                "light_source":   self.var_light_source.get(),
+                "light_dir":      self.var_light_dir.get(),
+                "light_quality":  self.var_light_quality.get(),
+                "contrast":       self.var_contrast.get(),
+                "shadow_type":    self.var_shadow_type.get(),
+                "lighting_style": self.var_lighting_style.get(),
+                "color_temp":     self.var_color_temp.get(),
+                "framing":        self.var_framing.get(),
+                "comp_depth":     self.var_comp_depth.get(),
+                "extra_notes":    self.extra_notes.get().strip(),
+                "system_prompt":  self.sys_prompt_box.get("0.0", "end").strip(),
+                "output_dir":     str(self.output_dir),
             }
             SETTINGS_FILE.write_text(json.dumps(d, indent=2), encoding="utf-8")
         except Exception:
@@ -1691,7 +2030,6 @@ class ImageGenStudio(ctk.CTk):
             fg=C["text_muted"], font=("Segoe UI", 13),
         )
         self.gen_preview._ref = None
-        self.btn_edit_image.configure(state="disabled")
         del old  # safe to GC now — widget no longer references the old image
 
     def _show_bulk_loading(self, sid: str):
@@ -1706,7 +2044,6 @@ class ImageGenStudio(ctk.CTk):
             self.gen_preview._ref = None
             del old
             self.btn_approve.configure(state="disabled")
-            self.btn_edit_image.configure(state="disabled")
 
     # ── Bulk helpers (sidebar) ────────────────────────────────────────────────
 
@@ -1739,6 +2076,192 @@ class ImageGenStudio(ctk.CTk):
         self._save_state()
         self._populate_stills_list()
         messagebox.showinfo("Saved", f"{n} images saved to:\n{self.output_dir}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+class ImageSettingsDialog(ctk.CTkToplevel):
+# ═════════════════════════════════════════════════════════════════════════════
+    """Layer 2 — Image Settings popup. All dropdowns bind directly to the main
+    app's StringVars so changes are immediately reflected in generation."""
+
+    def __init__(self, app: "ImageGenStudio"):
+        super().__init__(app)
+        self._app = app
+        self.title("Image Settings — Layer 2")
+        self.resizable(False, True)
+        self._adv_visible = False
+        self._build_ui()
+        self.geometry("500x680")
+        self.after(60, self._center)
+
+    def _center(self):
+        self.update_idletasks()
+        ax, ay = self._app.winfo_x(), self._app.winfo_y()
+        aw, ah = self._app.winfo_width(), self._app.winfo_height()
+        w, h   = self.winfo_width(), self.winfo_height()
+        self.geometry(f"+{ax + (aw - w)//2}+{ay + (ah - h)//2}")
+
+    def _build_ui(self):
+        self.configure(fg_color=C["app"])
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        outer = ctk.CTkScrollableFrame(
+            self, fg_color=C["app"],
+            scrollbar_button_color=C["divider"],
+            scrollbar_button_hover_color=C["accent"],
+        )
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.grid_columnconfigure(0, weight=1)
+        self._outer = outer
+
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = ctk.CTkFrame(outer, fg_color=C["header"], corner_radius=0)
+        hdr.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        ctk.CTkLabel(
+            hdr, text="⚙  Image Settings",
+            font=F(14, "bold"), text_color=C["header_text"],
+        ).pack(side="left", padx=18, pady=14)
+
+        # ── Basic Settings ─────────────────────────────────────────────────────
+        basic = ctk.CTkFrame(outer, fg_color=C["panel"], corner_radius=12,
+                              border_width=1, border_color=C["divider"])
+        basic.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+        basic.grid_columnconfigure(1, weight=1)
+        self._fill_basic(basic)
+
+        # ── Advanced toggle button ─────────────────────────────────────────────
+        self._adv_btn = ctk.CTkButton(
+            outer, text="▼  Advanced Settings",
+            height=36, corner_radius=8, font=F(13, "bold"),
+            fg_color=C["chip_bg"], hover_color=C["divider"],
+            text_color=C["text"], border_color=C["divider"], border_width=1,
+            command=self._toggle_advanced,
+        )
+        self._adv_btn.grid(row=2, column=0, padx=12, pady=(0, 6), sticky="ew")
+
+        # ── Advanced Settings (hidden initially) ───────────────────────────────
+        self._adv_frame = ctk.CTkFrame(outer, fg_color="transparent")
+        self._adv_frame.grid(row=3, column=0, sticky="ew", padx=0)
+        self._adv_frame.grid_columnconfigure(0, weight=1)
+        self._adv_frame.grid_remove()
+        self._build_advanced(self._adv_frame)
+
+        # ── Done button ────────────────────────────────────────────────────────
+        self._done_btn = ctk.CTkButton(
+            outer, text="Done", height=40, corner_radius=10,
+            font=F(14, "bold"), fg_color=C["btn_green"], hover_color="#1B4D2E",
+            command=self._on_done,
+        )
+        self._done_btn.grid(row=4, column=0, padx=12, pady=(6, 16), sticky="ew")
+
+    def _fill_basic(self, sec):
+        _ai = [AI_DECIDE]
+        app = self._app
+
+        def lbl(text, row):
+            ctk.CTkLabel(sec, text=text, font=F(13), text_color=C["text_mid"]).grid(
+                row=row, column=0, padx=(14, 8), pady=5, sticky="w")
+
+        def cmb(values, var, row):
+            make_combo(sec, values, var).grid(
+                row=row, column=1, padx=(0, 14), pady=5, sticky="ew")
+
+        ctk.CTkLabel(sec, text="BASIC SETTINGS", font=F(12, "bold"),
+                     text_color=C["accent"]).grid(
+            row=0, column=0, columnspan=2, padx=14, pady=(12, 6), sticky="w")
+
+        lbl("Art Style:",       1); cmb(_ai + ART_STYLES,     app.var_style,  1)
+        lbl("Camera Angle:",    2); cmb(_ai + CAMERA_ANGLES,  app.var_camera, 2)
+        lbl("Mood:",            3); cmb(_ai + MOODS,          app.var_mood,   3)
+        lbl("Lighting:",        4); cmb(_ai + LIGHTING,       app.var_light,  4)
+        lbl("Color Palette:",   5); cmb(_ai + COLOR_PALETTES, app.var_color,  5)
+        lbl("Depth of Field:",  6); cmb(_ai + DEPTH_OF_FIELD, app.var_dof,    6)
+
+        # Extra Notes — synced to the app's _NotesProxy via events
+        lbl("Extra Notes:", 7)
+        self._notes_entry = ctk.CTkEntry(
+            sec, fg_color=C["input"], text_color=C["text"],
+            border_color=C["divider"], border_width=1,
+            placeholder_text="Rendering details, special instructions…",
+            placeholder_text_color=C["text_muted"],
+            font=F(13), height=34,
+        )
+        self._notes_entry.grid(row=7, column=1, padx=(0, 14), pady=(5, 14), sticky="ew")
+        existing = app.extra_notes.get().strip()
+        if existing:
+            self._notes_entry.insert(0, existing)
+        self._notes_entry.bind("<FocusOut>", self._sync_notes)
+        self._notes_entry.bind("<Return>",   self._sync_notes)
+
+    def _build_advanced(self, parent):
+        sec = ctk.CTkFrame(parent, fg_color=C["panel"], corner_radius=12,
+                           border_width=1, border_color=C["divider"])
+        sec.grid(row=0, column=0, sticky="ew", padx=12, pady=(0, 8))
+        sec.grid_columnconfigure(1, weight=1)
+
+        app = self._app
+        r = [0]  # mutable row counter
+
+        def divider_title(title):
+            ctk.CTkFrame(sec, height=1, fg_color=C["divider"]).grid(
+                row=r[0], column=0, columnspan=2, sticky="ew", padx=14, pady=(8, 0))
+            r[0] += 1
+            ctk.CTkLabel(sec, text=title, font=F(12, "bold"),
+                         text_color=C["accent"]).grid(
+                row=r[0], column=0, columnspan=2, padx=14, pady=(4, 4), sticky="w")
+            r[0] += 1
+
+        def row(label, values, var):
+            ctk.CTkLabel(sec, text=label, font=F(13), text_color=C["text_mid"]).grid(
+                row=r[0], column=0, padx=(14, 8), pady=3, sticky="w")
+            make_combo(sec, values, var).grid(
+                row=r[0], column=1, padx=(0, 14), pady=3, sticky="ew")
+            r[0] += 1
+
+        divider_title("CAMERA  —  ADVANCED")
+        row("Shot Type:", SHOT_TYPES, app.var_shot_type)
+        row("Lens Type:", LENS_TYPES, app.var_lens_type)
+
+        divider_title("LIGHTING  —  ADVANCED")
+        row("Light Source:",   LIGHT_SOURCES,   app.var_light_source)
+        row("Direction:",      LIGHT_DIRS,      app.var_light_dir)
+        row("Quality:",        LIGHT_QUALITIES, app.var_light_quality)
+        row("Contrast:",       CONTRAST_LEVELS, app.var_contrast)
+        row("Shadow Type:",    SHADOW_TYPES,    app.var_shadow_type)
+        row("Lighting Style:", LIGHTING_STYLES, app.var_lighting_style)
+        row("Color Temp:",     COLOR_TEMPS,     app.var_color_temp)
+
+        divider_title("FOCUS  /  TECHNICAL")
+        row("Focus Type:", FOCUS_TYPES,    app.var_focus_type)
+        row("Exposure:",   EXPOSURE_MODES, app.var_exposure)
+        row("Motion:",     MOTION_MODES,   app.var_motion)
+
+        divider_title("COMPOSITION")
+        row("Framing Rule:", FRAMING_RULES, app.var_framing)
+        row("Depth Layers:", COMP_DEPTHS,   app.var_comp_depth)
+
+        # Bottom padding
+        ctk.CTkFrame(sec, height=10, fg_color="transparent").grid(
+            row=r[0], column=0, columnspan=2)
+
+    def _toggle_advanced(self):
+        self._adv_visible = not self._adv_visible
+        if self._adv_visible:
+            self._adv_frame.grid()
+            self._adv_btn.configure(text="▲  Advanced Settings")
+        else:
+            self._adv_frame.grid_remove()
+            self._adv_btn.configure(text="▼  Advanced Settings")
+
+    def _sync_notes(self, event=None):
+        val = self._notes_entry.get().strip()
+        self._app.extra_notes.delete(0, "end")
+        self._app.extra_notes.insert(0, val)
+
+    def _on_done(self):
+        self._sync_notes()
+        self.withdraw()  # hide so re-open is instant; dialog rebuilds only once per session
 
 
 # ═════════════════════════════════════════════════════════════════════════════

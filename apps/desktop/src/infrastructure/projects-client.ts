@@ -110,6 +110,10 @@ export type ImageJobRecord = {
   items: { id: string; groupId: string; promptVersionId: string; status: string; attempts: number; lastError: string | null; renderId: string | null }[];
 };
 export type ExportResultRecord = { path: string; fileCount: number };
+export type TimelineRecord = {
+  videoId: string; durationSeconds: number; playheadSeconds: number; zoom: number; updatedAt: string;
+  clips: { id: string; groupId: string; renderId: string | null; ordinal: number; startSeconds: number; endSeconds: number; label: string }[];
+};
 
 type BrowserData = {
   channels: ChannelRecord[];
@@ -345,6 +349,22 @@ export const projectsClient = {
   async importProjectBundle(): Promise<VideoRecord | null> {
     if (isTauri()) return invoke("import_project_bundle");
     throw new Error("Import requires the native application.");
+  },
+  async buildTimeline(videoId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("build_timeline", { videoId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async getTimeline(videoId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("get_timeline", { videoId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async updateTimelineView(videoId: string, playhead: number, zoom: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("update_timeline_view", { videoId, playhead, zoom });
+    throw new Error("Timeline requires the native application.");
+  },
+  async updateTimelineClip(videoId: string, clipId: string, start: number, end: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("update_timeline_clip", { videoId, clipId, start, end });
+    throw new Error("Timeline requires the native application.");
   },
   async createImageJob(videoId: string): Promise<ImageJobRecord> {
     if (isTauri()) return invoke("create_image_job", { videoId });

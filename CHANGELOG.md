@@ -207,3 +207,8 @@
 - Added portable `.agsproj` project bundles and collision-safe imports.
 - Added archive integrity validation, unsafe-path rejection, and failed-import cleanup.
 - Added a verified Windows installer with WebView bootstrap support.
+# 0.9.0
+
+- Added persistent timeline and still-clip data derived from visual-plan timing.
+- Added playhead, zoom, clip selection, and guarded boundary adjustment.
+- Added disabled previews for captions, animation, transitions, and audio mixing.

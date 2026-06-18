@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { originalDemoPlan } from "../data/demo";
 import type { VisualPlanGroup } from "../domain/visual-plan";
 
-export type AppStage = "home" | "inputs" | "visual-plan" | "images";
+export type AppStage = "home" | "inputs" | "visual-plan" | "images" | "timeline";
 export type Theme = "light" | "dark";
 
 type AppState = {

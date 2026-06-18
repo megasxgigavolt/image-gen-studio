@@ -2,7 +2,7 @@ mod projects;
 
 use projects::{
     Channel, ExportResult, ImageJob, ImageRender, ImageWorkspace, InputAsset, ProjectRepository,
-    PromptVersion, ProviderKeyStatus, ResumeState, Video, VideoInputs, VisualPlan,
+    PromptVersion, ProviderKeyStatus, ResumeState, Timeline, Video, VideoInputs, VisualPlan,
 };
 use std::fs;
 use std::sync::Mutex;
@@ -334,6 +334,41 @@ fn import_project_bundle(
     with_repository(state, |repository| repository.import_project_bundle(&path)).map(Some)
 }
 
+#[tauri::command]
+fn build_timeline(state: State<'_, RepositoryState>, video_id: String) -> Result<Timeline, String> {
+    with_repository(state, |repository| repository.build_timeline(&video_id))
+}
+
+#[tauri::command]
+fn get_timeline(state: State<'_, RepositoryState>, video_id: String) -> Result<Timeline, String> {
+    with_repository(state, |repository| repository.get_timeline(&video_id))
+}
+
+#[tauri::command]
+fn update_timeline_view(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    playhead: f64,
+    zoom: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.update_timeline_view(&video_id, playhead, zoom)
+    })
+}
+
+#[tauri::command]
+fn update_timeline_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    start: f64,
+    end: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.update_timeline_clip(&video_id, &clip_id, start, end)
+    })
+}
+
 fn spawn_job_workers(
     database_path: std::path::PathBuf,
     projects_dir: std::path::PathBuf,
@@ -569,7 +604,11 @@ pub fn run() {
             get_render_data_url,
             export_latest_stills,
             export_project_bundle,
-            import_project_bundle
+            import_project_bundle,
+            build_timeline,
+            get_timeline,
+            update_timeline_view,
+            update_timeline_clip
         ])
         .run(tauri::generate_context!())
         .expect("error while running Auto Gen Studio");

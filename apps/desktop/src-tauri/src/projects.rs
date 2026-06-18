@@ -165,6 +165,27 @@ ALTER TABLE image_renders ADD COLUMN kind TEXT NOT NULL DEFAULT 'generation';
 CREATE INDEX IF NOT EXISTS idx_image_renders_parent ON image_renders(parent_render_id);
 "#;
 
+const MIGRATION_007: &str = r#"
+CREATE TABLE IF NOT EXISTS timelines (
+    video_id TEXT PRIMARY KEY REFERENCES videos(id),
+    duration_seconds REAL NOT NULL,
+    playhead_seconds REAL NOT NULL DEFAULT 0,
+    zoom REAL NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS timeline_clips (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    group_id TEXT NOT NULL,
+    render_id TEXT REFERENCES image_renders(id),
+    ordinal INTEGER NOT NULL,
+    start_seconds REAL NOT NULL,
+    end_seconds REAL NOT NULL,
+    label TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_timeline_clips_video ON timeline_clips(video_id, ordinal);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -330,6 +351,29 @@ pub struct ExportResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct TimelineClip {
+    pub id: String,
+    pub group_id: String,
+    pub render_id: Option<String>,
+    pub ordinal: i64,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Timeline {
+    pub video_id: String,
+    pub duration_seconds: f64,
+    pub playhead_seconds: f64,
+    pub zoom: f64,
+    pub updated_at: String,
+    pub clips: Vec<TimelineClip>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct PlanSentence {
     pub id: String,
     pub ordinal: i64,
@@ -445,6 +489,15 @@ impl ProjectRepository {
         self.connection
             .execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(5, ?1)",
+                [Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| error.to_string())?;
+        self.connection
+            .execute_batch(MIGRATION_007)
+            .map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(7, ?1)",
                 [Utc::now().to_rfc3339()],
             )
             .map_err(|error| error.to_string())?;
@@ -1450,6 +1503,142 @@ impl ProjectRepository {
             .join(&render.relative_path))
     }
 
+    pub fn build_timeline(&self, video_id: &str) -> Result<Timeline, String> {
+        let plan = self.get_visual_plan(video_id)?;
+        let sentence_map: std::collections::HashMap<_, _> = plan
+            .sentences
+            .iter()
+            .map(|sentence| (sentence.id.as_str(), sentence))
+            .collect();
+        self.connection
+            .execute("DELETE FROM timeline_clips WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        let mut duration: f64 = 0.0;
+        for group in &plan.groups {
+            let sentences: Vec<_> = group
+                .sentence_ids
+                .iter()
+                .filter_map(|id| sentence_map.get(id.as_str()))
+                .collect();
+            let start = sentences
+                .first()
+                .map(|sentence| sentence.start_seconds)
+                .unwrap_or(duration);
+            let end = sentences
+                .last()
+                .map(|sentence| sentence.end_seconds)
+                .unwrap_or(start + 1.0);
+            let render_id = self
+                .list_image_renders(video_id, &group.id)?
+                .into_iter()
+                .next()
+                .map(|render| render.id);
+            self.connection.execute(
+                "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![Uuid::new_v4().to_string(), video_id, group.id, render_id, group.ordinal, start, end, group.label],
+            ).map_err(|e| e.to_string())?;
+            duration = duration.max(end);
+        }
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO timelines(video_id,duration_seconds,playhead_seconds,zoom,updated_at) VALUES(?1,?2,0,1,?3) ON CONFLICT(video_id) DO UPDATE SET duration_seconds=excluded.duration_seconds,playhead_seconds=0,updated_at=excluded.updated_at",
+            params![video_id, duration, now],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn get_timeline(&self, video_id: &str) -> Result<Timeline, String> {
+        let (duration_seconds, playhead_seconds, zoom, updated_at) = self.connection.query_row(
+            "SELECT duration_seconds,playhead_seconds,zoom,updated_at FROM timelines WHERE video_id=?1",
+            [video_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).map_err(|_| "Timeline has not been built.".to_string())?;
+        let mut statement = self.connection.prepare(
+            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
+        ).map_err(|e| e.to_string())?;
+        let clips = statement
+            .query_map([video_id], |row| {
+                Ok(TimelineClip {
+                    id: row.get(0)?,
+                    group_id: row.get(1)?,
+                    render_id: row.get(2)?,
+                    ordinal: row.get(3)?,
+                    start_seconds: row.get(4)?,
+                    end_seconds: row.get(5)?,
+                    label: row.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(Timeline {
+            video_id: video_id.into(),
+            duration_seconds,
+            playhead_seconds,
+            zoom,
+            updated_at,
+            clips,
+        })
+    }
+
+    pub fn update_timeline_view(
+        &self,
+        video_id: &str,
+        playhead: f64,
+        zoom: f64,
+    ) -> Result<Timeline, String> {
+        let timeline = self.get_timeline(video_id)?;
+        self.connection
+            .execute(
+                "UPDATE timelines SET playhead_seconds=?1,zoom=?2,updated_at=?3 WHERE video_id=?4",
+                params![
+                    playhead.clamp(0.0, timeline.duration_seconds),
+                    zoom.clamp(0.5, 4.0),
+                    Utc::now().to_rfc3339(),
+                    video_id
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn update_timeline_clip(
+        &self,
+        video_id: &str,
+        clip_id: &str,
+        start: f64,
+        end: f64,
+    ) -> Result<Timeline, String> {
+        if start < 0.0 || end <= start {
+            return Err("Clip boundaries are invalid.".into());
+        }
+        let overlap: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM timeline_clips WHERE video_id=?1 AND id<>?2 AND ?3 < end_seconds AND ?4 > start_seconds)",
+            params![video_id, clip_id, start, end], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if overlap {
+            return Err("Timeline clips may not overlap.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_clips SET start_seconds=?1,end_seconds=?2 WHERE id=?3 AND video_id=?4",
+            params![start, end, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        let duration: f64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(end_seconds),0) FROM timeline_clips WHERE video_id=?1",
+                [video_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        self.connection
+            .execute(
+                "UPDATE timelines SET duration_seconds=?1,updated_at=?2 WHERE video_id=?3",
+                params![duration, Utc::now().to_rfc3339(), video_id],
+            )
+            .map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
     pub fn save_provider_key(&self, provider: &str, api_key: &str) -> Result<(), String> {
         let entry = Entry::new("auto-gen-studio", provider).map_err(|e| e.to_string())?;
         entry.set_password(api_key).map_err(|e| e.to_string())
@@ -2408,5 +2597,38 @@ mod tests {
     fn rejects_unsafe_bundle_paths() {
         assert!(validate_bundle_path("../secret.txt").is_err());
         assert!(validate_bundle_path("renders/safe.png").is_ok());
+    }
+
+    #[test]
+    fn builds_and_persists_non_overlapping_timeline() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene. Third scene.", 4)
+            .unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        repo.generate_visual_plan(&video.id).unwrap();
+        let timeline = repo.build_timeline(&video.id).unwrap();
+        assert!(!timeline.clips.is_empty());
+        assert!(timeline
+            .clips
+            .windows(2)
+            .all(|clips| clips[0].end_seconds <= clips[1].start_seconds));
+        let updated = repo.update_timeline_view(&video.id, 999.0, 9.0).unwrap();
+        assert_eq!(updated.playhead_seconds, updated.duration_seconds);
+        assert_eq!(updated.zoom, 4.0);
+        if timeline.clips.len() > 1 {
+            let first = &timeline.clips[0];
+            assert!(repo
+                .update_timeline_clip(
+                    &video.id,
+                    &first.id,
+                    first.start_seconds,
+                    timeline.clips[1].end_seconds
+                )
+                .is_err());
+        }
     }
 }

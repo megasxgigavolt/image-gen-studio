@@ -28,11 +28,13 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
     "windows": {
       "webviewInstallMode": {
-        "type": "skip"
+        "type": "downloadBootstrapper",
+        "silent": true
       }
     }
   }

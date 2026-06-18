@@ -13,6 +13,7 @@ import {
   X,
   WandSparkles,
   Download,
+  PanelsTopLeft,
 } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { type AppStage, useAppStore } from "./store/app-store";
@@ -27,6 +28,7 @@ import {
   type ImageJobRecord,
   type ImageRenderRecord,
   type PromptVersionRecord,
+  type TimelineRecord,
 } from "./infrastructure/projects-client";
 
 const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
@@ -34,6 +36,7 @@ const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
   { stage: "inputs", label: "Inputs", icon: Upload },
   { stage: "visual-plan", label: "Visual plan", icon: FolderOpen },
   { stage: "images", label: "Images", icon: Image },
+  { stage: "timeline", label: "Timeline", icon: PanelsTopLeft },
 ];
 
 function formatTime(seconds: number) {
@@ -838,6 +841,68 @@ function ImagesView() {
   );
 }
 
+function TimelineView() {
+  const { activeVideoId } = useAppStore();
+  const [timeline, setTimeline] = useState<TimelineRecord | null>(null);
+  const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!activeVideoId) return;
+    projectsClient.getTimeline(activeVideoId).catch(() => projectsClient.buildTimeline(activeVideoId))
+      .then(setTimeline).catch((caught) => setError(String(caught)));
+  }, [activeVideoId]);
+
+  async function rebuild() {
+    if (!activeVideoId) return;
+    try { setTimeline(await projectsClient.buildTimeline(activeVideoId)); } catch (caught) { setError(String(caught)); }
+  }
+
+  async function updateView(playhead: number, zoom: number) {
+    if (!activeVideoId) return;
+    setTimeline(await projectsClient.updateTimelineView(activeVideoId, playhead, zoom));
+  }
+
+  async function nudgeBoundary(edge: "start" | "end", delta: number) {
+    if (!activeVideoId || !timeline || !selectedClipId) return;
+    const clip = timeline.clips.find((item) => item.id === selectedClipId);
+    if (!clip) return;
+    try {
+      setTimeline(await projectsClient.updateTimelineClip(
+        activeVideoId, clip.id,
+        edge === "start" ? clip.startSeconds + delta : clip.startSeconds,
+        edge === "end" ? clip.endSeconds + delta : clip.endSeconds,
+      ));
+    } catch (caught) { setError(String(caught)); }
+  }
+
+  return (
+    <section className="view">
+      <div className="page-heading"><div><p className="eyebrow">Editor foundation</p><h1>Timeline</h1><p>Arrange approved stills against narration timing.</p></div><button className="secondary" onClick={() => void rebuild()}><Undo2 size={16} />Reset from visual plan</button></div>
+      {error && <div className="inline-error">{error}</div>}
+      {!timeline ? <div className="empty-state">Building timeline…</div> : (
+        <div className="timeline-editor">
+          <div className="timeline-toolbar">
+            <label>Playhead <input type="range" min="0" max={timeline.durationSeconds} step=".1" value={timeline.playheadSeconds} onChange={(event) => void updateView(Number(event.target.value), timeline.zoom)} /></label>
+            <label>Zoom <input type="range" min=".5" max="4" step=".25" value={timeline.zoom} onChange={(event) => void updateView(timeline.playheadSeconds, Number(event.target.value))} /></label>
+            <span>{formatTime(timeline.playheadSeconds)} / {formatTime(timeline.durationSeconds)}</span>
+          </div>
+          <div className="timeline-track" style={{ width: `${Math.max(100, timeline.zoom * 100)}%` }}>
+            <i className="playhead" style={{ left: `${timeline.durationSeconds ? timeline.playheadSeconds / timeline.durationSeconds * 100 : 0}%` }} />
+            {timeline.clips.map((clip) => (
+              <button key={clip.id} className={clip.id === selectedClipId ? "timeline-clip active" : "timeline-clip"} style={{ width: `${(clip.endSeconds - clip.startSeconds) / timeline.durationSeconds * 100}%` }} onClick={() => setSelectedClipId(clip.id)}>
+                <strong>{clip.label}</strong><small>{formatTime(clip.startSeconds)}–{formatTime(clip.endSeconds)}</small><span>{clip.renderId ? "Still ready" : "Missing render"}</span>
+              </button>
+            ))}
+          </div>
+          {selectedClipId && <div className="clip-controls"><strong>Adjust selected clip</strong><button onClick={() => void nudgeBoundary("start", -.1)}>Start −0.1s</button><button onClick={() => void nudgeBoundary("start", .1)}>Start +0.1s</button><button onClick={() => void nudgeBoundary("end", -.1)}>End −0.1s</button><button onClick={() => void nudgeBoundary("end", .1)}>End +0.1s</button></div>}
+          <div className="future-tools">{["Captions","Animation","Transitions","Audio mixing"].map((tool) => <button key={tool} disabled><strong>{tool}</strong><span>Planned after 1.0</span></button>)}</div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 export function App() {
   const {
     stage,
@@ -846,7 +911,7 @@ export function App() {
     activeVideoId,
   } = useAppStore();
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
-  useEffect(() => log("info", "application_started", { release: "0.8.0" }), []);
+  useEffect(() => log("info", "application_started", { release: "0.9.0" }), []);
   useEffect(() => log("debug", "stage_opened", { stage }), [stage]);
   useEffect(() => {
     if (!activeChannelId || !activeVideoId) return;
@@ -865,7 +930,7 @@ export function App() {
   return (
     <div className="app-shell">
       <Sidebar />
-      <main><Header />{stage === "home" && <HomeView />}{stage === "inputs" && <InputsView />}{stage === "visual-plan" && <VisualPlanView />}{stage === "images" && <ImagesView />}</main>
+      <main><Header />{stage === "home" && <HomeView />}{stage === "inputs" && <InputsView />}{stage === "visual-plan" && <VisualPlanView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
     </div>
   );
 }

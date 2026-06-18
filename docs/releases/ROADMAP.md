@@ -13,7 +13,7 @@ in a release is not silently added to it.
 | 0.6.0 | Bulk Jobs | Complete: concurrent generation, retries, pause/stop/resume, recovery |
 | 0.7.0 | Image Editing | Complete: instruction-based editing and version comparison |
 | 0.8.0 | Export and Portability | Complete: project bundles, still export, recovery hardening |
-| 0.9.0 | Timeline Foundation | Interactive editor data model and disabled feature-preview surface |
+| 0.9.0 | Timeline Foundation | Complete: interactive editor data model and disabled feature-preview surface |
 | 1.0.0 | Personal Stable | Hardened Windows portable release |
 
 Animation generation remains a placeholder before `1.0.0`. Full video editing,

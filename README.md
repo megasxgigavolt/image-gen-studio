@@ -46,3 +46,10 @@ npm run tauri -- build --no-bundle
 
 The output is written under
 `apps/desktop/src-tauri/target/release/auto-gen-studio.exe`.
+
+Local project data is kept outside the repository:
+
+```text
+%LOCALAPPDATA%\studio.autogen.desktop\auto-gen-studio.db
+%LOCALAPPDATA%\studio.autogen.desktop\Projects
+```

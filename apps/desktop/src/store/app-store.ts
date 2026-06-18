@@ -9,10 +9,20 @@ type AppState = {
   stage: AppStage;
   theme: Theme;
   visualPlan: VisualPlanGroup[];
+  activeChannelId: string | null;
+  activeChannelName: string | null;
+  activeVideoId: string | null;
+  activeVideoTitle: string | null;
   setStage: (stage: AppStage) => void;
   toggleTheme: () => void;
   resetVisualPlan: () => void;
   moveSentence: (sentenceId: string, targetGroupId: string) => void;
+  setActiveProject: (
+    channelId: string,
+    channelName: string,
+    videoId: string,
+    videoTitle: string,
+  ) => void;
 };
 
 const cloneOriginalPlan = () =>
@@ -25,10 +35,21 @@ export const useAppStore = create<AppState>((set) => ({
   stage: "home",
   theme: "light",
   visualPlan: cloneOriginalPlan(),
+  activeChannelId: null,
+  activeChannelName: null,
+  activeVideoId: null,
+  activeVideoTitle: null,
   setStage: (stage) => set({ stage }),
   toggleTheme: () =>
     set((state) => ({ theme: state.theme === "light" ? "dark" : "light" })),
   resetVisualPlan: () => set({ visualPlan: cloneOriginalPlan() }),
+  setActiveProject: (channelId, channelName, videoId, videoTitle) =>
+    set({
+      activeChannelId: channelId,
+      activeChannelName: channelName,
+      activeVideoId: videoId,
+      activeVideoTitle: videoTitle,
+    }),
   moveSentence: (sentenceId, targetGroupId) =>
     set((state) => {
       const sourceIndex = state.visualPlan.findIndex((group) =>

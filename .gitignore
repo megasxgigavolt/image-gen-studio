@@ -38,6 +38,7 @@ old/
 # JavaScript / Tauri
 node_modules/
 apps/desktop/dist/
+apps/desktop/.vite/
 apps/desktop/src-tauri/target/
 coverage/
 *.log

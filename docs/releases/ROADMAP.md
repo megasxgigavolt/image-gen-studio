@@ -15,6 +15,7 @@ in a release is not silently added to it.
 | 0.8.0 | Export and Portability | Complete: project bundles, still export, recovery hardening |
 | 0.9.0 | Timeline Foundation | Complete: interactive editor data model and disabled feature-preview surface |
 | 1.0.0 | Personal Stable | Complete: hardened Windows personal release |
+| 1.1.0 | Usability | Complete: visual-plan regrouping, TTS pauses, pacing presets |
 
 Animation generation remains a placeholder before `1.0.0`. Full video editing,
 captions, thumbnails, metadata, publishing, cloud sync, accounts, teams, and

@@ -218,3 +218,8 @@
 - Added a user-visible startup recovery notice.
 - Hardened the verified Windows installer and portable executable release flow.
 - Completed the stable personal release documentation and regression suite.
+# 1.1.0
+
+- Fixed visual-plan drag and drop and added adjacent-scene move controls.
+- Added support for hidden `<#seconds#>` TTS pause markers in estimated timing.
+- Replaced the scene pacing slider with Calm, Balanced, Fast, and Custom ranges.

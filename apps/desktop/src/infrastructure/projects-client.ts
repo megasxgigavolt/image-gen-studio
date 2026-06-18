@@ -42,6 +42,9 @@ export type VideoInputsRecord = {
   videoId: string;
   scriptText: string;
   pacingSeconds: number;
+  pacingPreset: "calm" | "balanced" | "fast" | "custom";
+  pacingMinSeconds: number;
+  pacingMaxSeconds: number;
   audio: InputAssetRecord | null;
   references: InputAssetRecord[];
   updatedAt: string;
@@ -244,7 +247,7 @@ export const projectsClient = {
     if (isTauri()) return invoke("get_video_inputs", { videoId });
     const data = readBrowserData();
     return data.inputs?.[videoId] ?? {
-      videoId, scriptText: "", pacingSeconds: 8, audio: null, references: [], updatedAt: now(),
+      videoId, scriptText: "", pacingSeconds: 8, pacingPreset: "balanced", pacingMinSeconds: 6, pacingMaxSeconds: 10, audio: null, references: [], updatedAt: now(),
     };
   },
   async getImageWorkspace(videoId: string): Promise<ImageWorkspaceRecord> {
@@ -386,9 +389,18 @@ export const projectsClient = {
     if (isTauri()) return invoke<VideoInputsRecord>("save_video_inputs", { videoId, scriptText, pacingSeconds });
     const data = readBrowserData();
     const existing = data.inputs?.[videoId] ?? {
-      videoId, scriptText: "", pacingSeconds: 8, audio: null, references: [], updatedAt: now(),
+      videoId, scriptText: "", pacingSeconds: 8, pacingPreset: "balanced" as const, pacingMinSeconds: 6, pacingMaxSeconds: 10, audio: null, references: [], updatedAt: now(),
     };
     const inputs = { ...existing, scriptText, pacingSeconds, updatedAt: now() };
+    (data.inputs ??= {})[videoId] = inputs;
+    writeBrowserData(data);
+    return inputs;
+  },
+  async saveVideoPacing(videoId: string, preset: "calm" | "balanced" | "fast" | "custom", minSeconds: number, maxSeconds: number) {
+    if (isTauri()) return invoke<VideoInputsRecord>("save_video_pacing", { videoId, preset, minSeconds, maxSeconds });
+    const data = readBrowserData();
+    const existing = await this.getVideoInputs(videoId);
+    const inputs = { ...existing, pacingPreset: preset, pacingMinSeconds: minSeconds, pacingMaxSeconds: maxSeconds, pacingSeconds: Math.round((minSeconds + maxSeconds) / 2), updatedAt: now() };
     (data.inputs ??= {})[videoId] = inputs;
     writeBrowserData(data);
     return inputs;

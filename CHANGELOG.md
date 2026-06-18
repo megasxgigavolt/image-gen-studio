@@ -212,3 +212,9 @@
 - Added persistent timeline and still-clip data derived from visual-plan timing.
 - Added playhead, zoom, clip selection, and guarded boundary adjustment.
 - Added disabled previews for captions, animation, transitions, and audio mixing.
+# 1.0.0
+
+- Added SQLite integrity checks and timestamped recovery backups.
+- Added a user-visible startup recovery notice.
+- Hardened the verified Windows installer and portable executable release flow.
+- Completed the stable personal release documentation and regression suite.

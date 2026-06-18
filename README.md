@@ -20,9 +20,9 @@ mockup/                Current visual source of truth
 
 ## Current release
 
-Development is starting with `v0.1.0-foundation`. See
-[`docs/releases/ROADMAP.md`](docs/releases/ROADMAP.md) and
-[`docs/releases/v0.1.0.md`](docs/releases/v0.1.0.md).
+Version 1.0.0 is the stable personal Windows release. It includes local project
+persistence, source intake, visual planning, Gemini image generation and
+editing, durable bulk jobs, exports, project bundles, and timeline foundations.
 
 ## Development
 
@@ -38,14 +38,14 @@ npm install
 npm run dev
 ```
 
-Build the optimized Windows executable:
+Build the verified Windows installer:
 
 ```powershell
-npm run tauri -- build --no-bundle
+npm run tauri -- build
 ```
 
-The output is written under
-`apps/desktop/src-tauri/target/release/auto-gen-studio.exe`.
+The installer is written under
+`apps/desktop/src-tauri/target/release/bundle/nsis/`.
 
 Local project data is kept outside the repository:
 

@@ -140,6 +140,10 @@ function writeBrowserData(data: BrowserData) {
 }
 
 export const projectsClient = {
+  async startupDiagnostic(): Promise<string | null> {
+    if (isTauri()) return invoke("startup_diagnostic");
+    return null;
+  },
   async listChannels(includeTrashed = false): Promise<ChannelRecord[]> {
     if (isTauri()) return invoke("list_channels", { includeTrashed });
     const data = readBrowserData();

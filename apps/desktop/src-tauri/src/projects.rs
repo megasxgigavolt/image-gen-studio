@@ -1,6 +1,9 @@
+use base64::Engine;
 use chrono::Utc;
+use keyring::{Entry, Error as KeyringError};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -95,6 +98,37 @@ CREATE INDEX IF NOT EXISTS idx_plan_sentences_video ON visual_plan_sentences(vid
 CREATE INDEX IF NOT EXISTS idx_plan_groups_video ON visual_plan_groups(video_id, is_original, ordinal);
 "#;
 
+const MIGRATION_004: &str = r#"
+CREATE TABLE IF NOT EXISTS prompt_versions (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    group_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    settings_json TEXT NOT NULL,
+    system_prompt TEXT NOT NULL,
+    user_prompt TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prompt_versions_video_group ON prompt_versions(video_id, group_id, version DESC);
+
+CREATE TABLE IF NOT EXISTS image_renders (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    group_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    prompt_version_id TEXT NOT NULL REFERENCES prompt_versions(id),
+    file_name TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_image_renders_video_group ON image_renders(video_id, group_id, version DESC);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -149,6 +183,62 @@ pub struct VideoInputs {
     pub audio: Option<InputAsset>,
     pub references: Vec<InputAsset>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptVersion {
+    pub id: String,
+    pub video_id: String,
+    pub group_id: String,
+    pub version: i64,
+    pub settings_json: String,
+    pub system_prompt: String,
+    pub user_prompt: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageRender {
+    pub id: String,
+    pub video_id: String,
+    pub group_id: String,
+    pub version: i64,
+    pub prompt_version_id: String,
+    pub file_name: String,
+    pub relative_path: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSetting {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderKeyStatus {
+    pub provider: String,
+    pub configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageWorkspaceGroup {
+    pub group: PlanGroup,
+    pub prompt_versions: Vec<PromptVersion>,
+    pub image_renders: Vec<ImageRender>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageWorkspace {
+    pub video_id: String,
+    pub groups: Vec<ImageWorkspaceGroup>,
+    pub settings: Vec<AppSetting>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -229,6 +319,15 @@ impl ProjectRepository {
         self.connection
             .execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, ?1)",
+                [Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| error.to_string())?;
+        self.connection
+            .execute_batch(MIGRATION_004)
+            .map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(4, ?1)",
                 [Utc::now().to_rfc3339()],
             )
             .map_err(|error| error.to_string())?;
@@ -649,6 +748,295 @@ impl ProjectRepository {
         Ok(())
     }
 
+    pub fn get_app_setting(&self, key: &str) -> Result<Option<String>, String> {
+        self.connection
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn save_app_setting(&self, key: &str, value: &str) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO app_settings(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, value],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn list_app_settings(&self) -> Result<Vec<AppSetting>, String> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT key, value FROM app_settings ORDER BY key")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(AppSetting {
+                    key: row.get(0)?,
+                    value: row.get(1)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn get_image_workspace(&self, video_id: &str) -> Result<ImageWorkspace, String> {
+        let plan = self.get_visual_plan(video_id)?;
+        let groups = plan
+            .groups
+            .into_iter()
+            .map(|group| {
+                let prompt_versions = self.list_prompt_versions(video_id, &group.id)?;
+                let image_renders = self.list_image_renders(video_id, &group.id)?;
+                Ok(ImageWorkspaceGroup {
+                    group,
+                    prompt_versions,
+                    image_renders,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(ImageWorkspace {
+            video_id: video_id.into(),
+            groups,
+            settings: self.list_app_settings()?,
+        })
+    }
+
+    pub fn list_prompt_versions(
+        &self,
+        video_id: &str,
+        group_id: &str,
+    ) -> Result<Vec<PromptVersion>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, video_id, group_id, version, settings_json, system_prompt, user_prompt, created_at
+             FROM prompt_versions WHERE video_id = ?1 AND group_id = ?2 ORDER BY version DESC",
+        ).map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![video_id, group_id], |row| {
+                Ok(PromptVersion {
+                    id: row.get(0)?,
+                    video_id: row.get(1)?,
+                    group_id: row.get(2)?,
+                    version: row.get(3)?,
+                    settings_json: row.get(4)?,
+                    system_prompt: row.get(5)?,
+                    user_prompt: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn create_prompt_version(
+        &self,
+        video_id: &str,
+        group_id: &str,
+        settings_json: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<PromptVersion, String> {
+        serde_json::from_str::<serde_json::Value>(settings_json)
+            .map_err(|_| "Image settings must be valid JSON.".to_string())?;
+        if system_prompt.trim().is_empty() {
+            return Err("System prompt is required.".into());
+        }
+        if user_prompt.trim().is_empty() {
+            return Err("Scene prompt is required.".into());
+        }
+        let version: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM prompt_versions WHERE video_id = ?1 AND group_id = ?2",
+                params![video_id, group_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let id = Uuid::new_v4().to_string();
+        let created_at = Utc::now().to_rfc3339();
+        self.connection
+            .execute(
+                "INSERT INTO prompt_versions(id, video_id, group_id, version, settings_json, system_prompt, user_prompt, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![id, video_id, group_id, version, settings_json, system_prompt, user_prompt, created_at],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(PromptVersion {
+            id,
+            video_id: video_id.into(),
+            group_id: group_id.into(),
+            version,
+            settings_json: settings_json.into(),
+            system_prompt: system_prompt.into(),
+            user_prompt: user_prompt.into(),
+            created_at,
+        })
+    }
+
+    pub fn list_image_renders(
+        &self,
+        video_id: &str,
+        group_id: &str,
+    ) -> Result<Vec<ImageRender>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, video_id, group_id, version, prompt_version_id, file_name, relative_path, created_at
+             FROM image_renders WHERE video_id = ?1 AND group_id = ?2 ORDER BY version DESC",
+        ).map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![video_id, group_id], |row| {
+                Ok(ImageRender {
+                    id: row.get(0)?,
+                    video_id: row.get(1)?,
+                    group_id: row.get(2)?,
+                    version: row.get(3)?,
+                    prompt_version_id: row.get(4)?,
+                    file_name: row.get(5)?,
+                    relative_path: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    fn insert_image_render(
+        &self,
+        id: &str,
+        video_id: &str,
+        group_id: &str,
+        version: i64,
+        prompt_version_id: &str,
+        file_name: &str,
+        relative_path: &str,
+    ) -> Result<ImageRender, String> {
+        let created_at = Utc::now().to_rfc3339();
+        self.connection
+            .execute(
+                "INSERT INTO image_renders(id, video_id, group_id, version, prompt_version_id, file_name, relative_path, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![id, video_id, group_id, version, prompt_version_id, file_name, relative_path, created_at],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(ImageRender {
+            id: id.into(),
+            video_id: video_id.into(),
+            group_id: group_id.into(),
+            version,
+            prompt_version_id: prompt_version_id.into(),
+            file_name: file_name.into(),
+            relative_path: relative_path.into(),
+            created_at,
+        })
+    }
+
+    pub fn generate_image_render(
+        &self,
+        video_id: &str,
+        group_id: &str,
+        prompt_version_id: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        settings_json: &str,
+    ) -> Result<ImageRender, String> {
+        let prompt_exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM prompt_versions WHERE id = ?1 AND video_id = ?2 AND group_id = ?3)",
+            params![prompt_version_id, video_id, group_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !prompt_exists {
+            return Err("The selected prompt version does not belong to this still.".into());
+        }
+        let settings: serde_json::Value = serde_json::from_str(settings_json)
+            .map_err(|_| "Image settings must be valid JSON.".to_string())?;
+        let api_key = self
+            .get_provider_key("gemini")?
+            .ok_or("Add a Gemini API key in Settings before generating an image.")?;
+        let model = self
+            .get_app_setting("gemini_model")?
+            .unwrap_or_else(|| "gemini-2.5-flash-image".into());
+        let prompt = assemble_image_prompt(system_prompt, user_prompt, &settings);
+        let (image_bytes, extension) = request_gemini_image(&api_key, &model, &prompt)?;
+        let channel_id: String = self
+            .connection
+            .query_row(
+                "SELECT channel_id FROM videos WHERE id = ?1 AND trashed_at IS NULL",
+                [video_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Video was not found.".to_string())?;
+        let render_dir = self
+            .projects_dir
+            .join(channel_id)
+            .join(video_id)
+            .join("renders")
+            .join(group_id);
+        fs::create_dir_all(&render_dir).map_err(|e| e.to_string())?;
+        let version: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM image_renders WHERE video_id = ?1 AND group_id = ?2",
+                params![video_id, group_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let file_name = format!("render-v{}.{}", version, extension);
+        let relative_path = format!("renders/{}/{}", group_id, file_name);
+        let out_path = render_dir.join(&file_name);
+        fs::write(&out_path, image_bytes).map_err(|e| e.to_string())?;
+        let id = Uuid::new_v4().to_string();
+        let render = self.insert_image_render(
+            &id,
+            video_id,
+            group_id,
+            version,
+            prompt_version_id,
+            &file_name,
+            &relative_path,
+        )?;
+        self.create_snapshot(
+            video_id,
+            &json!({
+                "reason": "image-rendered",
+                "groupId": group_id,
+                "renderId": render.id,
+                "promptVersionId": prompt_version_id,
+                "version": render.version,
+            })
+            .to_string(),
+        )?;
+        Ok(render)
+    }
+
+    pub fn save_provider_key(&self, provider: &str, api_key: &str) -> Result<(), String> {
+        let entry = Entry::new("auto-gen-studio", provider).map_err(|e| e.to_string())?;
+        entry.set_password(api_key).map_err(|e| e.to_string())
+    }
+
+    fn get_provider_key(&self, provider: &str) -> Result<Option<String>, String> {
+        let entry = Entry::new("auto-gen-studio", provider).map_err(|e| e.to_string())?;
+        match entry.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(KeyringError::NoEntry) => Ok(None),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+
+    pub fn get_provider_key_status(&self, provider: &str) -> Result<ProviderKeyStatus, String> {
+        Ok(ProviderKeyStatus {
+            provider: provider.to_string(),
+            configured: self.get_provider_key(provider)?.is_some(),
+        })
+    }
+
     fn asset_by_id(&self, id: &str) -> Result<Option<InputAsset>, String> {
         self.connection.query_row(
             "SELECT id, video_id, kind, original_name, relative_path, media_type, size_bytes, created_at FROM input_assets WHERE id = ?1",
@@ -893,6 +1281,84 @@ fn extension_to_media_type(extension: &str) -> &'static str {
     }
 }
 
+fn assemble_image_prompt(
+    system_prompt: &str,
+    user_prompt: &str,
+    settings: &serde_json::Value,
+) -> String {
+    format!(
+        "SYSTEM DIRECTION:\n{}\n\nSCENE REQUEST:\n{}\n\nIMAGE SETTINGS:\n{}",
+        system_prompt.trim(),
+        user_prompt.trim(),
+        serde_json::to_string_pretty(settings).unwrap_or_else(|_| "{}".into())
+    )
+}
+
+fn request_gemini_image(
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<(Vec<u8>, &'static str), String> {
+    let model = model.trim();
+    if model.is_empty()
+        || !model.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_')
+        })
+    {
+        return Err("Gemini model name is invalid.".into());
+    }
+    let response = reqwest::blocking::Client::new()
+        .post(format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        ))
+        .header("x-goog-api-key", api_key)
+        .json(&json!({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
+        }))
+        .send()
+        .map_err(|error| format!("Could not reach Gemini: {error}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .map_err(|error| format!("Gemini returned an unreadable response: {error}"))?;
+    if !status.is_success() {
+        let message = body
+            .pointer("/error/message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Image generation failed.");
+        return Err(format!("Gemini error ({status}): {message}"));
+    }
+    let parts = body
+        .pointer("/candidates/0/content/parts")
+        .and_then(|value| value.as_array())
+        .ok_or("Gemini returned no image.")?;
+    for part in parts {
+        let inline = part.get("inlineData").or_else(|| part.get("inline_data"));
+        if let Some(inline) = inline {
+            let data = inline
+                .get("data")
+                .and_then(|value| value.as_str())
+                .ok_or("Gemini image data was empty.")?;
+            let mime = inline
+                .get("mimeType")
+                .or_else(|| inline.get("mime_type"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("image/png");
+            let extension = match mime {
+                "image/jpeg" => "jpg",
+                "image/webp" => "webp",
+                _ => "png",
+            };
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|_| "Gemini returned invalid image data.".to_string())?;
+            return Ok((bytes, extension));
+        }
+    }
+    Err("Gemini returned text but no image. Try a supported image model.".into())
+}
+
 fn split_sentences(script: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
@@ -1043,5 +1509,59 @@ mod tests {
                 original.groups
             );
         }
+    }
+
+    #[test]
+    fn persists_prompt_versions_and_image_workspace_settings() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "A complete scene.", 8)
+            .unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id).unwrap();
+        repo.save_app_setting("gemini_model", "gemini-2.5-flash-image")
+            .unwrap();
+        let first = repo
+            .create_prompt_version(
+                &video.id,
+                &plan.groups[0].id,
+                r#"{"aspectRatio":"16:9"}"#,
+                "Create a cinematic documentary still.",
+                "A deep ocean scene.",
+            )
+            .unwrap();
+        let second = repo
+            .create_prompt_version(
+                &video.id,
+                &plan.groups[0].id,
+                r#"{"aspectRatio":"16:9"}"#,
+                "Create a cinematic documentary still.",
+                "A wider deep ocean scene.",
+            )
+            .unwrap();
+        assert_eq!(first.version, 1);
+        assert_eq!(second.version, 2);
+        let workspace = repo.get_image_workspace(&video.id).unwrap();
+        assert_eq!(workspace.groups[0].prompt_versions[0].version, 2);
+        assert_eq!(workspace.settings[0].key, "gemini_model");
+    }
+
+    #[test]
+    fn rejects_invalid_prompt_layers() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        assert!(repo
+            .create_prompt_version(&video.id, "g1", "not-json", "system", "scene")
+            .is_err());
+        assert!(repo
+            .create_prompt_version(&video.id, "g1", "{}", "", "scene")
+            .is_err());
+        assert!(repo
+            .create_prompt_version(&video.id, "g1", "{}", "system", "")
+            .is_err());
     }
 }

@@ -51,6 +51,50 @@ export type PlanSentenceRecord = { id: string; ordinal: number; text: string; st
 export type PlanGroupRecord = { id: string; ordinal: number; label: string; kind: string; sentenceIds: string[] };
 export type VisualPlanRecord = { videoId: string; timingSource: string; sentences: PlanSentenceRecord[]; groups: PlanGroupRecord[]; updatedAt: string };
 
+export type PromptVersionRecord = {
+  id: string;
+  videoId: string;
+  groupId: string;
+  version: number;
+  settingsJson: string;
+  systemPrompt: string;
+  userPrompt: string;
+  createdAt: string;
+};
+
+export type ImageRenderRecord = {
+  id: string;
+  videoId: string;
+  groupId: string;
+  version: number;
+  promptVersionId: string;
+  fileName: string;
+  relativePath: string;
+  createdAt: string;
+};
+
+export type AppSettingRecord = {
+  key: string;
+  value: string;
+};
+
+export type ProviderKeyStatusRecord = {
+  provider: string;
+  configured: boolean;
+};
+
+export type ImageWorkspaceGroupRecord = {
+  group: PlanGroupRecord;
+  promptVersions: PromptVersionRecord[];
+  imageRenders: ImageRenderRecord[];
+};
+
+export type ImageWorkspaceRecord = {
+  videoId: string;
+  groups: ImageWorkspaceGroupRecord[];
+  settings: AppSettingRecord[];
+};
+
 type BrowserData = {
   channels: ChannelRecord[];
   videos: VideoRecord[];
@@ -177,6 +221,90 @@ export const projectsClient = {
     const data = readBrowserData();
     return data.inputs?.[videoId] ?? {
       videoId, scriptText: "", pacingSeconds: 8, audio: null, references: [], updatedAt: now(),
+    };
+  },
+  async getImageWorkspace(videoId: string): Promise<ImageWorkspaceRecord> {
+    if (isTauri()) return invoke("get_image_workspace", { videoId });
+    return { videoId, groups: [], settings: [] };
+  },
+  async saveAppSetting(key: string, value: string): Promise<void> {
+    if (isTauri()) return invoke("save_app_setting", { key, value });
+    localStorage.setItem(`${STORAGE_KEY}.setting.${key}`, value);
+  },
+  async getAppSetting(key: string): Promise<string | null> {
+    if (isTauri()) return invoke("get_app_setting", { key });
+    return localStorage.getItem(`${STORAGE_KEY}.setting.${key}`);
+  },
+  async saveProviderKey(provider: "openai" | "gemini", apiKey: string): Promise<void> {
+    if (isTauri()) return invoke("save_provider_key", { provider, apiKey });
+    localStorage.setItem(`${STORAGE_KEY}.key-status.${provider}`, apiKey ? "configured" : "");
+  },
+  async getProviderKeyStatus(provider: "openai" | "gemini"): Promise<ProviderKeyStatusRecord> {
+    if (isTauri()) return invoke("get_provider_key_status", { provider });
+    return { provider, configured: localStorage.getItem(`${STORAGE_KEY}.key-status.${provider}`) === "configured" };
+  },
+  async createPromptVersion(
+    videoId: string,
+    groupId: string,
+    settingsJson: string,
+    systemPrompt: string,
+    userPrompt: string,
+  ): Promise<PromptVersionRecord> {
+    if (isTauri()) {
+      return invoke("create_prompt_version", {
+        videoId,
+        groupId,
+        settingsJson,
+        systemPrompt,
+        userPrompt,
+      });
+    }
+    return {
+      id: id(),
+      videoId,
+      groupId,
+      version: 1,
+      settingsJson,
+      systemPrompt,
+      userPrompt,
+      createdAt: now(),
+    };
+  },
+  async listPromptVersions(videoId: string, groupId: string): Promise<PromptVersionRecord[]> {
+    if (isTauri()) return invoke("list_prompt_versions", { videoId, groupId });
+    return [];
+  },
+  async listImageRenders(videoId: string, groupId: string): Promise<ImageRenderRecord[]> {
+    if (isTauri()) return invoke("list_image_renders", { videoId, groupId });
+    return [];
+  },
+  async generateImageRender(
+    videoId: string,
+    groupId: string,
+    promptVersionId: string,
+    systemPrompt: string,
+    userPrompt: string,
+    settingsJson: string,
+  ): Promise<ImageRenderRecord> {
+    if (isTauri()) {
+      return invoke("generate_image_render", {
+        videoId,
+        groupId,
+        promptVersionId,
+        systemPrompt,
+        userPrompt,
+        settingsJson,
+      });
+    }
+    return {
+      id: id(),
+      videoId,
+      groupId,
+      version: 1,
+      promptVersionId,
+      fileName: "render-v1.png",
+      relativePath: `renders/${groupId}/render-v1.png`,
+      createdAt: now(),
     };
   },
   async saveVideoInputs(videoId: string, scriptText: string, pacingSeconds: number) {

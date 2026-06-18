@@ -185,3 +185,9 @@
 - After approve, preview resets to confirmation message instead of showing stale image
 - `_gen_error` button text corrected to `"Generate Image"`
 - Output dir setting always restored from `settings.json` regardless of whether path exists
+# 0.5.0
+
+- Added secure OpenAI and Gemini credential storage through Windows Credential Manager.
+- Added configurable provider models and durable three-layer image prompts.
+- Added per-still prompt restoration, Gemini single-image generation, and render history.
+- Added controlled project render folders and functional Prompt and Settings tabs.

@@ -9,7 +9,7 @@ in a release is not silently added to it.
 | 0.2.0 | Projects | Complete: channel/video creation, SQLite persistence, resume, trash, snapshots |
 | 0.3.0 | Inputs | Complete: script/audio/reference intake and validation |
 | 0.4.0 | Visual Plan | Complete: transcription adapter, sentence timing, plan generation, drag/drop, reset |
-| 0.5.0 | Image Workspace | In progress: three-layer prompts, settings, single generation, history |
+| 0.5.0 | Image Workspace | Complete: three-layer prompts, settings, single generation, history |
 | 0.6.0 | Bulk Jobs | Concurrent generation, retries, pause/stop/resume, recovery |
 | 0.7.0 | Image Editing | Instruction-based editing and version comparison |
 | 0.8.0 | Export and Portability | Project bundles, still export, recovery hardening |

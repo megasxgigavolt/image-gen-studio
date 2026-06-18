@@ -1,6 +1,7 @@
 # Credentials — NEVER commit these
 *.json
 !package.json
+!package-lock.json
 .env
 *.env.*
 
@@ -13,6 +14,11 @@ build/
 generation_state.json
 settings.json
 generated_images/
+logs/
+Projects/
+*.db
+*.db-shm
+*.db-wal
 
 # Office temp files
 ~$*
@@ -28,3 +34,11 @@ Thumbs.db
 
 # Old / scratch
 old/
+
+# JavaScript / Tauri
+node_modules/
+apps/desktop/dist/
+apps/desktop/src-tauri/target/
+coverage/
+*.log
+*.tsbuildinfo

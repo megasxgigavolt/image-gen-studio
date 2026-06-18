@@ -13,7 +13,7 @@ import {
   X,
   WandSparkles,
 } from "lucide-react";
-import { type FormEvent, useCallback, useEffect, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { type AppStage, useAppStore } from "./store/app-store";
 import { log } from "./infrastructure/logger";
 import {
@@ -22,6 +22,8 @@ import {
   type ResumeRecord,
   type VideoRecord,
   type VisualPlanRecord,
+  type ImageWorkspaceRecord,
+  type PromptVersionRecord,
 } from "./infrastructure/projects-client";
 
 const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
@@ -409,13 +411,302 @@ function VisualPlanView() {
 }
 
 function ImagesView() {
+  const { activeVideoId } = useAppStore();
+  const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
+  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
+  const [activePromptVersionId, setActivePromptVersionId] = useState<string | null>(null);
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const [userPrompt, setUserPrompt] = useState("");
+  const [settingsJson, setSettingsJson] = useState("{}");
+  const [geminiModel, setGeminiModel] = useState("gemini-2.5-flash-image");
+  const [openAiModel, setOpenAiModel] = useState("gpt-4.1");
+  const [geminiKey, setGeminiKey] = useState("");
+  const [openAiKey, setOpenAiKey] = useState("");
+  const [keyStatus, setKeyStatus] = useState({ gemini: false, openai: false });
+  const [tab, setTab] = useState<"prompt" | "settings">("prompt");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const selectedGroup = useMemo(
+    () => workspace?.groups.find((group) => group.group.id === selectedGroupId) ?? null,
+    [workspace, selectedGroupId],
+  );
+
+  useEffect(() => {
+    async function loadWorkspace() {
+      if (!activeVideoId) return;
+      setLoading(true);
+      setError(null);
+      try {
+        const loaded = await projectsClient.getImageWorkspace(activeVideoId);
+        setWorkspace(loaded);
+        setSelectedGroupId(loaded.groups[0]?.group.id ?? null);
+        setSettingsJson(loaded.settings.find((setting) => setting.key === "image_settings")?.value ?? "{}");
+        setGeminiModel(loaded.settings.find((setting) => setting.key === "gemini_model")?.value ?? "gemini-2.5-flash-image");
+        setOpenAiModel(loaded.settings.find((setting) => setting.key === "openai_model")?.value ?? "gpt-4.1");
+        const [geminiStatus, openAiStatus] = await Promise.all([
+          projectsClient.getProviderKeyStatus("gemini"),
+          projectsClient.getProviderKeyStatus("openai"),
+        ]);
+        setKeyStatus({ gemini: geminiStatus.configured, openai: openAiStatus.configured });
+        const latest = loaded.groups[0]?.promptVersions[0];
+        setActivePromptVersionId(latest?.id ?? null);
+        setSystemPrompt(latest?.systemPrompt ?? "");
+        setUserPrompt(latest?.userPrompt ?? "");
+      } catch (caught) {
+        setError(String(caught));
+      } finally {
+        setLoading(false);
+      }
+    }
+    void loadWorkspace();
+  }, [activeVideoId]);
+
+  async function refreshWorkspace() {
+    if (!activeVideoId) return;
+    try {
+      const loaded = await projectsClient.getImageWorkspace(activeVideoId);
+      setWorkspace(loaded);
+      setActivePromptVersionId((current) => {
+        if (current && loaded.groups.some((group) => group.promptVersions.some((version) => version.id === current))) {
+          return current;
+        }
+        return loaded.groups[0]?.promptVersions[0]?.id ?? null;
+      });
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  async function createVersion() {
+    if (!activeVideoId || !selectedGroupId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const version = await projectsClient.createPromptVersion(
+        activeVideoId,
+        selectedGroupId,
+        settingsJson,
+        systemPrompt,
+        userPrompt,
+      );
+      setActivePromptVersionId(version.id);
+      await refreshWorkspace();
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function generateRender() {
+    if (!activeVideoId || !selectedGroupId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const versionId = (
+        await projectsClient.createPromptVersion(
+          activeVideoId,
+          selectedGroupId,
+          settingsJson,
+          systemPrompt,
+          userPrompt,
+        )
+      ).id;
+      await projectsClient.generateImageRender(
+        activeVideoId,
+        selectedGroupId,
+        versionId,
+        systemPrompt,
+        userPrompt,
+        settingsJson,
+      );
+      await refreshWorkspace();
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function selectVersion(version: PromptVersionRecord) {
+    setActivePromptVersionId(version.id);
+    setSystemPrompt(version.systemPrompt);
+    setUserPrompt(version.userPrompt);
+    setSettingsJson(version.settingsJson);
+  }
+
+  function selectGroup(groupId: string) {
+    setSelectedGroupId(groupId);
+    const latest = workspace?.groups.find((item) => item.group.id === groupId)?.promptVersions[0];
+    setActivePromptVersionId(latest?.id ?? null);
+    setSystemPrompt(latest?.systemPrompt ?? "");
+    setUserPrompt(latest?.userPrompt ?? "");
+    setSettingsJson(latest?.settingsJson ?? "{}");
+  }
+
+  async function saveSettings() {
+    setLoading(true);
+    setError(null);
+    try {
+      JSON.parse(settingsJson);
+      await projectsClient.saveAppSetting("image_settings", settingsJson);
+      await projectsClient.saveAppSetting("gemini_model", geminiModel.trim());
+      await projectsClient.saveAppSetting("openai_model", openAiModel.trim());
+      if (geminiKey.trim()) await projectsClient.saveProviderKey("gemini", geminiKey.trim());
+      if (openAiKey.trim()) await projectsClient.saveProviderKey("openai", openAiKey.trim());
+      setKeyStatus({ gemini: keyStatus.gemini || Boolean(geminiKey.trim()), openai: keyStatus.openai || Boolean(openAiKey.trim()) });
+      setGeminiKey("");
+      setOpenAiKey("");
+      await refreshWorkspace();
+    } catch (caught) {
+      setError(caught instanceof SyntaxError ? "Image settings must be valid JSON." : String(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const previewLabel = selectedGroup?.group.label ?? "Still preview";
+  const stillCount = workspace?.groups.length ?? 0;
+  const promptVersions = selectedGroup?.promptVersions ?? [];
+  const imageRenders = selectedGroup?.imageRenders ?? [];
+
   return (
-    <section className="view image-view">
-      <div className="page-heading"><div><p className="eyebrow">Stage 3 of 3</p><h1>Image generation</h1></div><button className="primary"><WandSparkles size={17} />Generate pending</button></div>
+    <section className="view">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">Stage 3 of 3</p>
+          <h1>Image generation</h1>
+          <p>Select a still, review prompt versions, and generate render outputs.</p>
+        </div>
+        <button className="primary" onClick={() => void generateRender()} disabled={!selectedGroupId || loading}>
+          <WandSparkles size={17} /> Generate pending
+        </button>
+      </div>
+      {error && <div className="inline-error">{error}</div>}
       <div className="image-workspace">
-        <aside className="stills"><strong>Stills <span>12/18</span></strong>{[1,2,3,4,5,6].map((item) => <button className={item === 4 ? "active" : ""} key={item}><span>{item < 6 ? `v${(item % 3) + 1}` : "Pending"}</span><small>Still {String(item).padStart(2, "0")}</small></button>)}</aside>
-        <div className="preview"><header><span>Still 04</span><strong>00:26.4 – 00:35.8</strong></header><div className="preview-art"><Sparkles size={42} /><p>Generated image preview</p></div><footer>Far below the sunlit surface lies a world suspended between light and darkness.</footer></div>
-        <aside className="prompt-panel"><div className="tabs"><button className="active">Prompt</button><button>Settings</button></div><label>Scene prompt<textarea defaultValue="A wide cinematic view descending into the ocean's twilight zone, faint shafts of blue sunlight dissolving into darkness, suspended particles, immense scale, scientifically accurate deep-sea environment." /></label><button className="secondary"><Sparkles size={15} />Suggest improvement</button><button className="primary full">Generate new version</button><div className="placeholder"><strong>Animation</strong><span>Planned for a later release</span></div></aside>
+        <aside className="stills">
+          <strong>Stills <span>{stillCount}</span></strong>
+          {workspace?.groups.map((group) => (
+            <button
+              key={group.group.id}
+              className={group.group.id === selectedGroupId ? "active" : ""}
+              onClick={() => selectGroup(group.group.id)}
+            >
+              <span>{group.promptVersions[0] ? `v${group.promptVersions[0].version}` : "New"}</span>
+              <small>{group.group.label}</small>
+            </button>
+          ))}
+          {!workspace && <div className="empty-state">Loading stills…</div>}
+        </aside>
+        <div className="preview">
+          <header>
+            <span>{previewLabel}</span>
+            <strong>{selectedGroup?.group.sentenceIds.length ? `${selectedGroup.group.sentenceIds.length} sentence(s)` : "No scene selected"}</strong>
+          </header>
+          <div className="preview-art">
+            <Sparkles size={42} />
+            <p>{selectedGroup ? "Selected still preview" : "Choose a still to begin."}</p>
+          </div>
+          <footer>
+            {selectedGroup?.group.sentenceIds.length
+              ? `Group ${selectedGroup?.group.id} contains ${selectedGroup.group.sentenceIds.length} sentence(s).`
+              : "No prompt yet."}
+          </footer>
+        </div>
+        <aside className="prompt-panel">
+          <div className="tabs">
+            <button className={tab === "prompt" ? "active" : ""} onClick={() => setTab("prompt")}>Prompt</button>
+            <button className={tab === "settings" ? "active" : ""} onClick={() => setTab("settings")}>Settings</button>
+          </div>
+          {tab === "prompt" ? (
+            <>
+              <label>
+                System prompt
+                <textarea
+                  value={systemPrompt}
+                  onChange={(event) => setSystemPrompt(event.target.value)}
+                  placeholder="System prompt for image generation"
+                />
+              </label>
+              <label>
+                User prompt
+                <textarea
+                  value={userPrompt}
+                  onChange={(event) => setUserPrompt(event.target.value)}
+                  placeholder="User prompt for image generation"
+                />
+              </label>
+              <button className="secondary" disabled>
+                <Sparkles size={15} /> Suggest improvement
+              </button>
+              <button className="primary full" onClick={() => void createVersion()} disabled={!selectedGroupId || loading}>
+                Generate new version
+              </button>
+              <div className="placeholder">
+                <strong>Prompt history</strong>
+                <span>{promptVersions.length ? `${promptVersions.length} saved versions` : "No saved prompt versions yet."}</span>
+              </div>
+              {promptVersions.length > 0 && (
+                <div className="prompt-history">
+                  {promptVersions.map((version) => (
+                    <button
+                      key={version.id}
+                      className={version.id === activePromptVersionId ? "active" : ""}
+                      onClick={() => selectVersion(version)}
+                    >
+                      <span>v{version.version}</span>
+                      <small>{new Date(version.createdAt).toLocaleString()}</small>
+                    </button>
+                  ))}
+                </div>
+              )}
+              {imageRenders.length > 0 && (
+                <div className="placeholder">
+                  <strong>Render history</strong>
+                  <span>{imageRenders.length} render(s) stored</span>
+                </div>
+              )}
+              {imageRenders.map((render) => (
+                <div key={render.id} className="prompt-history">
+                  <button type="button">
+                    <span>{render.fileName}</span>
+                    <small>{new Date(render.createdAt).toLocaleString()}</small>
+                  </button>
+                </div>
+              ))}
+            </>
+          ) : (
+            <>
+              <label>
+                Image settings JSON
+                <textarea
+                  value={settingsJson}
+                  onChange={(event) => setSettingsJson(event.target.value)}
+                  rows={8}
+                  placeholder="Image generation settings JSON"
+                />
+              </label>
+              <label>Gemini image model<input value={geminiModel} onChange={(event) => setGeminiModel(event.target.value)} /></label>
+              <label>Gemini API key <small>{keyStatus.gemini ? "Configured" : "Not configured"}</small><input type="password" value={geminiKey} onChange={(event) => setGeminiKey(event.target.value)} placeholder={keyStatus.gemini ? "Enter to replace" : "Required"} /></label>
+              <label>OpenAI model<input value={openAiModel} onChange={(event) => setOpenAiModel(event.target.value)} /></label>
+              <label>OpenAI API key <small>{keyStatus.openai ? "Configured" : "Not configured"}</small><input type="password" value={openAiKey} onChange={(event) => setOpenAiKey(event.target.value)} placeholder={keyStatus.openai ? "Enter to replace" : "Optional"} /></label>
+              <button className="primary full" onClick={() => void saveSettings()} disabled={loading}>Apply settings</button>
+              <div className="placeholder">
+                <strong>Stored settings</strong>
+                <span>{workspace?.settings.length ? `${workspace.settings.length} setting(s)` : "No settings saved."}</span>
+              </div>
+              {workspace?.settings.map((setting) => (
+                <div key={setting.key} className="prompt-history">
+                  <button type="button">
+                    <span>{setting.key}</span>
+                    <small>{setting.value}</small>
+                  </button>
+                </div>
+              ))}
+            </>
+          )}
+        </aside>
       </div>
     </section>
   );

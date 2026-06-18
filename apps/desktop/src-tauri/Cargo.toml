@@ -1,6 +1,6 @@
 [package]
 name = "auto-gen-studio"
-version = "0.4.0"
+version = "0.5.0"
 description = "Local-first YouTube production workspace"
 authors = ["Auto Gen Studio"]
 edition = "2021"
@@ -20,6 +20,9 @@ tauri-plugin-dialog = "2"
 chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+keyring = { version = "3", features = ["windows-native"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
 
 [dev-dependencies]
 tempfile = "3"

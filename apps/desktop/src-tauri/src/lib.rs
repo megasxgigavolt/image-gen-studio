@@ -1,7 +1,8 @@
 mod projects;
 
 use projects::{
-    Channel, InputAsset, ProjectRepository, ResumeState, Video, VideoInputs, VisualPlan,
+    Channel, ImageRender, ImageWorkspace, InputAsset, ProjectRepository, PromptVersion,
+    ProviderKeyStatus, ResumeState, Video, VideoInputs, VisualPlan,
 };
 use std::fs;
 use std::sync::Mutex;
@@ -137,6 +138,120 @@ fn save_video_inputs(
 }
 
 #[tauri::command]
+fn get_app_setting(
+    state: State<'_, RepositoryState>,
+    key: String,
+) -> Result<Option<String>, String> {
+    with_repository(state, |repository| repository.get_app_setting(&key))
+}
+
+#[tauri::command]
+fn save_app_setting(
+    state: State<'_, RepositoryState>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    with_repository(state, |repository| {
+        repository.save_app_setting(&key, &value)
+    })
+}
+
+#[tauri::command]
+fn get_provider_key_status(
+    state: State<'_, RepositoryState>,
+    provider: String,
+) -> Result<ProviderKeyStatus, String> {
+    with_repository(state, |repository| {
+        repository.get_provider_key_status(&provider)
+    })
+}
+
+#[tauri::command]
+fn save_provider_key(
+    state: State<'_, RepositoryState>,
+    provider: String,
+    api_key: String,
+) -> Result<(), String> {
+    with_repository(state, |repository| {
+        repository.save_provider_key(&provider, &api_key)
+    })
+}
+
+#[tauri::command]
+fn list_prompt_versions(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_id: String,
+) -> Result<Vec<PromptVersion>, String> {
+    with_repository(state, |repository| {
+        repository.list_prompt_versions(&video_id, &group_id)
+    })
+}
+
+#[tauri::command]
+fn create_prompt_version(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_id: String,
+    settings_json: String,
+    system_prompt: String,
+    user_prompt: String,
+) -> Result<PromptVersion, String> {
+    with_repository(state, |repository| {
+        repository.create_prompt_version(
+            &video_id,
+            &group_id,
+            &settings_json,
+            &system_prompt,
+            &user_prompt,
+        )
+    })
+}
+
+#[tauri::command]
+fn list_image_renders(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_id: String,
+) -> Result<Vec<ImageRender>, String> {
+    with_repository(state, |repository| {
+        repository.list_image_renders(&video_id, &group_id)
+    })
+}
+
+#[tauri::command]
+fn generate_image_render(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_id: String,
+    prompt_version_id: String,
+    system_prompt: String,
+    user_prompt: String,
+    settings_json: String,
+) -> Result<ImageRender, String> {
+    with_repository(state, |repository| {
+        repository.generate_image_render(
+            &video_id,
+            &group_id,
+            &prompt_version_id,
+            &system_prompt,
+            &user_prompt,
+            &settings_json,
+        )
+    })
+}
+
+#[tauri::command]
+fn get_image_workspace(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<ImageWorkspace, String> {
+    with_repository(state, |repository| {
+        repository.get_image_workspace(&video_id)
+    })
+}
+
+#[tauri::command]
 fn pick_and_import_asset(
     app: tauri::AppHandle,
     state: State<'_, RepositoryState>,
@@ -259,7 +374,16 @@ pub fn run() {
             generate_visual_plan,
             get_visual_plan,
             move_plan_sentence,
-            reset_visual_plan
+            reset_visual_plan,
+            get_app_setting,
+            save_app_setting,
+            get_provider_key_status,
+            save_provider_key,
+            list_prompt_versions,
+            create_prompt_version,
+            list_image_renders,
+            generate_image_render,
+            get_image_workspace
         ])
         .run(tauri::generate_context!())
         .expect("error while running Auto Gen Studio");

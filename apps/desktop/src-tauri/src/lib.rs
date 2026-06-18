@@ -253,6 +253,28 @@ fn get_image_workspace(
     })
 }
 
+#[tauri::command]
+fn edit_image_render(
+    state: State<'_, RepositoryState>,
+    source_render_id: String,
+    instruction: String,
+) -> Result<ImageRender, String> {
+    with_repository(state, |repository| {
+        repository.edit_image_render(&source_render_id, &instruction)
+    })
+}
+
+#[tauri::command]
+fn get_render_data_url(
+    state: State<'_, RepositoryState>,
+    render_id: String,
+) -> Result<String, String> {
+    with_repository(state, |repository| {
+        let (mime, data) = repository.read_render_file(&render_id)?;
+        Ok(format!("data:{mime};base64,{data}"))
+    })
+}
+
 fn spawn_job_workers(
     database_path: std::path::PathBuf,
     projects_dir: std::path::PathBuf,
@@ -483,7 +505,9 @@ pub fn run() {
             get_image_workspace,
             create_image_job,
             get_latest_image_job,
-            control_image_job
+            control_image_job,
+            edit_image_render,
+            get_render_data_url
         ])
         .run(tauri::generate_context!())
         .expect("error while running Auto Gen Studio");

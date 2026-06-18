@@ -70,6 +70,9 @@ export type ImageRenderRecord = {
   promptVersionId: string;
   fileName: string;
   relativePath: string;
+  parentRenderId: string | null;
+  editInstruction: string | null;
+  kind: "generation" | "edit";
   createdAt: string;
 };
 
@@ -316,8 +319,19 @@ export const projectsClient = {
       promptVersionId,
       fileName: "render-v1.png",
       relativePath: `renders/${groupId}/render-v1.png`,
+      parentRenderId: null,
+      editInstruction: null,
+      kind: "generation",
       createdAt: now(),
     };
+  },
+  async editImageRender(sourceRenderId: string, instruction: string): Promise<ImageRenderRecord> {
+    if (isTauri()) return invoke("edit_image_render", { sourceRenderId, instruction });
+    throw new Error("Image editing requires the native application.");
+  },
+  async getRenderDataUrl(renderId: string): Promise<string> {
+    if (isTauri()) return invoke("get_render_data_url", { renderId });
+    return "";
   },
   async createImageJob(videoId: string): Promise<ImageJobRecord> {
     if (isTauri()) return invoke("create_image_job", { videoId });

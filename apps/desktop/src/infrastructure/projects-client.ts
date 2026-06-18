@@ -95,6 +95,18 @@ export type ImageWorkspaceRecord = {
   settings: AppSettingRecord[];
 };
 
+export type ImageJobRecord = {
+  id: string;
+  videoId: string;
+  status: "queued" | "running" | "paused" | "stopped" | "completed" | "failed";
+  totalItems: number;
+  completedItems: number;
+  failedItems: number;
+  createdAt: string;
+  updatedAt: string;
+  items: { id: string; groupId: string; promptVersionId: string; status: string; attempts: number; lastError: string | null; renderId: string | null }[];
+};
+
 type BrowserData = {
   channels: ChannelRecord[];
   videos: VideoRecord[];
@@ -306,6 +318,18 @@ export const projectsClient = {
       relativePath: `renders/${groupId}/render-v1.png`,
       createdAt: now(),
     };
+  },
+  async createImageJob(videoId: string): Promise<ImageJobRecord> {
+    if (isTauri()) return invoke("create_image_job", { videoId });
+    throw new Error("Bulk jobs require the native application.");
+  },
+  async getLatestImageJob(videoId: string): Promise<ImageJobRecord | null> {
+    if (isTauri()) return invoke("get_latest_image_job", { videoId });
+    return null;
+  },
+  async controlImageJob(jobId: string, action: "pause" | "resume" | "stop"): Promise<ImageJobRecord> {
+    if (isTauri()) return invoke("control_image_job", { jobId, action });
+    throw new Error("Bulk jobs require the native application.");
   },
   async saveVideoInputs(videoId: string, scriptText: string, pacingSeconds: number) {
     if (isTauri()) return invoke<VideoInputsRecord>("save_video_inputs", { videoId, scriptText, pacingSeconds });

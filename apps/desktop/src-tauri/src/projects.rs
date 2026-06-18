@@ -129,6 +129,34 @@ CREATE TABLE IF NOT EXISTS app_settings (
 );
 "#;
 
+const MIGRATION_005: &str = r#"
+CREATE TABLE IF NOT EXISTS image_jobs (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    status TEXT NOT NULL CHECK(status IN ('queued','running','paused','stopped','completed','failed')),
+    total_items INTEGER NOT NULL,
+    completed_items INTEGER NOT NULL DEFAULT 0,
+    failed_items INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS image_job_items (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES image_jobs(id),
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    group_id TEXT NOT NULL,
+    prompt_version_id TEXT NOT NULL REFERENCES prompt_versions(id),
+    status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','stopped')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    render_id TEXT REFERENCES image_renders(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_image_jobs_video ON image_jobs(video_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_image_job_items_job ON image_job_items(job_id, status, created_at);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -243,6 +271,32 @@ pub struct ImageWorkspace {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct ImageJobItem {
+    pub id: String,
+    pub group_id: String,
+    pub prompt_version_id: String,
+    pub status: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub render_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageJob {
+    pub id: String,
+    pub video_id: String,
+    pub status: String,
+    pub total_items: i64,
+    pub completed_items: i64,
+    pub failed_items: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub items: Vec<ImageJobItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct PlanSentence {
     pub id: String,
     pub ordinal: i64,
@@ -273,6 +327,7 @@ pub struct VisualPlan {
 
 pub struct ProjectRepository {
     connection: Connection,
+    database_path: PathBuf,
     projects_dir: PathBuf,
 }
 
@@ -288,6 +343,7 @@ impl ProjectRepository {
             .map_err(|error| error.to_string())?;
         let repository = Self {
             connection,
+            database_path: database_path.to_path_buf(),
             projects_dir: projects_dir.to_path_buf(),
         };
         repository.migrate()?;
@@ -331,7 +387,20 @@ impl ProjectRepository {
                 [Utc::now().to_rfc3339()],
             )
             .map_err(|error| error.to_string())?;
+        self.connection
+            .execute_batch(MIGRATION_005)
+            .map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(5, ?1)",
+                [Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    pub fn paths(&self) -> (PathBuf, PathBuf) {
+        (self.database_path.clone(), self.projects_dir.clone())
     }
 
     pub fn list_channels(&self, include_trashed: bool) -> Result<Vec<Channel>, String> {
@@ -1037,6 +1106,181 @@ impl ProjectRepository {
         })
     }
 
+    pub fn create_image_job(&self, video_id: &str) -> Result<ImageJob, String> {
+        let plan = self.get_visual_plan(video_id)?;
+        let mut prompts = Vec::new();
+        for group in plan.groups {
+            if self.list_image_renders(video_id, &group.id)?.is_empty() {
+                let prompt = self
+                    .list_prompt_versions(video_id, &group.id)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        format!(
+                            "{} needs a saved prompt before bulk generation.",
+                            group.label
+                        )
+                    })?;
+                prompts.push((group.id, prompt.id));
+            }
+        }
+        if prompts.is_empty() {
+            return Err("There are no pending stills to generate.".into());
+        }
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO image_jobs(id,video_id,status,total_items,created_at,updated_at) VALUES(?1,?2,'queued',?3,?4,?4)",
+            params![id, video_id, prompts.len() as i64, now],
+        ).map_err(|e| e.to_string())?;
+        for (group_id, prompt_id) in prompts {
+            self.connection.execute(
+                "INSERT INTO image_job_items(id,job_id,video_id,group_id,prompt_version_id,status,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,'queued',?6,?6)",
+                params![Uuid::new_v4().to_string(), id, video_id, group_id, prompt_id, now],
+            ).map_err(|e| e.to_string())?;
+        }
+        self.get_image_job(&id)
+    }
+
+    pub fn get_image_job(&self, job_id: &str) -> Result<ImageJob, String> {
+        let mut job: ImageJob = self.connection.query_row(
+            "SELECT id,video_id,status,total_items,completed_items,failed_items,created_at,updated_at FROM image_jobs WHERE id=?1",
+            [job_id],
+            |row| Ok(ImageJob { id: row.get(0)?, video_id: row.get(1)?, status: row.get(2)?, total_items: row.get(3)?, completed_items: row.get(4)?, failed_items: row.get(5)?, created_at: row.get(6)?, updated_at: row.get(7)?, items: vec![] }),
+        ).map_err(|_| "Image job was not found.".to_string())?;
+        let mut statement = self.connection.prepare(
+            "SELECT id,group_id,prompt_version_id,status,attempts,last_error,render_id FROM image_job_items WHERE job_id=?1 ORDER BY created_at"
+        ).map_err(|e| e.to_string())?;
+        job.items = statement
+            .query_map([job_id], |row| {
+                Ok(ImageJobItem {
+                    id: row.get(0)?,
+                    group_id: row.get(1)?,
+                    prompt_version_id: row.get(2)?,
+                    status: row.get(3)?,
+                    attempts: row.get(4)?,
+                    last_error: row.get(5)?,
+                    render_id: row.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(job)
+    }
+
+    pub fn latest_image_job(&self, video_id: &str) -> Result<Option<ImageJob>, String> {
+        let id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM image_jobs WHERE video_id=?1 ORDER BY created_at DESC LIMIT 1",
+                [video_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        id.map(|id| self.get_image_job(&id)).transpose()
+    }
+
+    pub fn set_image_job_status(&self, job_id: &str, status: &str) -> Result<ImageJob, String> {
+        if !["queued", "running", "paused", "stopped"].contains(&status) {
+            return Err("Unsupported image job transition.".into());
+        }
+        self.connection.execute(
+            "UPDATE image_jobs SET status=?1,updated_at=?2 WHERE id=?3 AND status NOT IN ('completed','failed')",
+            params![status, Utc::now().to_rfc3339(), job_id],
+        ).map_err(|e| e.to_string())?;
+        if status == "stopped" {
+            self.connection.execute(
+                "UPDATE image_job_items SET status='stopped',updated_at=?1 WHERE job_id=?2 AND status='queued'",
+                params![Utc::now().to_rfc3339(), job_id],
+            ).map_err(|e| e.to_string())?;
+        }
+        self.get_image_job(job_id)
+    }
+
+    pub fn recover_image_jobs(&self) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        self.connection
+            .execute(
+                "UPDATE image_job_items SET status='queued',updated_at=?1 WHERE status='running'",
+                [&now],
+            )
+            .map_err(|e| e.to_string())?;
+        self.connection
+            .execute(
+                "UPDATE image_jobs SET status='paused',updated_at=?1 WHERE status='running'",
+                [&now],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn claim_job_item(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<(String, String, String, PromptVersion)>, String> {
+        let job_status: String = self
+            .connection
+            .query_row(
+                "SELECT status FROM image_jobs WHERE id=?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !matches!(job_status.as_str(), "queued" | "running") {
+            return Ok(None);
+        }
+        let item: Option<(String, String, String)> = self.connection.query_row(
+            "SELECT id,video_id,group_id FROM image_job_items WHERE job_id=?1 AND status='queued' ORDER BY created_at LIMIT 1",
+            [job_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((item_id, video_id, group_id)) = item else {
+            return Ok(None);
+        };
+        let claimed = self.connection.execute(
+            "UPDATE image_job_items SET status='running',attempts=attempts+1,updated_at=?1 WHERE id=?2 AND status='queued'",
+            params![Utc::now().to_rfc3339(), item_id],
+        ).map_err(|e| e.to_string())?;
+        if claimed == 0 {
+            return self.claim_job_item(job_id);
+        }
+        self.connection.execute(
+            "UPDATE image_jobs SET status='running',updated_at=?1 WHERE id=?2 AND status='queued'",
+            params![Utc::now().to_rfc3339(), job_id],
+        ).map_err(|e| e.to_string())?;
+        let prompt = self.connection.query_row(
+            "SELECT p.id,p.video_id,p.group_id,p.version,p.settings_json,p.system_prompt,p.user_prompt,p.created_at FROM prompt_versions p JOIN image_job_items i ON i.prompt_version_id=p.id WHERE i.id=?1",
+            [&item_id], |row| Ok(PromptVersion { id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?, version: row.get(3)?, settings_json: row.get(4)?, system_prompt: row.get(5)?, user_prompt: row.get(6)?, created_at: row.get(7)? }),
+        ).map_err(|e| e.to_string())?;
+        Ok(Some((item_id, video_id, group_id, prompt)))
+    }
+
+    pub fn finish_job_item(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        result: Result<String, String>,
+    ) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        match result {
+            Ok(render_id) => self.connection.execute("UPDATE image_job_items SET status='completed',render_id=?1,last_error=NULL,updated_at=?2 WHERE id=?3", params![render_id, now, item_id]),
+            Err(error) => self.connection.execute("UPDATE image_job_items SET status='failed',last_error=?1,updated_at=?2 WHERE id=?3", params![error, now, item_id]),
+        }.map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "UPDATE image_jobs SET completed_items=(SELECT COUNT(*) FROM image_job_items WHERE job_id=?1 AND status='completed'),failed_items=(SELECT COUNT(*) FROM image_job_items WHERE job_id=?1 AND status='failed'),updated_at=?2 WHERE id=?1",
+            params![job_id, now],
+        ).map_err(|e| e.to_string())?;
+        let (pending, failed): (i64, i64) = self.connection.query_row(
+            "SELECT SUM(CASE WHEN status IN ('queued','running') THEN 1 ELSE 0 END),SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) FROM image_job_items WHERE job_id=?1",
+            [job_id], |row| Ok((row.get::<_, Option<i64>>(0)?.unwrap_or(0), row.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+        ).map_err(|e| e.to_string())?;
+        if pending == 0 {
+            self.connection.execute("UPDATE image_jobs SET status=?1,updated_at=?2 WHERE id=?3 AND status NOT IN ('paused','stopped')", params![if failed > 0 {"failed"} else {"completed"}, now, job_id]).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     fn asset_by_id(&self, id: &str) -> Result<Option<InputAsset>, String> {
         self.connection.query_row(
             "SELECT id, video_id, kind, original_name, relative_path, media_type, size_bytes, created_at FROM input_assets WHERE id = ?1",
@@ -1563,5 +1807,36 @@ mod tests {
         assert!(repo
             .create_prompt_version(&video.id, "g1", "{}", "system", "")
             .is_err());
+    }
+
+    #[test]
+    fn creates_and_controls_persistent_bulk_jobs() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4)
+            .unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id).unwrap();
+        for group in plan.groups {
+            repo.create_prompt_version(&video.id, &group.id, "{}", "system", "scene")
+                .unwrap();
+        }
+        let job = repo.create_image_job(&video.id).unwrap();
+        assert_eq!(job.total_items, job.items.len() as i64);
+        assert_eq!(
+            repo.set_image_job_status(&job.id, "paused").unwrap().status,
+            "paused"
+        );
+        assert_eq!(
+            repo.set_image_job_status(&job.id, "queued").unwrap().status,
+            "queued"
+        );
+        let claimed = repo.claim_job_item(&job.id).unwrap().unwrap();
+        repo.finish_job_item(&job.id, &claimed.0, Err("provider unavailable".into()))
+            .unwrap();
+        assert_eq!(repo.get_image_job(&job.id).unwrap().failed_items, 1);
     }
 }

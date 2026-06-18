@@ -1,11 +1,13 @@
 mod projects;
 
 use projects::{
-    Channel, ImageRender, ImageWorkspace, InputAsset, ProjectRepository, PromptVersion,
+    Channel, ImageJob, ImageRender, ImageWorkspace, InputAsset, ProjectRepository, PromptVersion,
     ProviderKeyStatus, ResumeState, Video, VideoInputs, VisualPlan,
 };
 use std::fs;
 use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 use tauri::{Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
@@ -251,6 +253,98 @@ fn get_image_workspace(
     })
 }
 
+fn spawn_job_workers(
+    database_path: std::path::PathBuf,
+    projects_dir: std::path::PathBuf,
+    job_id: String,
+) {
+    for _ in 0..2 {
+        let database_path = database_path.clone();
+        let projects_dir = projects_dir.clone();
+        let job_id = job_id.clone();
+        thread::spawn(move || {
+            let Ok(repository) = ProjectRepository::open(&database_path, &projects_dir) else {
+                return;
+            };
+            loop {
+                let Ok(Some((item_id, video_id, group_id, prompt))) =
+                    repository.claim_job_item(&job_id)
+                else {
+                    break;
+                };
+                let mut last_error = String::new();
+                let mut render_id = None;
+                for attempt in 0..3 {
+                    match repository.generate_image_render(
+                        &video_id,
+                        &group_id,
+                        &prompt.id,
+                        &prompt.system_prompt,
+                        &prompt.user_prompt,
+                        &prompt.settings_json,
+                    ) {
+                        Ok(render) => {
+                            render_id = Some(render.id);
+                            break;
+                        }
+                        Err(error) => {
+                            last_error = error;
+                            if attempt < 2 {
+                                thread::sleep(Duration::from_secs(2_u64.pow(attempt + 1)));
+                            }
+                        }
+                    }
+                }
+                let result = render_id.ok_or(last_error);
+                let _ = repository.finish_job_item(&job_id, &item_id, result);
+            }
+        });
+    }
+}
+
+#[tauri::command]
+fn create_image_job(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<ImageJob, String> {
+    let (job, paths) = with_repository(state, |repository| {
+        let job = repository.create_image_job(&video_id)?;
+        Ok((job, repository.paths()))
+    })?;
+    spawn_job_workers(paths.0, paths.1, job.id.clone());
+    Ok(job)
+}
+
+#[tauri::command]
+fn get_latest_image_job(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Option<ImageJob>, String> {
+    with_repository(state, |repository| repository.latest_image_job(&video_id))
+}
+
+#[tauri::command]
+fn control_image_job(
+    state: State<'_, RepositoryState>,
+    job_id: String,
+    action: String,
+) -> Result<ImageJob, String> {
+    let (job, paths) = with_repository(state, |repository| {
+        let status = match action.as_str() {
+            "pause" => "paused",
+            "resume" => "queued",
+            "stop" => "stopped",
+            _ => return Err("Unknown job action.".into()),
+        };
+        let job = repository.set_image_job_status(&job_id, status)?;
+        Ok((job, repository.paths()))
+    })?;
+    if action == "resume" {
+        spawn_job_workers(paths.0, paths.1, job.id.clone());
+    }
+    Ok(job)
+}
+
 #[tauri::command]
 fn pick_and_import_asset(
     app: tauri::AppHandle,
@@ -350,6 +444,9 @@ pub fn run() {
                 &data_dir.join("Projects"),
             )
             .map_err(std::io::Error::other)?;
+            repository
+                .recover_image_jobs()
+                .map_err(std::io::Error::other)?;
             app.manage(Mutex::new(repository));
             Ok(())
         })
@@ -383,7 +480,10 @@ pub fn run() {
             create_prompt_version,
             list_image_renders,
             generate_image_render,
-            get_image_workspace
+            get_image_workspace,
+            create_image_job,
+            get_latest_image_job,
+            control_image_job
         ])
         .run(tauri::generate_context!())
         .expect("error while running Auto Gen Studio");

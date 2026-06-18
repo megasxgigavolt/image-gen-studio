@@ -191,3 +191,8 @@
 - Added configurable provider models and durable three-layer image prompts.
 - Added per-still prompt restoration, Gemini single-image generation, and render history.
 - Added controlled project render folders and functional Prompt and Settings tabs.
+# 0.6.0
+
+- Added durable bulk image jobs for pending stills with two concurrent Gemini workers.
+- Added progress and provider error tracking with retry handling.
+- Added pause, resume, stop, and startup recovery for interrupted jobs.

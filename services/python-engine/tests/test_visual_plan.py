@@ -28,3 +28,10 @@ def test_whisper_dependency_error_is_actionable(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "whisper", None)
     with pytest.raises(EngineDependencyError, match="whisper"):
         transcribe_words("missing.wav")
+
+
+def test_tts_pause_tags_are_hidden_but_extend_timing():
+    script = "The ocean darkens. <#0.5#> Lanternfish glow."
+    result = build_plan(script, target_seconds=5, duration=10)
+    assert split_script(script) == ["The ocean darkens.", "Lanternfish glow."]
+    assert result["sentences"][-1]["end"] == 10.5

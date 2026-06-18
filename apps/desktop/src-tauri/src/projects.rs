@@ -186,6 +186,12 @@ CREATE TABLE IF NOT EXISTS timeline_clips (
 CREATE INDEX IF NOT EXISTS idx_timeline_clips_video ON timeline_clips(video_id, ordinal);
 "#;
 
+const MIGRATION_008: &str = r#"
+ALTER TABLE video_inputs ADD COLUMN pacing_preset TEXT NOT NULL DEFAULT 'balanced';
+ALTER TABLE video_inputs ADD COLUMN pacing_min_seconds INTEGER NOT NULL DEFAULT 6;
+ALTER TABLE video_inputs ADD COLUMN pacing_max_seconds INTEGER NOT NULL DEFAULT 10;
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -237,6 +243,9 @@ pub struct VideoInputs {
     pub video_id: String,
     pub script_text: String,
     pub pacing_seconds: i64,
+    pub pacing_preset: String,
+    pub pacing_min_seconds: i64,
+    pub pacing_max_seconds: i64,
     pub audio: Option<InputAsset>,
     pub references: Vec<InputAsset>,
     pub updated_at: String,
@@ -559,6 +568,21 @@ impl ProjectRepository {
                 [Utc::now().to_rfc3339()],
             )
             .map_err(|error| error.to_string())?;
+        let has_pacing_preset: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('video_inputs') WHERE name='pacing_preset')",
+            [], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !has_pacing_preset {
+            self.connection
+                .execute_batch(MIGRATION_008)
+                .map_err(|error| error.to_string())?;
+        }
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(8, ?1)",
+                [Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -808,11 +832,11 @@ impl ProjectRepository {
                 params![video_id, now],
             )
             .map_err(|e| e.to_string())?;
-        let (script_text, pacing_seconds, audio_id, updated_at): (String, i64, Option<String>, String) =
+        let (script_text, pacing_seconds, pacing_preset, pacing_min_seconds, pacing_max_seconds, audio_id, updated_at): (String, i64, String, i64, i64, Option<String>, String) =
             self.connection.query_row(
-                "SELECT script_text, pacing_seconds, audio_asset_id, updated_at FROM video_inputs WHERE video_id = ?1",
+                "SELECT script_text,pacing_seconds,pacing_preset,pacing_min_seconds,pacing_max_seconds,audio_asset_id,updated_at FROM video_inputs WHERE video_id=?1",
                 [video_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?)),
             ).map_err(|e| e.to_string())?;
         let audio = audio_id
             .map(|id| self.asset_by_id(&id))
@@ -823,6 +847,9 @@ impl ProjectRepository {
             video_id: video_id.into(),
             script_text,
             pacing_seconds,
+            pacing_preset,
+            pacing_min_seconds,
+            pacing_max_seconds,
             audio,
             references,
             updated_at,
@@ -858,6 +885,27 @@ impl ProjectRepository {
             video_id,
             &serde_json::json!({"reason":"inputs-saved","scriptLength":script_text.len(),"pacingSeconds":pacing_seconds}).to_string(),
         )?;
+        self.get_video_inputs(video_id)
+    }
+
+    pub fn save_video_pacing(
+        &self,
+        video_id: &str,
+        preset: &str,
+        min_seconds: i64,
+        max_seconds: i64,
+    ) -> Result<VideoInputs, String> {
+        if min_seconds < 2 || max_seconds > 30 || min_seconds > max_seconds {
+            return Err("Scene pacing must use a valid 2–30 second range.".into());
+        }
+        if !["calm", "balanced", "fast", "custom"].contains(&preset) {
+            return Err("Unknown pacing preset.".into());
+        }
+        self.get_video_inputs(video_id)?;
+        self.connection.execute(
+            "UPDATE video_inputs SET pacing_preset=?1,pacing_min_seconds=?2,pacing_max_seconds=?3,pacing_seconds=?4,updated_at=?5 WHERE video_id=?6",
+            params![preset,min_seconds,max_seconds,(min_seconds+max_seconds)/2,Utc::now().to_rfc3339(),video_id],
+        ).map_err(|e| e.to_string())?;
         self.get_video_inputs(video_id)
     }
 
@@ -1917,7 +1965,8 @@ impl ProjectRepository {
         if inputs.script_text.trim().is_empty() || inputs.audio.is_none() {
             return Err("Script and narration audio are required.".into());
         }
-        let texts = split_sentences(&inputs.script_text);
+        let (clean_script, pause_seconds) = remove_tts_pause_markers(&inputs.script_text);
+        let texts = split_sentences(&clean_script);
         if texts.is_empty() {
             return Err("No sentences could be extracted from the script.".into());
         }
@@ -1926,7 +1975,7 @@ impl ProjectRepository {
             .map(|text| text.split_whitespace().count().max(1))
             .collect();
         let total_words: usize = weights.iter().sum();
-        let duration = (total_words as f64 * 0.4).max(1.0);
+        let duration = (total_words as f64 * 0.4 + pause_seconds).max(1.0);
         let mut cursor = 0.0;
         let mut sentences = Vec::new();
         let sentence_count = texts.len();
@@ -1948,7 +1997,11 @@ impl ProjectRepository {
         if let Some(last) = sentences.last_mut() {
             last.end_seconds = duration;
         }
-        let groups = build_groups(&sentences, inputs.pacing_seconds as f64);
+        let groups = build_groups_range(
+            &sentences,
+            inputs.pacing_min_seconds as f64,
+            inputs.pacing_max_seconds as f64,
+        );
         self.save_plan(video_id, &sentences, &groups, true, "estimated")?;
         self.save_plan(video_id, &sentences, &groups, false, "estimated")?;
         self.get_visual_plan(video_id)
@@ -2289,9 +2342,10 @@ fn parse_gemini_image_response(
 }
 
 fn split_sentences(script: &str) -> Vec<String> {
+    let cleaned = remove_tts_pause_markers(script).0;
     let mut result = Vec::new();
     let mut current = String::new();
-    for character in script.chars() {
+    for character in cleaned.chars() {
         current.push(character);
         if matches!(character, '.' | '!' | '?') {
             let text = current.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2308,15 +2362,52 @@ fn split_sentences(script: &str) -> Vec<String> {
     result
 }
 
-fn build_groups(sentences: &[PlanSentence], target: f64) -> Vec<PlanGroup> {
+fn remove_tts_pause_markers(script: &str) -> (String, f64) {
+    let mut cleaned = String::new();
+    let mut pauses = 0.0;
+    let mut rest = script;
+    while let Some(start) = rest.find("<#") {
+        cleaned.push_str(&rest[..start]);
+        let marker = &rest[start + 2..];
+        let Some(end) = marker.find("#>") else {
+            cleaned.push_str(&rest[start..]);
+            return (cleaned, pauses);
+        };
+        if let Ok(seconds) = marker[..end].parse::<f64>() {
+            pauses += seconds.max(0.0);
+        } else {
+            cleaned.push_str(&rest[start..start + end + 4]);
+        }
+        cleaned.push(' ');
+        rest = &marker[end + 2..];
+    }
+    cleaned.push_str(rest);
+    (
+        cleaned.split_whitespace().collect::<Vec<_>>().join(" "),
+        pauses,
+    )
+}
+
+fn build_groups_range(
+    sentences: &[PlanSentence],
+    min_seconds: f64,
+    max_seconds: f64,
+) -> Vec<PlanGroup> {
     let mut groups = Vec::new();
     let mut pending: Vec<&PlanSentence> = Vec::new();
     for sentence in sentences {
-        pending.push(sentence);
-        if pending.last().unwrap().end_seconds - pending[0].start_seconds >= target {
+        let proposed = pending
+            .first()
+            .map(|first| sentence.end_seconds - first.start_seconds)
+            .unwrap_or(0.0);
+        if !pending.is_empty()
+            && proposed > max_seconds
+            && pending.last().unwrap().end_seconds - pending[0].start_seconds >= min_seconds
+        {
             groups.push(make_group(groups.len() + 1, &pending));
             pending.clear();
         }
+        pending.push(sentence);
     }
     if !pending.is_empty() {
         groups.push(make_group(groups.len() + 1, &pending));
@@ -2701,5 +2792,27 @@ mod tests {
         assert!(backup.as_ref().unwrap().exists());
         assert_eq!(fs::read(backup.unwrap()).unwrap(), b"not a sqlite database");
         assert!(repo.verify_integrity().is_ok());
+    }
+
+    #[test]
+    fn strips_tts_pause_tags_and_preserves_pause_duration() {
+        let (cleaned, pause) = remove_tts_pause_markers("One. <#0.5#> Two. <#1.25#>");
+        assert_eq!(cleaned, "One. Two.");
+        assert_eq!(pause, 1.75);
+        assert_eq!(split_sentences("One. <#0.5#> Two."), vec!["One.", "Two."]);
+    }
+
+    #[test]
+    fn saves_pacing_presets_and_custom_ranges() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let pacing = repo.save_video_pacing(&video.id, "calm", 10, 16).unwrap();
+        assert_eq!(pacing.pacing_preset, "calm");
+        assert_eq!(
+            (pacing.pacing_min_seconds, pacing.pacing_max_seconds),
+            (10, 16)
+        );
+        assert!(repo.save_video_pacing(&video.id, "custom", 12, 4).is_err());
     }
 }

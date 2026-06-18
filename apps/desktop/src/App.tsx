@@ -296,6 +296,9 @@ function InputsView() {
   const { setStage, activeVideoId } = useAppStore();
   const [script, setScript] = useState("");
   const [pacing, setPacing] = useState(8);
+  const [pacingPreset, setPacingPreset] = useState<"calm" | "balanced" | "fast" | "custom">("balanced");
+  const [pacingMin, setPacingMin] = useState(6);
+  const [pacingMax, setPacingMax] = useState(10);
   const [audio, setAudio] = useState<import("./infrastructure/projects-client").InputAssetRecord | null>(null);
   const [references, setReferences] = useState<import("./infrastructure/projects-client").InputAssetRecord[]>([]);
   const [status, setStatus] = useState("Loading source material…");
@@ -307,6 +310,9 @@ function InputsView() {
     void projectsClient.getVideoInputs(activeVideoId).then((inputs) => {
       setScript(inputs.scriptText);
       setPacing(inputs.pacingSeconds);
+      setPacingPreset(inputs.pacingPreset);
+      setPacingMin(inputs.pacingMinSeconds);
+      setPacingMax(inputs.pacingMaxSeconds);
       setAudio(inputs.audio);
       setReferences(inputs.references);
       setStatus("Saved locally");
@@ -323,6 +329,16 @@ function InputsView() {
     }, 500);
     return () => window.clearTimeout(timeout);
   }, [activeVideoId, hydrated, pacing, script]);
+
+  async function choosePacing(preset: "calm" | "balanced" | "fast" | "custom", min = pacingMin, max = pacingMax) {
+    if (!activeVideoId) return;
+    const ranges = { calm: [10, 16], balanced: [6, 10], fast: [3, 6], custom: [min, max] } as const;
+    const [nextMin, nextMax] = ranges[preset];
+    setPacingPreset(preset); setPacingMin(nextMin); setPacingMax(nextMax);
+    setPacing(Math.round((nextMin + nextMax) / 2)); setStatus("Saving…");
+    await projectsClient.saveVideoPacing(activeVideoId, preset, nextMin, nextMax);
+    setStatus("Saved locally");
+  }
 
   async function importAsset(kind: "audio" | "reference") {
     if (!activeVideoId) return;
@@ -354,7 +370,7 @@ function InputsView() {
         <div className="panel-stack">
           <article className="panel"><div className="panel-heading"><div><h2>Narration audio</h2><p>Used for word-level timing.</p></div><button className="secondary" onClick={() => void importAsset("audio")}><Upload size={15} />{audio ? "Replace" : "Import"}</button></div>{audio ? <div className="file-row"><span>♪</span><div><strong>{audio.originalName}</strong><small>{(audio.sizeBytes / 1024 / 1024).toFixed(1)} MB</small></div><button className="icon-button" onClick={() => void removeAsset(audio.id)}><X size={15} /></button></div> : <div className="asset-empty">WAV, MP3, M4A, AAC, or FLAC</div>}</article>
           <article className="panel"><div className="panel-heading"><div><h2>Visual references</h2><p>Optional style and subject guidance.</p></div><button className="secondary" onClick={() => void importAsset("reference")}><Plus size={15} />Add</button></div><div className="reference-list">{references.map((reference) => <div key={reference.id}><span>IMG</span><p>{reference.originalName}</p><button onClick={() => void removeAsset(reference.id)}><X size={13} /></button></div>)}{references.length === 0 && <div className="asset-empty">PNG, JPEG, or WebP</div>}</div></article>
-          <article className="panel"><div className="pacing-heading"><div><h2>Scene pacing</h2><p>Target duration per still</p></div><strong>{pacing} sec</strong></div><input type="range" min="4" max="14" value={pacing} onChange={(event) => { setPacing(Number(event.target.value)); setStatus("Saving…"); }} /></article>
+          <article className="panel"><div className="pacing-heading"><div><h2>Scene pacing</h2><p>Preferred duration range per still</p></div><strong>{pacingMin}–{pacingMax} sec</strong></div><div className="pacing-options">{([["calm","Calm","10–16s"],["balanced","Balanced","6–10s"],["fast","Fast","3–6s"],["custom","Custom","Choose range"]] as const).map(([value,label,detail]) => <button key={value} className={pacingPreset === value ? "active" : ""} onClick={() => void choosePacing(value)}><strong>{label}</strong><small>{detail}</small></button>)}</div>{pacingPreset === "custom" && <div className="custom-pacing"><label>Minimum<input type="number" min="2" max="30" value={pacingMin} onChange={(event) => setPacingMin(Number(event.target.value))} /></label><label>Maximum<input type="number" min="2" max="30" value={pacingMax} onChange={(event) => setPacingMax(Number(event.target.value))} /></label><button className="secondary" onClick={() => void choosePacing("custom", pacingMin, pacingMax)}>Apply</button></div>}</article>
           <article className={ready ? "readiness ready" : "readiness"}><strong>{ready ? "Ready for visual planning" : "Source material incomplete"}</strong><span>{ready ? "Script and narration audio are available." : "Add a script and narration audio to continue."}</span></article>
         </div>
       </div>
@@ -367,6 +383,7 @@ function VisualPlanView() {
   const { activeVideoId, setStage } = useAppStore();
   const [plan, setPlan] = useState<VisualPlanRecord | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [draggedSentenceId, setDraggedSentenceId] = useState<string | null>(null);
   useEffect(() => {
     if (!activeVideoId) return;
     void projectsClient.getVisualPlan(activeVideoId).then(setPlan).catch((caught) => setError(String(caught)));
@@ -400,8 +417,8 @@ function VisualPlanView() {
             <article
               className="plan-row"
               key={group.id}
-              onDragOver={(event) => event.preventDefault()}
-              onDrop={(event) => void moveSentence(event.dataTransfer.getData("text/sentence-id"), group.id)}
+              onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }}
+              onDrop={(event) => { event.preventDefault(); const id = draggedSentenceId || event.dataTransfer.getData("text/plain"); setDraggedSentenceId(null); if (id) void moveSentence(id, group.id); }}
             >
               <span className="plan-index">{String(index + 1).padStart(2, "0")}</span>
               <div className="timing"><strong>{formatTime(timing.startSeconds)} – {formatTime(timing.endSeconds)}</strong><small>{timing.durationSeconds.toFixed(1)} sec</small></div>
@@ -411,9 +428,11 @@ function VisualPlanView() {
                     className="sentence"
                     draggable
                     key={sentence.id}
-                    onDragStart={(event) => event.dataTransfer.setData("text/sentence-id", sentence.id)}
+                    onDragStart={(event) => { setDraggedSentenceId(sentence.id); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", sentence.id); }}
+                    onDragEnd={() => setDraggedSentenceId(null)}
                   >
                     <b>⠿</b><span>{sentence.text}</span><small>{formatTime(sentence.startSeconds)}</small>
+                    <div className="sentence-move">{index > 0 && <button onClick={() => void moveSentence(sentence.id, plan.groups[index - 1].id)} aria-label="Move to previous scene">←</button>}{index + 1 < plan.groups.length && <button onClick={() => void moveSentence(sentence.id, plan.groups[index + 1].id)} aria-label="Move to next scene">→</button>}</div>
                   </div>
                 ))}
               </div>
@@ -912,7 +931,7 @@ export function App() {
   } = useAppStore();
   const [startupNotice, setStartupNotice] = useState<string | null>(null);
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
-  useEffect(() => log("info", "application_started", { release: "1.0.0" }), []);
+  useEffect(() => log("info", "application_started", { release: "1.1.0" }), []);
   useEffect(() => { void projectsClient.startupDiagnostic().then(setStartupNotice); }, []);
   useEffect(() => log("debug", "stage_opened", { stage }), [stage]);
   useEffect(() => {

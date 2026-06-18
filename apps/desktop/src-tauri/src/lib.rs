@@ -152,6 +152,19 @@ fn save_video_inputs(
 }
 
 #[tauri::command]
+fn save_video_pacing(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    preset: String,
+    min_seconds: i64,
+    max_seconds: i64,
+) -> Result<VideoInputs, String> {
+    with_repository(state, |repository| {
+        repository.save_video_pacing(&video_id, &preset, min_seconds, max_seconds)
+    })
+}
+
+#[tauri::command]
 fn get_app_setting(
     state: State<'_, RepositoryState>,
     key: String,
@@ -595,6 +608,7 @@ pub fn run() {
             create_video_snapshot,
             get_video_inputs,
             save_video_inputs,
+            save_video_pacing,
             pick_and_import_asset,
             remove_input_asset,
             pick_script_text,

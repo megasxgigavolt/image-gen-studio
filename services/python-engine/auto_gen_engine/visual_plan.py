@@ -41,6 +41,10 @@ def split_script(script: str) -> list[str]:
     return sentences
 
 
+def tts_pause_seconds(script: str) -> float:
+    return sum(float(value) for value in re.findall(r"<#([\d.]+)#>", script))
+
+
 def normalize(text: str) -> list[str]:
     return NORMALIZE_RE.sub(" ", text.lower().replace("’", "'")).split()
 
@@ -89,6 +93,7 @@ def align_sentences(script: str, words: list[WordTiming]) -> list[TimedSentence]
 
 def estimate_sentence_timings(script: str, duration: float) -> list[TimedSentence]:
     texts = split_script(script)
+    duration += tts_pause_seconds(script)
     weights = [max(1, len(normalize(text))) for text in texts]
     total = sum(weights)
     cursor = 0.0

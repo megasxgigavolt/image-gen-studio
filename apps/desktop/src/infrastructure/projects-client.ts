@@ -27,12 +27,33 @@ export type ResumeRecord = {
   updatedAt: string;
 };
 
+export type InputAssetRecord = {
+  id: string;
+  videoId: string;
+  kind: "audio" | "reference";
+  originalName: string;
+  relativePath: string;
+  mediaType: string;
+  sizeBytes: number;
+  createdAt: string;
+};
+
+export type VideoInputsRecord = {
+  videoId: string;
+  scriptText: string;
+  pacingSeconds: number;
+  audio: InputAssetRecord | null;
+  references: InputAssetRecord[];
+  updatedAt: string;
+};
+
 type BrowserData = {
   channels: ChannelRecord[];
   videos: VideoRecord[];
   trashedChannels?: ChannelRecord[];
   trashedVideos?: VideoRecord[];
   resume: ResumeRecord | null;
+  inputs?: Record<string, VideoInputsRecord>;
 };
 
 const STORAGE_KEY = "auto-gen-studio.dev-projects";
@@ -146,5 +167,34 @@ export const projectsClient = {
       });
     }
     return id();
+  },
+  async getVideoInputs(videoId: string): Promise<VideoInputsRecord> {
+    if (isTauri()) return invoke("get_video_inputs", { videoId });
+    const data = readBrowserData();
+    return data.inputs?.[videoId] ?? {
+      videoId, scriptText: "", pacingSeconds: 8, audio: null, references: [], updatedAt: now(),
+    };
+  },
+  async saveVideoInputs(videoId: string, scriptText: string, pacingSeconds: number) {
+    if (isTauri()) return invoke<VideoInputsRecord>("save_video_inputs", { videoId, scriptText, pacingSeconds });
+    const data = readBrowserData();
+    const existing = data.inputs?.[videoId] ?? {
+      videoId, scriptText: "", pacingSeconds: 8, audio: null, references: [], updatedAt: now(),
+    };
+    const inputs = { ...existing, scriptText, pacingSeconds, updatedAt: now() };
+    (data.inputs ??= {})[videoId] = inputs;
+    writeBrowserData(data);
+    return inputs;
+  },
+  async pickAndImportAsset(videoId: string, kind: "audio" | "reference") {
+    if (isTauri()) return invoke<InputAssetRecord | null>("pick_and_import_asset", { videoId, kind });
+    return null;
+  },
+  async removeInputAsset(assetId: string) {
+    if (isTauri()) return invoke<void>("remove_input_asset", { assetId });
+  },
+  async pickScriptText() {
+    if (isTauri()) return invoke<string | null>("pick_script_text");
+    return null;
   },
 };

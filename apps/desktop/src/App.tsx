@@ -910,8 +910,10 @@ export function App() {
     activeChannelId,
     activeVideoId,
   } = useAppStore();
+  const [startupNotice, setStartupNotice] = useState<string | null>(null);
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
-  useEffect(() => log("info", "application_started", { release: "0.9.0" }), []);
+  useEffect(() => log("info", "application_started", { release: "1.0.0" }), []);
+  useEffect(() => { void projectsClient.startupDiagnostic().then(setStartupNotice); }, []);
   useEffect(() => log("debug", "stage_opened", { stage }), [stage]);
   useEffect(() => {
     if (!activeChannelId || !activeVideoId) return;
@@ -930,7 +932,7 @@ export function App() {
   return (
     <div className="app-shell">
       <Sidebar />
-      <main><Header />{stage === "home" && <HomeView />}{stage === "inputs" && <InputsView />}{stage === "visual-plan" && <VisualPlanView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
+      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{stage === "inputs" && <InputsView />}{stage === "visual-plan" && <VisualPlanView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
     </div>
   );
 }

@@ -5,6 +5,7 @@ use projects::{
     PromptVersion, ProviderKeyStatus, ResumeState, Timeline, Video, VideoInputs, VisualPlan,
 };
 use std::fs;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -17,6 +18,17 @@ fn application_version() -> &'static str {
 }
 
 type RepositoryState = Mutex<ProjectRepository>;
+struct StartupState {
+    recovery_backup: Option<PathBuf>,
+}
+
+#[tauri::command]
+fn startup_diagnostic(state: State<'_, StartupState>) -> Option<String> {
+    state.recovery_backup.as_ref().map(|path| format!(
+        "The local database was damaged and replaced with a clean database. A recovery copy was preserved at {}.",
+        path.display()
+    ))
+}
 
 fn with_repository<T>(
     state: State<'_, RepositoryState>,
@@ -555,7 +567,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_local_data_dir()?;
-            let repository = ProjectRepository::open(
+            let (repository, recovery_backup) = ProjectRepository::open_with_recovery(
                 &data_dir.join("auto-gen-studio.db"),
                 &data_dir.join("Projects"),
             )
@@ -564,10 +576,12 @@ pub fn run() {
                 .recover_image_jobs()
                 .map_err(std::io::Error::other)?;
             app.manage(Mutex::new(repository));
+            app.manage(StartupState { recovery_backup });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             application_version,
+            startup_diagnostic,
             list_channels,
             create_channel,
             list_videos,

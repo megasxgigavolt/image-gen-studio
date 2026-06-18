@@ -409,6 +409,52 @@ pub struct ProjectRepository {
 }
 
 impl ProjectRepository {
+    pub fn open_with_recovery(
+        database_path: &Path,
+        projects_dir: &Path,
+    ) -> Result<(Self, Option<PathBuf>), String> {
+        match Self::open(database_path, projects_dir) {
+            Ok(repository) => {
+                repository.verify_integrity()?;
+                Ok((repository, None))
+            }
+            Err(first_error) => {
+                if !database_path.exists() {
+                    return Err(first_error);
+                }
+                let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
+                let backup = database_path
+                    .with_file_name(format!("auto-gen-studio-recovery-{timestamp}.db"));
+                fs::copy(database_path, &backup).map_err(|error| {
+                    format!("Database failed to open ({first_error}) and backup failed: {error}")
+                })?;
+                for suffix in ["-wal", "-shm"] {
+                    let sidecar = PathBuf::from(format!("{}{}", database_path.display(), suffix));
+                    if sidecar.exists() {
+                        let _ = fs::copy(
+                            &sidecar,
+                            PathBuf::from(format!("{}{}", backup.display(), suffix)),
+                        );
+                        let _ = fs::remove_file(sidecar);
+                    }
+                }
+                fs::remove_file(database_path).map_err(|error| {
+                    format!(
+                        "Database backup was created at {} but recovery failed: {error}",
+                        backup.display()
+                    )
+                })?;
+                let repository = Self::open(database_path, projects_dir).map_err(|error| {
+                    format!(
+                        "Recovery backup: {}. Clean database initialization failed: {error}",
+                        backup.display()
+                    )
+                })?;
+                Ok((repository, Some(backup)))
+            }
+        }
+    }
+
     pub fn open(database_path: &Path, projects_dir: &Path) -> Result<Self, String> {
         if let Some(parent) = database_path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -425,6 +471,18 @@ impl ProjectRepository {
         };
         repository.migrate()?;
         Ok(repository)
+    }
+
+    fn verify_integrity(&self) -> Result<(), String> {
+        let status: String = self
+            .connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|error| format!("Database integrity check failed: {error}"))?;
+        if status == "ok" {
+            Ok(())
+        } else {
+            Err(format!("Database integrity check reported: {status}"))
+        }
     }
 
     fn migrate(&self) -> Result<(), String> {
@@ -2630,5 +2688,18 @@ mod tests {
                 )
                 .is_err());
         }
+    }
+
+    #[test]
+    fn preserves_corrupt_database_before_recovery() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("app.db");
+        fs::write(&database, b"not a sqlite database").unwrap();
+        let (repo, backup) =
+            ProjectRepository::open_with_recovery(&database, &temp.path().join("Projects"))
+                .unwrap();
+        assert!(backup.as_ref().unwrap().exists());
+        assert_eq!(fs::read(backup.unwrap()).unwrap(), b"not a sqlite database");
+        assert!(repo.verify_integrity().is_ok());
     }
 }

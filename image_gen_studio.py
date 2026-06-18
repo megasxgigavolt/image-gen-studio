@@ -182,6 +182,14 @@ COLOR_TEMPS     = _ADV + ["Warm Light", "Cool Light", "Neutral Light", "Mixed Te
 FRAMING_RULES   = _ADV + ["Rule of Thirds", "Centered / Symmetrical", "Golden Ratio", "Diagonal", "Frame Within Frame"]
 COMP_DEPTHS     = _ADV + ["Foreground Emphasis", "Midground Emphasis", "Background Emphasis", "Full Layered Depth"]
 
+# Style / Rendering — for precise style-reproduction from reference images
+OUTLINE_WEIGHTS  = _ADV + ["No Outline", "Hairline (0.5px)", "Thin (1px)", "Medium (2px)", "Bold (3px)", "Very Bold (4px+)"]
+SHADING_STYLES   = _ADV + ["Flat / No Shading", "Flat Cel-Shaded (2-tone)", "Cel-Shaded (3-tone)", "Smooth Gradient", "Hard Edge Shading", "Cross-Hatch", "Painterly / Loose Strokes"]
+SATURATION_LVLS  = _ADV + ["Hyper-Saturated", "High Saturation", "Natural / Moderate", "Muted / Desaturated", "Greyscale / Monochromatic"]
+DETAIL_LEVELS    = _ADV + ["Ultra Detailed", "Highly Detailed", "Medium Detail", "Simplified / Clean", "Minimalist"]
+HIGHLIGHT_STYLES = _ADV + ["Sharp Specular Highlights", "Soft Diffuse Highlights", "Flat Colour Highlights", "No Highlights"]
+TEXTURE_STYLES   = _ADV + ["Smooth / Clean Digital", "Hand-Drawn Line Texture", "Painterly Brushstrokes", "Film Grain / Noise", "Cross-Hatch Texture", "Stipple / Pointillist"]
+
 # GPT model tiers — only multimodal/chat-capable models relevant for prompt & vision work
 HC_MODELS = ["gpt-4o", "gpt-4.1", "gpt-5", "gpt-5.1", "o3"]      # Higher Capacity
 HV_MODELS = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1-nano",
@@ -214,22 +222,26 @@ def _build_extraction_prompt(ref_desc: str) -> tuple[str, str]:
         )
 
     system_msg = (
-        "You are an elite visual analyst whose output will be fed verbatim into AI image generation prompts. "
-        "Extract technical rendering details so precisely that another AI reproduces the EXACT same visual without seeing the original. "
+        "You are an elite visual forensics analyst. Your output feeds directly into an AI image generator. "
+        "Your job: extract style parameters so precisely that the generator reproduces the EXACT same visual "
+        "style without ever seeing the original image. "
+        "Every measurement, colour, technique, and pixel-level detail must be named explicitly. "
         "Rules: "
-        "(1) Copy dropdown option strings EXACTLY — letter for letter. "
-        "(2) extra_notes = ONLY rendering/technique details — no subjects, no objects, no scene descriptions. "
-        "(3) style_prompt = direct actionable instructions starting with verbs (Use/Apply/Render/Add). "
-        "    NEVER use 'capture', 'mirror', 'reflect', 'evoke', 'ensure consistency', or 'cohesive'. "
-        "(4) main_subject = a CONDITIONAL appearance rule starting with 'SUBJECT STYLE:' that says "
-        "    'When a [type] appears in the scene, render it as:' then lists hex colour regions, "
-        "    markings, fur/texture rendering, and ends with 'maintain natural real-world proportions'. "
-        "    NEVER use 'always depict' or 'include in every image' — it is conditional on scene context."
+        "(1) Copy dropdown option strings EXACTLY — character for character. "
+        "(2) Never use vague terms — 'bold black outlines' tells an AI nothing; "
+        "    '3-4px solid #000000 ink outlines on every silhouette and internal edge' does. "
+        "(3) style_prompt = DIRECT Gemini image-generation instructions. Each sentence starts with a verb "
+        "    (Draw / Apply / Use / Render / Fill / Cast / Add / Make). "
+        "    FORBIDDEN words: capture, mirror, reflect, evoke, ensure, cohesive, maintain consistency. "
+        "(4) main_subject = CONDITIONAL appearance rule, never unconditional. "
+        "    Start with 'SUBJECT STYLE: When a [type] appears, render it as:' "
+        "    Include exact hex codes for every colour region."
     )
     user_text = (
-        f"Perform a deep visual style analysis of this image. {focus_instruction}\n\n"
+        f"Perform a forensic visual style extraction of this image. {focus_instruction}\n\n"
         f"Return a JSON object with EXACTLY these keys:\n\n"
 
+        # ── Basic dropdowns ──────────────────────────────────────────────────
         f'"art_style": one of {json.dumps(ART_STYLES)}\n'
         f'"camera_angle": one of {json.dumps(CAMERA_ANGLES)}\n'
         f'"mood": one of {json.dumps(MOODS)}\n'
@@ -237,48 +249,7 @@ def _build_extraction_prompt(ref_desc: str) -> tuple[str, str]:
         f'"color_palette": one of {json.dumps(COLOR_PALETTES)}\n'
         f'"depth_of_field": one of {json.dumps(DEPTH_OF_FIELD)}\n\n'
 
-        f'"extra_notes": HIGHLY DETAILED rendering technique only (NO subjects/objects). Must include:\n'
-        f'  - Outline weight and colour (e.g. "bold 3px solid black ink outlines")\n'
-        f'  - Shading method (e.g. "flat cel-shading with 2-3 tonal steps per surface")\n'
-        f'  - Exact dominant scene colours WITH hex codes (e.g. "rust orange #C4622D, cream white #FFF5E6")\n'
-        f'  - Shadow technique (e.g. "hard-edged shadows, no ambient occlusion")\n'
-        f'  - Texture/pattern details (e.g. "45° crosshatch on shadow areas, plaid fabric patterns")\n'
-        f'  - Background complexity (e.g. "fully detailed interior with perspective lines")\n\n'
-
-        f'"main_subject": A CONDITIONAL appearance rule for the primary subject. '
-        f'Start with "SUBJECT STYLE: When a [species/type] appears in the scene, render it as:" '
-        f'then in ONE compact paragraph:\n'
-        f'  - Species/type (e.g. "grey American Shorthair tabby cat")\n'
-        f'  - Every colour region with hex codes (e.g. "base fur silver-grey #9A9A9A, '
-        f'    bold stripe markings charcoal #2D2D2D, eyes amber-gold #C87941")\n'
-        f'  - Distinctive markings (e.g. "M-marking on forehead, tabby swirls on flanks")\n'
-        f'  - Fur/texture rendering technique (e.g. "fine parallel curved strokes")\n'
-        f'  - End with: "Maintain natural real-world proportions — do not exaggerate size."\n'
-        f'  NEVER use "always depict", "include in every image", or unconditional language.\n'
-        f'  Example: "SUBJECT STYLE: When a cat appears in the scene, render it as a grey '
-        f'  American Shorthair tabby: base fur silver-grey #9A9A9A, bold black tabby stripe '
-        f'  markings #2D2D2D, amber-gold eyes #C87941, fine parallel fur strokes. '
-        f'  Maintain natural real-world proportions — do not exaggerate size."\n\n'
-
-        f'"style_prompt": 6-8 sentences of DIRECT technical style instructions. Each starts with a verb. '
-        f'MUST cover in order: (1) outline style with pixel weight, (2) shading/colouring method, '
-        f'(3) exact colour palette with 4-6 hex codes and names, (4) shadow/highlight technique, '
-        f'(5) texture and pattern details, (6) background rendering approach, '
-        f'(7) lighting quality and direction, (8) subject-specific rendering — '
-        f'explicitly state how the MAIN SUBJECT should be rendered (fur strokes, eye style, markings). '
-        f'Example for a comic-book cat illustration: '
-        f'"Render with bold 3px solid black ink outlines on all shapes. '
-        f'Apply flat cel-shading using exactly 3 tonal values: base, mid-shadow, and accent highlight. '
-        f'Use this restricted palette: rust orange #C4622D, cream white #FFF5E6, silver-grey #9A9A9A, '
-        f'charcoal #2D2D2D, warm tan #C8956C, amber #C87941. '
-        f'Cast hard-edged shadows with no gradient softness. '
-        f'Add 45-degree crosshatch strokes in shadow regions on fabric and fur. '
-        f'Render backgrounds with full interior perspective detail and plaid/tartan textile patterns. '
-        f'Light from a warm window source at upper-left with golden ambient fill. '
-        f'Depict the cat with fine directional parallel fur strokes, bold black tabby stripe markings, '
-        f'and large amber eyes with black slit pupils." '
-        f'Do NOT use vague terms.\n\n'
-
+        # ── Advanced camera / lighting / composition ──────────────────────────
         f'"shot_type": one of {json.dumps(SHOT_TYPES[2:])}\n'
         f'"light_source": one of {json.dumps(LIGHT_SOURCES[2:])}\n'
         f'"light_direction": one of {json.dumps(LIGHT_DIRS[2:])}\n'
@@ -289,7 +260,66 @@ def _build_extraction_prompt(ref_desc: str) -> tuple[str, str]:
         f'"color_temperature": one of {json.dumps(COLOR_TEMPS[2:])}\n'
         f'"framing_rule": one of {json.dumps(FRAMING_RULES[2:])}\n\n'
 
-        f"Return ONLY valid JSON with ALL keys listed above. No markdown fences, no extra text."
+        # ── Style reproduction ────────────────────────────────────────────────
+        f'"outline_weight": one of {json.dumps(OUTLINE_WEIGHTS[2:])}\n'
+        f'"shading_style": one of {json.dumps(SHADING_STYLES[2:])}\n'
+        f'"saturation": one of {json.dumps(SATURATION_LVLS[2:])}\n'
+        f'"detail_level": one of {json.dumps(DETAIL_LEVELS[2:])}\n'
+        f'"highlight_style": one of {json.dumps(HIGHLIGHT_STYLES[2:])}\n'
+        f'"texture_style": one of {json.dumps(TEXTURE_STYLES[2:])}\n\n'
+
+        # ── extra_notes ───────────────────────────────────────────────────────
+        f'"extra_notes": Ultra-specific rendering recipe (NO subject descriptions — technique only). '
+        f'Structure it as numbered lines:\n'
+        f'  1. Outline: exact px weight + colour (e.g. "3px solid #1A1A1A ink outline on every silhouette and internal edge")\n'
+        f'  2. Shading: method + number of tonal steps + blend type (e.g. "flat cel-shading, 3 tonal steps: '
+        f'     base #F0D5A0, mid-shadow #C8956C at hard edge, deep shadow #7A4A28 no gradient")\n'
+        f'  3. Palette: ALL dominant colours as "name #hex" pairs, max 8 (e.g. "rust #C4622D, cream #FFF5E6, '
+        f'     charcoal #2D2D2D")\n'
+        f'  4. Highlights: exact style (e.g. "1px white #FFFFFF specular dot on glossy surfaces and eyes")\n'
+        f'  5. Shadows: hardness + colour (e.g. "hard-cut shadow edges, shadow fill #2D2D2D, zero gradient")\n'
+        f'  6. Textures: any applied texture or pattern (e.g. "45° crosshatch at 0.5px in shadow regions on fabric")\n'
+        f'  7. Line quality: stroke consistency (e.g. "uniform weight, no taper, no rough edges, clean vector-like")\n'
+        f'  8. Background: complexity and treatment (e.g. "fully detailed interior with 2-point perspective, '
+        f'     all surfaces textured and coloured")\n\n'
+
+        # ── main_subject ──────────────────────────────────────────────────────
+        f'"main_subject": CONDITIONAL appearance rule. '
+        f'Format: "SUBJECT STYLE: When a [species/type] appears in the scene, render it as: [compact paragraph]." '
+        f'The paragraph must include:\n'
+        f'  - Species/breed (e.g. "grey American Shorthair tabby cat")\n'
+        f'  - Every colour region with name + hex (e.g. "base fur silver-grey #9A9A9A, '
+        f'    stripe markings charcoal #2D2D2D, eyes amber-gold #C87941, nose pink #E8A090")\n'
+        f'  - Distinctive markings with positions (e.g. "M-marking on forehead, swirl pattern on flanks, '
+        f'    white bib on chest")\n'
+        f'  - Fur/texture rendering (e.g. "fine directional parallel curved strokes following muscle contour")\n'
+        f'  - "Maintain natural real-world proportions — do not exaggerate any feature."\n'
+        f'  NEVER use "always depict", "include in every image", or unconditional phrasing.\n\n'
+
+        # ── style_prompt ──────────────────────────────────────────────────────
+        f'"style_prompt": 12-15 sentences of DIRECT technical image-generation instructions. '
+        f'Each sentence starts with a strong verb and covers exactly ONE visual parameter. '
+        f'Write as if commanding an image generator — be prescriptive, not descriptive. '
+        f'Cover IN ORDER:\n'
+        f'  1. Outline/linework: verb + exact weight + colour + where applied\n'
+        f'  2. Shading method: verb + technique name + number of tonal values\n'
+        f'  3. Colour palette: "Use ONLY these N colours:" then list name #hex for each\n'
+        f'  4. Highlight rendering: verb + style + colour + placement rule\n'
+        f'  5. Shadow rendering: verb + hardness + colour + edge treatment\n'
+        f'  6. Texture/surface treatment: verb + technique + which surfaces it applies to\n'
+        f'  7. Line quality/stroke consistency: verb + uniformity + character\n'
+        f'  8. Background complexity: verb + detail level + perspective type if applicable\n'
+        f'  9. Lighting: verb + source position + colour temperature + quality\n'
+        f' 10. Colour saturation: verb + level + overall feel\n'
+        f' 11. Detail density: verb + level + which areas get most detail\n'
+        f' 12. Subject rendering — fur/skin/material: verb + exact technique for the main subject surface\n'
+        f' 13. Eye rendering (if applicable): verb + exact style (iris, pupil, highlight)\n'
+        f' 14. Any special effects (grain, bloom, vignette): include if present, else "Apply no post-processing effects."\n'
+        f' 15. Overall style lock: "Reproduce the [art style] aesthetic precisely across every element."\n'
+        f'Example sentence style: "Draw bold 3px solid #1A1A1A ink outlines on every shape silhouette and internal structural edge."\n'
+        f'NEVER use vague words: beautiful, vibrant, artistic, stylized, evocative, or dynamic.\n\n'
+
+        f"Return ONLY valid JSON with ALL keys above. No markdown fences, no extra text."
     )
     return system_msg, user_text
 
@@ -364,7 +394,6 @@ class ImageGenStudio(ctk.CTk):
         self._still_states:       dict        = {}
         self.current_image_bytes: bytes | None = None
         self.ref_image_b64:       str | None  = None
-        self._creative_mode:      bool        = False
         self.output_dir:          Path        = BASE_DIR / "generated_images"
         self.gen_state:           dict        = {}
         self._nb2_client                      = None
@@ -593,6 +622,13 @@ class ImageGenStudio(ctk.CTk):
         self.var_color_temp     = ctk.StringVar(value=AI_DECIDE)
         self.var_framing        = ctk.StringVar(value=AI_DECIDE)
         self.var_comp_depth     = ctk.StringVar(value=AI_DECIDE)
+        # Style reproduction
+        self.var_outline_weight  = ctk.StringVar(value=AI_DECIDE)
+        self.var_shading_style   = ctk.StringVar(value=AI_DECIDE)
+        self.var_saturation      = ctk.StringVar(value=AI_DECIDE)
+        self.var_detail_level    = ctk.StringVar(value=AI_DECIDE)
+        self.var_highlight_style = ctk.StringVar(value=AI_DECIDE)
+        self.var_texture_style   = ctk.StringVar(value=AI_DECIDE)
         # Extra notes — proxy so save/load/bulk-sync still use .get/.delete/.insert
         self.extra_notes = _NotesProxy()
 
@@ -618,7 +654,7 @@ class ImageGenStudio(ctk.CTk):
 
         btn_row = ctk.CTkFrame(img_card, fg_color="transparent")
         btn_row.grid(row=1, column=0, columnspan=2, padx=16, pady=(0, 14), sticky="ew")
-        btn_row.grid_columnconfigure(2, weight=1)
+        btn_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkButton(
             btn_row, text="⚙  Open Image Settings",
@@ -627,20 +663,11 @@ class ImageGenStudio(ctk.CTk):
             command=self._open_image_settings,
         ).grid(row=0, column=0, padx=(0, 10))
 
-        self._btn_creative = ctk.CTkButton(
-            btn_row, text="✦  Creative Mode",
-            height=40, corner_radius=10, width=160,
-            font=F(14, "bold"), fg_color=C["chip_bg"], hover_color=C["divider"],
-            text_color=C["text_muted"], border_width=1, border_color=C["divider"],
-            command=self._toggle_creative_mode,
-        )
-        self._btn_creative.grid(row=0, column=1, padx=(0, 10))
-
         self._settings_status_lbl = ctk.CTkLabel(
             btn_row, text="All: Let AI Decide",
             font=F(12), text_color=C["text_muted"], anchor="w",
         )
-        self._settings_status_lbl.grid(row=0, column=2, sticky="ew")
+        self._settings_status_lbl.grid(row=0, column=1, sticky="ew")
 
         # ── Section B: System Prompt (its own card) ───────────────────────────
         f = ctk.CTkFrame(wrap, fg_color=C["panel"], corner_radius=12,
@@ -717,102 +744,6 @@ class ImageGenStudio(ctk.CTk):
             self._img_settings_dlg.focus()
             return
         self._img_settings_dlg = ImageSettingsDialog(self)
-
-    def _toggle_creative_mode(self):
-        self._creative_mode = not self._creative_mode
-        if self._creative_mode:
-            self._btn_creative.configure(
-                fg_color=C["accent"], hover_color="#1A4D70",
-                text_color="white", border_color=C["accent"],
-                text="✦  Creative Mode  ON",
-            )
-        else:
-            self._btn_creative.configure(
-                fg_color=C["chip_bg"], hover_color=C["divider"],
-                text_color=C["text_muted"], border_color=C["divider"],
-                text="✦  Creative Mode",
-            )
-
-    def _get_creative_settings(self, voiceover: str, ctx_stills: list,
-                               model: str) -> str:
-        """GPT decides which image settings to activate for this specific voiceover moment.
-        Returns a formatted settings block string (only non-AI_DECIDE values)."""
-        try:
-            client = OpenAI(api_key=OPENAI_API_KEY)
-            ctx_lines = "\n".join(
-                f"  [{s['still_id']}]{'  ← THIS STILL' if s.get('voiceover') == voiceover else ''}: "
-                f"\"{s.get('voiceover', '')}\""
-                for s in ctx_stills
-            )
-            options_block = (
-                f"mood:              {json.dumps(MOODS)}\n"
-                f"lighting:          {json.dumps(LIGHTING)}\n"
-                f"color_palette:     {json.dumps(COLOR_PALETTES)}\n"
-                f"depth_of_field:    {json.dumps(DEPTH_OF_FIELD)}\n"
-                f"shot_type:         {json.dumps(SHOT_TYPES[2:])}\n"
-                f"light_source:      {json.dumps(LIGHT_SOURCES[2:])}\n"
-                f"light_direction:   {json.dumps(LIGHT_DIRS[2:])}\n"
-                f"light_quality:     {json.dumps(LIGHT_QUALITIES[2:])}\n"
-                f"contrast_level:    {json.dumps(CONTRAST_LEVELS[2:])}\n"
-                f"shadow_type:       {json.dumps(SHADOW_TYPES[2:])}\n"
-                f"lighting_style:    {json.dumps(LIGHTING_STYLES[2:])}\n"
-                f"color_temperature: {json.dumps(COLOR_TEMPS[2:])}\n"
-                f"framing_rule:      {json.dumps(FRAMING_RULES[2:])}\n"
-                f"comp_depth:        {json.dumps(COMP_DEPTHS[2:])}\n"
-            )
-            messages = [
-                {"role": "system", "content": (
-                    "You are a cinematographer choosing camera, lighting, and composition settings "
-                    "for a specific frame of an animated video. "
-                    "Pick settings that match the EMOTIONAL and VISUAL tone of the voiceover. "
-                    "Create variety between stills — different moments deserve different visual treatments. "
-                    "Return ONLY valid JSON with chosen keys. Values must be copied EXACTLY from the options. "
-                    "Only include 3-6 settings where a specific value clearly fits; omit the rest."
-                )},
-                {"role": "user", "content": (
-                    f"VOICEOVER FOR THIS STILL: \"{voiceover}\"\n\n"
-                    f"SURROUNDING STILLS FOR CONTEXT:\n{ctx_lines}\n\n"
-                    f"Choose settings that emotionally fit this moment and differ visually from adjacent stills.\n\n"
-                    f"AVAILABLE SETTINGS AND VALID VALUES:\n{options_block}\n"
-                    f"Return JSON with 3-6 settings. Omit settings where 'Let AI Decide' is fine."
-                )},
-            ]
-            resp = _gpt_call(client, model, messages, 300)
-            raw = resp.choices[0].message.content.strip()
-            if raw.startswith("```"):
-                raw = raw[raw.index("\n") + 1:]
-                if "```" in raw:
-                    raw = raw[:raw.rindex("```")]
-            data = json.loads(raw.strip())
-
-            _label_map = {
-                "mood": ("Mood:",            MOODS),
-                "lighting": ("Lighting:",    LIGHTING),
-                "color_palette": ("Color Palette:", COLOR_PALETTES),
-                "depth_of_field": ("Depth of Field:", DEPTH_OF_FIELD),
-                "shot_type": ("Shot Type:",  SHOT_TYPES),
-                "light_source": ("Light Source:", LIGHT_SOURCES),
-                "light_direction": ("Light Direction:", LIGHT_DIRS),
-                "light_quality": ("Light Quality:", LIGHT_QUALITIES),
-                "contrast_level": ("Contrast:", CONTRAST_LEVELS),
-                "shadow_type": ("Shadow Type:", SHADOW_TYPES),
-                "lighting_style": ("Lighting Style:", LIGHTING_STYLES),
-                "color_temperature": ("Color Temp:", COLOR_TEMPS),
-                "framing_rule": ("Framing Rule:", FRAMING_RULES),
-                "comp_depth": ("Depth Layers:", COMP_DEPTHS),
-            }
-            _skip = {AI_DECIDE, "N/A", ""}
-            lines = []
-            for key, (label, options) in _label_map.items():
-                val = data.get(key, "").strip()
-                if val and val not in _skip and val in options:
-                    lines.append(f"{label:22} {val}")
-            result = "\n".join(lines)
-            _logger.info(f"[CREATIVE] Settings for '{voiceover[:60]}': {result!r}")
-            return result
-        except Exception as exc:
-            _logger.warning(f"[CREATIVE] GPT call failed: {exc}")
-            return ""
 
     def _prebuild_image_settings(self):
         """Build the Image Settings dialog in the background so first click is instant."""
@@ -1297,6 +1228,13 @@ class ImageGenStudio(ctk.CTk):
         try_set(self.var_lighting_style, "lighting_style",   LIGHTING_STYLES)
         try_set(self.var_color_temp,     "color_temperature", COLOR_TEMPS)
         try_set(self.var_framing,        "framing_rule",     FRAMING_RULES)
+        # Style reproduction
+        try_set(self.var_outline_weight,  "outline_weight",   OUTLINE_WEIGHTS)
+        try_set(self.var_shading_style,   "shading_style",    SHADING_STYLES)
+        try_set(self.var_saturation,      "saturation",       SATURATION_LVLS)
+        try_set(self.var_detail_level,    "detail_level",     DETAIL_LEVELS)
+        try_set(self.var_highlight_style, "highlight_style",  HIGHLIGHT_STYLES)
+        try_set(self.var_texture_style,   "texture_style",    TEXTURE_STYLES)
 
         notes = data.get("extra_notes", "").strip()
         if notes:
@@ -1392,6 +1330,13 @@ class ImageGenStudio(ctk.CTk):
         # Layer 2 — Composition
         add("Framing Rule:",     self.var_framing)
         add("Depth Layers:",     self.var_comp_depth)
+        # Style Reproduction
+        add("Outline Weight:",   self.var_outline_weight)
+        add("Shading Style:",    self.var_shading_style)
+        add("Saturation:",       self.var_saturation)
+        add("Detail Level:",     self.var_detail_level)
+        add("Highlights:",       self.var_highlight_style)
+        add("Texture Style:",    self.var_texture_style)
 
         notes = self.extra_notes.get().strip()
         if notes:
@@ -1661,19 +1606,11 @@ class ImageGenStudio(ctk.CTk):
         if self._generating:
             return
 
-        # Snapshot all main-thread values before handing off to worker
-        sys_p      = self.sys_prompt_box.get("0.0", "end").strip()
-        settings   = self._settings_block()        # user-locked settings (AI_DECIDE already filtered)
-        voiceover  = self.selected_still.get("voiceover", "")
-        cur_id     = self.selected_still["still_id"]
-        idx        = next((i for i, s in enumerate(self.stills)
-                           if s["still_id"] == cur_id), 0)
-        ctx_stills = self.stills[max(0, idx - 2): idx + 3]
-        model      = self.gpt_model_var.get()
-
-        sid = cur_id
+        sys_p    = self.sys_prompt_box.get("0.0", "end").strip()
+        settings = self._settings_block()
+        sid      = self.selected_still["still_id"]
         _logger.info(
-            f"[SINGLE-GEN] Start — still={sid} | creative={self._creative_mode} | "
+            f"[SINGLE-GEN] Start — still={sid} | "
             f"sys_p_len={len(sys_p)} | prompt_len={len(prompt)}"
         )
 
@@ -1688,29 +1625,17 @@ class ImageGenStudio(ctk.CTk):
         self._start_spinner()
         threading.Thread(
             target=self._gen_worker,
-            args=(sys_p, prompt, settings, voiceover, ctx_stills, model),
+            args=(sys_p, prompt, settings),
             daemon=True,
         ).start()
 
-    def _gen_worker(self, sys_p: str, user_prompt: str, settings: str,
-                    voiceover: str, ctx_stills: list, model: str):
-        # If creative mode is on, get per-still settings from GPT and merge them in
-        creative_block = ""
-        if self._creative_mode and voiceover:
-            creative_block = self._get_creative_settings(voiceover, ctx_stills, model)
-
-        # Assemble full Gemini prompt (3-layer + optional creative override)
+    def _gen_worker(self, sys_p: str, user_prompt: str, settings: str):
         parts = []
         if sys_p:
             parts.append(sys_p)
         parts.append(user_prompt)
         if settings:
             parts.append(f"APPLY THESE IMAGE SETTINGS EXACTLY:\n{settings}")
-        if creative_block:
-            parts.append(
-                f"CREATIVE SETTINGS FOR THIS FRAME (apply for any settings not listed above):\n"
-                f"{creative_block}"
-            )
         prompt = "\n\n".join(parts)
 
         _logger.info(f"[NB2] Single-still Gemini call — prompt_len={len(prompt)}")
@@ -1967,8 +1892,14 @@ class ImageGenStudio(ctk.CTk):
             if "shadow_type"    in d: self.var_shadow_type.set(d["shadow_type"])
             if "lighting_style" in d: self.var_lighting_style.set(d["lighting_style"])
             if "color_temp"     in d: self.var_color_temp.set(d["color_temp"])
-            if "framing"        in d: self.var_framing.set(d["framing"])
-            if "comp_depth"     in d: self.var_comp_depth.set(d["comp_depth"])
+            if "framing"         in d: self.var_framing.set(d["framing"])
+            if "comp_depth"      in d: self.var_comp_depth.set(d["comp_depth"])
+            if "outline_weight"  in d: self.var_outline_weight.set(d["outline_weight"])
+            if "shading_style"   in d: self.var_shading_style.set(d["shading_style"])
+            if "saturation"      in d: self.var_saturation.set(d["saturation"])
+            if "detail_level"    in d: self.var_detail_level.set(d["detail_level"])
+            if "highlight_style" in d: self.var_highlight_style.set(d["highlight_style"])
+            if "texture_style"   in d: self.var_texture_style.set(d["texture_style"])
             # Extra notes
             if "extra_notes"   in d:
                 self.extra_notes.delete(0, "end")
@@ -2006,9 +1937,15 @@ class ImageGenStudio(ctk.CTk):
                 "shadow_type":    self.var_shadow_type.get(),
                 "lighting_style": self.var_lighting_style.get(),
                 "color_temp":     self.var_color_temp.get(),
-                "framing":        self.var_framing.get(),
-                "comp_depth":     self.var_comp_depth.get(),
-                "extra_notes":    self.extra_notes.get().strip(),
+                "framing":          self.var_framing.get(),
+                "comp_depth":       self.var_comp_depth.get(),
+                "outline_weight":   self.var_outline_weight.get(),
+                "shading_style":    self.var_shading_style.get(),
+                "saturation":       self.var_saturation.get(),
+                "detail_level":     self.var_detail_level.get(),
+                "highlight_style":  self.var_highlight_style.get(),
+                "texture_style":    self.var_texture_style.get(),
+                "extra_notes":      self.extra_notes.get().strip(),
                 "system_prompt":  self.sys_prompt_box.get("0.0", "end").strip(),
                 "output_dir":     str(self.output_dir),
             }
@@ -2240,6 +2177,14 @@ class ImageSettingsDialog(ctk.CTkToplevel):
         divider_title("COMPOSITION")
         row("Framing Rule:", FRAMING_RULES, app.var_framing)
         row("Depth Layers:", COMP_DEPTHS,   app.var_comp_depth)
+
+        divider_title("STYLE REPRODUCTION")
+        row("Outline Weight:",  OUTLINE_WEIGHTS,  app.var_outline_weight)
+        row("Shading Style:",   SHADING_STYLES,   app.var_shading_style)
+        row("Saturation:",      SATURATION_LVLS,  app.var_saturation)
+        row("Detail Level:",    DETAIL_LEVELS,    app.var_detail_level)
+        row("Highlights:",      HIGHLIGHT_STYLES, app.var_highlight_style)
+        row("Texture Style:",   TEXTURE_STYLES,   app.var_texture_style)
 
         # Bottom padding
         ctk.CTkFrame(sec, height=10, fg_color="transparent").grid(

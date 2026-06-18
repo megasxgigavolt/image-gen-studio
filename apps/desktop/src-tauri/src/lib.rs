@@ -1,6 +1,8 @@
 mod projects;
 
-use projects::{Channel, InputAsset, ProjectRepository, ResumeState, Video, VideoInputs};
+use projects::{
+    Channel, InputAsset, ProjectRepository, ResumeState, Video, VideoInputs, VisualPlan,
+};
 use std::fs;
 use std::sync::Mutex;
 use tauri::{Manager, State};
@@ -184,6 +186,44 @@ fn pick_script_text(app: tauri::AppHandle) -> Result<Option<String>, String> {
         .map_err(|_| "Script must be a UTF-8 plain-text file.".to_string())
 }
 
+#[tauri::command]
+fn generate_visual_plan(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<VisualPlan, String> {
+    with_repository(state, |repository| {
+        repository.generate_visual_plan(&video_id)
+    })
+}
+
+#[tauri::command]
+fn get_visual_plan(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<VisualPlan, String> {
+    with_repository(state, |repository| repository.get_visual_plan(&video_id))
+}
+
+#[tauri::command]
+fn move_plan_sentence(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    sentence_id: String,
+    target_group_id: String,
+) -> Result<VisualPlan, String> {
+    with_repository(state, |repository| {
+        repository.move_plan_sentence(&video_id, &sentence_id, &target_group_id)
+    })
+}
+
+#[tauri::command]
+fn reset_visual_plan(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<VisualPlan, String> {
+    with_repository(state, |repository| repository.reset_visual_plan(&video_id))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -215,7 +255,11 @@ pub fn run() {
             save_video_inputs,
             pick_and_import_asset,
             remove_input_asset,
-            pick_script_text
+            pick_script_text,
+            generate_visual_plan,
+            get_visual_plan,
+            move_plan_sentence,
+            reset_visual_plan
         ])
         .run(tauri::generate_context!())
         .expect("error while running Auto Gen Studio");

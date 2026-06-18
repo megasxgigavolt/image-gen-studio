@@ -1,5 +1,16 @@
 # Image Gen Studio — Changelog
 
+## [0.4.0-visual-plan] — 2026-06-18
+
+### Added
+- Versioned Python JSON-lines engine contract.
+- CPU-configured optional local Whisper transcription adapter.
+- Deterministic script segmentation and estimated sentence timing.
+- SQLite migration 3 for immutable sentences and original/current groups.
+- Persistent adjacent-scene sentence drag and drop.
+- Automatic group timestamp derivation and exact reset to original plan.
+- Python tests and CI quality gate.
+
 ## [0.3.0-inputs] — 2026-06-18
 
 ### Added

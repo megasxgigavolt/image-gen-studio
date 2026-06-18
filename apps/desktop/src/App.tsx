@@ -14,8 +14,6 @@ import {
   WandSparkles,
 } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useState } from "react";
-import { demoSentences } from "./data/demo";
-import { deriveGroupTiming } from "./domain/visual-plan";
 import { type AppStage, useAppStore } from "./store/app-store";
 import { log } from "./infrastructure/logger";
 import {
@@ -23,6 +21,7 @@ import {
   type ChannelRecord,
   type ResumeRecord,
   type VideoRecord,
+  type VisualPlanRecord,
 } from "./infrastructure/projects-client";
 
 const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
@@ -341,29 +340,50 @@ function InputsView() {
           <article className={ready ? "readiness ready" : "readiness"}><strong>{ready ? "Ready for visual planning" : "Source material incomplete"}</strong><span>{ready ? "Script and narration audio are available." : "Add a script and narration audio to continue."}</span></article>
         </div>
       </div>
-      <div className="footer-actions"><button className="secondary" onClick={() => setStage("home")}>Back</button><button className="primary" disabled={!ready} onClick={() => setStage("visual-plan")}>Generate visual plan →</button></div>
+      <div className="footer-actions"><button className="secondary" onClick={() => setStage("home")}>Back</button><button className="primary" disabled={!ready || !activeVideoId} onClick={() => void projectsClient.generateVisualPlan(activeVideoId!).then(() => setStage("visual-plan")).catch((caught) => setError(String(caught)))}>Generate visual plan →</button></div>
     </section>
   );
 }
 
 function VisualPlanView() {
-  const { visualPlan, moveSentence, resetVisualPlan, setStage } = useAppStore();
+  const { activeVideoId, setStage } = useAppStore();
+  const [plan, setPlan] = useState<VisualPlanRecord | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!activeVideoId) return;
+    void projectsClient.getVisualPlan(activeVideoId).then(setPlan).catch((caught) => setError(String(caught)));
+  }, [activeVideoId]);
+
+  async function moveSentence(sentenceId: string, targetGroupId: string) {
+    if (!activeVideoId) return;
+    try { setPlan(await projectsClient.movePlanSentence(activeVideoId, sentenceId, targetGroupId)); }
+    catch (caught) { setError(String(caught)); }
+  }
+
+  async function resetPlan() {
+    if (!activeVideoId) return;
+    setPlan(await projectsClient.resetVisualPlan(activeVideoId));
+  }
+
   return (
     <section className="view">
       <div className="page-heading">
         <div><p className="eyebrow">Stage 2 of 3</p><h1>Visual plan</h1><p>Drag a sentence into an adjacent still to regroup it. Chronological order remains enforced.</p></div>
-        <div className="heading-actions"><button className="secondary" onClick={resetVisualPlan}>Reset original</button><button className="primary" onClick={() => setStage("images")}>Continue to images →</button></div>
+        <div className="heading-actions"><button className="secondary" disabled={!plan} onClick={() => void resetPlan()}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
       </div>
-      <div className="plan-summary"><strong>{visualPlan.length} stills</strong><span>Original AI plan is always recoverable</span></div>
+      {error && <div className="inline-error">{error}</div>}
+      {!plan && !error && <div className="empty-state">Loading visual plan…</div>}
+      {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{plan.timingSource} timing · Original plan is always recoverable</span></div>
       <div className="plan-list">
-        {visualPlan.map((group, index) => {
-          const timing = deriveGroupTiming(group, demoSentences);
+        {plan.groups.map((group, index) => {
+          const members = group.sentenceIds.map((id) => plan.sentences.find((sentence) => sentence.id === id)).filter((sentence): sentence is NonNullable<typeof sentence> => Boolean(sentence)).sort((a,b) => a.ordinal-b.ordinal);
+          const timing = { startSeconds: members[0].startSeconds, endSeconds: members.at(-1)!.endSeconds, durationSeconds: members.at(-1)!.endSeconds-members[0].startSeconds, members };
           return (
             <article
               className="plan-row"
               key={group.id}
               onDragOver={(event) => event.preventDefault()}
-              onDrop={(event) => moveSentence(event.dataTransfer.getData("text/sentence-id"), group.id)}
+              onDrop={(event) => void moveSentence(event.dataTransfer.getData("text/sentence-id"), group.id)}
             >
               <span className="plan-index">{String(index + 1).padStart(2, "0")}</span>
               <div className="timing"><strong>{formatTime(timing.startSeconds)} – {formatTime(timing.endSeconds)}</strong><small>{timing.durationSeconds.toFixed(1)} sec</small></div>
@@ -383,7 +403,7 @@ function VisualPlanView() {
             </article>
           );
         })}
-      </div>
+      </div></>}
     </section>
   );
 }
@@ -409,7 +429,7 @@ export function App() {
     activeVideoId,
   } = useAppStore();
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
-  useEffect(() => log("info", "application_started", { release: "0.3.0" }), []);
+  useEffect(() => log("info", "application_started", { release: "0.4.0" }), []);
   useEffect(() => log("debug", "stage_opened", { stage }), [stage]);
   useEffect(() => {
     if (!activeChannelId || !activeVideoId) return;

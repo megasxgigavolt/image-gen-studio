@@ -1,0 +1,10 @@
+pyproject.toml
+auto_gen_engine/__init__.py
+auto_gen_engine/main.py
+auto_gen_engine/visual_plan.py
+auto_gen_studio_engine.egg-info/PKG-INFO
+auto_gen_studio_engine.egg-info/SOURCES.txt
+auto_gen_studio_engine.egg-info/dependency_links.txt
+auto_gen_studio_engine.egg-info/requires.txt
+auto_gen_studio_engine.egg-info/top_level.txt
+tests/test_visual_plan.py

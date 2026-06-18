@@ -29,4 +29,13 @@ describe("projectsClient browser fallback", () => {
       pacingSeconds: 10,
     });
   });
+
+  it("generates and resets a browser visual plan", async () => {
+    const channel = await projectsClient.createChannel("Channel");
+    const video = await projectsClient.createVideo(channel.id, "Video");
+    await projectsClient.saveVideoInputs(video.id, "First sentence. Second sentence.", 8);
+    const original = await projectsClient.generateVisualPlan(video.id);
+    expect(original.sentences).toHaveLength(2);
+    expect((await projectsClient.resetVisualPlan(video.id)).groups).toEqual(original.groups);
+  });
 });

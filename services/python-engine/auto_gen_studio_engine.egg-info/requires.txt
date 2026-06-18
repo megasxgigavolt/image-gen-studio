@@ -1,0 +1,6 @@
+
+[test]
+pytest>=8
+
+[whisper]
+openai-whisper>=20240930

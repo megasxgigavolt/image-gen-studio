@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: auto-gen-studio-engine
+Version: 0.4.0
+Requires-Python: >=3.10
+Provides-Extra: whisper
+Requires-Dist: openai-whisper>=20240930; extra == "whisper"
+Provides-Extra: test
+Requires-Dist: pytest>=8; extra == "test"

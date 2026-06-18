@@ -1,5 +1,21 @@
 # Image Gen Studio — Changelog
 
+## [0.1.0-foundation] — Unreleased
+
+### Added
+- Auto Gen Studio monorepo and release-scoped development roadmap.
+- React 19 and TypeScript product shell based on the approved HTML mockup.
+- Home, Inputs, Visual Plan, and Image Generation stage navigation.
+- Light and dark design tokens with responsive desktop layouts.
+- Typed visual-plan domain model, sentence regrouping, timestamp derivation,
+  chronological movement constraints, and reset-to-original behavior.
+- Frontend lint, type-check, unit test, and production build quality gates.
+- GitHub Actions quality workflow and architecture decision records.
+
+### Migration
+- The existing CustomTkinter app remains unchanged as a legacy behavioral
+  reference. New production modules must not import it.
+
 ## [v1.6.0] — 2026-06-16 — Dynamic per-still GPT prompts, restart button, ref image sync
 
 ### Features

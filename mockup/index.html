@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Auto Gen Studio</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <span class="logo-back"></span>
+          <span class="logo-front"></span>
+          <span class="logo-play"></span>
+        </span>
+        <span class="brand-name">Auto Gen <b>Studio</b></span>
+      </div>
+      <nav>
+        <button class="nav-item active" data-page="home"><span>⌂</span>Home</button>
+        <button class="nav-item" data-page="inputs"><span>＋</span>Inputs</button>
+        <button class="nav-item" data-page="plan"><span>▤</span>Visual plan</button>
+        <button class="nav-item" data-page="images"><span>▧</span>Images</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <button class="nav-item"><span>⚙</span>Settings</button>
+        <div class="profile"><span>AK</span><div><strong>Ahmed</strong><small>Local workspace</small></div></div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div class="breadcrumbs"><span>Beneath the Fins</span><b>/</b><strong>The Ocean's Twilight Zone</strong></div>
+        <div class="top-actions"><span class="autosave">● Saved locally</span><button class="icon-btn" title="Notifications">♢</button></div>
+      </header>
+
+      <section class="page active" id="home">
+        <div class="page-head"><div><p class="eyebrow">Workspace</p><h1>Good evening, Ahmed</h1><p>Continue a video or begin a new production.</p></div><button class="primary" data-go="inputs">＋ New video</button></div>
+        <button class="resume" data-go="images">
+          <div><span class="eyebrow">Continue where you left off</span><h2>The Ocean's Twilight Zone</h2><p>12 of 18 stills generated · Image generation</p></div>
+          <span class="resume-arrow">→</span>
+        </button>
+        <div class="section-title"><h2>Channels</h2><button class="text-btn">＋ Add channel</button></div>
+        <div class="channel-layout">
+          <div class="channel-list">
+            <button class="channel active"><span class="channel-art ocean">BF</span><div><strong>Beneath the Fins</strong><small>4 videos</small></div><b>›</b></button>
+            <button class="channel"><span class="channel-art history">HF</span><div><strong>Hidden Frontiers</strong><small>2 videos</small></div><b>›</b></button>
+          </div>
+          <div class="video-grid">
+            <article class="video-card" data-go="images"><div class="thumb ocean-thumb"><span>12 / 18</span></div><div><small>IN PROGRESS</small><h3>The Ocean's Twilight Zone</h3><p>Image generation · Edited 8 min ago</p><progress value="67" max="100"></progress></div></article>
+            <article class="video-card" data-go="plan"><div class="thumb reef-thumb"><span>18 scenes</span></div><div><small>PLAN READY</small><h3>Why Coral Reefs Glow at Night</h3><p>Visual plan · Edited yesterday</p><progress value="38" max="100"></progress></div></article>
+            <article class="video-card"><div class="thumb whale-thumb"><span>Complete</span></div><div><small class="done">EXPORTED</small><h3>The Secret Language of Whales</h3><p>Completed June 12</p><progress value="100" max="100"></progress></div></article>
+          </div>
+        </div>
+      </section>
+
+      <section class="page" id="inputs">
+        <div class="stage-head"><div><p class="eyebrow">Stage 1 of 3</p><h1>Source material</h1><p>Add the narration and references that will guide the visual plan.</p></div><div class="stepper"><span class="on">1</span><i></i><span>2</span><i></i><span>3</span></div></div>
+        <div class="input-grid">
+          <div class="panel script-panel"><div class="panel-head"><div><h2>Script</h2><p>Paste narration or import a text file.</p></div><button class="secondary">↑ Import</button></div><textarea>Far below the sunlit surface lies a world suspended between light and darkness. Oceanographers call it the twilight zone, a vast layer stretching from two hundred to one thousand meters deep.</textarea><div class="field-meta"><span>1,248 words</span><span>Approx. 8 min 20 sec</span></div></div>
+          <div class="right-stack">
+            <div class="panel"><div class="panel-head"><div><h2>Narration audio</h2><p>Used for word-level timing.</p></div></div><div class="audio-file"><button>▶</button><div><strong>twilight-zone-final.wav</strong><small>08:17 · WAV · 79.6 MB</small></div><button class="icon-btn">×</button></div></div>
+            <div class="panel"><div class="panel-head"><div><h2>Visual references</h2><p>Optional style and subject guidance.</p></div><button class="secondary">＋ Add</button></div><div class="reference-row"><div class="mini-ref ocean-thumb"></div><div class="mini-ref reef-thumb"></div><button class="add-ref">＋</button></div></div>
+            <div class="panel pacing"><div class="panel-head"><div><h2>Scene pacing</h2><p>Controls the target duration per still.</p></div><strong id="paceValue">8 sec</strong></div><input id="pace" type="range" min="4" max="14" value="8"><div class="range-labels"><span>Fast · 4s</span><span>Slow · 14s</span></div></div>
+          </div>
+        </div>
+        <div class="footer-actions"><button class="secondary" data-go="home">Back</button><button class="primary" data-go="plan">Generate visual plan →</button></div>
+      </section>
+
+      <section class="page" id="plan">
+        <div class="stage-head"><div><p class="eyebrow">Stage 2 of 3</p><h1>Visual plan</h1><p>Review how the narration is grouped before generating visuals.</p></div><div class="plan-actions"><button class="secondary">↻ Re-run plan</button><button class="primary" data-go="images">Continue to images →</button></div></div>
+        <div class="plan-toolbar"><div><strong id="stillCount">8 stills</strong><span id="planSummary">01:10 total · Drag sentences to regroup scenes</span></div><div><button class="seg active">All</button><button class="seg">Flagged 2</button></div></div>
+        <div class="drag-help"><span class="drag-demo">⠿</span><div><strong>Drag sentences between stills</strong><p>Drop onto another row to merge, or between rows to create a new still. Timestamps update automatically.</p></div><button class="text-btn" id="resetPlan">Reset demo</button></div>
+        <div class="scene-list" id="sceneList"></div>
+      </section>
+
+      <section class="page image-page" id="images">
+        <div class="image-toolbar">
+          <div><p class="eyebrow">Stage 3 of 3</p><h1>Image generation</h1></div>
+          <div><button class="secondary">⇩ Export</button><button class="primary" id="bulkBtn">▶ Generate pending</button></div>
+        </div>
+        <div class="workspace">
+          <aside class="filmstrip"><div class="film-head"><strong>Stills</strong><span>12/18</span></div><div id="filmItems"></div></aside>
+          <div class="canvas-column">
+            <div class="canvas-head"><div><span class="scene-number">Still 04</span><strong>00:26.4 – 00:35.8</strong></div><div><button class="icon-btn">↶</button><button class="icon-btn">↷</button><button class="icon-btn">⋯</button></div></div>
+            <div class="image-canvas"><img src="../generated_images/s1_v1.png" alt="Generated deep ocean scene"><span class="version">Version 3</span></div>
+            <div class="canvas-actions"><div><button class="secondary">⌕ View full</button><button class="secondary">✎ Edit image</button></div><div><button class="icon-btn" title="Previous">←</button><button class="icon-btn" title="Next">→</button></div></div>
+            <div class="timeline-copy"><span></span><p>Far below the sunlit surface lies a world suspended between light and darkness.</p></div>
+          </div>
+          <aside class="control-panel">
+            <button class="style-summary" id="styleToggle"><div><span class="eyebrow">Video style</span><strong>Cinematic deep-ocean documentary</strong></div><span id="styleChevron">⌄</span></button>
+            <div class="style-details" id="styleDetails">
+              <label>Style directive<textarea>Natural-history documentary, photoreal marine life, restrained cinematic lighting.</textarea></label>
+              <label class="toggle-row"><span><strong>Subject consistency</strong><small>Keep recurring subjects recognizable</small></span><input type="checkbox" checked></label>
+              <label>Diversity <input type="range" value="45"></label>
+            </div>
+            <div class="tabs"><button class="active" data-tab="promptTab">Prompt</button><button data-tab="settingsTab">Settings</button></div>
+            <div class="tab-content active" id="promptTab">
+              <label class="field-label">Scene prompt</label>
+              <textarea class="prompt-box">A wide cinematic view descending into the ocean's twilight zone, faint shafts of blue sunlight dissolving into darkness, suspended particles, immense scale, scientifically accurate deep-sea environment.</textarea>
+              <div class="prompt-tools"><button class="secondary" id="suggestBtn">✦ Suggest improvement</button><span>62 words</span></div>
+              <div class="suggestion hidden" id="suggestion"><span>AI SUGGESTION</span><p>Emphasize the visible transition from blue surface light to near-black water, with a lone lanternfish establishing scale.</p><button class="text-btn" id="useSuggestion">Use this</button></div>
+              <button class="generate" id="generateBtn">Generate new version <span>⌘ ↵</span></button>
+              <div class="history"><div><strong>Prompt history</strong><button class="text-btn">View all</button></div><button><span>v3</span><p>Wide cinematic descent into...</p><small>Current</small></button><button><span>v2</span><p>Dark blue open water with...</p><small>Restore</small></button></div>
+            </div>
+            <div class="tab-content" id="settingsTab">
+              <div class="setting-grid">
+                <label>Aspect ratio<select><option>16:9 · YouTube</option><option>9:16 · Shorts</option></select></label>
+                <label>Art style<select><option>Photorealistic</option><option>Cinematic</option><option>Randomize</option><option>Undefined</option></select></label>
+                <label>Camera angle<select><option>Wide establishing</option><option>Close-up</option><option>Randomize</option></select></label>
+                <label>Mood<select><option>Mysterious</option><option>Awe-inspiring</option><option>Undefined</option></select></label>
+                <label>Lighting<select><option>Volumetric</option><option>Natural</option><option>Undefined</option></select></label>
+                <label>Depth of field<select><option>Randomize</option><option>Deep focus</option><option>Shallow</option></select></label>
+              </div>
+              <details><summary>Advanced settings <span>＋</span></summary><div class="advanced-note">Composition, lens, color grade, texture, and negative prompts.</div></details>
+              <button class="generate">Apply settings</button>
+            </div>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+  <div class="toast" id="toast">Generating still 04…</div>
+  <script src="app.js"></script>
+</body>
+</html>

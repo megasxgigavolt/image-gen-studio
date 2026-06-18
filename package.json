@@ -1,0 +1,19 @@
+{
+  "name": "auto-gen-studio",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace @auto-gen-studio/desktop",
+    "build": "npm run build --workspace @auto-gen-studio/desktop",
+    "typecheck": "npm run typecheck --workspace @auto-gen-studio/desktop",
+    "test": "npm run test --workspace @auto-gen-studio/desktop",
+    "lint": "npm run lint --workspace @auto-gen-studio/desktop"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

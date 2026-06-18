@@ -109,6 +109,7 @@ export type ImageJobRecord = {
   updatedAt: string;
   items: { id: string; groupId: string; promptVersionId: string; status: string; attempts: number; lastError: string | null; renderId: string | null }[];
 };
+export type ExportResultRecord = { path: string; fileCount: number };
 
 type BrowserData = {
   channels: ChannelRecord[];
@@ -332,6 +333,18 @@ export const projectsClient = {
   async getRenderDataUrl(renderId: string): Promise<string> {
     if (isTauri()) return invoke("get_render_data_url", { renderId });
     return "";
+  },
+  async exportLatestStills(videoId: string): Promise<ExportResultRecord | null> {
+    if (isTauri()) return invoke("export_latest_stills", { videoId });
+    throw new Error("Export requires the native application.");
+  },
+  async exportProjectBundle(videoId: string): Promise<ExportResultRecord | null> {
+    if (isTauri()) return invoke("export_project_bundle", { videoId });
+    throw new Error("Export requires the native application.");
+  },
+  async importProjectBundle(): Promise<VideoRecord | null> {
+    if (isTauri()) return invoke("import_project_bundle");
+    throw new Error("Import requires the native application.");
   },
   async createImageJob(videoId: string): Promise<ImageJobRecord> {
     if (isTauri()) return invoke("create_image_job", { videoId });

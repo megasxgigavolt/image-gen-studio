@@ -12,6 +12,7 @@ import {
   Upload,
   X,
   WandSparkles,
+  Download,
 } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { type AppStage, useAppStore } from "./store/app-store";
@@ -205,6 +206,16 @@ function HomeView() {
     await loadWorkspace();
   }
 
+  async function importBundle() {
+    try {
+      const imported = await projectsClient.importProjectBundle();
+      if (imported) {
+        setSelectedChannelId(imported.channelId);
+        await loadWorkspace();
+      }
+    } catch (caught) { setError(String(caught)); }
+  }
+
   const resumeVideoRecord = videos.find((video) => video.id === resume?.videoId);
   return (
     <section className="view">
@@ -218,7 +229,7 @@ function HomeView() {
           <strong>→</strong>
         </button>
       )}
-      <div className="section-heading"><h2>Channels</h2><div><button onClick={() => void openTrash()}><Trash2 size={14} /> Trash</button><button onClick={() => setDialog("channel")}>+ Add channel</button></div></div>
+      <div className="section-heading"><h2>Channels</h2><div><button onClick={() => void importBundle()}><Upload size={14} /> Import project</button><button onClick={() => void openTrash()}><Trash2 size={14} /> Trash</button><button onClick={() => setDialog("channel")}>+ Add channel</button></div></div>
       {error && <div className="inline-error">{error}</div>}
       {loading && <div className="empty-state">Loading local workspace…</div>}
       {!loading && channels.length === 0 && (
@@ -649,6 +660,22 @@ function ImagesView() {
     setSelectedRenderId(render.id);
   }
 
+  async function exportStills() {
+    if (!activeVideoId) return;
+    try {
+      const result = await projectsClient.exportLatestStills(activeVideoId);
+      if (result) setError(`Exported ${result.fileCount} stills to ${result.path}`);
+    } catch (caught) { setError(String(caught)); }
+  }
+
+  async function exportBundle() {
+    if (!activeVideoId) return;
+    try {
+      const result = await projectsClient.exportProjectBundle(activeVideoId);
+      if (result) setError(`Project bundle saved to ${result.path}`);
+    } catch (caught) { setError(String(caught)); }
+  }
+
   return (
     <section className="view">
       <div className="page-heading">
@@ -657,9 +684,7 @@ function ImagesView() {
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <button className="primary" onClick={() => void generatePending()} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>
-          <WandSparkles size={17} /> Generate pending
-        </button>
+        <div className="heading-actions"><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Export stills</button><button className="secondary" onClick={() => void exportBundle()}><Download size={16} />Project bundle</button><button className="primary" onClick={() => void generatePending()} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} /> Generate pending</button></div>
       </div>
       {error && <div className="inline-error">{error}</div>}
       {job && (
@@ -821,7 +846,7 @@ export function App() {
     activeVideoId,
   } = useAppStore();
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
-  useEffect(() => log("info", "application_started", { release: "0.7.0" }), []);
+  useEffect(() => log("info", "application_started", { release: "0.8.0" }), []);
   useEffect(() => log("debug", "stage_opened", { stage }), [stage]);
   useEffect(() => {
     if (!activeChannelId || !activeVideoId) return;

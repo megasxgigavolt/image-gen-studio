@@ -201,3 +201,9 @@
 - Added Gemini image editing using the selected render as visual context.
 - Added persistent parent/child render lineage and edit instructions.
 - Added selectable image versions and side-by-side comparison.
+# 0.8.0
+
+- Added deterministic latest-still exports with JSON manifests.
+- Added portable `.agsproj` project bundles and collision-safe imports.
+- Added archive integrity validation, unsafe-path rejection, and failed-import cleanup.
+- Added a verified Windows installer with WebView bootstrap support.

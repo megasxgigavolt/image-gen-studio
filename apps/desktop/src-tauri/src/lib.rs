@@ -1,8 +1,8 @@
 mod projects;
 
 use projects::{
-    Channel, ImageJob, ImageRender, ImageWorkspace, InputAsset, ProjectRepository, PromptVersion,
-    ProviderKeyStatus, ResumeState, Video, VideoInputs, VisualPlan,
+    Channel, ExportResult, ImageJob, ImageRender, ImageWorkspace, InputAsset, ProjectRepository,
+    PromptVersion, ProviderKeyStatus, ResumeState, Video, VideoInputs, VisualPlan,
 };
 use std::fs;
 use std::sync::Mutex;
@@ -275,6 +275,65 @@ fn get_render_data_url(
     })
 }
 
+#[tauri::command]
+fn export_latest_stills(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Option<ExportResult>, String> {
+    let Some(path) = app
+        .dialog()
+        .file()
+        .blocking_pick_folder()
+        .and_then(|value| value.as_path().map(ToOwned::to_owned))
+    else {
+        return Ok(None);
+    };
+    with_repository(state, |repository| {
+        repository.export_latest_stills(&video_id, &path)
+    })
+    .map(Some)
+}
+
+#[tauri::command]
+fn export_project_bundle(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Option<ExportResult>, String> {
+    let Some(path) = app
+        .dialog()
+        .file()
+        .add_filter("Auto Gen Studio project", &["agsproj"])
+        .set_file_name("project.agsproj")
+        .blocking_save_file()
+        .and_then(|value| value.as_path().map(ToOwned::to_owned))
+    else {
+        return Ok(None);
+    };
+    with_repository(state, |repository| {
+        repository.export_project_bundle(&video_id, &path)
+    })
+    .map(Some)
+}
+
+#[tauri::command]
+fn import_project_bundle(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+) -> Result<Option<Video>, String> {
+    let Some(path) = app
+        .dialog()
+        .file()
+        .add_filter("Auto Gen Studio project", &["agsproj"])
+        .blocking_pick_file()
+        .and_then(|value| value.as_path().map(ToOwned::to_owned))
+    else {
+        return Ok(None);
+    };
+    with_repository(state, |repository| repository.import_project_bundle(&path)).map(Some)
+}
+
 fn spawn_job_workers(
     database_path: std::path::PathBuf,
     projects_dir: std::path::PathBuf,
@@ -507,7 +566,10 @@ pub fn run() {
             get_latest_image_job,
             control_image_job,
             edit_image_render,
-            get_render_data_url
+            get_render_data_url,
+            export_latest_stills,
+            export_project_bundle,
+            import_project_bundle
         ])
         .run(tauri::generate_context!())
         .expect("error while running Auto Gen Studio");

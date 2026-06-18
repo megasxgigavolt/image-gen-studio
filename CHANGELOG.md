@@ -1,5 +1,17 @@
 # Image Gen Studio — Changelog
 
+## [0.3.0-inputs] — 2026-06-18
+
+### Added
+- Persistent script text and scene-pacing controls with guarded autosave.
+- Native UTF-8 text-file import with a 1 MB safety limit.
+- Narration audio import, replacement, and removal.
+- Multiple visual-reference imports and removal.
+- Controlled copies under each video's project directory.
+- Input readiness validation before visual-plan generation.
+- SQLite migration 2 for video inputs and source assets.
+- Recovery snapshots for input saves and asset changes.
+
 ## [0.2.0-projects] — 2026-06-18
 
 ### Added

@@ -10,6 +10,7 @@ import {
   Trash2,
   Undo2,
   Upload,
+  X,
   WandSparkles,
 } from "lucide-react";
 import { type FormEvent, useCallback, useEffect, useState } from "react";
@@ -275,23 +276,72 @@ function HomeView() {
 }
 
 function InputsView() {
-  const setStage = useAppStore((state) => state.setStage);
+  const { setStage, activeVideoId } = useAppStore();
+  const [script, setScript] = useState("");
+  const [pacing, setPacing] = useState(8);
+  const [audio, setAudio] = useState<import("./infrastructure/projects-client").InputAssetRecord | null>(null);
+  const [references, setReferences] = useState<import("./infrastructure/projects-client").InputAssetRecord[]>([]);
+  const [status, setStatus] = useState("Loading source material…");
+  const [error, setError] = useState<string | null>(null);
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    if (!activeVideoId) return;
+    void projectsClient.getVideoInputs(activeVideoId).then((inputs) => {
+      setScript(inputs.scriptText);
+      setPacing(inputs.pacingSeconds);
+      setAudio(inputs.audio);
+      setReferences(inputs.references);
+      setStatus("Saved locally");
+      setHydrated(true);
+    }).catch((caught) => setError(String(caught)));
+  }, [activeVideoId]);
+
+  useEffect(() => {
+    if (!activeVideoId || !hydrated) return;
+    const timeout = window.setTimeout(() => {
+      void projectsClient.saveVideoInputs(activeVideoId, script, pacing)
+        .then(() => setStatus("Saved locally"))
+        .catch((caught) => { setError(String(caught)); setStatus("Save failed"); });
+    }, 500);
+    return () => window.clearTimeout(timeout);
+  }, [activeVideoId, hydrated, pacing, script]);
+
+  async function importAsset(kind: "audio" | "reference") {
+    if (!activeVideoId) return;
+    const asset = await projectsClient.pickAndImportAsset(activeVideoId, kind);
+    if (!asset) return;
+    if (kind === "audio") setAudio(asset);
+    else setReferences((items) => [...items, asset]);
+  }
+
+  async function removeAsset(assetId: string) {
+    await projectsClient.removeInputAsset(assetId);
+    if (audio?.id === assetId) setAudio(null);
+    setReferences((items) => items.filter((item) => item.id !== assetId));
+  }
+
+  const wordCount = script.trim() ? script.trim().split(/\s+/).length : 0;
+  const ready = Boolean(script.trim() && audio);
   return (
     <section className="view">
-      <div className="page-heading"><div><p className="eyebrow">Stage 1 of 3</p><h1>Source material</h1><p>Add narration and references that will guide the visual plan.</p></div></div>
+      <div className="page-heading"><div><p className="eyebrow">Stage 1 of 3</p><h1>Source material</h1><p>Add narration and references that will guide the visual plan.</p></div><span className="save-state">{status}</span></div>
+      {!activeVideoId && <div className="inline-error">Open or create a video before adding source material.</div>}
+      {error && <div className="inline-error">{error}</div>}
       <div className="inputs-grid">
         <article className="panel script-panel">
-          <div className="panel-heading"><div><h2>Script</h2><p>Paste narration or import a text file.</p></div><button className="secondary"><Upload size={15} />Import</button></div>
-          <textarea defaultValue="Far below the sunlit surface lies a world suspended between light and darkness. Oceanographers call it the twilight zone, a vast layer stretching from two hundred to one thousand meters deep." />
-          <footer><span>1,248 words</span><span>Approx. 8 min 20 sec</span></footer>
+          <div className="panel-heading"><div><h2>Script</h2><p>Paste narration or import a UTF-8 text file.</p></div><button className="secondary" onClick={() => void projectsClient.pickScriptText().then((text) => { if (text !== null) setScript(text); })}><Upload size={15} />Import</button></div>
+          <textarea value={script} onChange={(event) => { setScript(event.target.value); setStatus("Saving…"); }} placeholder="Paste the final narration script here…" />
+          <footer><span>{wordCount.toLocaleString()} words</span><span>Approx. {Math.ceil(wordCount / 150)} min</span></footer>
         </article>
         <div className="panel-stack">
-          <article className="panel"><h2>Narration audio</h2><p>Used for word-level timing.</p><div className="file-row"><span>▶</span><div><strong>twilight-zone-final.wav</strong><small>08:17 · WAV · 79.6 MB</small></div></div></article>
-          <article className="panel"><div className="panel-heading"><div><h2>Visual references</h2><p>Optional style and subject guidance.</p></div><button className="secondary"><Plus size={15} />Add</button></div><div className="reference-strip"><span /><span /><button>+</button></div></article>
-          <article className="panel"><h2>Scene pacing</h2><p>Target duration per still</p><input type="range" min="4" max="14" defaultValue="8" /></article>
+          <article className="panel"><div className="panel-heading"><div><h2>Narration audio</h2><p>Used for word-level timing.</p></div><button className="secondary" onClick={() => void importAsset("audio")}><Upload size={15} />{audio ? "Replace" : "Import"}</button></div>{audio ? <div className="file-row"><span>♪</span><div><strong>{audio.originalName}</strong><small>{(audio.sizeBytes / 1024 / 1024).toFixed(1)} MB</small></div><button className="icon-button" onClick={() => void removeAsset(audio.id)}><X size={15} /></button></div> : <div className="asset-empty">WAV, MP3, M4A, AAC, or FLAC</div>}</article>
+          <article className="panel"><div className="panel-heading"><div><h2>Visual references</h2><p>Optional style and subject guidance.</p></div><button className="secondary" onClick={() => void importAsset("reference")}><Plus size={15} />Add</button></div><div className="reference-list">{references.map((reference) => <div key={reference.id}><span>IMG</span><p>{reference.originalName}</p><button onClick={() => void removeAsset(reference.id)}><X size={13} /></button></div>)}{references.length === 0 && <div className="asset-empty">PNG, JPEG, or WebP</div>}</div></article>
+          <article className="panel"><div className="pacing-heading"><div><h2>Scene pacing</h2><p>Target duration per still</p></div><strong>{pacing} sec</strong></div><input type="range" min="4" max="14" value={pacing} onChange={(event) => { setPacing(Number(event.target.value)); setStatus("Saving…"); }} /></article>
+          <article className={ready ? "readiness ready" : "readiness"}><strong>{ready ? "Ready for visual planning" : "Source material incomplete"}</strong><span>{ready ? "Script and narration audio are available." : "Add a script and narration audio to continue."}</span></article>
         </div>
       </div>
-      <div className="footer-actions"><button className="secondary" onClick={() => setStage("home")}>Back</button><button className="primary" onClick={() => setStage("visual-plan")}>Generate visual plan →</button></div>
+      <div className="footer-actions"><button className="secondary" onClick={() => setStage("home")}>Back</button><button className="primary" disabled={!ready} onClick={() => setStage("visual-plan")}>Generate visual plan →</button></div>
     </section>
   );
 }
@@ -359,7 +409,7 @@ export function App() {
     activeVideoId,
   } = useAppStore();
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
-  useEffect(() => log("info", "application_started", { release: "0.2.0" }), []);
+  useEffect(() => log("info", "application_started", { release: "0.3.0" }), []);
   useEffect(() => log("debug", "stage_opened", { stage }), [stage]);
   useEffect(() => {
     if (!activeChannelId || !activeVideoId) return;

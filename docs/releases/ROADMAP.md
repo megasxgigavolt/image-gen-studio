@@ -7,7 +7,7 @@ in a release is not silently added to it.
 | --- | --- | --- |
 | 0.1.0 | Foundation | Complete: runnable native shell, architecture, design system, navigation, CI-ready quality gates |
 | 0.2.0 | Projects | Complete: channel/video creation, SQLite persistence, resume, trash, snapshots |
-| 0.3.0 | Inputs | Script/audio/reference intake and validation |
+| 0.3.0 | Inputs | Complete: script/audio/reference intake and validation |
 | 0.4.0 | Visual Plan | Transcription adapter, sentence timing, AI plan, drag/drop, reset |
 | 0.5.0 | Image Workspace | Three-layer prompts, settings, single generation, history |
 | 0.6.0 | Bulk Jobs | Concurrent generation, retries, pause/stop/resume, recovery |

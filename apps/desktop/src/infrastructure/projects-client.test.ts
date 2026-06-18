@@ -18,4 +18,15 @@ describe("projectsClient browser fallback", () => {
     await projectsClient.restoreVideo(video.id);
     expect(await projectsClient.listVideos(channel.id)).toHaveLength(1);
   });
+
+  it("persists script and pacing in the browser fallback", async () => {
+    const channel = await projectsClient.createChannel("Channel");
+    const video = await projectsClient.createVideo(channel.id, "Video");
+    await projectsClient.saveVideoInputs(video.id, "Narration text", 10);
+
+    expect(await projectsClient.getVideoInputs(video.id)).toMatchObject({
+      scriptText: "Narration text",
+      pacingSeconds: 10,
+    });
+  });
 });

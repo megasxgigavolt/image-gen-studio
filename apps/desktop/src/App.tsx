@@ -24,6 +24,7 @@ import {
   type VisualPlanRecord,
   type ImageWorkspaceRecord,
   type ImageJobRecord,
+  type ImageRenderRecord,
   type PromptVersionRecord,
 } from "./infrastructure/projects-client";
 
@@ -428,6 +429,10 @@ function ImagesView() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [job, setJob] = useState<ImageJobRecord | null>(null);
+  const [selectedRenderId, setSelectedRenderId] = useState<string | null>(null);
+  const [compareRenderId, setCompareRenderId] = useState<string | null>(null);
+  const [renderUrls, setRenderUrls] = useState<Record<string, string>>({});
+  const [editInstruction, setEditInstruction] = useState("");
 
   const selectedGroup = useMemo(
     () => workspace?.groups.find((group) => group.group.id === selectedGroupId) ?? null,
@@ -456,6 +461,9 @@ function ImagesView() {
         setActivePromptVersionId(latest?.id ?? null);
         setSystemPrompt(latest?.systemPrompt ?? "");
         setUserPrompt(latest?.userPrompt ?? "");
+        const latestRender = loaded.groups[0]?.imageRenders[0];
+        setSelectedRenderId(latestRender?.id ?? null);
+        setCompareRenderId(latestRender?.parentRenderId ?? loaded.groups[0]?.imageRenders[1]?.id ?? null);
       } catch (caught) {
         setError(String(caught));
       } finally {
@@ -580,6 +588,9 @@ function ImagesView() {
     setSystemPrompt(latest?.systemPrompt ?? "");
     setUserPrompt(latest?.userPrompt ?? "");
     setSettingsJson(latest?.settingsJson ?? "{}");
+    const latestRender = workspace?.groups.find((item) => item.group.id === groupId)?.imageRenders[0];
+    setSelectedRenderId(latestRender?.id ?? null);
+    setCompareRenderId(latestRender?.parentRenderId ?? null);
   }
 
   async function saveSettings() {
@@ -607,6 +618,36 @@ function ImagesView() {
   const stillCount = workspace?.groups.length ?? 0;
   const promptVersions = selectedGroup?.promptVersions ?? [];
   const imageRenders = selectedGroup?.imageRenders ?? [];
+
+  useEffect(() => {
+    const ids = [selectedRenderId, compareRenderId].filter(Boolean) as string[];
+    void Promise.all(ids.filter((id) => !renderUrls[id]).map(async (id) => {
+      const url = await projectsClient.getRenderDataUrl(id);
+      setRenderUrls((current) => ({ ...current, [id]: url }));
+    }));
+  }, [selectedRenderId, compareRenderId, renderUrls]);
+
+  async function editSelectedRender() {
+    if (!selectedRenderId || !editInstruction.trim()) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const edited = await projectsClient.editImageRender(selectedRenderId, editInstruction.trim());
+      setCompareRenderId(selectedRenderId);
+      setSelectedRenderId(edited.id);
+      setEditInstruction("");
+      await refreshWorkspace();
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function selectRender(render: ImageRenderRecord) {
+    setCompareRenderId(render.parentRenderId ?? selectedRenderId);
+    setSelectedRenderId(render.id);
+  }
 
   return (
     <section className="view">
@@ -652,9 +693,13 @@ function ImagesView() {
             <span>{previewLabel}</span>
             <strong>{selectedGroup?.group.sentenceIds.length ? `${selectedGroup.group.sentenceIds.length} sentence(s)` : "No scene selected"}</strong>
           </header>
-          <div className="preview-art">
-            <Sparkles size={42} />
-            <p>{selectedGroup ? "Selected still preview" : "Choose a still to begin."}</p>
+          <div className={compareRenderId ? "preview-art comparison" : "preview-art"}>
+            {selectedRenderId && renderUrls[selectedRenderId] ? (
+              <figure><img src={renderUrls[selectedRenderId]} alt="Selected image version" /><figcaption>Selected</figcaption></figure>
+            ) : <><Sparkles size={42} /><p>{selectedGroup ? "No rendered version yet" : "Choose a still to begin."}</p></>}
+            {compareRenderId && renderUrls[compareRenderId] && (
+              <figure><img src={renderUrls[compareRenderId]} alt="Comparison image version" /><figcaption>Compare</figcaption></figure>
+            )}
           </div>
           <footer>
             {selectedGroup?.group.sentenceIds.length
@@ -718,12 +763,19 @@ function ImagesView() {
               )}
               {imageRenders.map((render) => (
                 <div key={render.id} className="prompt-history">
-                  <button type="button">
-                    <span>{render.fileName}</span>
-                    <small>{new Date(render.createdAt).toLocaleString()}</small>
+                  <button type="button" className={render.id === selectedRenderId ? "active" : ""} onClick={() => selectRender(render)}>
+                    <span>v{render.version} · {render.kind}</span>
+                    <small>{render.editInstruction ?? new Date(render.createdAt).toLocaleString()}</small>
                   </button>
                 </div>
               ))}
+              {selectedRenderId && (
+                <div className="edit-panel">
+                  <label>Edit instruction<textarea value={editInstruction} onChange={(event) => setEditInstruction(event.target.value)} placeholder="Remove the buoy while preserving everything else." /></label>
+                  <button className="primary full" onClick={() => void editSelectedRender()} disabled={!editInstruction.trim() || loading}>Edit selected version</button>
+                  <small>The selected image is sent back to Gemini as visual context.</small>
+                </div>
+              )}
             </>
           ) : (
             <>
@@ -769,7 +821,7 @@ export function App() {
     activeVideoId,
   } = useAppStore();
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
-  useEffect(() => log("info", "application_started", { release: "0.6.0" }), []);
+  useEffect(() => log("info", "application_started", { release: "0.7.0" }), []);
   useEffect(() => log("debug", "stage_opened", { stage }), [stage]);
   useEffect(() => {
     if (!activeChannelId || !activeVideoId) return;

@@ -157,6 +157,13 @@ CREATE INDEX IF NOT EXISTS idx_image_jobs_video ON image_jobs(video_id, created_
 CREATE INDEX IF NOT EXISTS idx_image_job_items_job ON image_job_items(job_id, status, created_at);
 "#;
 
+const MIGRATION_006: &str = r#"
+ALTER TABLE image_renders ADD COLUMN parent_render_id TEXT REFERENCES image_renders(id);
+ALTER TABLE image_renders ADD COLUMN edit_instruction TEXT;
+ALTER TABLE image_renders ADD COLUMN kind TEXT NOT NULL DEFAULT 'generation';
+CREATE INDEX IF NOT EXISTS idx_image_renders_parent ON image_renders(parent_render_id);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -236,6 +243,9 @@ pub struct ImageRender {
     pub prompt_version_id: String,
     pub file_name: String,
     pub relative_path: String,
+    pub parent_render_id: Option<String>,
+    pub edit_instruction: Option<String>,
+    pub kind: String,
     pub created_at: String,
 }
 
@@ -389,6 +399,25 @@ impl ProjectRepository {
             .map_err(|error| error.to_string())?;
         self.connection
             .execute_batch(MIGRATION_005)
+            .map_err(|error| error.to_string())?;
+        let has_render_kind: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('image_renders') WHERE name='kind')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_render_kind {
+            self.connection
+                .execute_batch(MIGRATION_006)
+                .map_err(|error| error.to_string())?;
+        }
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(6, ?1)",
+                [Utc::now().to_rfc3339()],
+            )
             .map_err(|error| error.to_string())?;
         self.connection
             .execute(
@@ -956,7 +985,7 @@ impl ProjectRepository {
         group_id: &str,
     ) -> Result<Vec<ImageRender>, String> {
         let mut statement = self.connection.prepare(
-            "SELECT id, video_id, group_id, version, prompt_version_id, file_name, relative_path, created_at
+            "SELECT id, video_id, group_id, version, prompt_version_id, file_name, relative_path, parent_render_id, edit_instruction, kind, created_at
              FROM image_renders WHERE video_id = ?1 AND group_id = ?2 ORDER BY version DESC",
         ).map_err(|e| e.to_string())?;
         let rows = statement
@@ -969,7 +998,10 @@ impl ProjectRepository {
                     prompt_version_id: row.get(4)?,
                     file_name: row.get(5)?,
                     relative_path: row.get(6)?,
-                    created_at: row.get(7)?,
+                    parent_render_id: row.get(7)?,
+                    edit_instruction: row.get(8)?,
+                    kind: row.get(9)?,
+                    created_at: row.get(10)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -986,13 +1018,16 @@ impl ProjectRepository {
         prompt_version_id: &str,
         file_name: &str,
         relative_path: &str,
+        parent_render_id: Option<&str>,
+        edit_instruction: Option<&str>,
+        kind: &str,
     ) -> Result<ImageRender, String> {
         let created_at = Utc::now().to_rfc3339();
         self.connection
             .execute(
-                "INSERT INTO image_renders(id, video_id, group_id, version, prompt_version_id, file_name, relative_path, created_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![id, video_id, group_id, version, prompt_version_id, file_name, relative_path, created_at],
+                "INSERT INTO image_renders(id, video_id, group_id, version, prompt_version_id, file_name, relative_path, parent_render_id, edit_instruction, kind, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![id, video_id, group_id, version, prompt_version_id, file_name, relative_path, parent_render_id, edit_instruction, kind, created_at],
             )
             .map_err(|e| e.to_string())?;
         Ok(ImageRender {
@@ -1003,6 +1038,9 @@ impl ProjectRepository {
             prompt_version_id: prompt_version_id.into(),
             file_name: file_name.into(),
             relative_path: relative_path.into(),
+            parent_render_id: parent_render_id.map(str::to_string),
+            edit_instruction: edit_instruction.map(str::to_string),
+            kind: kind.into(),
             created_at,
         })
     }
@@ -1070,6 +1108,9 @@ impl ProjectRepository {
             prompt_version_id,
             &file_name,
             &relative_path,
+            None,
+            None,
+            "generation",
         )?;
         self.create_snapshot(
             video_id,
@@ -1083,6 +1124,138 @@ impl ProjectRepository {
             .to_string(),
         )?;
         Ok(render)
+    }
+
+    pub fn edit_image_render(
+        &self,
+        source_render_id: &str,
+        instruction: &str,
+    ) -> Result<ImageRender, String> {
+        if instruction.trim().is_empty() {
+            return Err("Describe the requested image change.".into());
+        }
+        let source: ImageRender = self.connection.query_row(
+            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,created_at FROM image_renders WHERE id=?1",
+            [source_render_id],
+            |row| Ok(ImageRender {
+                id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?,
+                version: row.get(3)?, prompt_version_id: row.get(4)?, file_name: row.get(5)?,
+                relative_path: row.get(6)?, parent_render_id: row.get(7)?,
+                edit_instruction: row.get(8)?, kind: row.get(9)?, created_at: row.get(10)?,
+            }),
+        ).map_err(|_| "Source image version was not found.".to_string())?;
+        let channel_id: String = self
+            .connection
+            .query_row(
+                "SELECT channel_id FROM videos WHERE id=?1 AND trashed_at IS NULL",
+                [&source.video_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Video was not found.".to_string())?;
+        let source_path = self
+            .projects_dir
+            .join(&channel_id)
+            .join(&source.video_id)
+            .join(&source.relative_path);
+        let source_bytes =
+            fs::read(&source_path).map_err(|_| "Source render file is missing.".to_string())?;
+        let mime_type = extension_to_media_type(
+            source_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("png"),
+        );
+        let prompt = self
+            .connection
+            .query_row(
+                "SELECT system_prompt,user_prompt,settings_json FROM prompt_versions WHERE id=?1",
+                [&source.prompt_version_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        let edit_prompt = format!(
+            "Edit the provided image according to the user request.\n\nUse the input image as the visual source of truth. Preserve camera angle, composition, lighting, colors, subject identity, background, and every unrelated detail. Only modify what the request requires. Do not add text or watermarks.\n\nExisting style directive:\n{}\n\nOriginal prompt context:\n{}\n\nOriginal settings:\n{}\n\nUser edit request:\n{}",
+            prompt.0, prompt.1, prompt.2, instruction.trim()
+        );
+        let api_key = self
+            .get_provider_key("gemini")?
+            .ok_or("Add a Gemini API key in Settings before editing an image.")?;
+        let model = self
+            .get_app_setting("gemini_model")?
+            .unwrap_or_else(|| "gemini-2.5-flash-image".into());
+        let (image_bytes, extension) = request_gemini_image_with_source(
+            &api_key,
+            &model,
+            &edit_prompt,
+            &source_bytes,
+            mime_type,
+        )?;
+        let render_dir = self
+            .projects_dir
+            .join(channel_id)
+            .join(&source.video_id)
+            .join("renders")
+            .join(&source.group_id);
+        fs::create_dir_all(&render_dir).map_err(|e| e.to_string())?;
+        let version: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM image_renders WHERE video_id=?1 AND group_id=?2",
+            params![source.video_id, source.group_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let file_name = format!("render-v{version}.{extension}");
+        let relative_path = format!("renders/{}/{}", source.group_id, file_name);
+        fs::write(render_dir.join(&file_name), image_bytes).map_err(|e| e.to_string())?;
+        self.insert_image_render(
+            &Uuid::new_v4().to_string(),
+            &source.video_id,
+            &source.group_id,
+            version,
+            &source.prompt_version_id,
+            &file_name,
+            &relative_path,
+            Some(&source.id),
+            Some(instruction.trim()),
+            "edit",
+        )
+    }
+
+    pub fn read_render_file(&self, render_id: &str) -> Result<(String, String), String> {
+        let (video_id, relative_path): (String, String) = self
+            .connection
+            .query_row(
+                "SELECT video_id,relative_path FROM image_renders WHERE id=?1",
+                [render_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| "Image version was not found.".to_string())?;
+        let channel_id: String = self
+            .connection
+            .query_row(
+                "SELECT channel_id FROM videos WHERE id=?1",
+                [&video_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let path = self
+            .projects_dir
+            .join(channel_id)
+            .join(video_id)
+            .join(relative_path);
+        let bytes = fs::read(&path).map_err(|_| "Image version file is missing.".to_string())?;
+        let mime = extension_to_media_type(
+            path.extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("png"),
+        );
+        Ok((
+            mime.into(),
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        ))
     }
 
     pub fn save_provider_key(&self, provider: &str, api_key: &str) -> Result<(), String> {
@@ -1603,6 +1776,79 @@ fn request_gemini_image(
     Err("Gemini returned text but no image. Try a supported image model.".into())
 }
 
+fn request_gemini_image_with_source(
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+    source_bytes: &[u8],
+    mime_type: &str,
+) -> Result<(Vec<u8>, &'static str), String> {
+    let model = model.trim();
+    if model.is_empty()
+        || !model.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_')
+        })
+    {
+        return Err("Gemini model name is invalid.".into());
+    }
+    let response = reqwest::blocking::Client::new()
+        .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"))
+        .header("x-goog-api-key", api_key)
+        .json(&json!({
+            "contents": [{"parts": [
+                {"inlineData": {"mimeType": mime_type, "data": base64::engine::general_purpose::STANDARD.encode(source_bytes)}},
+                {"text": prompt}
+            ]}],
+            "generationConfig": {"responseModalities": ["IMAGE"]}
+        }))
+        .send()
+        .map_err(|error| format!("Could not reach Gemini: {error}"))?;
+    parse_gemini_image_response(response)
+}
+
+fn parse_gemini_image_response(
+    response: reqwest::blocking::Response,
+) -> Result<(Vec<u8>, &'static str), String> {
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .map_err(|error| format!("Gemini returned an unreadable response: {error}"))?;
+    if !status.is_success() {
+        let message = body
+            .pointer("/error/message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Image editing failed.");
+        return Err(format!("Gemini error ({status}): {message}"));
+    }
+    let parts = body
+        .pointer("/candidates/0/content/parts")
+        .and_then(|value| value.as_array())
+        .ok_or("Gemini returned no edited image.")?;
+    for part in parts {
+        if let Some(inline) = part.get("inlineData").or_else(|| part.get("inline_data")) {
+            let data = inline
+                .get("data")
+                .and_then(|value| value.as_str())
+                .ok_or("Gemini image data was empty.")?;
+            let mime = inline
+                .get("mimeType")
+                .or_else(|| inline.get("mime_type"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("image/png");
+            let extension = match mime {
+                "image/jpeg" => "jpg",
+                "image/webp" => "webp",
+                _ => "png",
+            };
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|_| "Gemini returned invalid image data.".to_string())?;
+            return Ok((bytes, extension));
+        }
+    }
+    Err("Gemini returned no edited image.".into())
+}
+
 fn split_sentences(script: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
@@ -1838,5 +2084,56 @@ mod tests {
         repo.finish_job_item(&job.id, &claimed.0, Err("provider unavailable".into()))
             .unwrap();
         assert_eq!(repo.get_image_job(&job.id).unwrap().failed_items, 1);
+    }
+
+    #[test]
+    fn stores_image_edit_lineage_and_reads_render_files() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let prompt = repo
+            .create_prompt_version(&video.id, "g1", "{}", "system", "scene")
+            .unwrap();
+        let render_dir = temp
+            .path()
+            .join("Projects")
+            .join(&channel.id)
+            .join(&video.id)
+            .join("renders")
+            .join("g1");
+        fs::create_dir_all(&render_dir).unwrap();
+        fs::write(render_dir.join("render-v1.png"), b"source").unwrap();
+        let original = repo
+            .insert_image_render(
+                "original",
+                &video.id,
+                "g1",
+                1,
+                &prompt.id,
+                "render-v1.png",
+                "renders/g1/render-v1.png",
+                None,
+                None,
+                "generation",
+            )
+            .unwrap();
+        fs::write(render_dir.join("render-v2.png"), b"edited").unwrap();
+        let edited = repo
+            .insert_image_render(
+                "edited",
+                &video.id,
+                "g1",
+                2,
+                &prompt.id,
+                "render-v2.png",
+                "renders/g1/render-v2.png",
+                Some(&original.id),
+                Some("Remove the buoy"),
+                "edit",
+            )
+            .unwrap();
+        assert_eq!(edited.parent_render_id.as_deref(), Some("original"));
+        assert_eq!(edited.edit_instruction.as_deref(), Some("Remove the buoy"));
+        assert_eq!(repo.read_render_file("edited").unwrap().1, "ZWRpdGVk");
     }
 }

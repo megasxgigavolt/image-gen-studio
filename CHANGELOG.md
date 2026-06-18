@@ -196,3 +196,8 @@
 - Added durable bulk image jobs for pending stills with two concurrent Gemini workers.
 - Added progress and provider error tracking with retry handling.
 - Added pause, resume, stop, and startup recovery for interrupted jobs.
+# 0.7.0
+
+- Added Gemini image editing using the selected render as visual context.
+- Added persistent parent/child render lineage and edit instructions.
+- Added selectable image versions and side-by-side comparison.

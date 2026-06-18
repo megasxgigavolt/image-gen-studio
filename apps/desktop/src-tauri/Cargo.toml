@@ -1,6 +1,6 @@
 [package]
 name = "auto-gen-studio"
-version = "0.7.0"
+version = "0.8.0"
 description = "Local-first YouTube production workspace"
 authors = ["Auto Gen Studio"]
 edition = "2021"
@@ -23,7 +23,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
 keyring = { version = "3", features = ["windows-native"] }
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
+zip = "4"
 
 [dev-dependencies]
 tempfile = "3"
-

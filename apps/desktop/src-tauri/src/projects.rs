@@ -7,6 +7,7 @@ use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
 const MIGRATION_001: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -303,6 +304,28 @@ pub struct ImageJob {
     pub created_at: String,
     pub updated_at: String,
     pub items: Vec<ImageJobItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectBundleManifest {
+    format: String,
+    version: i64,
+    exported_at: String,
+    channel_name: String,
+    video_title: String,
+    stage: String,
+    progress: i64,
+    script_text: String,
+    pacing_seconds: i64,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportResult {
+    pub path: String,
+    pub file_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1258,6 +1281,175 @@ impl ProjectRepository {
         ))
     }
 
+    pub fn export_latest_stills(
+        &self,
+        video_id: &str,
+        destination: &Path,
+    ) -> Result<ExportResult, String> {
+        fs::create_dir_all(destination).map_err(|e| e.to_string())?;
+        let plan = self.get_visual_plan(video_id)?;
+        let mut files = Vec::new();
+        for group in plan.groups {
+            if let Some(render) = self
+                .list_image_renders(video_id, &group.id)?
+                .into_iter()
+                .next()
+            {
+                let source = self.render_absolute_path(&render)?;
+                let extension = source
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("png");
+                let name = format!(
+                    "still-{:03}-v{}.{}",
+                    group.ordinal, render.version, extension
+                );
+                fs::copy(source, destination.join(&name)).map_err(|e| e.to_string())?;
+                files.push(name);
+            }
+        }
+        fs::write(
+            destination.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({
+                "format": "auto-gen-studio-stills", "version": 1, "videoId": video_id,
+                "exportedAt": Utc::now().to_rfc3339(), "files": files
+            }))
+            .unwrap(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(ExportResult {
+            path: destination.display().to_string(),
+            file_count: files.len(),
+        })
+    }
+
+    pub fn export_project_bundle(
+        &self,
+        video_id: &str,
+        destination: &Path,
+    ) -> Result<ExportResult, String> {
+        let (channel_name, video_title, stage, progress, channel_id): (String, String, String, i64, String) =
+            self.connection.query_row(
+                "SELECT c.name,v.title,v.stage,v.progress,c.id FROM videos v JOIN channels c ON c.id=v.channel_id WHERE v.id=?1",
+                [video_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            ).map_err(|_| "Video was not found.".to_string())?;
+        let inputs = self.get_video_inputs(video_id)?;
+        let root = self.projects_dir.join(channel_id).join(video_id);
+        let mut relative_files = Vec::new();
+        collect_relative_files(&root, &root, &mut relative_files)?;
+        let manifest = ProjectBundleManifest {
+            format: "auto-gen-studio-project".into(),
+            version: 1,
+            exported_at: Utc::now().to_rfc3339(),
+            channel_name,
+            video_title,
+            stage,
+            progress,
+            script_text: inputs.script_text,
+            pacing_seconds: inputs.pacing_seconds,
+            files: relative_files.clone(),
+        };
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let file = fs::File::create(destination).map_err(|e| e.to_string())?;
+        let mut zip = ZipWriter::new(file);
+        zip.start_file("manifest.json", SimpleFileOptions::default())
+            .map_err(|e| e.to_string())?;
+        std::io::Write::write_all(&mut zip, &serde_json::to_vec_pretty(&manifest).unwrap())
+            .map_err(|e| e.to_string())?;
+        for relative in &relative_files {
+            zip.start_file(format!("assets/{relative}"), SimpleFileOptions::default())
+                .map_err(|e| e.to_string())?;
+            std::io::Write::write_all(
+                &mut zip,
+                &fs::read(root.join(relative)).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        zip.finish().map_err(|e| e.to_string())?;
+        Ok(ExportResult {
+            path: destination.display().to_string(),
+            file_count: relative_files.len() + 1,
+        })
+    }
+
+    pub fn import_project_bundle(&self, source: &Path) -> Result<Video, String> {
+        let file = fs::File::open(source)
+            .map_err(|_| "Project bundle could not be opened.".to_string())?;
+        let mut archive = ZipArchive::new(file)
+            .map_err(|_| "Project bundle is not a valid ZIP archive.".to_string())?;
+        let manifest: ProjectBundleManifest = {
+            let mut entry = archive
+                .by_name("manifest.json")
+                .map_err(|_| "Project bundle manifest is missing.".to_string())?;
+            serde_json::from_reader(&mut entry)
+                .map_err(|_| "Project bundle manifest is invalid.".to_string())?
+        };
+        if manifest.format != "auto-gen-studio-project" || manifest.version != 1 {
+            return Err("Unsupported project bundle format.".into());
+        }
+        for path in &manifest.files {
+            validate_bundle_path(path)?;
+            archive
+                .by_name(&format!("assets/{path}"))
+                .map_err(|_| format!("Bundle asset is missing: {path}"))?;
+        }
+        let channel =
+            self.create_channel(&format!("{} (Imported)", manifest.channel_name), None)?;
+        let video =
+            self.create_video(&channel.id, &format!("{} (Imported)", manifest.video_title))?;
+        let target = self.projects_dir.join(&channel.id).join(&video.id);
+        let result = (|| {
+            self.save_video_inputs(&video.id, &manifest.script_text, manifest.pacing_seconds)?;
+            for path in &manifest.files {
+                let mut entry = archive
+                    .by_name(&format!("assets/{path}"))
+                    .map_err(|e| e.to_string())?;
+                let destination = target.join(path);
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let mut output = fs::File::create(destination).map_err(|e| e.to_string())?;
+                std::io::copy(&mut entry, &mut output).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(&target);
+            let _ = self
+                .connection
+                .execute("DELETE FROM video_snapshots WHERE video_id=?1", [&video.id]);
+            let _ = self
+                .connection
+                .execute("DELETE FROM video_inputs WHERE video_id=?1", [&video.id]);
+            let _ = self
+                .connection
+                .execute("DELETE FROM videos WHERE id=?1", [&video.id]);
+            let _ = self
+                .connection
+                .execute("DELETE FROM channels WHERE id=?1", [&channel.id]);
+            return Err(error);
+        }
+        Ok(video)
+    }
+
+    fn render_absolute_path(&self, render: &ImageRender) -> Result<PathBuf, String> {
+        let channel_id: String = self
+            .connection
+            .query_row(
+                "SELECT channel_id FROM videos WHERE id=?1",
+                [&render.video_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(self
+            .projects_dir
+            .join(channel_id)
+            .join(&render.video_id)
+            .join(&render.relative_path))
+    }
+
     pub fn save_provider_key(&self, provider: &str, api_key: &str) -> Result<(), String> {
         let entry = Entry::new("auto-gen-studio", provider).map_err(|e| e.to_string())?;
         entry.set_password(api_key).map_err(|e| e.to_string())
@@ -1906,6 +2098,44 @@ fn sentence_number(id: &str) -> i64 {
     id.trim_start_matches('s').parse().unwrap_or(i64::MAX)
 }
 
+fn collect_relative_files(
+    root: &Path,
+    current: &Path,
+    output: &mut Vec<String>,
+) -> Result<(), String> {
+    if !current.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(current).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.is_dir() {
+            collect_relative_files(root, &path, output)?;
+        } else {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| e.to_string())?
+                .to_string_lossy()
+                .replace('\\', "/");
+            validate_bundle_path(&relative)?;
+            output.push(relative);
+        }
+    }
+    output.sort();
+    Ok(())
+}
+
+fn validate_bundle_path(path: &str) -> Result<(), String> {
+    let candidate = Path::new(path);
+    if candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err("Project bundle contains an unsafe path.".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2135,5 +2365,48 @@ mod tests {
         assert_eq!(edited.parent_render_id.as_deref(), Some("original"));
         assert_eq!(edited.edit_instruction.as_deref(), Some("Remove the buoy"));
         assert_eq!(repo.read_render_file("edited").unwrap().1, "ZWRpdGVk");
+    }
+
+    #[test]
+    fn exports_and_imports_validated_project_bundles() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Source Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Source Video").unwrap();
+        repo.save_video_inputs(&video.id, "Portable script.", 8)
+            .unwrap();
+        let asset_dir = temp
+            .path()
+            .join("Projects")
+            .join(&channel.id)
+            .join(&video.id)
+            .join("renders");
+        fs::create_dir_all(&asset_dir).unwrap();
+        fs::write(asset_dir.join("sample.png"), b"portable-image").unwrap();
+        let bundle = temp.path().join("project.agsproj");
+        assert!(
+            repo.export_project_bundle(&video.id, &bundle)
+                .unwrap()
+                .file_count
+                >= 2
+        );
+        let imported = repo.import_project_bundle(&bundle).unwrap();
+        assert_ne!(imported.id, video.id);
+        assert_eq!(
+            repo.get_video_inputs(&imported.id).unwrap().script_text,
+            "Portable script."
+        );
+        assert!(temp
+            .path()
+            .join("Projects")
+            .join(imported.channel_id)
+            .join(imported.id)
+            .join("renders/sample.png")
+            .exists());
+    }
+
+    #[test]
+    fn rejects_unsafe_bundle_paths() {
+        assert!(validate_bundle_path("../secret.txt").is_err());
+        assert!(validate_bundle_path("renders/safe.png").is_ok());
     }
 }

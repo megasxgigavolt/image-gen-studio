@@ -1,6 +1,6 @@
 # Legacy Migration Map
 
-`image_gen_studio.py` is a behavioral reference, not the new architecture.
+`legacy/prototype/image_gen_studio.py` is a behavioral reference, not the new architecture.
 
 ## Reuse after extraction and tests
 
@@ -23,5 +23,5 @@
 - Approval/pending image workflow
 - Excel as an integration contract
 
-No production module may import `image_gen_studio.py`.
+No production module may import `legacy/prototype/image_gen_studio.py`.
 

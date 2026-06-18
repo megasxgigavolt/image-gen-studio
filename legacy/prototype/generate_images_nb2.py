@@ -18,7 +18,7 @@ One-time setup:
 #  CONFIG  —  edit these 3 lines, then press F5
 # ══════════════════════════════════════════════════════════════════════════════
 
-SA_KEY_FILE     = "beneath-the-fins-843aa8608070.json"
+SA_KEY_FILE     = "runtime/beneath-the-fins-843aa8608070.json"
 DRIVE_FOLDER_ID = "1mowfSfDJoAETKO-Wf7Xq_2T-QvKzcwjm"  # unused — saving locally now
 GCP_PROJECT_ID  = "beneath-the-fins"
 OUTPUT_DIR      = "generated_images"   # folder created next to this script
@@ -163,7 +163,7 @@ def save_locally(filename: str, image_bytes: bytes) -> str:
 # RESUME STATE
 # ──────────────────────────────────────────────────────────────────────────────
 
-STATE_FILE = "generation_state.json"
+STATE_FILE = "runtime/generation_state.json"
 
 
 def load_state() -> dict:

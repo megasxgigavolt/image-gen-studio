@@ -34,12 +34,12 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = Path(__file__).parent
 
-SA_KEY_FILE    = BASE_DIR / "beneath-the-fins-843aa8608070.json"
+SA_KEY_FILE    = BASE_DIR / "runtime" / "beneath-the-fins-843aa8608070.json"
 GCP_PROJECT_ID = "beneath-the-fins"
-STATE_FILE     = BASE_DIR / "generation_state.json"
-SETTINGS_FILE  = BASE_DIR / "settings.json"
+STATE_FILE     = BASE_DIR / "runtime" / "generation_state.json"
+SETTINGS_FILE  = BASE_DIR / "runtime" / "settings.json"
 
-for _p in [BASE_DIR / ".env", BASE_DIR / "other automations" / ".env"]:
+for _p in [BASE_DIR / ".env", BASE_DIR.parent.parent / "tools" / "standalone" / ".env"]:
     if _p.exists():
         load_dotenv(_p)
         break

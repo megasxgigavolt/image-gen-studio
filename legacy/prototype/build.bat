@@ -10,7 +10,7 @@ echo ============================================================
 
 echo.
 echo [1/3] Installing / updating dependencies...
-"%PYTHON%" -m pip install -r requirements.txt pyinstaller --quiet
+"%PYTHON%" -m pip install -r "%~dp0requirements.txt" pyinstaller --quiet
 
 echo.
 echo [2/3] Building .exe with PyInstaller...
@@ -22,13 +22,13 @@ echo [2/3] Building .exe with PyInstaller...
   --hidden-import "PIL._tkinter_finder" ^
   --hidden-import "google.auth.transport.requests" ^
   --hidden-import "google.oauth2.service_account" ^
-  image_gen_studio.py
+  "%~dp0image_gen_studio.py"
 
 echo.
 echo [3/3] Copying required runtime files next to the .exe...
 if not exist dist mkdir dist
-copy /Y "beneath-the-fins-843aa8608070.json" "dist\" >nul 2>&1
-copy /Y "other automations\.env"              "dist\.env" >nul 2>&1
+copy /Y "%~dp0runtime\beneath-the-fins-843aa8608070.json" "dist\" >nul 2>&1
+copy /Y "%~dp0..\..\tools\standalone\.env" "dist\.env" >nul 2>&1
 
 echo.
 echo ============================================================

@@ -4,8 +4,8 @@ Auto Gen Studio is a Windows desktop production workspace for faceless YouTube
 automation. The first product track covers script and narration input, visual
 planning, image generation, image editing, and export.
 
-The existing `image_gen_studio.py` application is retained as a legacy reference
-while the product is rebuilt incrementally.
+The retired Python prototype is retained under `legacy/prototype` as a
+behavioral reference.
 
 ## Repository layout
 
@@ -15,6 +15,8 @@ services/python-engine/ Python AI and media engine (introduced incrementally)
 packages/contracts/    Shared versioned contracts
 docs/                  Architecture, releases, and engineering records
 legacy/                Migration notes for the existing prototype
+tools/                 Standalone utility scripts
+releases/              Local release artifacts (not committed)
 mockup/                Current visual source of truth
 ```
 

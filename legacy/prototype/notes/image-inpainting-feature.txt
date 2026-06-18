@@ -1,0 +1,227 @@
+You need to switch from “regenerate from prompt” to “edit from existing image.”
+
+Right now your flow sounds like this:
+
+```text
+original prompt + user change request -> generate new image
+```
+
+That will almost always reconstruct the full picture, because the model is sampling a new image from text. Even if the prompt is similar, it is not preserving pixels.
+
+What you want is:
+
+```text
+original image + edit instruction + optional mask -> image edit / inpainting
+```
+
+The key idea: **the previously generated image must become the visual context for the next generation.** The prompt alone is not enough.
+
+## Recommended Implementation
+
+Store these things for every generated image:
+
+```json
+{
+  "image_id": "img_123",
+  "original_prompt": "A diver exploring a sunken ship...",
+  "image_url": "/generated/img_123.png",
+  "model": "nano-banana-2",
+  "seed": 123456,
+  "generation_settings": {
+    "aspect_ratio": "16:9",
+    "style": "cinematic",
+    "quality": "high"
+  },
+  "chat_history": [
+    {
+      "role": "user",
+      "content": "Remove the red buoy from the top left."
+    }
+  ]
+}
+```
+
+But most importantly, when the user asks for an edit, send the **actual image file** back into the model.
+
+## Use Image Editing, Not Image Generation
+
+Your backend should distinguish between:
+
+```ts
+generateImage(prompt)
+```
+
+and:
+
+```ts
+editImage({
+  sourceImage,
+  instruction,
+  mask
+})
+```
+
+Example flow:
+
+```ts
+async function editExistingImage(imageId, userInstruction) {
+  const image = await db.images.findById(imageId)
+
+  const editedImage = await imageApi.edit({
+    model: "your-image-edit-model",
+    image: image.file,
+    prompt: `
+      Edit only the requested area.
+      Preserve the rest of the image exactly as much as possible.
+
+      User request:
+      ${userInstruction}
+    `,
+    mask: image.editMask // optional but strongly recommended
+  })
+
+  return editedImage
+}
+```
+
+## Use a Mask for Best Results
+
+If the user says “remove this object,” your software should ideally let them mark the object visually.
+
+For example:
+
+1. User selects brush/lasso tool.
+2. User paints over the object.
+3. You create a black/white mask.
+4. Send original image + mask + edit instruction to the image editing API.
+
+The mask tells the model:
+
+```text
+Only modify this region. Keep everything else unchanged.
+```
+
+Without a mask, the model has to guess what part should change, and it may alter unrelated areas.
+
+## Important: Keep the Original Image as Input
+
+Do not rely only on chat history like this:
+
+```text
+Original prompt:
+"A shark swimming near coral..."
+
+User:
+"Remove the diver."
+```
+
+That is weak context.
+
+Use this instead:
+
+```text
+Input image: actual previous PNG/JPEG
+Instruction: "Remove the diver. Fill the background naturally. Preserve everything else."
+Mask: selected diver area
+```
+
+That gives the model visual memory.
+
+## Add “Edit Strength” / Denoising Control If Available
+
+Some image APIs expose parameters like:
+
+```json
+{
+  "strength": 0.2
+}
+```
+
+or:
+
+```json
+{
+  "denoise": 0.25
+}
+```
+
+Lower values preserve more of the original image.
+
+Typical values:
+
+```text
+0.1 - 0.25 = small localized edits
+0.3 - 0.5 = moderate edits
+0.6+ = major reconstruction
+```
+
+For object removal, you usually want a low edit strength plus a mask.
+
+## If Your Model Does Not Support Editing
+
+If Nano Banana 2 only supports text-to-image generation and not image-to-image editing, then you cannot reliably preserve the previous image.
+
+In that case you need one of these:
+
+```text
+image-to-image model
+inpainting model
+image editing API
+ControlNet-style workflow
+reference-image conditioning
+```
+
+A plain text-to-image model will not maintain exact context.
+
+## Practical Architecture
+
+Your chat system should decide intent:
+
+```ts
+if (userMessageLooksLikeEdit(message)) {
+  editExistingImage(previousImage, message)
+} else {
+  generateNewImage(message)
+}
+```
+
+Example edit prompt:
+
+```text
+Edit the provided image according to the user request.
+
+User request:
+Remove the small boat on the right side.
+
+Rules:
+- Only change the boat area.
+- Preserve the camera angle, lighting, colors, composition, and all other objects.
+- Do not restyle the image.
+- Do not recreate the full image.
+```
+
+## Best Result Stack
+
+For your feature, I would implement:
+
+```text
+1. Store generated image file
+2. Store prompt/settings/seed
+3. Let user select edit area with brush/lasso
+4. Send original image + mask + edit instruction
+5. Use image-editing or inpainting endpoint
+6. Save edited result as a new version linked to the original
+```
+
+Versioning matters:
+
+```text
+Image v1: original
+Image v2: removed buoy
+Image v3: made water darker
+Image v4: added fish near coral
+```
+
+That way every edit is based on the latest image, not just the original prompt.
+
+The short answer: **you maintain context by using the previous image itself as input, preferably with a mask, not by relying on the prompt/chat history alone.**

@@ -67,6 +67,34 @@ CREATE TABLE IF NOT EXISTS input_assets (
 CREATE INDEX IF NOT EXISTS idx_input_assets_video ON input_assets(video_id, kind);
 "#;
 
+const MIGRATION_003: &str = r#"
+CREATE TABLE IF NOT EXISTS visual_plan_sentences (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    ordinal INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    start_seconds REAL NOT NULL,
+    end_seconds REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS visual_plan_groups (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    ordinal INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    sentence_ids_json TEXT NOT NULL,
+    is_original INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS visual_plan_meta (
+    video_id TEXT PRIMARY KEY REFERENCES videos(id),
+    timing_source TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plan_sentences_video ON visual_plan_sentences(video_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_plan_groups_video ON visual_plan_groups(video_id, is_original, ordinal);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -123,6 +151,36 @@ pub struct VideoInputs {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanSentence {
+    pub id: String,
+    pub ordinal: i64,
+    pub text: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanGroup {
+    pub id: String,
+    pub ordinal: i64,
+    pub label: String,
+    pub kind: String,
+    pub sentence_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VisualPlan {
+    pub video_id: String,
+    pub timing_source: String,
+    pub sentences: Vec<PlanSentence>,
+    pub groups: Vec<PlanGroup>,
+    pub updated_at: String,
+}
+
 pub struct ProjectRepository {
     connection: Connection,
     projects_dir: PathBuf,
@@ -162,6 +220,15 @@ impl ProjectRepository {
         self.connection
             .execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, ?1)",
+                [Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| error.to_string())?;
+        self.connection
+            .execute_batch(MIGRATION_003)
+            .map_err(|error| error.to_string())?;
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, ?1)",
                 [Utc::now().to_rfc3339()],
             )
             .map_err(|error| error.to_string())?;
@@ -601,6 +668,180 @@ impl ProjectRepository {
             .map_err(|e| e.to_string())
     }
 
+    pub fn generate_visual_plan(&self, video_id: &str) -> Result<VisualPlan, String> {
+        let inputs = self.get_video_inputs(video_id)?;
+        if inputs.script_text.trim().is_empty() || inputs.audio.is_none() {
+            return Err("Script and narration audio are required.".into());
+        }
+        let texts = split_sentences(&inputs.script_text);
+        if texts.is_empty() {
+            return Err("No sentences could be extracted from the script.".into());
+        }
+        let weights: Vec<usize> = texts
+            .iter()
+            .map(|text| text.split_whitespace().count().max(1))
+            .collect();
+        let total_words: usize = weights.iter().sum();
+        let duration = (total_words as f64 * 0.4).max(1.0);
+        let mut cursor = 0.0;
+        let mut sentences = Vec::new();
+        let sentence_count = texts.len();
+        for (index, (text, weight)) in texts.into_iter().zip(weights).enumerate() {
+            let end = if index + 1 == sentence_count {
+                duration
+            } else {
+                cursor + duration * weight as f64 / total_words as f64
+            };
+            sentences.push(PlanSentence {
+                id: format!("s{}", index + 1),
+                ordinal: index as i64 + 1,
+                text,
+                start_seconds: cursor,
+                end_seconds: end,
+            });
+            cursor = end;
+        }
+        if let Some(last) = sentences.last_mut() {
+            last.end_seconds = duration;
+        }
+        let groups = build_groups(&sentences, inputs.pacing_seconds as f64);
+        self.save_plan(video_id, &sentences, &groups, true, "estimated")?;
+        self.save_plan(video_id, &sentences, &groups, false, "estimated")?;
+        self.get_visual_plan(video_id)
+    }
+
+    pub fn get_visual_plan(&self, video_id: &str) -> Result<VisualPlan, String> {
+        let (timing_source, updated_at): (String, String) = self
+            .connection
+            .query_row(
+                "SELECT timing_source, updated_at FROM visual_plan_meta WHERE video_id = ?1",
+                [video_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| "Visual plan has not been generated.".to_string())?;
+        let mut sentence_statement = self.connection.prepare(
+            "SELECT id, ordinal, text, start_seconds, end_seconds FROM visual_plan_sentences WHERE video_id = ?1 ORDER BY ordinal"
+        ).map_err(|e| e.to_string())?;
+        let sentences = sentence_statement
+            .query_map([video_id], |row| {
+                Ok(PlanSentence {
+                    id: row.get(0)?,
+                    ordinal: row.get(1)?,
+                    text: row.get(2)?,
+                    start_seconds: row.get(3)?,
+                    end_seconds: row.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let groups = self.load_groups(video_id, false)?;
+        Ok(VisualPlan {
+            video_id: video_id.into(),
+            timing_source,
+            sentences,
+            groups,
+            updated_at,
+        })
+    }
+
+    pub fn move_plan_sentence(
+        &self,
+        video_id: &str,
+        sentence_id: &str,
+        target_group_id: &str,
+    ) -> Result<VisualPlan, String> {
+        let mut groups = self.load_groups(video_id, false)?;
+        let source = groups
+            .iter()
+            .position(|group| group.sentence_ids.contains(&sentence_id.to_string()))
+            .ok_or("Sentence was not found.")?;
+        let target = groups
+            .iter()
+            .position(|group| group.id == target_group_id)
+            .ok_or("Target group was not found.")?;
+        if source.abs_diff(target) > 1 {
+            return Err("Sentences may only move to an adjacent scene.".into());
+        }
+        if source == target {
+            return self.get_visual_plan(video_id);
+        }
+        groups[source].sentence_ids.retain(|id| id != sentence_id);
+        groups[target].sentence_ids.push(sentence_id.into());
+        groups[target]
+            .sentence_ids
+            .sort_by_key(|id| sentence_number(id));
+        groups.retain(|group| !group.sentence_ids.is_empty());
+        for (index, group) in groups.iter_mut().enumerate() {
+            group.ordinal = index as i64 + 1;
+        }
+        let sentences = self.get_visual_plan(video_id)?.sentences;
+        self.save_plan(video_id, &sentences, &groups, false, "estimated")?;
+        self.get_visual_plan(video_id)
+    }
+
+    pub fn reset_visual_plan(&self, video_id: &str) -> Result<VisualPlan, String> {
+        let original = self.load_groups(video_id, true)?;
+        let sentences = self.get_visual_plan(video_id)?.sentences;
+        self.save_plan(video_id, &sentences, &original, false, "estimated")?;
+        self.get_visual_plan(video_id)
+    }
+
+    fn save_plan(
+        &self,
+        video_id: &str,
+        sentences: &[PlanSentence],
+        groups: &[PlanGroup],
+        original: bool,
+        timing_source: &str,
+    ) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        if original {
+            self.connection
+                .execute(
+                    "DELETE FROM visual_plan_sentences WHERE video_id = ?1",
+                    [video_id],
+                )
+                .map_err(|e| e.to_string())?;
+            for sentence in sentences {
+                self.connection.execute("INSERT INTO visual_plan_sentences(id, video_id, ordinal, text, start_seconds, end_seconds) VALUES(?1,?2,?3,?4,?5,?6)", params![sentence.id, video_id, sentence.ordinal, sentence.text, sentence.start_seconds, sentence.end_seconds]).map_err(|e| e.to_string())?;
+            }
+        }
+        self.connection
+            .execute(
+                "DELETE FROM visual_plan_groups WHERE video_id = ?1 AND is_original = ?2",
+                params![video_id, original as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        for group in groups {
+            self.connection.execute("INSERT INTO visual_plan_groups(id, video_id, ordinal, label, kind, sentence_ids_json, is_original) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![format!("{}-{}", if original {"original"} else {"current"}, group.id), video_id, group.ordinal, group.label, group.kind, serde_json::to_string(&group.sentence_ids).unwrap(), original as i64]).map_err(|e| e.to_string())?;
+        }
+        self.connection.execute("INSERT INTO visual_plan_meta(video_id,timing_source,generated_at,updated_at) VALUES(?1,?2,?3,?3) ON CONFLICT(video_id) DO UPDATE SET timing_source=excluded.timing_source,updated_at=excluded.updated_at", params![video_id,timing_source,now]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn load_groups(&self, video_id: &str, original: bool) -> Result<Vec<PlanGroup>, String> {
+        let mut statement = self.connection.prepare("SELECT id, ordinal, label, kind, sentence_ids_json FROM visual_plan_groups WHERE video_id = ?1 AND is_original = ?2 ORDER BY ordinal").map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![video_id, original as i64], |row| {
+                let stored_id: String = row.get(0)?;
+                Ok(PlanGroup {
+                    id: stored_id
+                        .split_once('-')
+                        .map(|(_, id)| id.to_string())
+                        .unwrap_or(stored_id),
+                    ordinal: row.get(1)?,
+                    label: row.get(2)?,
+                    kind: row.get(3)?,
+                    sentence_ids: serde_json::from_str(&row.get::<_, String>(4)?)
+                        .unwrap_or_default(),
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
     #[cfg(test)]
     fn snapshot_count(&self, video_id: &str) -> i64 {
         self.connection
@@ -650,6 +891,63 @@ fn extension_to_media_type(extension: &str) -> &'static str {
         "webp" => "image/webp",
         _ => "application/octet-stream",
     }
+}
+
+fn split_sentences(script: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    for character in script.chars() {
+        current.push(character);
+        if matches!(character, '.' | '!' | '?') {
+            let text = current.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !text.is_empty() {
+                result.push(text);
+            }
+            current.clear();
+        }
+    }
+    let remaining = current.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !remaining.is_empty() {
+        result.push(remaining);
+    }
+    result
+}
+
+fn build_groups(sentences: &[PlanSentence], target: f64) -> Vec<PlanGroup> {
+    let mut groups = Vec::new();
+    let mut pending: Vec<&PlanSentence> = Vec::new();
+    for sentence in sentences {
+        pending.push(sentence);
+        if pending.last().unwrap().end_seconds - pending[0].start_seconds >= target {
+            groups.push(make_group(groups.len() + 1, &pending));
+            pending.clear();
+        }
+    }
+    if !pending.is_empty() {
+        groups.push(make_group(groups.len() + 1, &pending));
+    }
+    groups
+}
+
+fn make_group(ordinal: usize, sentences: &[&PlanSentence]) -> PlanGroup {
+    PlanGroup {
+        id: format!("g{ordinal}"),
+        ordinal: ordinal as i64,
+        label: format!("Scene {ordinal}"),
+        kind: if ordinal == 1 {
+            "establishing".into()
+        } else {
+            "subject".into()
+        },
+        sentence_ids: sentences
+            .iter()
+            .map(|sentence| sentence.id.clone())
+            .collect(),
+    }
+}
+
+fn sentence_number(id: &str) -> i64 {
+    id.trim_start_matches('s').parse().unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
@@ -717,5 +1015,33 @@ mod tests {
         assert_eq!(inputs.script_text, "A script.");
         assert_eq!(inputs.pacing_seconds, 9);
         assert_eq!(inputs.audio.unwrap().id, asset.id);
+    }
+
+    #[test]
+    fn generates_moves_and_resets_visual_plan() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(
+            &video.id,
+            "One short sentence. A second sentence follows. The final sentence closes.",
+            4,
+        )
+        .unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let original = repo.generate_visual_plan(&video.id).unwrap();
+        assert!(!original.groups.is_empty());
+        if original.groups.len() > 1 {
+            let sentence = original.groups[0].sentence_ids.last().unwrap().clone();
+            let target = original.groups[1].id.clone();
+            repo.move_plan_sentence(&video.id, &sentence, &target)
+                .unwrap();
+            assert_eq!(
+                repo.reset_visual_plan(&video.id).unwrap().groups,
+                original.groups
+            );
+        }
     }
 }

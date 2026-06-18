@@ -47,6 +47,10 @@ export type VideoInputsRecord = {
   updatedAt: string;
 };
 
+export type PlanSentenceRecord = { id: string; ordinal: number; text: string; startSeconds: number; endSeconds: number };
+export type PlanGroupRecord = { id: string; ordinal: number; label: string; kind: string; sentenceIds: string[] };
+export type VisualPlanRecord = { videoId: string; timingSource: string; sentences: PlanSentenceRecord[]; groups: PlanGroupRecord[]; updatedAt: string };
+
 type BrowserData = {
   channels: ChannelRecord[];
   videos: VideoRecord[];
@@ -196,5 +200,46 @@ export const projectsClient = {
   async pickScriptText() {
     if (isTauri()) return invoke<string | null>("pick_script_text");
     return null;
+  },
+  async generateVisualPlan(videoId: string): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("generate_visual_plan", { videoId });
+    const inputs = await this.getVideoInputs(videoId);
+    const texts = inputs.scriptText.match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.map((text) => text.trim()) ?? [];
+    let cursor = 0;
+    const sentences = texts.map((text, index) => {
+      const duration = Math.max(1, text.split(/\s+/).length * 0.4);
+      const sentence = { id: `s${index + 1}`, ordinal: index + 1, text, startSeconds: cursor, endSeconds: cursor + duration };
+      cursor += duration; return sentence;
+    });
+    const groups = sentences.map((sentence, index) => ({ id: `g${index + 1}`, ordinal: index + 1, label: `Scene ${index + 1}`, kind: index ? "subject" : "establishing", sentenceIds: [sentence.id] }));
+    const plan = { videoId, timingSource: "estimated", sentences, groups, updatedAt: now() };
+    localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
+    localStorage.setItem(`${STORAGE_KEY}.plan.original.${videoId}`, JSON.stringify(plan));
+    return plan;
+  },
+  async getVisualPlan(videoId: string): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("get_visual_plan", { videoId });
+    const stored = localStorage.getItem(`${STORAGE_KEY}.plan.${videoId}`);
+    if (!stored) throw new Error("Visual plan has not been generated.");
+    return JSON.parse(stored) as VisualPlanRecord;
+  },
+  async movePlanSentence(videoId: string, sentenceId: string, targetGroupId: string): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("move_plan_sentence", { videoId, sentenceId, targetGroupId });
+    const plan = await this.getVisualPlan(videoId);
+    const source = plan.groups.findIndex((group) => group.sentenceIds.includes(sentenceId));
+    const target = plan.groups.findIndex((group) => group.id === targetGroupId);
+    if (Math.abs(source - target) > 1) throw new Error("Sentences may only move to an adjacent scene.");
+    plan.groups[source].sentenceIds = plan.groups[source].sentenceIds.filter((id) => id !== sentenceId);
+    plan.groups[target].sentenceIds.push(sentenceId);
+    plan.groups = plan.groups.filter((group) => group.sentenceIds.length);
+    localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
+    return plan;
+  },
+  async resetVisualPlan(videoId: string): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("reset_visual_plan", { videoId });
+    const original = localStorage.getItem(`${STORAGE_KEY}.plan.original.${videoId}`);
+    if (!original) throw new Error("Original visual plan was not found.");
+    localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, original);
+    return JSON.parse(original) as VisualPlanRecord;
   },
 };

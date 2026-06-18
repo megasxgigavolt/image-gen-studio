@@ -1,5 +1,23 @@
 # Image Gen Studio — Changelog
 
+## [0.2.0-projects] — 2026-06-18
+
+### Added
+- SQLite project database with versioned schema migrations and WAL journaling.
+- Local channel and video creation backed by application-controlled folders.
+- Durable last-video and last-stage resume state.
+- Automatic video snapshots on open and every five minutes, retaining ten.
+- Recoverable channel and video trash with restore controls.
+- Native project creation dialogs and loading, empty, and error states.
+- Browser development fallback that follows the same typed project contract.
+- Rust repository tests and Rust quality gates in GitHub Actions.
+
+### Storage
+- Project state is stored under
+  `%LOCALAPPDATA%\studio.autogen.desktop\auto-gen-studio.db`.
+- Project assets are stored under
+  `%LOCALAPPDATA%\studio.autogen.desktop\Projects`.
+
 ## [0.1.0-foundation] — 2026-06-18
 
 ### Added

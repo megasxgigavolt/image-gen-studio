@@ -38,6 +38,11 @@ npm install
 npm run dev
 ```
 
-Tauri commands will be enabled after the Windows Rust prerequisites are
-installed.
+Build the optimized Windows executable:
 
+```powershell
+npm run tauri -- build --no-bundle
+```
+
+The output is written under
+`apps/desktop/src-tauri/target/release/auto-gen-studio.exe`.

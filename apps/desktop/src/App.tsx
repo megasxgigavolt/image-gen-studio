@@ -14,6 +14,7 @@ import { useEffect } from "react";
 import { demoSentences } from "./data/demo";
 import { deriveGroupTiming } from "./domain/visual-plan";
 import { type AppStage, useAppStore } from "./store/app-store";
+import { log } from "./infrastructure/logger";
 
 const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
   { stage: "home", label: "Home", icon: Home },
@@ -179,6 +180,8 @@ function ImagesView() {
 export function App() {
   const { stage, theme } = useAppStore();
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
+  useEffect(() => log("info", "application_started", { release: "0.1.0" }), []);
+  useEffect(() => log("debug", "stage_opened", { stage }), [stage]);
   return (
     <div className="app-shell">
       <Sidebar />

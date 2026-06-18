@@ -1,6 +1,6 @@
 # Image Gen Studio — Changelog
 
-## [0.1.0-foundation] — Unreleased
+## [0.1.0-foundation] — 2026-06-18
 
 ### Added
 - Auto Gen Studio monorepo and release-scoped development roadmap.
@@ -11,6 +11,10 @@
   chronological movement constraints, and reset-to-original behavior.
 - Frontend lint, type-check, unit test, and production build quality gates.
 - GitHub Actions quality workflow and architecture decision records.
+- React error boundary and structured credential-redacting logs.
+- Tauri 2 Windows shell with a restrictive content security policy and
+  least-privilege default capability.
+- Verified optimized Windows executable build and launch.
 
 ### Migration
 - The existing CustomTkinter app remains unchanged as a legacy behavioral

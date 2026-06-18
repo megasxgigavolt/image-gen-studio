@@ -23,6 +23,7 @@ import {
   type VideoRecord,
   type VisualPlanRecord,
   type ImageWorkspaceRecord,
+  type ImageJobRecord,
   type PromptVersionRecord,
 } from "./infrastructure/projects-client";
 
@@ -426,6 +427,7 @@ function ImagesView() {
   const [tab, setTab] = useState<"prompt" | "settings">("prompt");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [job, setJob] = useState<ImageJobRecord | null>(null);
 
   const selectedGroup = useMemo(
     () => workspace?.groups.find((group) => group.group.id === selectedGroupId) ?? null,
@@ -449,6 +451,7 @@ function ImagesView() {
           projectsClient.getProviderKeyStatus("openai"),
         ]);
         setKeyStatus({ gemini: geminiStatus.configured, openai: openAiStatus.configured });
+        setJob(await projectsClient.getLatestImageJob(activeVideoId));
         const latest = loaded.groups[0]?.promptVersions[0];
         setActivePromptVersionId(latest?.id ?? null);
         setSystemPrompt(latest?.systemPrompt ?? "");
@@ -461,6 +464,18 @@ function ImagesView() {
     }
     void loadWorkspace();
   }, [activeVideoId]);
+
+  useEffect(() => {
+    if (!activeVideoId || !job || !["queued", "running"].includes(job.status)) return;
+    const timer = window.setInterval(async () => {
+      const latest = await projectsClient.getLatestImageJob(activeVideoId);
+      setJob(latest);
+      if (latest && ["completed", "failed"].includes(latest.status)) {
+        setWorkspace(await projectsClient.getImageWorkspace(activeVideoId));
+      }
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [activeVideoId, job]);
 
   async function refreshWorkspace() {
     if (!activeVideoId) return;
@@ -529,6 +544,28 @@ function ImagesView() {
     }
   }
 
+  async function generatePending() {
+    if (!activeVideoId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      setJob(await projectsClient.createImageJob(activeVideoId));
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function controlJob(action: "pause" | "resume" | "stop") {
+    if (!job) return;
+    try {
+      setJob(await projectsClient.controlImageJob(job.id, action));
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
   function selectVersion(version: PromptVersionRecord) {
     setActivePromptVersionId(version.id);
     setSystemPrompt(version.systemPrompt);
@@ -579,11 +616,22 @@ function ImagesView() {
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <button className="primary" onClick={() => void generateRender()} disabled={!selectedGroupId || loading}>
+        <button className="primary" onClick={() => void generatePending()} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>
           <WandSparkles size={17} /> Generate pending
         </button>
       </div>
       {error && <div className="inline-error">{error}</div>}
+      {job && (
+        <div className="job-status">
+          <div><strong>Bulk job: {job.status}</strong><span>{job.completedItems}/{job.totalItems} completed · {job.failedItems} failed</span></div>
+          <progress value={job.completedItems + job.failedItems} max={job.totalItems} />
+          <div>
+            {["queued", "running"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("pause")}>Pause</button>}
+            {job.status === "paused" && <button className="secondary" onClick={() => void controlJob("resume")}>Resume</button>}
+            {["queued", "running", "paused"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("stop")}>Stop</button>}
+          </div>
+        </div>
+      )}
       <div className="image-workspace">
         <aside className="stills">
           <strong>Stills <span>{stillCount}</span></strong>
@@ -641,8 +689,9 @@ function ImagesView() {
                 <Sparkles size={15} /> Suggest improvement
               </button>
               <button className="primary full" onClick={() => void createVersion()} disabled={!selectedGroupId || loading}>
-                Generate new version
+                Save prompt version
               </button>
+              <button className="secondary full" onClick={() => void generateRender()} disabled={!selectedGroupId || loading}>Generate this still</button>
               <div className="placeholder">
                 <strong>Prompt history</strong>
                 <span>{promptVersions.length ? `${promptVersions.length} saved versions` : "No saved prompt versions yet."}</span>
@@ -720,7 +769,7 @@ export function App() {
     activeVideoId,
   } = useAppStore();
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
-  useEffect(() => log("info", "application_started", { release: "0.4.0" }), []);
+  useEffect(() => log("info", "application_started", { release: "0.6.0" }), []);
   useEffect(() => log("debug", "stage_opened", { stage }), [stage]);
   useEffect(() => {
     if (!activeChannelId || !activeVideoId) return;

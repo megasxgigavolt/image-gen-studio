@@ -33,10 +33,8 @@ import {
 
 const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
   { stage: "home", label: "Home", icon: Home },
-  { stage: "inputs", label: "Inputs", icon: Upload },
-  { stage: "visual-plan", label: "Visual plan", icon: FolderOpen },
+  { stage: "inputs", label: "Production", icon: Upload },
   { stage: "images", label: "Images", icon: Image },
-  { stage: "timeline", label: "Timeline", icon: PanelsTopLeft },
 ];
 
 function formatTime(seconds: number) {
@@ -46,7 +44,7 @@ function formatTime(seconds: number) {
 }
 
 function Sidebar() {
-  const { stage, setStage } = useAppStore();
+  const { stage, setStage, activeVideoId } = useAppStore();
   return (
     <aside className="sidebar">
       <button className="brand" onClick={() => setStage("home")}>
@@ -56,16 +54,18 @@ function Sidebar() {
       <nav>
         {navItems.map(({ stage: itemStage, label, icon: Icon }) => (
           <button
-            className={stage === itemStage ? "nav-item active" : "nav-item"}
+            className={(itemStage === "inputs" ? ["inputs", "visual-plan"].includes(stage) : stage === itemStage) ? "nav-item active" : "nav-item"}
             key={itemStage}
-            onClick={() => setStage(itemStage)}
+            onClick={() => setStage(itemStage === "inputs" && stage === "images" ? "visual-plan" : itemStage)}
+            disabled={(itemStage !== "home" && !activeVideoId) || (itemStage === "images" && stage === "inputs")}
           >
             <Icon size={18} />
             <span>{label}</span>
           </button>
         ))}
       </nav>
-      <button className="nav-item settings"><Settings size={18} /><span>Settings</span></button>
+      <button className="nav-item settings" disabled><Settings size={18} /><span>Preferences · soon</span></button>
+      <button className="nav-item" disabled><PanelsTopLeft size={18} /><span>Timeline · in production</span></button>
     </aside>
   );
 }
@@ -300,7 +300,6 @@ function InputsView() {
   const [pacingMin, setPacingMin] = useState(6);
   const [pacingMax, setPacingMax] = useState(10);
   const [audio, setAudio] = useState<import("./infrastructure/projects-client").InputAssetRecord | null>(null);
-  const [references, setReferences] = useState<import("./infrastructure/projects-client").InputAssetRecord[]>([]);
   const [status, setStatus] = useState("Loading source material…");
   const [error, setError] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
@@ -314,7 +313,6 @@ function InputsView() {
       setPacingMin(inputs.pacingMinSeconds);
       setPacingMax(inputs.pacingMaxSeconds);
       setAudio(inputs.audio);
-      setReferences(inputs.references);
       setStatus("Saved locally");
       setHydrated(true);
     }).catch((caught) => setError(String(caught)));
@@ -340,24 +338,23 @@ function InputsView() {
     setStatus("Saved locally");
   }
 
-  async function importAsset(kind: "audio" | "reference") {
+  async function importAsset(kind: "audio") {
     if (!activeVideoId) return;
     const asset = await projectsClient.pickAndImportAsset(activeVideoId, kind);
     if (!asset) return;
-    if (kind === "audio") setAudio(asset);
-    else setReferences((items) => [...items, asset]);
+    setAudio(asset);
   }
 
   async function removeAsset(assetId: string) {
     await projectsClient.removeInputAsset(assetId);
     if (audio?.id === assetId) setAudio(null);
-    setReferences((items) => items.filter((item) => item.id !== assetId));
   }
 
   const wordCount = script.trim() ? script.trim().split(/\s+/).length : 0;
   const ready = Boolean(script.trim() && audio);
   return (
     <section className="view">
+      <div className="workflow-tabs"><button className="active">1 · Source & pacing</button><button disabled>2 · Visual plan</button></div>
       <div className="page-heading"><div><p className="eyebrow">Stage 1 of 3</p><h1>Source material</h1><p>Add narration and references that will guide the visual plan.</p></div><span className="save-state">{status}</span></div>
       {!activeVideoId && <div className="inline-error">Open or create a video before adding source material.</div>}
       {error && <div className="inline-error">{error}</div>}
@@ -369,7 +366,6 @@ function InputsView() {
         </article>
         <div className="panel-stack">
           <article className="panel"><div className="panel-heading"><div><h2>Narration audio</h2><p>Used for word-level timing.</p></div><button className="secondary" onClick={() => void importAsset("audio")}><Upload size={15} />{audio ? "Replace" : "Import"}</button></div>{audio ? <div className="file-row"><span>♪</span><div><strong>{audio.originalName}</strong><small>{(audio.sizeBytes / 1024 / 1024).toFixed(1)} MB</small></div><button className="icon-button" onClick={() => void removeAsset(audio.id)}><X size={15} /></button></div> : <div className="asset-empty">WAV, MP3, M4A, AAC, or FLAC</div>}</article>
-          <article className="panel"><div className="panel-heading"><div><h2>Visual references</h2><p>Optional style and subject guidance.</p></div><button className="secondary" onClick={() => void importAsset("reference")}><Plus size={15} />Add</button></div><div className="reference-list">{references.map((reference) => <div key={reference.id}><span>IMG</span><p>{reference.originalName}</p><button onClick={() => void removeAsset(reference.id)}><X size={13} /></button></div>)}{references.length === 0 && <div className="asset-empty">PNG, JPEG, or WebP</div>}</div></article>
           <article className="panel"><div className="pacing-heading"><div><h2>Scene pacing</h2><p>Preferred duration range per still</p></div><strong>{pacingMin}–{pacingMax} sec</strong></div><div className="pacing-options">{([["calm","Calm","10–16s"],["balanced","Balanced","6–10s"],["fast","Fast","3–6s"],["custom","Custom","Choose range"]] as const).map(([value,label,detail]) => <button key={value} className={pacingPreset === value ? "active" : ""} onClick={() => void choosePacing(value)}><strong>{label}</strong><small>{detail}</small></button>)}</div>{pacingPreset === "custom" && <div className="custom-pacing"><label>Minimum<input type="number" min="2" max="30" value={pacingMin} onChange={(event) => setPacingMin(Number(event.target.value))} /></label><label>Maximum<input type="number" min="2" max="30" value={pacingMax} onChange={(event) => setPacingMax(Number(event.target.value))} /></label><button className="secondary" onClick={() => void choosePacing("custom", pacingMin, pacingMax)}>Apply</button></div>}</article>
           <article className={ready ? "readiness ready" : "readiness"}><strong>{ready ? "Ready for visual planning" : "Source material incomplete"}</strong><span>{ready ? "Script and narration audio are available." : "Add a script and narration audio to continue."}</span></article>
         </div>
@@ -402,6 +398,7 @@ function VisualPlanView() {
 
   return (
     <section className="view">
+      <div className="workflow-tabs"><button onClick={() => setStage("inputs")}>1 · Source & pacing</button><button className="active">2 · Visual plan</button></div>
       <div className="page-heading">
         <div><p className="eyebrow">Stage 2 of 3</p><h1>Visual plan</h1><p>Drag a sentence into an adjacent still to regroup it. Chronological order remains enforced.</p></div>
         <div className="heading-actions"><button className="secondary" disabled={!plan} onClick={() => void resetPlan()}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
@@ -445,6 +442,25 @@ function VisualPlanView() {
   );
 }
 
+function ProductionView() {
+  const { stage } = useAppStore();
+  return stage === "visual-plan" ? <VisualPlanView /> : <InputsView />;
+}
+
+type ImageSettings = {
+  aspectRatio: string;
+  artStyle: string;
+  cameraAngle: string;
+  mood: string;
+  lighting: string;
+  depthOfField: string;
+};
+const defaultImageSettings: ImageSettings = { aspectRatio: "16:9", artStyle: "Photorealistic", cameraAngle: "Wide establishing", mood: "Cinematic", lighting: "Natural", depthOfField: "Deep focus" };
+function parseImageSettings(value?: string): ImageSettings {
+  try { return { ...defaultImageSettings, ...(value ? JSON.parse(value) : {}) }; }
+  catch { return defaultImageSettings; }
+}
+
 function ImagesView() {
   const { activeVideoId } = useAppStore();
   const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
@@ -452,11 +468,9 @@ function ImagesView() {
   const [activePromptVersionId, setActivePromptVersionId] = useState<string | null>(null);
   const [systemPrompt, setSystemPrompt] = useState("");
   const [userPrompt, setUserPrompt] = useState("");
-  const [settingsJson, setSettingsJson] = useState("{}");
+  const [imageSettings, setImageSettings] = useState<ImageSettings>(defaultImageSettings);
+  const settingsJson = JSON.stringify(imageSettings);
   const [geminiModel, setGeminiModel] = useState("gemini-2.5-flash-image");
-  const [openAiModel, setOpenAiModel] = useState("gpt-4.1");
-  const [geminiKey, setGeminiKey] = useState("");
-  const [openAiKey, setOpenAiKey] = useState("");
   const [keyStatus, setKeyStatus] = useState({ gemini: false, openai: false });
   const [tab, setTab] = useState<"prompt" | "settings">("prompt");
   const [loading, setLoading] = useState(false);
@@ -466,6 +480,7 @@ function ImagesView() {
   const [compareRenderId, setCompareRenderId] = useState<string | null>(null);
   const [renderUrls, setRenderUrls] = useState<Record<string, string>>({});
   const [editInstruction, setEditInstruction] = useState("");
+  const [references, setReferences] = useState<import("./infrastructure/projects-client").InputAssetRecord[]>([]);
 
   const selectedGroup = useMemo(
     () => workspace?.groups.find((group) => group.group.id === selectedGroupId) ?? null,
@@ -481,14 +496,15 @@ function ImagesView() {
         const loaded = await projectsClient.getImageWorkspace(activeVideoId);
         setWorkspace(loaded);
         setSelectedGroupId(loaded.groups[0]?.group.id ?? null);
-        setSettingsJson(loaded.settings.find((setting) => setting.key === "image_settings")?.value ?? "{}");
+        setImageSettings(parseImageSettings(loaded.settings.find((setting) => setting.key === "image_settings")?.value));
         setGeminiModel(loaded.settings.find((setting) => setting.key === "gemini_model")?.value ?? "gemini-2.5-flash-image");
-        setOpenAiModel(loaded.settings.find((setting) => setting.key === "openai_model")?.value ?? "gpt-4.1");
-        const [geminiStatus, openAiStatus] = await Promise.all([
+        const [geminiStatus, openAiStatus, inputs] = await Promise.all([
           projectsClient.getProviderKeyStatus("gemini"),
           projectsClient.getProviderKeyStatus("openai"),
+          projectsClient.getVideoInputs(activeVideoId),
         ]);
         setKeyStatus({ gemini: geminiStatus.configured, openai: openAiStatus.configured });
+        setReferences(inputs.references);
         setJob(await projectsClient.getLatestImageJob(activeVideoId));
         const latest = loaded.groups[0]?.promptVersions[0];
         setActivePromptVersionId(latest?.id ?? null);
@@ -611,7 +627,7 @@ function ImagesView() {
     setActivePromptVersionId(version.id);
     setSystemPrompt(version.systemPrompt);
     setUserPrompt(version.userPrompt);
-    setSettingsJson(version.settingsJson);
+    setImageSettings(parseImageSettings(version.settingsJson));
   }
 
   function selectGroup(groupId: string) {
@@ -620,7 +636,7 @@ function ImagesView() {
     setActivePromptVersionId(latest?.id ?? null);
     setSystemPrompt(latest?.systemPrompt ?? "");
     setUserPrompt(latest?.userPrompt ?? "");
-    setSettingsJson(latest?.settingsJson ?? "{}");
+    setImageSettings(parseImageSettings(latest?.settingsJson));
     const latestRender = workspace?.groups.find((item) => item.group.id === groupId)?.imageRenders[0];
     setSelectedRenderId(latestRender?.id ?? null);
     setCompareRenderId(latestRender?.parentRenderId ?? null);
@@ -630,21 +646,29 @@ function ImagesView() {
     setLoading(true);
     setError(null);
     try {
-      JSON.parse(settingsJson);
       await projectsClient.saveAppSetting("image_settings", settingsJson);
       await projectsClient.saveAppSetting("gemini_model", geminiModel.trim());
-      await projectsClient.saveAppSetting("openai_model", openAiModel.trim());
-      if (geminiKey.trim()) await projectsClient.saveProviderKey("gemini", geminiKey.trim());
-      if (openAiKey.trim()) await projectsClient.saveProviderKey("openai", openAiKey.trim());
-      setKeyStatus({ gemini: keyStatus.gemini || Boolean(geminiKey.trim()), openai: keyStatus.openai || Boolean(openAiKey.trim()) });
-      setGeminiKey("");
-      setOpenAiKey("");
       await refreshWorkspace();
     } catch (caught) {
-      setError(caught instanceof SyntaxError ? "Image settings must be valid JSON." : String(caught));
+      setError(String(caught));
     } finally {
       setLoading(false);
     }
+  }
+
+  function updateImageSetting(key: keyof ImageSettings, value: string) {
+    setImageSettings((current) => ({ ...current, [key]: value }));
+  }
+
+  async function importReference() {
+    if (!activeVideoId) return;
+    const asset = await projectsClient.pickAndImportAsset(activeVideoId, "reference");
+    if (asset) setReferences((items) => [...items, asset]);
+  }
+
+  async function removeReference(assetId: string) {
+    await projectsClient.removeInputAsset(assetId);
+    setReferences((items) => items.filter((item) => item.id !== assetId));
   }
 
   const previewLabel = selectedGroup?.group.label ?? "Still preview";
@@ -826,32 +850,24 @@ function ImagesView() {
             </>
           ) : (
             <>
-              <label>
-                Image settings JSON
-                <textarea
-                  value={settingsJson}
-                  onChange={(event) => setSettingsJson(event.target.value)}
-                  rows={8}
-                  placeholder="Image generation settings JSON"
-                />
-              </label>
-              <label>Gemini image model<input value={geminiModel} onChange={(event) => setGeminiModel(event.target.value)} /></label>
-              <label>Gemini API key <small>{keyStatus.gemini ? "Configured" : "Not configured"}</small><input type="password" value={geminiKey} onChange={(event) => setGeminiKey(event.target.value)} placeholder={keyStatus.gemini ? "Enter to replace" : "Required"} /></label>
-              <label>OpenAI model<input value={openAiModel} onChange={(event) => setOpenAiModel(event.target.value)} /></label>
-              <label>OpenAI API key <small>{keyStatus.openai ? "Configured" : "Not configured"}</small><input type="password" value={openAiKey} onChange={(event) => setOpenAiKey(event.target.value)} placeholder={keyStatus.openai ? "Enter to replace" : "Optional"} /></label>
-              <button className="primary full" onClick={() => void saveSettings()} disabled={loading}>Apply settings</button>
-              <div className="placeholder">
-                <strong>Stored settings</strong>
-                <span>{workspace?.settings.length ? `${workspace.settings.length} setting(s)` : "No settings saved."}</span>
+              <div className="setting-grid">
+                <label>Aspect ratio<select value={imageSettings.aspectRatio} onChange={(event) => updateImageSetting("aspectRatio", event.target.value)}><option>16:9</option><option>9:16</option><option>1:1</option></select></label>
+                <label>Art style<select value={imageSettings.artStyle} onChange={(event) => updateImageSetting("artStyle", event.target.value)}><option>Photorealistic</option><option>Cinematic</option><option>Editorial illustration</option><option>Documentary</option></select></label>
+                <label>Camera angle<select value={imageSettings.cameraAngle} onChange={(event) => updateImageSetting("cameraAngle", event.target.value)}><option>Wide establishing</option><option>Medium shot</option><option>Close-up</option><option>Overhead</option></select></label>
+                <label>Mood<select value={imageSettings.mood} onChange={(event) => updateImageSetting("mood", event.target.value)}><option>Cinematic</option><option>Mysterious</option><option>Calm</option><option>Dramatic</option></select></label>
+                <label>Lighting<select value={imageSettings.lighting} onChange={(event) => updateImageSetting("lighting", event.target.value)}><option>Natural</option><option>Volumetric</option><option>Low key</option><option>Studio</option></select></label>
+                <label>Depth of field<select value={imageSettings.depthOfField} onChange={(event) => updateImageSetting("depthOfField", event.target.value)}><option>Deep focus</option><option>Shallow</option><option>Natural</option></select></label>
               </div>
-              {workspace?.settings.map((setting) => (
-                <div key={setting.key} className="prompt-history">
-                  <button type="button">
-                    <span>{setting.key}</span>
-                    <small>{setting.value}</small>
-                  </button>
-                </div>
-              ))}
+              <label>Image model<select value={geminiModel} onChange={(event) => setGeminiModel(event.target.value)}><option value="gemini-2.5-flash-image">Gemini 2.5 Flash Image</option><option value="gemini-3.1-flash-image">Gemini 3.1 Flash Image</option></select></label>
+              <div className={keyStatus.gemini ? "provider-status ready" : "provider-status"}>
+                <strong>Generation service</strong><span>{keyStatus.gemini ? "Configured securely in Windows Credential Manager" : "Not configured. Add the Gemini credential on the backend."}</span>
+              </div>
+              <div className="reference-manager">
+                <div><strong>Visual references</strong><span>Optional style or subject guidance for image work.</span></div>
+                <button className="secondary" onClick={() => void importReference()}><Plus size={14} />Add image</button>
+                {references.map((reference) => <div className="reference-item" key={reference.id}><span>IMG</span><p>{reference.originalName}</p><button onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button></div>)}
+              </div>
+              <button className="primary full" onClick={() => void saveSettings()} disabled={loading}>Apply settings</button>
             </>
           )}
         </aside>
@@ -895,6 +911,11 @@ function TimelineView() {
     } catch (caught) { setError(String(caught)); }
   }
 
+  const timelineReleased = false;
+  if (!timelineReleased) {
+    return <section className="view"><div className="coming-soon"><PanelsTopLeft size={34} /><p className="eyebrow">In production</p><h1>Timeline is coming soon</h1><p>Timeline editing is being refined and is not available in this build.</p></div></section>;
+  }
+
   return (
     <section className="view">
       <div className="page-heading"><div><p className="eyebrow">Editor foundation</p><h1>Timeline</h1><p>Arrange approved stills against narration timing.</p></div><button className="secondary" onClick={() => void rebuild()}><Undo2 size={16} />Reset from visual plan</button></div>
@@ -931,7 +952,7 @@ export function App() {
   } = useAppStore();
   const [startupNotice, setStartupNotice] = useState<string | null>(null);
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
-  useEffect(() => log("info", "application_started", { release: "1.1.0" }), []);
+  useEffect(() => log("info", "application_started", { release: "1.2.0" }), []);
   useEffect(() => { void projectsClient.startupDiagnostic().then(setStartupNotice); }, []);
   useEffect(() => log("debug", "stage_opened", { stage }), [stage]);
   useEffect(() => {
@@ -951,7 +972,7 @@ export function App() {
   return (
     <div className="app-shell">
       <Sidebar />
-      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{stage === "inputs" && <InputsView />}{stage === "visual-plan" && <VisualPlanView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
+      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
     </div>
   );
 }

@@ -1,6 +1,6 @@
 [package]
 name = "auto-gen-studio"
-version = "1.1.0"
+version = "1.2.0"
 description = "Local-first YouTube production workspace"
 authors = ["Auto Gen Studio"]
 edition = "2021"

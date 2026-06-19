@@ -588,6 +588,16 @@ pub fn run() {
             repository
                 .recover_image_jobs()
                 .map_err(std::io::Error::other)?;
+            for (provider, variable) in [("gemini", "GEMINI_API_KEY"), ("openai", "OPENAI_API_KEY")]
+            {
+                if let Ok(secret) = std::env::var(variable) {
+                    if !secret.trim().is_empty() {
+                        repository
+                            .save_provider_key(provider, secret.trim())
+                            .map_err(std::io::Error::other)?;
+                    }
+                }
+            }
             app.manage(Mutex::new(repository));
             app.manage(StartupState { recovery_backup });
             Ok(())

@@ -45,7 +45,7 @@ apps/desktop/src-tauri/target/
 coverage/
 *.log
 *.tsbuildinfo
-releases/
+/releases/
 legacy/prototype/runtime/
 legacy/prototype/samples/
 tools/standalone/.env

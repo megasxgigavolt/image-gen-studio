@@ -55,3 +55,9 @@ Local project data is kept outside the repository:
 %LOCALAPPDATA%\studio.autogen.desktop\auto-gen-studio.db
 %LOCALAPPDATA%\studio.autogen.desktop\Projects
 ```
+
+## Provider credentials
+
+API keys are never entered in the frontend. Set `GEMINI_API_KEY` and optionally
+`OPENAI_API_KEY` in the Windows environment before starting the application.
+On startup, the native backend stores them in Windows Credential Manager.

@@ -223,3 +223,10 @@
 - Fixed visual-plan drag and drop and added adjacent-scene move controls.
 - Added support for hidden `<#seconds#>` TTS pause markers in estimated timing.
 - Replaced the scene pacing slider with Calm, Balanced, Fast, and Custom ranges.
+# 1.2.0
+
+- Combined source material and visual planning into one guided Production workflow.
+- Moved visual references and structured image settings into the Images workspace.
+- Removed API-secret entry from the frontend; backend environment credentials are stored securely.
+- Hid unavailable downstream screens and marked Timeline as in production.
+- Corrected video-card spacing and tightened typography to match the product mockup.

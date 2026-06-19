@@ -16,6 +16,7 @@ in a release is not silently added to it.
 | 0.9.0 | Timeline Foundation | Complete: interactive editor data model and disabled feature-preview surface |
 | 1.0.0 | Personal Stable | Complete: hardened Windows personal release |
 | 1.1.0 | Usability | Complete: visual-plan regrouping, TTS pauses, pacing presets |
+| 1.2.0 | Workflow UX | Complete: consolidated production flow and secure image settings |
 
 Animation generation remains a placeholder before `1.0.0`. Full video editing,
 captions, thumbnails, metadata, publishing, cloud sync, accounts, teams, and

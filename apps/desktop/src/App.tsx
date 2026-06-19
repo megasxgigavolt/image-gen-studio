@@ -14,8 +14,21 @@ import {
   WandSparkles,
   Download,
   PanelsTopLeft,
+  LoaderCircle,
+  GripVertical,
 } from "lucide-react";
-import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import {
+  DndContext,
+  PointerSensor,
+  useDraggable,
+  useDroppable,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import { CSS } from "@dnd-kit/utilities";
+import { type ChangeEvent, type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type AppStage, useAppStore } from "./store/app-store";
 import { log } from "./infrastructure/logger";
 import {
@@ -303,6 +316,23 @@ function InputsView() {
   const [status, setStatus] = useState("Loading source material…");
   const [error, setError] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
+  const [hasPlan, setHasPlan] = useState(false);
+  const [generatedInputSignature, setGeneratedInputSignature] = useState<string | null>(null);
+  const [generating, setGenerating] = useState(false);
+  const [generationProgress, setGenerationProgress] = useState({
+    percent: 0,
+    stage: "Preparing visual plan",
+    detail: "",
+  });
+  const scriptFileRef = useRef<HTMLInputElement>(null);
+  const audioFileRef = useRef<HTMLInputElement>(null);
+  const inputSignature = useMemo(() => JSON.stringify({
+    script,
+    audioId: audio?.id ?? null,
+    pacingPreset,
+    pacingMin,
+    pacingMax,
+  }), [audio?.id, pacingMax, pacingMin, pacingPreset, script]);
 
   useEffect(() => {
     if (!activeVideoId) return;
@@ -315,6 +345,16 @@ function InputsView() {
       setAudio(inputs.audio);
       setStatus("Saved locally");
       setHydrated(true);
+      const signature = JSON.stringify({
+        script: inputs.scriptText,
+        audioId: inputs.audio?.id ?? null,
+        pacingPreset: inputs.pacingPreset,
+        pacingMin: inputs.pacingMinSeconds,
+        pacingMax: inputs.pacingMaxSeconds,
+      });
+      void projectsClient.getVisualPlan(activeVideoId)
+        .then(() => { setHasPlan(true); setGeneratedInputSignature(signature); })
+        .catch(() => { setHasPlan(false); setGeneratedInputSignature(null); });
     }).catch((caught) => setError(String(caught)));
   }, [activeVideoId]);
 
@@ -341,8 +381,39 @@ function InputsView() {
   async function importAsset(kind: "audio") {
     if (!activeVideoId) return;
     const asset = await projectsClient.pickAndImportAsset(activeVideoId, kind);
-    if (!asset) return;
+    if (!asset) {
+      audioFileRef.current?.click();
+      return;
+    }
     setAudio(asset);
+  }
+
+  async function importBrowserAudio(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file || !activeVideoId) return;
+    try {
+      setAudio(await projectsClient.importBrowserAsset(activeVideoId, "audio", file));
+      setStatus("Saved locally");
+    } catch (caught) { setError(String(caught)); }
+  }
+
+  async function importScript() {
+    try {
+      const text = await projectsClient.pickScriptText();
+      if (text !== null) setScript(text);
+      else scriptFileRef.current?.click();
+    } catch (caught) { setError(String(caught)); }
+  }
+
+  async function importBrowserScript(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      setScript(await projectsClient.readBrowserScript(file));
+      setStatus("Saving…");
+    } catch (caught) { setError(String(caught)); }
   }
 
   async function removeAsset(assetId: string) {
@@ -352,25 +423,64 @@ function InputsView() {
 
   const wordCount = script.trim() ? script.trim().split(/\s+/).length : 0;
   const ready = Boolean(script.trim() && audio);
+  async function generatePlan() {
+    if (!activeVideoId) return;
+    setGenerating(true);
+    setGenerationProgress({ percent: 0, stage: "Preparing visual plan", detail: "" });
+    setError(null);
+    let unlisten: (() => void) | undefined;
+    try {
+      try {
+        unlisten = await listen<{
+          videoId: string;
+          percent: number;
+          stage: string;
+          detail: string;
+        }>("visual-plan-progress", ({ payload }) => {
+          if (payload.videoId === activeVideoId) {
+            setGenerationProgress({
+              percent: payload.percent,
+              stage: payload.stage,
+              detail: payload.detail,
+            });
+          }
+        });
+      } catch {
+        // Browser preview has no native event bridge.
+      }
+      await projectsClient.generateVisualPlan(activeVideoId);
+      setHasPlan(true);
+      setGeneratedInputSignature(inputSignature);
+      setStage("visual-plan");
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      unlisten?.();
+      setGenerating(false);
+    }
+  }
   return (
     <section className="view">
-      <div className="workflow-tabs"><button className="active">1 · Source & pacing</button><button disabled>2 · Visual plan</button></div>
+      <input ref={scriptFileRef} className="visually-hidden" type="file" accept=".txt,text/plain" onChange={(event) => void importBrowserScript(event)} />
+      <input ref={audioFileRef} className="visually-hidden" type="file" accept=".wav,.mp3,.m4a,.aac,.flac,audio/*" onChange={(event) => void importBrowserAudio(event)} />
+      {generating && <GenerationProgress progress={generationProgress} />}
+      <div className="workflow-tabs"><button className="active">1 · Source & pacing</button><button disabled={!hasPlan} onClick={() => setStage("visual-plan")}>2 · Visual plan</button></div>
       <div className="page-heading"><div><p className="eyebrow">Stage 1 of 3</p><h1>Source material</h1><p>Add narration and references that will guide the visual plan.</p></div><span className="save-state">{status}</span></div>
       {!activeVideoId && <div className="inline-error">Open or create a video before adding source material.</div>}
       {error && <div className="inline-error">{error}</div>}
       <div className="inputs-grid">
         <article className="panel script-panel">
-          <div className="panel-heading"><div><h2>Script</h2><p>Paste narration or import a UTF-8 text file.</p></div><button className="secondary" onClick={() => void projectsClient.pickScriptText().then((text) => { if (text !== null) setScript(text); })}><Upload size={15} />Import</button></div>
+          <div className="panel-heading"><div><h2>Script</h2><p>Paste narration or import a UTF-8 text file.</p></div><button className="secondary" onClick={() => void importScript()}><Upload size={15} />Import</button></div>
           <textarea value={script} onChange={(event) => { setScript(event.target.value); setStatus("Saving…"); }} placeholder="Paste the final narration script here…" />
           <footer><span>{wordCount.toLocaleString()} words</span><span>Approx. {Math.ceil(wordCount / 150)} min</span></footer>
         </article>
         <div className="panel-stack">
           <article className="panel"><div className="panel-heading"><div><h2>Narration audio</h2><p>Used for word-level timing.</p></div><button className="secondary" onClick={() => void importAsset("audio")}><Upload size={15} />{audio ? "Replace" : "Import"}</button></div>{audio ? <div className="file-row"><span>♪</span><div><strong>{audio.originalName}</strong><small>{(audio.sizeBytes / 1024 / 1024).toFixed(1)} MB</small></div><button className="icon-button" onClick={() => void removeAsset(audio.id)}><X size={15} /></button></div> : <div className="asset-empty">WAV, MP3, M4A, AAC, or FLAC</div>}</article>
-          <article className="panel"><div className="pacing-heading"><div><h2>Scene pacing</h2><p>Preferred duration range per still</p></div><strong>{pacingMin}–{pacingMax} sec</strong></div><div className="pacing-options">{([["calm","Calm","10–16s"],["balanced","Balanced","6–10s"],["fast","Fast","3–6s"],["custom","Custom","Choose range"]] as const).map(([value,label,detail]) => <button key={value} className={pacingPreset === value ? "active" : ""} onClick={() => void choosePacing(value)}><strong>{label}</strong><small>{detail}</small></button>)}</div>{pacingPreset === "custom" && <div className="custom-pacing"><label>Minimum<input type="number" min="2" max="30" value={pacingMin} onChange={(event) => setPacingMin(Number(event.target.value))} /></label><label>Maximum<input type="number" min="2" max="30" value={pacingMax} onChange={(event) => setPacingMax(Number(event.target.value))} /></label><button className="secondary" onClick={() => void choosePacing("custom", pacingMin, pacingMax)}>Apply</button></div>}</article>
+          <article className="panel"><div className="pacing-heading"><div><h2>Scene pacing</h2><p>Preferred duration range per still</p></div><strong>{pacingMin}–{pacingMax} sec</strong></div><div className="pacing-options">{([["calm","Calm","10–16s"],["balanced","Balanced","6–10s"],["fast","Fast","3–6s"],["custom","Custom","Choose range"]] as const).map(([value,label,detail]) => <button key={value} className={pacingPreset === value ? "active" : ""} onClick={() => void choosePacing(value)}><strong>{label}</strong><small>{detail}</small></button>)}</div><div className="custom-pacing"><label>Minimum<input type="number" min="2" max="30" value={pacingMin} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMin(Number(event.target.value))} /></label><label>Maximum<input type="number" min="2" max="30" value={pacingMax} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMax(Number(event.target.value))} /></label><button className="secondary" disabled={pacingPreset !== "custom"} onClick={() => void choosePacing("custom", pacingMin, pacingMax)}>Apply</button></div></article>
           <article className={ready ? "readiness ready" : "readiness"}><strong>{ready ? "Ready for visual planning" : "Source material incomplete"}</strong><span>{ready ? "Script and narration audio are available." : "Add a script and narration audio to continue."}</span></article>
         </div>
       </div>
-      <div className="footer-actions"><button className="secondary" onClick={() => setStage("home")}>Back</button><button className="primary" disabled={!ready || !activeVideoId} onClick={() => void projectsClient.generateVisualPlan(activeVideoId!).then(() => setStage("visual-plan")).catch((caught) => setError(String(caught)))}>Generate visual plan →</button></div>
+      <div className="footer-actions"><button className="secondary" onClick={() => setStage("home")}>Back</button><button className="primary" disabled={!ready || !activeVideoId || generating || (hasPlan && inputSignature === generatedInputSignature)} onClick={() => void generatePlan()}>{generating ? <><LoaderCircle className="spin" size={16} />Generating…</> : "Generate visual plan →"}</button></div>
     </section>
   );
 }
@@ -380,6 +490,8 @@ function VisualPlanView() {
   const [plan, setPlan] = useState<VisualPlanRecord | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [draggedSentenceId, setDraggedSentenceId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
   useEffect(() => {
     if (!activeVideoId) return;
     void projectsClient.getVisualPlan(activeVideoId).then(setPlan).catch((caught) => setError(String(caught)));
@@ -396,6 +508,25 @@ function VisualPlanView() {
     setPlan(await projectsClient.resetVisualPlan(activeVideoId));
   }
 
+  async function createGroup(sentenceId: string, insertIndex: number) {
+    if (!activeVideoId) return;
+    try { setPlan(await projectsClient.createPlanGroup(activeVideoId, sentenceId, insertIndex)); }
+    catch (caught) { setError(String(caught)); }
+  }
+
+  function finishDrag(event: DragEndEvent) {
+    const sentenceId = String(event.active.id).replace(/^sentence:/, "");
+    const target = event.over ? String(event.over.id) : "";
+    setDraggedSentenceId(null);
+    setDropTarget(null);
+    if (!sentenceId || !target) return;
+    if (target.startsWith("group:")) {
+      void moveSentence(sentenceId, target.replace(/^group:/, ""));
+    } else if (target.startsWith("divider:")) {
+      void createGroup(sentenceId, Number(target.replace(/^divider:/, "")));
+    }
+  }
+
   return (
     <section className="view">
       <div className="workflow-tabs"><button onClick={() => setStage("inputs")}>1 · Source & pacing</button><button className="active">2 · Visual plan</button></div>
@@ -405,41 +536,85 @@ function VisualPlanView() {
       </div>
       {error && <div className="inline-error">{error}</div>}
       {!plan && !error && <div className="empty-state">Loading visual plan…</div>}
-      {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{plan.timingSource} timing · Original plan is always recoverable</span></div>
+      {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{formatTime(plan.sentences.at(-1)?.endSeconds ?? 0)} total · Average {((plan.sentences.at(-1)?.endSeconds ?? 0) / plan.groups.length).toFixed(1)} sec · {plan.timingSource}</span></div>
+      <div className="drag-help"><GripVertical size={22} /><div><strong>Drag sentences between stills</strong><p>Drop onto another row to merge, or between rows to create a new still. Timestamps update automatically.</p></div><button className="text-button" onClick={() => void resetPlan()}>Reset original</button></div>
+      <DndContext
+        sensors={sensors}
+        onDragStart={(event) => setDraggedSentenceId(String(event.active.id).replace(/^sentence:/, ""))}
+        onDragOver={(event) => setDropTarget(event.over ? String(event.over.id) : null)}
+        onDragCancel={() => { setDraggedSentenceId(null); setDropTarget(null); }}
+        onDragEnd={finishDrag}
+      >
       <div className="plan-list">
+        <StillDivider insertIndex={0} active={dropTarget === "divider:0"} />
         {plan.groups.map((group, index) => {
           const members = group.sentenceIds.map((id) => plan.sentences.find((sentence) => sentence.id === id)).filter((sentence): sentence is NonNullable<typeof sentence> => Boolean(sentence)).sort((a,b) => a.ordinal-b.ordinal);
           const timing = { startSeconds: members[0].startSeconds, endSeconds: members.at(-1)!.endSeconds, durationSeconds: members.at(-1)!.endSeconds-members[0].startSeconds, members };
-          return (
-            <article
-              className="plan-row"
-              key={group.id}
-              onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "move"; }}
-              onDrop={(event) => { event.preventDefault(); const id = draggedSentenceId || event.dataTransfer.getData("text/plain"); setDraggedSentenceId(null); if (id) void moveSentence(id, group.id); }}
-            >
+          return <div className="plan-group-shell" key={group.id}>
+            <DroppableStill groupId={group.id} active={dropTarget === `group:${group.id}`}>
               <span className="plan-index">{String(index + 1).padStart(2, "0")}</span>
               <div className="timing"><strong>{formatTime(timing.startSeconds)} – {formatTime(timing.endSeconds)}</strong><small>{timing.durationSeconds.toFixed(1)} sec</small></div>
               <div className="sentences">
                 {timing.members.map((sentence) => (
-                  <div
-                    className="sentence"
-                    draggable
-                    key={sentence.id}
-                    onDragStart={(event) => { setDraggedSentenceId(sentence.id); event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", sentence.id); }}
-                    onDragEnd={() => setDraggedSentenceId(null)}
-                  >
-                    <b>⠿</b><span>{sentence.text}</span><small>{formatTime(sentence.startSeconds)}</small>
-                    <div className="sentence-move">{index > 0 && <button onClick={() => void moveSentence(sentence.id, plan.groups[index - 1].id)} aria-label="Move to previous scene">←</button>}{index + 1 < plan.groups.length && <button onClick={() => void moveSentence(sentence.id, plan.groups[index + 1].id)} aria-label="Move to next scene">→</button>}</div>
-                  </div>
+                  <DraggableSentence key={sentence.id} sentence={sentence} active={draggedSentenceId === sentence.id} />
                 ))}
               </div>
               <div className="scene-label"><span>{group.kind}</span><small>{group.label}</small></div>
-            </article>
-          );
+            </DroppableStill>
+            <StillDivider insertIndex={index + 1} active={dropTarget === `divider:${index + 1}`} />
+          </div>;
         })}
-      </div></>}
+      </div>
+      </DndContext></>}
     </section>
   );
+}
+
+type PlanSentenceRecord = VisualPlanRecord["sentences"][number];
+
+function DraggableSentence({ sentence, active }: { sentence: PlanSentenceRecord; active: boolean }) {
+  const { attributes, listeners, setNodeRef, transform } = useDraggable({ id: `sentence:${sentence.id}` });
+  return <div
+    ref={setNodeRef}
+    className={active ? "sentence dragging" : "sentence"}
+    style={{ transform: CSS.Translate.toString(transform), touchAction: "none" }}
+    {...listeners}
+    {...attributes}
+  >
+    <b title="Drag sentence"><GripVertical size={18} /></b>
+    <span>{sentence.text}</span>
+    <small>{formatTime(sentence.startSeconds)}</small>
+  </div>;
+}
+
+function DroppableStill({ groupId, active, children }: { groupId: string; active: boolean; children: ReactNode }) {
+  const { setNodeRef, isOver } = useDroppable({ id: `group:${groupId}` });
+  return <article ref={setNodeRef} className={active || isOver ? "plan-row drag-over" : "plan-row"}>{children}</article>;
+}
+
+function StillDivider({ insertIndex, active }: { insertIndex: number; active: boolean }) {
+  const { setNodeRef, isOver } = useDroppable({ id: `divider:${insertIndex}` });
+  return <div ref={setNodeRef} className={active || isOver ? "drop-divider drag-over" : "drop-divider"} />;
+}
+
+function LoadingOverlay({ label }: { label: string }) {
+  return <div className="loading-overlay" role="status"><div className="loading-card"><LoaderCircle size={28} /><strong>{label}</strong><span>This may take a moment.</span><div className="loading-bar"><i /></div></div></div>;
+}
+
+function GenerationProgress({ progress }: { progress: { percent: number; stage: string; detail: string } }) {
+  const percent = Math.max(0, Math.min(100, progress.percent));
+  return <div className="loading-overlay" role="status" aria-live="polite">
+    <div className="loading-card generation-progress">
+      <div className="progress-heading">
+        <LoaderCircle className="spin" size={26} />
+        <strong>{progress.stage}</strong>
+        <b>{percent}%</b>
+      </div>
+      <span>{progress.detail || "Starting the local visual-planning engine…"}</span>
+      <div className="loading-bar determinate"><i style={{ width: `${percent}%` }} /></div>
+      <small>Keep Auto Gen Studio open while Whisper analyzes the narration.</small>
+    </div>
+  </div>;
 }
 
 function ProductionView() {
@@ -454,8 +629,16 @@ type ImageSettings = {
   mood: string;
   lighting: string;
   depthOfField: string;
+  styleDirective: string;
+  subjectConsistency: boolean;
+  diversity: number;
+  composition: string;
+  lens: string;
+  colorGrade: string;
+  texture: string;
+  negativePrompt: string;
 };
-const defaultImageSettings: ImageSettings = { aspectRatio: "16:9", artStyle: "Photorealistic", cameraAngle: "Wide establishing", mood: "Cinematic", lighting: "Natural", depthOfField: "Deep focus" };
+const defaultImageSettings: ImageSettings = { aspectRatio: "16:9", artStyle: "Photorealistic", cameraAngle: "Wide establishing", mood: "Cinematic", lighting: "Natural", depthOfField: "Deep focus", styleDirective: "Natural-history documentary, coherent visual language, restrained cinematic lighting.", subjectConsistency: true, diversity: 45, composition: "Rule of thirds", lens: "35mm cinematic", colorGrade: "Natural cinematic", texture: "Photoreal detail", negativePrompt: "text, watermark, logo, duplicate subjects, malformed anatomy" };
 function parseImageSettings(value?: string): ImageSettings {
   try { return { ...defaultImageSettings, ...(value ? JSON.parse(value) : {}) }; }
   catch { return defaultImageSettings; }
@@ -485,6 +668,12 @@ function ImagesView() {
   const selectedGroup = useMemo(
     () => workspace?.groups.find((group) => group.group.id === selectedGroupId) ?? null,
     [workspace, selectedGroupId],
+  );
+  const selectedSentences = useMemo(
+    () => selectedGroup?.group.sentenceIds
+      .map((id) => workspace?.sentences.find((sentence) => sentence.id === id))
+      .filter((sentence): sentence is PlanSentenceRecord => Boolean(sentence)) ?? [],
+    [selectedGroup, workspace],
   );
 
   useEffect(() => {
@@ -656,7 +845,7 @@ function ImagesView() {
     }
   }
 
-  function updateImageSetting(key: keyof ImageSettings, value: string) {
+  function updateImageSetting<K extends keyof ImageSettings>(key: K, value: ImageSettings[K]) {
     setImageSettings((current) => ({ ...current, [key]: value }));
   }
 
@@ -724,6 +913,7 @@ function ImagesView() {
 
   return (
     <section className="view">
+      {loading && <LoadingOverlay label="Working on your images" />}
       <div className="page-heading">
         <div>
           <p className="eyebrow">Stage 3 of 3</p>
@@ -767,14 +957,14 @@ function ImagesView() {
           <div className={compareRenderId ? "preview-art comparison" : "preview-art"}>
             {selectedRenderId && renderUrls[selectedRenderId] ? (
               <figure><img src={renderUrls[selectedRenderId]} alt="Selected image version" /><figcaption>Selected</figcaption></figure>
-            ) : <><Sparkles size={42} /><p>{selectedGroup ? "No rendered version yet" : "Choose a still to begin."}</p></>}
+            ) : <figure className="dummy-still"><img src="/dummy-still.png" alt="Cinematic underwater placeholder still" /><figcaption>{selectedGroup ? "Placeholder preview" : "Choose a still to begin"}</figcaption></figure>}
             {compareRenderId && renderUrls[compareRenderId] && (
               <figure><img src={renderUrls[compareRenderId]} alt="Comparison image version" /><figcaption>Compare</figcaption></figure>
             )}
           </div>
           <footer>
-            {selectedGroup?.group.sentenceIds.length
-              ? `Group ${selectedGroup?.group.id} contains ${selectedGroup.group.sentenceIds.length} sentence(s).`
+            {selectedSentences.length
+              ? selectedSentences.map((sentence) => sentence.text).join(" ")
               : "No prompt yet."}
           </footer>
         </div>
@@ -850,6 +1040,11 @@ function ImagesView() {
             </>
           ) : (
             <>
+              <section className="style-settings">
+                <label>Video style directive<textarea value={imageSettings.styleDirective} onChange={(event) => updateImageSetting("styleDirective", event.target.value)} /></label>
+                <label className="toggle-setting"><span><strong>Subject consistency</strong><small>Keep recurring subjects recognizable across stills.</small></span><input type="checkbox" checked={imageSettings.subjectConsistency} onChange={(event) => updateImageSetting("subjectConsistency", event.target.checked)} /></label>
+                <label>Diversity <strong>{imageSettings.diversity}%</strong><input type="range" min="0" max="100" value={imageSettings.diversity} onChange={(event) => setImageSettings((current) => ({ ...current, diversity: Number(event.target.value) }))} /></label>
+              </section>
               <div className="setting-grid">
                 <label>Aspect ratio<select value={imageSettings.aspectRatio} onChange={(event) => updateImageSetting("aspectRatio", event.target.value)}><option>16:9</option><option>9:16</option><option>1:1</option></select></label>
                 <label>Art style<select value={imageSettings.artStyle} onChange={(event) => updateImageSetting("artStyle", event.target.value)}><option>Photorealistic</option><option>Cinematic</option><option>Editorial illustration</option><option>Documentary</option></select></label>
@@ -858,6 +1053,12 @@ function ImagesView() {
                 <label>Lighting<select value={imageSettings.lighting} onChange={(event) => updateImageSetting("lighting", event.target.value)}><option>Natural</option><option>Volumetric</option><option>Low key</option><option>Studio</option></select></label>
                 <label>Depth of field<select value={imageSettings.depthOfField} onChange={(event) => updateImageSetting("depthOfField", event.target.value)}><option>Deep focus</option><option>Shallow</option><option>Natural</option></select></label>
               </div>
+              <details className="advanced-settings"><summary>Advanced settings <span>＋</span></summary><div className="setting-grid">
+                <label>Composition<input value={imageSettings.composition} onChange={(event) => updateImageSetting("composition", event.target.value)} /></label>
+                <label>Lens<input value={imageSettings.lens} onChange={(event) => updateImageSetting("lens", event.target.value)} /></label>
+                <label>Color grade<input value={imageSettings.colorGrade} onChange={(event) => updateImageSetting("colorGrade", event.target.value)} /></label>
+                <label>Texture<input value={imageSettings.texture} onChange={(event) => updateImageSetting("texture", event.target.value)} /></label>
+              </div><label>Negative prompt<textarea value={imageSettings.negativePrompt} onChange={(event) => updateImageSetting("negativePrompt", event.target.value)} /></label></details>
               <label>Image model<select value={geminiModel} onChange={(event) => setGeminiModel(event.target.value)}><option value="gemini-2.5-flash-image">Gemini 2.5 Flash Image</option><option value="gemini-3.1-flash-image">Gemini 3.1 Flash Image</option></select></label>
               <div className={keyStatus.gemini ? "provider-status ready" : "provider-status"}>
                 <strong>Generation service</strong><span>{keyStatus.gemini ? "Configured securely in Windows Credential Manager" : "Not configured. Add the Gemini credential on the backend."}</span>

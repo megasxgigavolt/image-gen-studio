@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 
 SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?])(?:[”’"\')\]]*)\s+')
 NORMALIZE_RE = re.compile(r"[^\w\s]", re.UNICODE)
-TTS_TAG_RE = re.compile(r"<#[\d.]+#>")
+TTS_TAG_RE = re.compile(r"<#\s*\d+(?:\.\d+)?\s*#>")
 
 
 @dataclass(frozen=True)
@@ -42,7 +42,7 @@ def split_script(script: str) -> list[str]:
 
 
 def tts_pause_seconds(script: str) -> float:
-    return sum(float(value) for value in re.findall(r"<#([\d.]+)#>", script))
+    return sum(float(value) for value in re.findall(r"<#\s*(\d+(?:\.\d+)?)\s*#>", script))
 
 
 def normalize(text: str) -> list[str]:
@@ -93,7 +93,6 @@ def align_sentences(script: str, words: list[WordTiming]) -> list[TimedSentence]
 
 def estimate_sentence_timings(script: str, duration: float) -> list[TimedSentence]:
     texts = split_script(script)
-    duration += tts_pause_seconds(script)
     weights = [max(1, len(normalize(text))) for text in texts]
     total = sum(weights)
     cursor = 0.0

@@ -2,7 +2,12 @@
 name = "auto-gen-studio-engine"
 version = "0.4.0"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+  "openai>=1.68",
+  "pydantic>=2.10",
+  "python-dotenv>=1.0",
+  "xlsxwriter>=3.2",
+]
 
 [project.optional-dependencies]
 whisper = ["openai-whisper>=20240930"]

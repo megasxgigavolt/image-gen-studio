@@ -30,8 +30,8 @@ def test_whisper_dependency_error_is_actionable(monkeypatch):
         transcribe_words("missing.wav")
 
 
-def test_tts_pause_tags_are_hidden_but_extend_timing():
-    script = "The ocean darkens. <#0.5#> Lanternfish glow."
+def test_tts_pause_tags_are_removed_before_planning():
+    script = "The ocean darkens. <#0.5#> Lanternfish glow. <# 1.25 #>"
     result = build_plan(script, target_seconds=5, duration=10)
     assert split_script(script) == ["The ocean darkens.", "Lanternfish glow."]
-    assert result["sentences"][-1]["end"] == 10.5
+    assert result["sentences"][-1]["end"] == 10

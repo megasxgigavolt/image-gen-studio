@@ -97,6 +97,7 @@ export type ImageWorkspaceGroupRecord = {
 
 export type ImageWorkspaceRecord = {
   videoId: string;
+  sentences: PlanSentenceRecord[];
   groups: ImageWorkspaceGroupRecord[];
   settings: AppSettingRecord[];
 };
@@ -252,7 +253,13 @@ export const projectsClient = {
   },
   async getImageWorkspace(videoId: string): Promise<ImageWorkspaceRecord> {
     if (isTauri()) return invoke("get_image_workspace", { videoId });
-    return { videoId, groups: [], settings: [] };
+    const plan = await this.getVisualPlan(videoId);
+    return {
+      videoId,
+      sentences: plan.sentences,
+      groups: plan.groups.map((group) => ({ group, promptVersions: [], imageRenders: [] })),
+      settings: [],
+    };
   },
   async saveAppSetting(key: string, value: string): Promise<void> {
     if (isTauri()) return invoke("save_app_setting", { key, value });
@@ -409,6 +416,27 @@ export const projectsClient = {
     if (isTauri()) return invoke<InputAssetRecord | null>("pick_and_import_asset", { videoId, kind });
     return null;
   },
+  async importBrowserAsset(videoId: string, kind: "audio" | "reference", file: File) {
+    if (isTauri()) throw new Error("Browser-file import is only available in the web preview.");
+    const data = readBrowserData();
+    const existing = await this.getVideoInputs(videoId);
+    const asset: InputAssetRecord = {
+      id: crypto.randomUUID(),
+      videoId,
+      kind,
+      originalName: file.name,
+      relativePath: `browser-preview/${file.name}`,
+      mediaType: file.type || "application/octet-stream",
+      sizeBytes: file.size,
+      createdAt: now(),
+    };
+    const inputs = kind === "audio"
+      ? { ...existing, audio: asset, updatedAt: now() }
+      : { ...existing, references: [...existing.references, asset], updatedAt: now() };
+    (data.inputs ??= {})[videoId] = inputs;
+    writeBrowserData(data);
+    return asset;
+  },
   async removeInputAsset(assetId: string) {
     if (isTauri()) return invoke<void>("remove_input_asset", { assetId });
   },
@@ -416,10 +444,18 @@ export const projectsClient = {
     if (isTauri()) return invoke<string | null>("pick_script_text");
     return null;
   },
+  async readBrowserScript(file: File) {
+    if (file.size > 1_000_000) throw new Error("Script exceeds the 1 MB limit.");
+    return file.text();
+  },
   async generateVisualPlan(videoId: string): Promise<VisualPlanRecord> {
     if (isTauri()) return invoke("generate_visual_plan", { videoId });
     const inputs = await this.getVideoInputs(videoId);
-    const texts = inputs.scriptText.match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.map((text) => text.trim()) ?? [];
+    const cleanedScript = inputs.scriptText
+      .replace(/<#\s*\d+(?:\.\d+)?\s*#>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const texts = cleanedScript.match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.map((text) => text.trim()) ?? [];
     let cursor = 0;
     const sentences = texts.map((text, index) => {
       const duration = Math.max(1, text.split(/\s+/).length * 0.4);
@@ -447,6 +483,21 @@ export const projectsClient = {
     plan.groups[source].sentenceIds = plan.groups[source].sentenceIds.filter((id) => id !== sentenceId);
     plan.groups[target].sentenceIds.push(sentenceId);
     plan.groups = plan.groups.filter((group) => group.sentenceIds.length);
+    localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
+    return plan;
+  },
+  async createPlanGroup(videoId: string, sentenceId: string, insertIndex: number): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("create_plan_group", { videoId, sentenceId, insertIndex });
+    const plan = await this.getVisualPlan(videoId);
+    const source = plan.groups.findIndex((group) => group.sentenceIds.includes(sentenceId));
+    if (source < 0) throw new Error("Sentence was not found.");
+    plan.groups[source].sentenceIds = plan.groups[source].sentenceIds.filter((id) => id !== sentenceId);
+    plan.groups = plan.groups.filter((group) => group.sentenceIds.length);
+    plan.groups.splice(Math.min(insertIndex, plan.groups.length), 0, {
+      id: crypto.randomUUID(), ordinal: 0, label: "New scene", kind: "custom", sentenceIds: [sentenceId],
+    });
+    plan.groups.sort((a, b) => Number(a.sentenceIds[0].slice(1)) - Number(b.sentenceIds[0].slice(1)));
+    plan.groups.forEach((group, index) => { group.ordinal = index + 1; });
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
     return plan;
   },

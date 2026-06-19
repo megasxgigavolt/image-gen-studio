@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(not(test))]
+use std::io::{BufRead, BufReader};
+#[cfg(not(test))]
+use std::process::{Command, Stdio};
+#[cfg(all(not(test), windows))]
+use std::os::windows::process::CommandExt;
 use uuid::Uuid;
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
@@ -306,6 +312,7 @@ pub struct ImageWorkspaceGroup {
 #[serde(rename_all = "camelCase")]
 pub struct ImageWorkspace {
     pub video_id: String,
+    pub sentences: Vec<PlanSentence>,
     pub groups: Vec<ImageWorkspaceGroup>,
     pub settings: Vec<AppSetting>,
 }
@@ -1069,6 +1076,7 @@ impl ProjectRepository {
 
     pub fn get_image_workspace(&self, video_id: &str) -> Result<ImageWorkspace, String> {
         let plan = self.get_visual_plan(video_id)?;
+        let sentences = plan.sentences.clone();
         let groups = plan
             .groups
             .into_iter()
@@ -1084,6 +1092,7 @@ impl ProjectRepository {
             .collect::<Result<Vec<_>, String>>()?;
         Ok(ImageWorkspace {
             video_id: video_id.into(),
+            sentences,
             groups,
             settings: self.list_app_settings()?,
         })
@@ -1961,50 +1970,239 @@ impl ProjectRepository {
     }
 
     pub fn generate_visual_plan(&self, video_id: &str) -> Result<VisualPlan, String> {
+        self.generate_visual_plan_with_progress(video_id, |_, _, _| {})
+    }
+
+    pub fn generate_visual_plan_with_progress<F>(
+        &self,
+        video_id: &str,
+        mut progress: F,
+    ) -> Result<VisualPlan, String>
+    where
+        F: FnMut(i64, &str, &str),
+    {
         let inputs = self.get_video_inputs(video_id)?;
         if inputs.script_text.trim().is_empty() || inputs.audio.is_none() {
             return Err("Script and narration audio are required.".into());
         }
-        let (clean_script, pause_seconds) = remove_tts_pause_markers(&inputs.script_text);
-        let texts = split_sentences(&clean_script);
-        if texts.is_empty() {
-            return Err("No sentences could be extracted from the script.".into());
+        #[cfg(test)]
+        {
+            let (clean_script, _) = remove_tts_pause_markers(&inputs.script_text);
+            let texts = split_sentences(&clean_script);
+            let weights: Vec<usize> = texts
+                .iter()
+                .map(|text| text.split_whitespace().count().max(1))
+                .collect();
+            let total_words: usize = weights.iter().sum();
+            let duration = (total_words as f64 * 0.4).max(1.0);
+            let mut cursor = 0.0;
+            let sentence_count = texts.len();
+            let sentences = texts
+                .into_iter()
+                .zip(weights)
+                .enumerate()
+                .map(|(index, (text, weight))| {
+                    let end = if index + 1 == sentence_count {
+                        duration
+                    } else {
+                        cursor + duration * weight as f64 / total_words as f64
+                    };
+                    let sentence = PlanSentence {
+                        id: format!("s{}", index + 1),
+                        ordinal: index as i64 + 1,
+                        text,
+                        start_seconds: cursor,
+                        end_seconds: end,
+                    };
+                    cursor = end;
+                    sentence
+                })
+                .collect::<Vec<_>>();
+            let groups = build_groups_range(
+                &sentences,
+                inputs.pacing_min_seconds as f64,
+                inputs.pacing_max_seconds as f64,
+            );
+            self.save_plan(
+                video_id,
+                &sentences,
+                &groups,
+                true,
+                "estimated test fixture",
+            )?;
+            self.save_plan(
+                video_id,
+                &sentences,
+                &groups,
+                false,
+                "estimated test fixture",
+            )?;
+            return self.get_visual_plan(video_id);
         }
-        let weights: Vec<usize> = texts
-            .iter()
-            .map(|text| text.split_whitespace().count().max(1))
-            .collect();
-        let total_words: usize = weights.iter().sum();
-        let duration = (total_words as f64 * 0.4 + pause_seconds).max(1.0);
-        let mut cursor = 0.0;
-        let mut sentences = Vec::new();
-        let sentence_count = texts.len();
-        for (index, (text, weight)) in texts.into_iter().zip(weights).enumerate() {
-            let end = if index + 1 == sentence_count {
-                duration
-            } else {
-                cursor + duration * weight as f64 / total_words as f64
-            };
-            sentences.push(PlanSentence {
-                id: format!("s{}", index + 1),
-                ordinal: index as i64 + 1,
-                text,
-                start_seconds: cursor,
-                end_seconds: end,
+        #[cfg(not(test))]
+        {
+            let audio = inputs.audio.as_ref().unwrap();
+            let channel_id: String = self
+                .connection
+                .query_row(
+                    "SELECT channel_id FROM videos WHERE id=?1",
+                    [video_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            let video_dir = self.projects_dir.join(channel_id).join(video_id);
+            let audio_path = video_dir.join(&audio.relative_path);
+            let work_dir = video_dir.join("visual-plan");
+            fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
+            let script_path = work_dir.join("authoritative-script.txt");
+            let output_path = work_dir.join("visual-plan.xlsx");
+            let (clean_script, _) = remove_tts_pause_markers(&inputs.script_text);
+            fs::write(&script_path, clean_script).map_err(|e| e.to_string())?;
+            let engine_dir =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../services/python-engine");
+            let grouping_engine = engine_dir.join("auto_gen_engine/scene_grouping_engine.py");
+            if !grouping_engine.exists() {
+                return Err(format!(
+                    "Internal scene-grouping engine was not found at {}.",
+                    grouping_engine.display()
+                ));
+            }
+            let mut command = Command::new("python");
+            command
+                .arg(&grouping_engine)
+                .arg(&audio_path)
+                .arg(&script_path)
+                .arg("--min-duration")
+                .arg(inputs.pacing_min_seconds.to_string())
+                .arg("--max-duration")
+                .arg(inputs.pacing_max_seconds.to_string())
+                .arg("--output")
+                .arg(&output_path)
+                .arg("--fallback-on-ai-error")
+                .current_dir(&engine_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(openai_key) = self.get_provider_key("openai")? {
+                command.env("OPENAI_API_KEY", openai_key);
+            }
+            #[cfg(windows)]
+            command.creation_flags(0x08000000);
+            let mut child = command
+                .spawn()
+                .map_err(|e| format!("Could not start the Python visual-plan engine: {e}"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or("Could not capture visual-plan engine output.")?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or("Could not capture visual-plan engine errors.")?;
+            let stderr_thread = std::thread::spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                let mut bytes = Vec::new();
+                let mut output = Vec::new();
+                loop {
+                    bytes.clear();
+                    match reader.read_until(b'\n', &mut bytes) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => output.push(String::from_utf8_lossy(&bytes).trim().to_string()),
+                    }
+                }
+                output.join("\n")
             });
-            cursor = end;
+            let mut output_lines = Vec::new();
+            let mut stdout_reader = BufReader::new(stdout);
+            let mut line_bytes = Vec::new();
+            loop {
+                line_bytes.clear();
+                let count = stdout_reader
+                    .read_until(b'\n', &mut line_bytes)
+                    .map_err(|e| format!("Could not read engine progress: {e}"))?;
+                if count == 0 {
+                    break;
+                }
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                if let Some(payload) = line.strip_prefix("AUTOGEN_PROGRESS ") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                        progress(
+                            value["percent"].as_i64().unwrap_or(0),
+                            value["stage"].as_str().unwrap_or("Building visual plan"),
+                            value["detail"].as_str().unwrap_or_default(),
+                        );
+                    }
+                } else {
+                    output_lines.push(line);
+                }
+            }
+            let status = child
+                .wait()
+                .map_err(|e| format!("Could not wait for visual-plan engine: {e}"))?;
+            let stderr = stderr_thread.join().unwrap_or_default();
+            if !status.success() {
+                return Err(format!(
+                    "Visual-plan engine failed. {}{}",
+                    output_lines.join("\n"),
+                    stderr
+                ));
+            }
+            let audit_path = output_path.with_extension("json");
+            let audit: serde_json::Value = serde_json::from_slice(
+                &fs::read(&audit_path)
+                    .map_err(|e| format!("Could not read visual-plan audit: {e}"))?,
+            )
+            .map_err(|e| format!("Visual-plan audit was invalid: {e}"))?;
+            let sentences = audit["sentences"]
+                .as_array()
+                .ok_or("Visual-plan audit contained no sentences.")?
+                .iter()
+                .map(|item| PlanSentence {
+                    id: format!("s{}", item["sentence_id"].as_i64().unwrap_or(0)),
+                    ordinal: item["sentence_id"].as_i64().unwrap_or(0),
+                    text: item["text"].as_str().unwrap_or_default().to_string(),
+                    start_seconds: item["start"].as_f64().unwrap_or(0.0),
+                    end_seconds: item["end"].as_f64().unwrap_or(0.0),
+                })
+                .collect::<Vec<_>>();
+            let groups = audit["groups"]
+                .as_array()
+                .ok_or("Visual-plan audit contained no groups.")?
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let start = item["start_sentence_id"].as_i64().unwrap_or(1);
+                    let end = item["end_sentence_id"].as_i64().unwrap_or(start);
+                    PlanGroup {
+                        id: format!("g{}", index + 1),
+                        ordinal: index as i64 + 1,
+                        label: item["visual_anchor"]
+                            .as_str()
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or_else(|| {
+                                item["scene_description"].as_str().unwrap_or("Visual scene")
+                            })
+                            .to_string(),
+                        kind: item["scene_type"].as_str().unwrap_or("still").to_string(),
+                        sentence_ids: (start..=end).map(|id| format!("s{id}")).collect(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            self.save_plan(
+                video_id,
+                &sentences,
+                &groups,
+                true,
+                "whisper + AI boundary scoring",
+            )?;
+            self.save_plan(
+                video_id,
+                &sentences,
+                &groups,
+                false,
+                "whisper + AI boundary scoring",
+            )?;
+            self.get_visual_plan(video_id)
         }
-        if let Some(last) = sentences.last_mut() {
-            last.end_seconds = duration;
-        }
-        let groups = build_groups_range(
-            &sentences,
-            inputs.pacing_min_seconds as f64,
-            inputs.pacing_max_seconds as f64,
-        );
-        self.save_plan(video_id, &sentences, &groups, true, "estimated")?;
-        self.save_plan(video_id, &sentences, &groups, false, "estimated")?;
-        self.get_visual_plan(video_id)
     }
 
     pub fn get_visual_plan(&self, video_id: &str) -> Result<VisualPlan, String> {
@@ -2021,8 +2219,12 @@ impl ProjectRepository {
         ).map_err(|e| e.to_string())?;
         let sentences = sentence_statement
             .query_map([video_id], |row| {
+                let stored_id: String = row.get(0)?;
                 Ok(PlanSentence {
-                    id: row.get(0)?,
+                    id: stored_id
+                        .rsplit_once("::")
+                        .map(|(_, id)| id.to_string())
+                        .unwrap_or(stored_id),
                     ordinal: row.get(1)?,
                     text: row.get(2)?,
                     start_seconds: row.get(3)?,
@@ -2063,6 +2265,18 @@ impl ProjectRepository {
         if source == target {
             return self.get_visual_plan(video_id);
         }
+        let source_ids = &groups[source].sentence_ids;
+        let is_valid_boundary_move = if source < target {
+            source_ids.last().map(String::as_str) == Some(sentence_id)
+        } else {
+            source_ids.first().map(String::as_str) == Some(sentence_id)
+        };
+        if !is_valid_boundary_move {
+            return Err(
+                "Only the first or last sentence of a still can cross its boundary. Chronological order must remain intact."
+                    .into(),
+            );
+        }
         groups[source].sentence_ids.retain(|id| id != sentence_id);
         groups[target].sentence_ids.push(sentence_id.into());
         groups[target]
@@ -2072,15 +2286,77 @@ impl ProjectRepository {
         for (index, group) in groups.iter_mut().enumerate() {
             group.ordinal = index as i64 + 1;
         }
+        validate_group_chronology(&groups)?;
         let sentences = self.get_visual_plan(video_id)?.sentences;
-        self.save_plan(video_id, &sentences, &groups, false, "estimated")?;
+        let timing_source = self.get_visual_plan(video_id)?.timing_source;
+        self.save_plan(video_id, &sentences, &groups, false, &timing_source)?;
         self.get_visual_plan(video_id)
     }
 
     pub fn reset_visual_plan(&self, video_id: &str) -> Result<VisualPlan, String> {
         let original = self.load_groups(video_id, true)?;
         let sentences = self.get_visual_plan(video_id)?.sentences;
-        self.save_plan(video_id, &sentences, &original, false, "estimated")?;
+        let timing_source = self.get_visual_plan(video_id)?.timing_source;
+        self.save_plan(video_id, &sentences, &original, false, &timing_source)?;
+        self.get_visual_plan(video_id)
+    }
+
+    pub fn create_plan_group(
+        &self,
+        video_id: &str,
+        sentence_id: &str,
+        insert_index: usize,
+    ) -> Result<VisualPlan, String> {
+        let mut groups = self.load_groups(video_id, false)?;
+        let source = groups
+            .iter()
+            .position(|group| group.sentence_ids.contains(&sentence_id.to_string()))
+            .ok_or("Sentence was not found.")?;
+        let source_ids = &groups[source].sentence_ids;
+        let expected_insert_index = if source_ids.first().map(String::as_str) == Some(sentence_id) {
+            source
+        } else if source_ids.last().map(String::as_str) == Some(sentence_id) {
+            source + 1
+        } else {
+            return Err(
+                "A new still can only be created from the first or last sentence of an existing still."
+                    .into(),
+            );
+        };
+        if insert_index != expected_insert_index {
+            return Err("Drop at the sentence's chronological boundary to create a new still.".into());
+        }
+        groups[source].sentence_ids.retain(|id| id != sentence_id);
+        groups.retain(|group| !group.sentence_ids.is_empty());
+        let next_id = groups
+            .iter()
+            .map(|group| sentence_number(group.id.trim_start_matches('g')))
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let target = insert_index.min(groups.len());
+        groups.insert(
+            target,
+            PlanGroup {
+                id: format!("g{next_id}"),
+                ordinal: 0,
+                label: "New scene".into(),
+                kind: "custom".into(),
+                sentence_ids: vec![sentence_id.into()],
+            },
+        );
+        for (index, group) in groups.iter_mut().enumerate() {
+            group.ordinal = index as i64 + 1;
+        }
+        validate_group_chronology(&groups)?;
+        let current = self.get_visual_plan(video_id)?;
+        self.save_plan(
+            video_id,
+            &current.sentences,
+            &groups,
+            false,
+            &current.timing_source,
+        )?;
         self.get_visual_plan(video_id)
     }
 
@@ -2101,7 +2377,17 @@ impl ProjectRepository {
                 )
                 .map_err(|e| e.to_string())?;
             for sentence in sentences {
-                self.connection.execute("INSERT INTO visual_plan_sentences(id, video_id, ordinal, text, start_seconds, end_seconds) VALUES(?1,?2,?3,?4,?5,?6)", params![sentence.id, video_id, sentence.ordinal, sentence.text, sentence.start_seconds, sentence.end_seconds]).map_err(|e| e.to_string())?;
+                self.connection.execute(
+                    "INSERT INTO visual_plan_sentences(id, video_id, ordinal, text, start_seconds, end_seconds) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        format!("{video_id}::{}", sentence.id),
+                        video_id,
+                        sentence.ordinal,
+                        sentence.text,
+                        sentence.start_seconds,
+                        sentence.end_seconds
+                    ],
+                ).map_err(|e| e.to_string())?;
             }
         }
         self.connection
@@ -2111,7 +2397,22 @@ impl ProjectRepository {
             )
             .map_err(|e| e.to_string())?;
         for group in groups {
-            self.connection.execute("INSERT INTO visual_plan_groups(id, video_id, ordinal, label, kind, sentence_ids_json, is_original) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![format!("{}-{}", if original {"original"} else {"current"}, group.id), video_id, group.ordinal, group.label, group.kind, serde_json::to_string(&group.sentence_ids).unwrap(), original as i64]).map_err(|e| e.to_string())?;
+            self.connection.execute(
+                "INSERT INTO visual_plan_groups(id, video_id, ordinal, label, kind, sentence_ids_json, is_original) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    format!(
+                        "{video_id}::{}::{}",
+                        if original {"original"} else {"current"},
+                        group.id
+                    ),
+                    video_id,
+                    group.ordinal,
+                    group.label,
+                    group.kind,
+                    serde_json::to_string(&group.sentence_ids).unwrap(),
+                    original as i64
+                ],
+            ).map_err(|e| e.to_string())?;
         }
         self.connection.execute("INSERT INTO visual_plan_meta(video_id,timing_source,generated_at,updated_at) VALUES(?1,?2,?3,?3) ON CONFLICT(video_id) DO UPDATE SET timing_source=excluded.timing_source,updated_at=excluded.updated_at", params![video_id,timing_source,now]).map_err(|e| e.to_string())?;
         Ok(())
@@ -2124,8 +2425,13 @@ impl ProjectRepository {
                 let stored_id: String = row.get(0)?;
                 Ok(PlanGroup {
                     id: stored_id
-                        .split_once('-')
+                        .rsplit_once("::")
                         .map(|(_, id)| id.to_string())
+                        .or_else(|| {
+                            stored_id
+                                .split_once('-')
+                                .map(|(_, id)| id.to_string())
+                        })
                         .unwrap_or(stored_id),
                     ordinal: row.get(1)?,
                     label: row.get(2)?,
@@ -2373,7 +2679,7 @@ fn remove_tts_pause_markers(script: &str) -> (String, f64) {
             cleaned.push_str(&rest[start..]);
             return (cleaned, pauses);
         };
-        if let Ok(seconds) = marker[..end].parse::<f64>() {
+        if let Ok(seconds) = marker[..end].trim().parse::<f64>() {
             pauses += seconds.max(0.0);
         } else {
             cleaned.push_str(&rest[start..start + end + 4]);
@@ -2434,6 +2740,21 @@ fn make_group(ordinal: usize, sentences: &[&PlanSentence]) -> PlanGroup {
 
 fn sentence_number(id: &str) -> i64 {
     id.trim_start_matches('s').parse().unwrap_or(i64::MAX)
+}
+
+fn validate_group_chronology(groups: &[PlanGroup]) -> Result<(), String> {
+    let flattened = groups
+        .iter()
+        .flat_map(|group| group.sentence_ids.iter())
+        .map(|id| sentence_number(id))
+        .collect::<Vec<_>>();
+    if flattened
+        .windows(2)
+        .any(|pair| pair[1] != pair[0].saturating_add(1))
+    {
+        return Err("This move would disrupt the chronological sentence sequence.".into());
+    }
+    Ok(())
 }
 
 fn collect_relative_files(
@@ -2570,6 +2891,44 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_chronological_group_sequences() {
+        let groups = vec![
+            PlanGroup {
+                id: "g1".into(),
+                ordinal: 1,
+                label: "First".into(),
+                kind: "still".into(),
+                sentence_ids: vec!["s1".into(), "s3".into()],
+            },
+            PlanGroup {
+                id: "g2".into(),
+                ordinal: 2,
+                label: "Second".into(),
+                kind: "still".into(),
+                sentence_ids: vec!["s2".into()],
+            },
+        ];
+        assert!(validate_group_chronology(&groups).is_err());
+    }
+
+    #[test]
+    fn visual_plan_ids_are_scoped_per_video() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        for title in ["First", "Second"] {
+            let video = repo.create_video(&channel.id, title).unwrap();
+            let audio = temp.path().join(format!("{title}.wav"));
+            fs::write(&audio, b"audio").unwrap();
+            repo.save_video_inputs(&video.id, "One. Two. Three.", 6)
+                .unwrap();
+            repo.import_asset(&video.id, &audio, "audio").unwrap();
+            let plan = repo.generate_visual_plan(&video.id).unwrap();
+            assert_eq!(plan.sentences[0].id, "s1");
+            assert_eq!(plan.groups[0].id, "g1");
+        }
+    }
+
+    #[test]
     fn persists_prompt_versions_and_image_workspace_settings() {
         let (temp, repo) = repository();
         let channel = repo.create_channel("Channel", None).unwrap();
@@ -2603,6 +2962,7 @@ mod tests {
         assert_eq!(first.version, 1);
         assert_eq!(second.version, 2);
         let workspace = repo.get_image_workspace(&video.id).unwrap();
+        assert_eq!(workspace.sentences[0].text, "A complete scene.");
         assert_eq!(workspace.groups[0].prompt_versions[0].version, 2);
         assert_eq!(workspace.settings[0].key, "gemini_model");
     }
@@ -2796,7 +3156,7 @@ mod tests {
 
     #[test]
     fn strips_tts_pause_tags_and_preserves_pause_duration() {
-        let (cleaned, pause) = remove_tts_pause_markers("One. <#0.5#> Two. <#1.25#>");
+        let (cleaned, pause) = remove_tts_pause_markers("One. <#0.5#> Two. <# 1.25 #>");
         assert_eq!(cleaned, "One. Two.");
         assert_eq!(pause, 1.75);
         assert_eq!(split_sentences("One. <#0.5#> Two."), vec!["One.", "Two."]);

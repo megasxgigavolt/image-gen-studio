@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command]
@@ -537,13 +537,34 @@ fn pick_script_text(app: tauri::AppHandle) -> Result<Option<String>, String> {
 }
 
 #[tauri::command]
-fn generate_visual_plan(
+async fn generate_visual_plan(
+    app: tauri::AppHandle,
     state: State<'_, RepositoryState>,
     video_id: String,
 ) -> Result<VisualPlan, String> {
-    with_repository(state, |repository| {
-        repository.generate_visual_plan(&video_id)
+    let (database_path, projects_dir) = {
+        let repository = state
+            .lock()
+            .map_err(|_| "Project database lock was poisoned.".to_string())?;
+        repository.paths()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        let event_video_id = video_id.clone();
+        repository.generate_visual_plan_with_progress(&video_id, |percent, stage, detail| {
+            let _ = app.emit(
+                "visual-plan-progress",
+                serde_json::json!({
+                    "videoId": &event_video_id,
+                    "percent": percent,
+                    "stage": stage,
+                    "detail": detail,
+                }),
+            );
+        })
     })
+    .await
+    .map_err(|error| format!("Visual-plan worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -567,6 +588,18 @@ fn move_plan_sentence(
 }
 
 #[tauri::command]
+fn create_plan_group(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    sentence_id: String,
+    insert_index: usize,
+) -> Result<VisualPlan, String> {
+    with_repository(state, |repository| {
+        repository.create_plan_group(&video_id, &sentence_id, insert_index)
+    })
+}
+
+#[tauri::command]
 fn reset_visual_plan(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -579,6 +612,28 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../services/python-engine");
+            let local_env = engine_dir.join(".env");
+            if let Ok(contents) = fs::read_to_string(&local_env) {
+                for line in contents.lines() {
+                    let Some((key, value)) = line.split_once('=') else {
+                        continue;
+                    };
+                    let key = key.trim();
+                    if ["OPENAI_API_KEY", "GEMINI_API_KEY"].contains(&key)
+                        && std::env::var_os(key).is_none()
+                    {
+                        std::env::set_var(key, value.trim().trim_matches(['"', '\'']));
+                    }
+                }
+            }
+            let google_credentials = engine_dir.join("google-service-account.json");
+            if google_credentials.exists()
+                && std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").is_none()
+            {
+                std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &google_credentials);
+            }
             let data_dir = app.path().app_local_data_dir()?;
             let (repository, recovery_backup) = ProjectRepository::open_with_recovery(
                 &data_dir.join("auto-gen-studio.db"),
@@ -625,6 +680,7 @@ pub fn run() {
             generate_visual_plan,
             get_visual_plan,
             move_plan_sentence,
+            create_plan_group,
             reset_visual_plan,
             get_app_setting,
             save_app_setting,

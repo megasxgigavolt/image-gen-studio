@@ -38,4 +38,20 @@ describe("projectsClient browser fallback", () => {
     expect(original.sentences).toHaveLength(2);
     expect((await projectsClient.resetVisualPlan(video.id)).groups).toEqual(original.groups);
   });
+
+  it("removes TTS pause markers from generated plan sentences", async () => {
+    const channel = await projectsClient.createChannel("Channel");
+    const video = await projectsClient.createVideo(channel.id, "Video");
+    await projectsClient.saveVideoInputs(
+      video.id,
+      "First sentence. <#0.5#> Second sentence. <# 1.25 #>",
+      8,
+    );
+    const plan = await projectsClient.generateVisualPlan(video.id);
+    expect(plan.sentences.map((sentence) => sentence.text)).toEqual([
+      "First sentence.",
+      "Second sentence.",
+    ]);
+    expect(JSON.stringify(plan)).not.toContain("<#");
+  });
 });

@@ -76,6 +76,10 @@ export type ImageRenderRecord = {
   parentRenderId: string | null;
   editInstruction: string | null;
   kind: "generation" | "edit";
+  isFinal: boolean;
+  editStrength: string | null;
+  maskPath: string | null;
+  maskUsed: boolean;
   createdAt: string;
 };
 
@@ -101,6 +105,7 @@ export type ImageWorkspaceRecord = {
   groups: ImageWorkspaceGroupRecord[];
   settings: AppSettingRecord[];
 };
+export type StyleExtractionRecord = { styleDirective: string; imageSettings: Partial<Record<string, string>> };
 
 export type ImageJobRecord = {
   id: string;
@@ -341,11 +346,15 @@ export const projectsClient = {
       parentRenderId: null,
       editInstruction: null,
       kind: "generation",
+      isFinal: true,
+      editStrength: null,
+      maskPath: null,
+      maskUsed: false,
       createdAt: now(),
     };
   },
-  async editImageRender(sourceRenderId: string, instruction: string): Promise<ImageRenderRecord> {
-    if (isTauri()) return invoke("edit_image_render", { sourceRenderId, instruction });
+  async editImageRender(sourceRenderId: string, instruction: string, maskDataUrl?: string, editStrength = "Low"): Promise<ImageRenderRecord> {
+    if (isTauri()) return invoke("edit_image_render", { sourceRenderId, instruction, maskDataUrl: maskDataUrl || null, editStrength });
     throw new Error("Image editing requires the native application.");
   },
   async getRenderDataUrl(renderId: string): Promise<string> {
@@ -415,6 +424,36 @@ export const projectsClient = {
   async pickAndImportAsset(videoId: string, kind: "audio" | "reference") {
     if (isTauri()) return invoke<InputAssetRecord | null>("pick_and_import_asset", { videoId, kind });
     return null;
+  },
+  async deletePromptVersion(promptVersionId: string): Promise<void> {
+    if (isTauri()) return invoke("delete_prompt_version", { promptVersionId });
+  },
+  async getAssetDataUrl(assetId: string): Promise<string> {
+    if (isTauri()) return invoke("get_asset_data_url", { assetId });
+    return "";
+  },
+  async setFinalRender(renderId: string, isFinal: boolean): Promise<ImageRenderRecord> {
+    if (isTauri()) return invoke("set_final_render", { renderId, isFinal });
+    throw new Error("Final image selection requires the native application.");
+  },
+  async deleteImageRender(renderId: string): Promise<void> {
+    if (isTauri()) return invoke("delete_image_render", { renderId });
+  },
+  async suggestImagePrompt(
+    videoId: string,
+    groupId: string,
+    settingsJson: string,
+    styleDirective: string,
+  ): Promise<string> {
+    if (isTauri()) return invoke("suggest_image_prompt", { videoId, groupId, settingsJson, styleDirective });
+    const plan = await this.getVisualPlan(videoId);
+    const group = plan.groups.find((item) => item.id === groupId);
+    const text = group?.sentenceIds.map((sentenceId) => plan.sentences.find((sentence) => sentence.id === sentenceId)?.text).filter(Boolean).join(" ");
+    return `Create a direct visual depiction of: ${text ?? "this narration"}.`;
+  },
+  async extractReferenceStyle(assetId: string): Promise<StyleExtractionRecord> {
+    if (isTauri()) return invoke("extract_reference_style", { assetId });
+    throw new Error("Style extraction requires the native application.");
   },
   async importBrowserAsset(videoId: string, kind: "audio" | "reference", file: File) {
     if (isTauri()) throw new Error("Browser-file import is only available in the web preview.");

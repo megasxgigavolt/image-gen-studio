@@ -16,6 +16,12 @@ import {
   PanelsTopLeft,
   LoaderCircle,
   GripVertical,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Maximize2,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -28,7 +34,7 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { type ChangeEvent, type FormEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type FormEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type AppStage, useAppStore } from "./store/app-store";
 import { log } from "./infrastructure/logger";
 import {
@@ -537,7 +543,6 @@ function VisualPlanView() {
       {error && <div className="inline-error">{error}</div>}
       {!plan && !error && <div className="empty-state">Loading visual plan…</div>}
       {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{formatTime(plan.sentences.at(-1)?.endSeconds ?? 0)} total · Average {((plan.sentences.at(-1)?.endSeconds ?? 0) / plan.groups.length).toFixed(1)} sec · {plan.timingSource}</span></div>
-      <div className="drag-help"><GripVertical size={22} /><div><strong>Drag sentences between stills</strong><p>Drop onto another row to merge, or between rows to create a new still. Timestamps update automatically.</p></div><button className="text-button" onClick={() => void resetPlan()}>Reset original</button></div>
       <DndContext
         sensors={sensors}
         onDragStart={(event) => setDraggedSentenceId(String(event.active.id).replace(/^sentence:/, ""))}
@@ -624,24 +629,71 @@ function ProductionView() {
 
 type ImageSettings = {
   aspectRatio: string;
-  artStyle: string;
+  shotType: string;
   cameraAngle: string;
-  mood: string;
   lighting: string;
-  depthOfField: string;
-  styleDirective: string;
-  subjectConsistency: boolean;
-  diversity: number;
+  mood: string;
   composition: string;
-  lens: string;
-  colorGrade: string;
-  texture: string;
-  negativePrompt: string;
+  visualStyle: string;
+  colorPalette: string;
+  lensFeel: string;
+  depthOfField: string;
+  backgroundComplexity: string;
+  subjectDistance: string;
+  motionFeel: string;
+  textureDetail: string;
+  realismLevel: string;
+  negativePromptStrength: string;
+  referenceAdherence: string;
 };
-const defaultImageSettings: ImageSettings = { aspectRatio: "16:9", artStyle: "Photorealistic", cameraAngle: "Wide establishing", mood: "Cinematic", lighting: "Natural", depthOfField: "Deep focus", styleDirective: "Natural-history documentary, coherent visual language, restrained cinematic lighting.", subjectConsistency: true, diversity: 45, composition: "Rule of thirds", lens: "35mm cinematic", colorGrade: "Natural cinematic", texture: "Photoreal detail", negativePrompt: "text, watermark, logo, duplicate subjects, malformed anatomy" };
+const defaultImageSettings: ImageSettings = { aspectRatio: "16:9", shotType: "Undefined", cameraAngle: "Undefined", lighting: "Undefined", mood: "Undefined", composition: "Undefined", visualStyle: "Undefined", colorPalette: "Undefined", lensFeel: "Undefined", depthOfField: "Undefined", backgroundComplexity: "Undefined", subjectDistance: "Undefined", motionFeel: "Undefined", textureDetail: "Undefined", realismLevel: "Undefined", negativePromptStrength: "Undefined", referenceAdherence: "Undefined" };
 function parseImageSettings(value?: string): ImageSettings {
   try { return { ...defaultImageSettings, ...(value ? JSON.parse(value) : {}) }; }
   catch { return defaultImageSettings; }
+}
+
+function mergeExtractedSettings(current: ImageSettings, extracted: Partial<Record<string, string>>): ImageSettings {
+  const aliases: Record<string, keyof ImageSettings> = {
+    artStyle: "visualStyle", style: "visualStyle", lens: "lensFeel",
+    colorGrade: "colorPalette", texture: "textureDetail",
+  };
+  const presets: Partial<Record<keyof ImageSettings, string[]>> = {
+    shotType: ["Extreme close up","Close up","Medium shot","Wide shot","Establishing shot"],
+    cameraAngle: ["Eye level","Low angle","High angle","Over the shoulder","Top down","Dutch angle"],
+    lighting: ["Soft natural","Cinematic","Dramatic","Studio","Low key","High contrast"],
+    mood: ["Calm","Tense","Emotional","Mysterious","Educational","Dramatic"],
+    composition: ["Centered subject","Rule of thirds","Negative space","Thumbnail style","Symmetrical"],
+    visualStyle: ["Near photorealistic illustration","Cinematic still","Editorial digital painting","Semi realistic animation","Natural history illustration"],
+    colorPalette: ["Warm","Cool","Neutral","Muted","Pastel","High contrast"],
+    lensFeel: ["Wide angle","Portrait lens","Telephoto compression","Macro"],
+    depthOfField: ["Shallow","Medium","Deep"],
+    backgroundComplexity: ["Plain","Minimal","Environmental","Detailed"],
+    subjectDistance: ["Very close","Close","Medium","Far"],
+    motionFeel: ["Static","Subtle motion","Dynamic action"],
+    textureDetail: ["Soft","Detailed","Highly detailed"],
+    realismLevel: ["Stylized","Semi realistic","Near photorealistic"],
+    negativePromptStrength: ["Low","Medium","High"],
+    referenceAdherence: ["Loose","Balanced","Strict"],
+  };
+  const next = { ...current };
+  for (const [rawKey, rawValue] of Object.entries(extracted)) {
+    const key = (aliases[rawKey] ?? rawKey) as keyof ImageSettings;
+    if (!(key in next) || !rawValue?.trim()) continue;
+    const value = rawValue.trim();
+    const normalized = value.toLowerCase().replace(/[-_]/g, " ");
+    const match = presets[key]?.find((preset) => {
+      const candidate = preset.toLowerCase();
+      return normalized === candidate || normalized.includes(candidate) || candidate.includes(normalized);
+    });
+    next[key] = match ?? value;
+  }
+  return next;
+}
+
+function SettingSelect({ label, value, options, onChange }: { label: string; value: string; options: string[]; onChange: (value: string) => void }) {
+  const custom = value.startsWith("Custom: ") || !options.includes(value);
+  const customValue = value.startsWith("Custom: ") ? value.slice(8) : custom ? value : "";
+  return <label className="setting-control"><span>{label}</span>{custom ? <div className="custom-control"><input autoFocus value={customValue} placeholder={`Custom ${label.toLowerCase()}`} onChange={(event) => onChange(`Custom: ${event.target.value}`)} /><button type="button" onClick={() => onChange("Undefined")} title="Choose a preset">×</button></div> : <select value={value} onChange={(event) => onChange(event.target.value)}>{options.map((option) => <option key={option}>{option}</option>)}</select>}</label>;
 }
 
 function ImagesView() {
@@ -653,9 +705,9 @@ function ImagesView() {
   const [userPrompt, setUserPrompt] = useState("");
   const [imageSettings, setImageSettings] = useState<ImageSettings>(defaultImageSettings);
   const settingsJson = JSON.stringify(imageSettings);
-  const [geminiModel, setGeminiModel] = useState("gemini-2.5-flash-image");
+  const [geminiModel, setGeminiModel] = useState("gemini-3.1-flash-image");
   const [keyStatus, setKeyStatus] = useState({ gemini: false, openai: false });
-  const [tab, setTab] = useState<"prompt" | "settings">("prompt");
+  const [tab, setTab] = useState<"prompt" | "settings" | "edit">("prompt");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [job, setJob] = useState<ImageJobRecord | null>(null);
@@ -663,7 +715,23 @@ function ImagesView() {
   const [compareRenderId, setCompareRenderId] = useState<string | null>(null);
   const [renderUrls, setRenderUrls] = useState<Record<string, string>>({});
   const [editInstruction, setEditInstruction] = useState("");
+  const [editStrength, setEditStrength] = useState("Low");
+  const [editOpen, setEditOpen] = useState(false);
+  const [brushSize, setBrushSize] = useState(36);
+  const [eraseMask, setEraseMask] = useState(false);
+  const maskCanvasRef = useRef<HTMLCanvasElement>(null);
+  const paintingRef = useRef(false);
+  const [zoomOpen, setZoomOpen] = useState(false);
+  const [zoom, setZoom] = useState(1);
   const [references, setReferences] = useState<import("./infrastructure/projects-client").InputAssetRecord[]>([]);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkDiversity, setBulkDiversity] = useState(25);
+  const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null);
+  const [preparingGroupIds, setPreparingGroupIds] = useState<Set<string>>(new Set());
+  const [promptPrepStatus, setPromptPrepStatus] = useState<"running" | "paused" | null>(null);
+  const promptPrepControl = useRef<"running" | "paused" | "stopped">("stopped");
+  const promptPrepTask = useRef<{ items: ImageWorkspaceRecord["groups"]; index: number } | null>(null);
+  const [referenceUrl, setReferenceUrl] = useState("");
 
   const selectedGroup = useMemo(
     () => workspace?.groups.find((group) => group.group.id === selectedGroupId) ?? null,
@@ -675,6 +743,10 @@ function ImagesView() {
       .filter((sentence): sentence is PlanSentenceRecord => Boolean(sentence)) ?? [],
     [selectedGroup, workspace],
   );
+  const selectedTiming = selectedSentences.length ? {
+    start: selectedSentences[0].startSeconds,
+    end: selectedSentences.at(-1)!.endSeconds,
+  } : null;
 
   useEffect(() => {
     async function loadWorkspace() {
@@ -686,7 +758,7 @@ function ImagesView() {
         setWorkspace(loaded);
         setSelectedGroupId(loaded.groups[0]?.group.id ?? null);
         setImageSettings(parseImageSettings(loaded.settings.find((setting) => setting.key === "image_settings")?.value));
-        setGeminiModel(loaded.settings.find((setting) => setting.key === "gemini_model")?.value ?? "gemini-2.5-flash-image");
+        setGeminiModel(loaded.settings.find((setting) => setting.key === "gemini_model")?.value ?? "gemini-3.1-flash-image");
         const [geminiStatus, openAiStatus, inputs] = await Promise.all([
           projectsClient.getProviderKeyStatus("gemini"),
           projectsClient.getProviderKeyStatus("openai"),
@@ -694,7 +766,8 @@ function ImagesView() {
         ]);
         setKeyStatus({ gemini: geminiStatus.configured, openai: openAiStatus.configured });
         setReferences(inputs.references);
-        setJob(await projectsClient.getLatestImageJob(activeVideoId));
+        const latestJob = await projectsClient.getLatestImageJob(activeVideoId);
+        setJob(latestJob && ["queued", "running", "paused"].includes(latestJob.status) ? latestJob : null);
         const latest = loaded.groups[0]?.promptVersions[0];
         setActivePromptVersionId(latest?.id ?? null);
         setSystemPrompt(latest?.systemPrompt ?? "");
@@ -715,19 +788,24 @@ function ImagesView() {
     if (!activeVideoId || !job || !["queued", "running"].includes(job.status)) return;
     const timer = window.setInterval(async () => {
       const latest = await projectsClient.getLatestImageJob(activeVideoId);
-      setJob(latest);
-      if (latest && ["completed", "failed"].includes(latest.status)) {
-        setWorkspace(await projectsClient.getImageWorkspace(activeVideoId));
-      }
+      setJob(latest && ["queued", "running", "paused"].includes(latest.status) ? latest : null);
+      const refreshed = await projectsClient.getImageWorkspace(activeVideoId);
+      setWorkspace(refreshed);
+      const selected = refreshed.groups.find((item) => item.group.id === selectedGroupId);
+      const newest = selected?.imageRenders[0];
+      if (newest && newest.id !== selectedRenderId) setSelectedRenderId(newest.id);
     }, 1200);
     return () => window.clearInterval(timer);
-  }, [activeVideoId, job]);
+  }, [activeVideoId, job, selectedGroupId, selectedRenderId]);
 
   async function refreshWorkspace() {
     if (!activeVideoId) return;
     try {
       const loaded = await projectsClient.getImageWorkspace(activeVideoId);
       setWorkspace(loaded);
+      const selected = loaded.groups.find((group) => group.group.id === selectedGroupId);
+      const newest = selected?.imageRenders[0];
+      if (newest) setSelectedRenderId(newest.id);
       setActivePromptVersionId((current) => {
         if (current && loaded.groups.some((group) => group.promptVersions.some((version) => version.id === current))) {
           return current;
@@ -748,7 +826,7 @@ function ImagesView() {
         activeVideoId,
         selectedGroupId,
         settingsJson,
-        systemPrompt,
+        systemPrompt || "Preserve a coherent visual style.",
         userPrompt,
       );
       setActivePromptVersionId(version.id);
@@ -770,32 +848,25 @@ function ImagesView() {
           activeVideoId,
           selectedGroupId,
           settingsJson,
-          systemPrompt,
+          systemPrompt || "Preserve a coherent visual style.",
           userPrompt,
         )
       ).id;
-      await projectsClient.generateImageRender(
+      const render = await projectsClient.generateImageRender(
         activeVideoId,
         selectedGroupId,
         versionId,
-        systemPrompt,
+        systemPrompt || "Preserve a coherent visual style.",
         userPrompt,
         settingsJson,
       );
+      setSelectedRenderId(render.id);
+      setRenderUrls((current) => {
+        const next = { ...current };
+        delete next[render.id];
+        return next;
+      });
       await refreshWorkspace();
-    } catch (caught) {
-      setError(String(caught));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function generatePending() {
-    if (!activeVideoId) return;
-    setLoading(true);
-    setError(null);
-    try {
-      setJob(await projectsClient.createImageJob(activeVideoId));
     } catch (caught) {
       setError(String(caught));
     } finally {
@@ -832,11 +903,16 @@ function ImagesView() {
   }
 
   async function saveSettings() {
+    if (!activeVideoId || !selectedGroupId) return;
     setLoading(true);
     setError(null);
     try {
       await projectsClient.saveAppSetting("image_settings", settingsJson);
       await projectsClient.saveAppSetting("gemini_model", geminiModel.trim());
+      if (userPrompt.trim()) {
+        const version = await projectsClient.createPromptVersion(activeVideoId, selectedGroupId, settingsJson, systemPrompt || "Preserve a coherent visual style.", userPrompt);
+        setActivePromptVersionId(version.id);
+      }
       await refreshWorkspace();
     } catch (caught) {
       setError(String(caught));
@@ -845,19 +921,151 @@ function ImagesView() {
     }
   }
 
+  async function runPromptPreparation() {
+    if (!activeVideoId || !promptPrepTask.current) return;
+    promptPrepControl.current = "running";
+    setPromptPrepStatus("running");
+    const task = promptPrepTask.current;
+    try {
+      const varied = ["shotType", "cameraAngle", "lighting", "composition", "subjectDistance", "depthOfField", "backgroundComplexity"] as (keyof ImageSettings)[];
+      for (; task.index < task.items.length; task.index++) {
+        if (promptPrepControl.current !== "running") break;
+        const index = task.index;
+        const item = task.items[index];
+        const perStill = { ...imageSettings };
+        if (bulkDiversity > 0) {
+          const changes = Math.max(1, Math.round((bulkDiversity / 100) * 3));
+          for (let change = 0; change < changes; change++) {
+            const key = varied[(index + change * 3) % varied.length];
+            const values: Partial<Record<keyof ImageSettings, string[]>> = {
+              shotType: ["Close up","Medium shot","Wide shot","Establishing shot"],
+              cameraAngle: ["Eye level","Low angle","High angle","Top down"],
+              lighting: ["Soft natural","Cinematic","Dramatic","High contrast"],
+              composition: ["Centered subject","Rule of thirds","Negative space","Symmetrical"],
+              subjectDistance: ["Close","Medium","Far"],
+              depthOfField: ["Shallow","Medium","Deep"],
+              backgroundComplexity: ["Minimal","Environmental","Detailed"],
+            };
+            const choices = values[key];
+            if (choices) perStill[key] = choices[index % choices.length];
+          }
+        }
+        const narration = item.group.sentenceIds.map((id) => workspace?.sentences.find((sentence) => sentence.id === id)?.text ?? "").join(" ");
+        const signature = JSON.stringify({ perStill, style: systemPrompt, narration, kind: item.group.kind });
+        const storedSettings = (() => { try { return JSON.parse(item.promptVersions[0]?.settingsJson ?? "{}") as { _bulkSignature?: string }; } catch { return {}; } })();
+        setBulkProgress({ current: index, total: task.items.length, label: storedSettings._bulkSignature === signature ? `Reusing prompt for Still ${item.group.ordinal}` : `Generating prompt for Still ${item.group.ordinal}` });
+        if (storedSettings._bulkSignature !== signature) {
+          const perStillJson = JSON.stringify({ ...perStill, _bulkSignature: signature });
+          const prompt = await projectsClient.suggestImagePrompt(activeVideoId, item.group.id, perStillJson, systemPrompt);
+          await projectsClient.createPromptVersion(activeVideoId, item.group.id, perStillJson, systemPrompt || "Preserve a coherent visual style.", prompt);
+          if (item.group.id === selectedGroupId) {
+            setImageSettings(perStill);
+            setUserPrompt(prompt);
+          }
+        }
+        const live = await projectsClient.getImageWorkspace(activeVideoId);
+        setWorkspace(live);
+        setPreparingGroupIds((current) => {
+          const next = new Set(current);
+          next.delete(item.group.id);
+          return next;
+        });
+        setBulkProgress({ current: index + 1, total: task.items.length, label: `Prompt ready for Still ${item.group.ordinal}` });
+      }
+      const finalControl = promptPrepControl.current as "running" | "paused" | "stopped";
+      if (finalControl === "running" && task.index >= task.items.length) {
+        setBulkProgress({ current: task.items.length, total: task.items.length, label: "Starting image generation" });
+        setJob(await projectsClient.createImageJob(activeVideoId));
+        promptPrepTask.current = null;
+        promptPrepControl.current = "stopped";
+        setPromptPrepStatus(null);
+        setBulkProgress(null);
+        setPreparingGroupIds(new Set());
+      } else if (finalControl === "paused") {
+        setPromptPrepStatus("paused");
+      } else if (finalControl === "stopped") {
+        setPromptPrepStatus(null);
+        setBulkProgress(null);
+        setPreparingGroupIds(new Set());
+        promptPrepTask.current = null;
+      }
+    } catch (caught) { setError(String(caught)); }
+  }
+
+  async function prepareBulkPrompts() {
+    if (!activeVideoId || !workspace) return;
+    setError(null);
+    await projectsClient.saveAppSetting("image_settings", settingsJson);
+    await projectsClient.saveAppSetting("gemini_model", "gemini-3.1-flash-image");
+    await projectsClient.saveAppSetting("bulk_diversity", String(bulkDiversity));
+    setBulkOpen(false);
+    setJob(null);
+    setPreparingGroupIds(new Set(workspace.groups.map((item) => item.group.id)));
+    setBulkProgress({ current: 0, total: workspace.groups.length, label: "Preparing prompts" });
+    promptPrepTask.current = { items: workspace.groups, index: 0 };
+    await runPromptPreparation();
+  }
+
+  function controlPromptPreparation(action: "pause" | "resume" | "stop") {
+    if (action === "pause") {
+      promptPrepControl.current = "paused";
+      setPromptPrepStatus("paused");
+    } else if (action === "stop") {
+      promptPrepControl.current = "stopped";
+      setPromptPrepStatus(null);
+    } else if (promptPrepTask.current) {
+      void runPromptPreparation();
+    }
+  }
+
+  async function suggestPrompt() {
+    if (!activeVideoId || !selectedGroupId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      setUserPrompt(await projectsClient.suggestImagePrompt(
+        activeVideoId, selectedGroupId, settingsJson, systemPrompt,
+      ));
+    } catch (caught) { setError(String(caught)); }
+    finally { setLoading(false); }
+  }
+
   function updateImageSetting<K extends keyof ImageSettings>(key: K, value: ImageSettings[K]) {
     setImageSettings((current) => ({ ...current, [key]: value }));
   }
 
   async function importReference() {
     if (!activeVideoId) return;
+    if (references.length) await removeReference(references[0].id);
     const asset = await projectsClient.pickAndImportAsset(activeVideoId, "reference");
-    if (asset) setReferences((items) => [...items, asset]);
+    if (asset) {
+      setReferences([asset]);
+      setReferenceUrl(await projectsClient.getAssetDataUrl(asset.id));
+    }
   }
+
+  useEffect(() => {
+    const reference = references[0];
+    if (!reference) return;
+    void projectsClient.getAssetDataUrl(reference.id).then(setReferenceUrl).catch(() => setReferenceUrl(""));
+  }, [references]);
 
   async function removeReference(assetId: string) {
     await projectsClient.removeInputAsset(assetId);
     setReferences((items) => items.filter((item) => item.id !== assetId));
+    setReferenceUrl("");
+  }
+
+  async function extractStyle(assetId: string) {
+    setLoading(true);
+    setError(null);
+    try {
+      const extracted = await projectsClient.extractReferenceStyle(assetId);
+      setSystemPrompt(extracted.styleDirective);
+      setImageSettings((current) => mergeExtractedSettings(current, extracted.imageSettings));
+      setTab("settings");
+    } catch (caught) { setError(String(caught)); }
+    finally { setLoading(false); }
   }
 
   const previewLabel = selectedGroup?.group.label ?? "Still preview";
@@ -873,15 +1081,27 @@ function ImagesView() {
     }));
   }, [selectedRenderId, compareRenderId, renderUrls]);
 
+  useEffect(() => {
+    const ids = workspace?.groups.map((group) => group.imageRenders[0]?.id).filter(Boolean) as string[] | undefined;
+    if (!ids?.length) return;
+    void Promise.all(ids.filter((id) => !renderUrls[id]).map(async (id) => {
+      const url = await projectsClient.getRenderDataUrl(id);
+      setRenderUrls((current) => ({ ...current, [id]: url }));
+    }));
+  }, [workspace, renderUrls]);
+
   async function editSelectedRender() {
     if (!selectedRenderId || !editInstruction.trim()) return;
     setLoading(true);
     setError(null);
     try {
-      const edited = await projectsClient.editImageRender(selectedRenderId, editInstruction.trim());
+      const canvas = maskCanvasRef.current;
+      const maskDataUrl = canvas && canvas.dataset.painted === "true" ? canvas.toDataURL("image/png") : undefined;
+      const edited = await projectsClient.editImageRender(selectedRenderId, editInstruction.trim(), maskDataUrl, editStrength);
       setCompareRenderId(selectedRenderId);
       setSelectedRenderId(edited.id);
       setEditInstruction("");
+      setEditOpen(false);
       await refreshWorkspace();
     } catch (caught) {
       setError(String(caught));
@@ -894,6 +1114,73 @@ function ImagesView() {
     setCompareRenderId(render.parentRenderId ?? selectedRenderId);
     setSelectedRenderId(render.id);
   }
+
+  function paintMask(event: ReactPointerEvent<HTMLCanvasElement>) {
+    if (!paintingRef.current) return;
+    const canvas = event.currentTarget;
+    const rect = canvas.getBoundingClientRect();
+    const x = (event.clientX - rect.left) * canvas.width / rect.width;
+    const y = (event.clientY - rect.top) * canvas.height / rect.height;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.globalCompositeOperation = eraseMask ? "destination-out" : "source-over";
+    context.fillStyle = "#fff";
+    context.beginPath();
+    context.arc(x, y, brushSize / 2, 0, Math.PI * 2);
+    context.fill();
+    canvas.dataset.painted = "true";
+  }
+
+  function clearMask() {
+    const canvas = maskCanvasRef.current;
+    canvas?.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+    if (canvas) canvas.dataset.painted = "false";
+  }
+
+  async function toggleFinal(render: ImageRenderRecord) {
+    try {
+      await projectsClient.setFinalRender(render.id, !render.isFinal);
+      await refreshWorkspace();
+    } catch (caught) { setError(String(caught)); }
+  }
+
+  async function deletePromptVersion(version: PromptVersionRecord) {
+    try {
+      await projectsClient.deletePromptVersion(version.id);
+      if (activePromptVersionId === version.id) setActivePromptVersionId(null);
+      await refreshWorkspace();
+    } catch (caught) { setError(String(caught)); }
+  }
+
+  async function deleteRender(render: ImageRenderRecord) {
+    try {
+      await projectsClient.deleteImageRender(render.id);
+      setRenderUrls((current) => {
+        const next = { ...current };
+        delete next[render.id];
+        return next;
+      });
+      if (selectedRenderId === render.id) setSelectedRenderId(null);
+      await refreshWorkspace();
+    } catch (caught) { setError(String(caught)); }
+  }
+
+  function moveVersion(delta: number) {
+    const index = imageRenders.findIndex((render) => render.id === selectedRenderId);
+    const next = imageRenders[index + delta];
+    if (next) selectRender(next);
+  }
+
+  useEffect(() => {
+    if (!zoomOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setZoomOpen(false);
+      if (event.key === "+") setZoom((value) => Math.min(5, value + .25));
+      if (event.key === "-") setZoom((value) => Math.max(.25, value - .25));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [zoomOpen]);
 
   async function exportStills() {
     if (!activeVideoId) return;
@@ -912,7 +1199,7 @@ function ImagesView() {
   }
 
   return (
-    <section className="view">
+    <section className="view images-view">
       {loading && <LoadingOverlay label="Working on your images" />}
       <div className="page-heading">
         <div>
@@ -920,10 +1207,10 @@ function ImagesView() {
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <div className="heading-actions"><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Export stills</button><button className="secondary" onClick={() => void exportBundle()}><Download size={16} />Project bundle</button><button className="primary" onClick={() => void generatePending()} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} /> Generate pending</button></div>
+        <div className="heading-actions"><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Final output folder</button><button className="secondary" onClick={() => void exportBundle()}><Download size={16} />Project bundle</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} />Bulk Gen Config</button></div>
       </div>
       {error && <div className="inline-error">{error}</div>}
-      {job && (
+      {job && !bulkProgress && (
         <div className="job-status">
           <div><strong>Bulk job: {job.status}</strong><span>{job.completedItems}/{job.totalItems} completed · {job.failedItems} failed</span></div>
           <progress value={job.completedItems + job.failedItems} max={job.totalItems} />
@@ -934,6 +1221,7 @@ function ImagesView() {
           </div>
         </div>
       )}
+      {bulkProgress && <div className="bulk-live-progress"><div><strong>{bulkProgress.label}</strong><span>{bulkProgress.current} / {bulkProgress.total}</span></div><progress value={bulkProgress.current} max={bulkProgress.total} /><div className="prompt-progress-actions">{promptPrepStatus === "running" && <button className="secondary" onClick={() => controlPromptPreparation("pause")}>Pause</button>}{promptPrepStatus === "paused" && <button className="secondary" onClick={() => controlPromptPreparation("resume")}>Resume</button>}<button className="secondary" onClick={() => controlPromptPreparation("stop")}>Stop</button></div></div>}
       <div className="image-workspace">
         <aside className="stills">
           <strong>Stills <span>{stillCount}</span></strong>
@@ -943,136 +1231,158 @@ function ImagesView() {
               className={group.group.id === selectedGroupId ? "active" : ""}
               onClick={() => selectGroup(group.group.id)}
             >
-              <span>{group.promptVersions[0] ? `v${group.promptVersions[0].version}` : "New"}</span>
-              <small>{group.group.label}</small>
+              <div><strong>Still {group.group.ordinal}</strong>{group.imageRenders.length > 0 && <Check size={14} />}</div>
+              <small>{(() => { const rows = group.group.sentenceIds.map((id) => workspace.sentences.find((s) => s.id === id)).filter(Boolean) as PlanSentenceRecord[]; return rows.length ? `${formatTime(rows[0].startSeconds)} – ${formatTime(rows.at(-1)!.endSeconds)}` : ""; })()}</small>
+              <p>{group.group.sentenceIds.map((id) => workspace.sentences.find((s) => s.id === id)?.text).filter(Boolean).join(" ").slice(0, 72)}</p>
+              {(() => { const item = job?.items.find((candidate) => candidate.groupId === group.group.id); const status = group.imageRenders.length ? "Generated" : preparingGroupIds.has(group.group.id) ? "Preparing prompt" : item?.status === "running" ? "Generating" : item?.status === "failed" ? "Failed" : group.promptVersions[0] ? "Prompt ready" : "No prompt"; return <span className={`still-status ${status.toLowerCase().replace(" ","-")}`}>{status}</span>; })()}
             </button>
           ))}
           {!workspace && <div className="empty-state">Loading stills…</div>}
         </aside>
         <div className="preview">
           <header>
-            <span>{previewLabel}</span>
-            <strong>{selectedGroup?.group.sentenceIds.length ? `${selectedGroup.group.sentenceIds.length} sentence(s)` : "No scene selected"}</strong>
+            <div><span className="timestamp-heading">{selectedTiming ? `${formatTime(selectedTiming.start)} – ${formatTime(selectedTiming.end)}` : previewLabel}</span><strong className="production-copy">{selectedSentences.map((sentence) => sentence.text).join(" ")}</strong></div>
           </header>
-          <div className={compareRenderId ? "preview-art comparison" : "preview-art"}>
+          <div className="preview-art">
             {selectedRenderId && renderUrls[selectedRenderId] ? (
-              <figure><img src={renderUrls[selectedRenderId]} alt="Selected image version" /><figcaption>Selected</figcaption></figure>
-            ) : <figure className="dummy-still"><img src="/dummy-still.png" alt="Cinematic underwater placeholder still" /><figcaption>{selectedGroup ? "Placeholder preview" : "Choose a still to begin"}</figcaption></figure>}
-            {compareRenderId && renderUrls[compareRenderId] && (
-              <figure><img src={renderUrls[compareRenderId]} alt="Comparison image version" /><figcaption>Compare</figcaption></figure>
-            )}
+              <figure className={`image-frame ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}`}><img src={renderUrls[selectedRenderId]} alt="Selected image version" /><button className="inspect-button" onClick={() => { setZoom(1); setZoomOpen(true); }}><Maximize2 size={16} /><span>Inspect</span></button></figure>
+            ) : <div className={`image-frame empty-frame ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}`}><div className="image-empty"><Image size={34} /><strong>No image generated yet</strong><span>{imageSettings.aspectRatio === "9:16" ? "YouTube Short · 9:16" : "YouTube Video · 16:9"}</span></div></div>}
           </div>
           <footer>
-            {selectedSentences.length
-              ? selectedSentences.map((sentence) => sentence.text).join(" ")
-              : "No prompt yet."}
+            <div className="version-nav"><button disabled={imageRenders.findIndex((r) => r.id === selectedRenderId) >= imageRenders.length - 1} onClick={() => moveVersion(1)}><ChevronLeft size={16} />Previous</button><strong>{selectedRenderId ? `Version ${imageRenders.find((r) => r.id === selectedRenderId)?.version} / ${imageRenders.length}` : "No versions"}</strong><button disabled={imageRenders.findIndex((r) => r.id === selectedRenderId) <= 0} onClick={() => moveVersion(-1)}>Next<ChevronRight size={16} /></button></div>
+            {imageRenders.find((render) => render.id === selectedRenderId) && <div className="version-actions"><button className="secondary" onClick={() => void toggleFinal(imageRenders.find((render) => render.id === selectedRenderId)!)}>{imageRenders.find((render) => render.id === selectedRenderId)?.isFinal ? "Unmark Final" : "Mark as Final"}</button><button className="secondary" onClick={() => { const render = imageRenders.find((item) => item.id === selectedRenderId); const version = promptVersions.find((item) => item.id === render?.promptVersionId); if (version) selectVersion(version); }}>Roll Back To This Version</button></div>}
           </footer>
         </div>
         <aside className="prompt-panel">
           <div className="tabs">
             <button className={tab === "prompt" ? "active" : ""} onClick={() => setTab("prompt")}>Prompt</button>
             <button className={tab === "settings" ? "active" : ""} onClick={() => setTab("settings")}>Settings</button>
+            <button className={tab === "edit" ? "active" : ""} onClick={() => setTab("edit")}>Edit / Inpaint</button>
           </div>
           {tab === "prompt" ? (
             <>
+              <div className="panel-section-heading"><h3>Scene prompt</h3><small>Still {selectedGroup?.group.ordinal ?? "—"}</small></div>
               <label>
-                System prompt
-                <textarea
-                  value={systemPrompt}
-                  onChange={(event) => setSystemPrompt(event.target.value)}
-                  placeholder="System prompt for image generation"
-                />
-              </label>
-              <label>
-                User prompt
-                <textarea
+                <span className="field-heading">User prompt</span>
+                <textarea className="production-copy"
                   value={userPrompt}
                   onChange={(event) => setUserPrompt(event.target.value)}
-                  placeholder="User prompt for image generation"
+                  placeholder="Describe the scene that directly supports this narration."
                 />
               </label>
-              <button className="secondary" disabled>
-                <Sparkles size={15} /> Suggest improvement
-              </button>
+              <button className="secondary full" onClick={() => void suggestPrompt()} disabled={!selectedGroupId || loading || !keyStatus.openai}><Sparkles size={15} />Suggest Prompt</button>
+              <label>
+                <span className="field-heading">Style Directive <small>Optional</small></span>
+                <textarea className="production-copy"
+                  value={systemPrompt}
+                  onChange={(event) => setSystemPrompt(event.target.value)}
+                  placeholder="Reusable visual style, medium, rendering, and color treatment."
+                />
+              </label>
               <button className="primary full" onClick={() => void createVersion()} disabled={!selectedGroupId || loading}>
                 Save prompt version
               </button>
-              <button className="secondary full" onClick={() => void generateRender()} disabled={!selectedGroupId || loading}>Generate this still</button>
-              <div className="placeholder">
-                <strong>Prompt history</strong>
-                <span>{promptVersions.length ? `${promptVersions.length} saved versions` : "No saved prompt versions yet."}</span>
-              </div>
+              <button className="primary full" onClick={() => void generateRender()} disabled={!selectedGroupId || !userPrompt.trim() || loading}>Generate Image</button>
               {promptVersions.length > 0 && (
-                <div className="prompt-history">
+                <div className="version-history"><strong>Prompt versions</strong>
                   {promptVersions.map((version) => (
-                    <button
-                      key={version.id}
-                      className={version.id === activePromptVersionId ? "active" : ""}
-                      onClick={() => selectVersion(version)}
-                    >
-                      <span>v{version.version}</span>
-                      <small>{new Date(version.createdAt).toLocaleString()}</small>
-                    </button>
+                    <div className="version-row" key={version.id}><button className={version.id === activePromptVersionId ? "active" : ""} onClick={() => selectVersion(version)}><span>v{version.version}</span><small>{new Date(version.createdAt).toLocaleString()}</small></button><button className="delete-version" onClick={() => void deletePromptVersion(version)} title="Delete prompt version"><Trash2 size={14} /></button></div>
                   ))}
                 </div>
               )}
-              {imageRenders.length > 0 && (
-                <div className="placeholder">
-                  <strong>Render history</strong>
-                  <span>{imageRenders.length} render(s) stored</span>
-                </div>
-              )}
-              {imageRenders.map((render) => (
-                <div key={render.id} className="prompt-history">
+              {imageRenders.length > 0 && <div className="version-history"><strong>Image versions</strong>{imageRenders.map((render) => (
+                <div className="version-row" key={render.id}>
                   <button type="button" className={render.id === selectedRenderId ? "active" : ""} onClick={() => selectRender(render)}>
-                    <span>v{render.version} · {render.kind}</span>
+                    <span>Version {render.version} · {render.kind}{render.isFinal ? " · Final" : ""}</span>
                     <small>{render.editInstruction ?? new Date(render.createdAt).toLocaleString()}</small>
                   </button>
+                  <button className="delete-version" onClick={() => void deleteRender(render)} title="Delete image version"><Trash2 size={14} /></button>
                 </div>
-              ))}
-              {selectedRenderId && (
-                <div className="edit-panel">
-                  <label>Edit instruction<textarea value={editInstruction} onChange={(event) => setEditInstruction(event.target.value)} placeholder="Remove the buoy while preserving everything else." /></label>
-                  <button className="primary full" onClick={() => void editSelectedRender()} disabled={!editInstruction.trim() || loading}>Edit selected version</button>
-                  <small>The selected image is sent back to Gemini as visual context.</small>
-                </div>
-              )}
+              ))}</div>}
             </>
-          ) : (
+          ) : tab === "settings" ? (
             <>
-              <section className="style-settings">
-                <label>Video style directive<textarea value={imageSettings.styleDirective} onChange={(event) => updateImageSetting("styleDirective", event.target.value)} /></label>
-                <label className="toggle-setting"><span><strong>Subject consistency</strong><small>Keep recurring subjects recognizable across stills.</small></span><input type="checkbox" checked={imageSettings.subjectConsistency} onChange={(event) => updateImageSetting("subjectConsistency", event.target.checked)} /></label>
-                <label>Diversity <strong>{imageSettings.diversity}%</strong><input type="range" min="0" max="100" value={imageSettings.diversity} onChange={(event) => setImageSettings((current) => ({ ...current, diversity: Number(event.target.value) }))} /></label>
-              </section>
+              <div className="panel-section-heading"><h3>Image settings</h3><small>Saved per still</small></div>
               <div className="setting-grid">
-                <label>Aspect ratio<select value={imageSettings.aspectRatio} onChange={(event) => updateImageSetting("aspectRatio", event.target.value)}><option>16:9</option><option>9:16</option><option>1:1</option></select></label>
-                <label>Art style<select value={imageSettings.artStyle} onChange={(event) => updateImageSetting("artStyle", event.target.value)}><option>Photorealistic</option><option>Cinematic</option><option>Editorial illustration</option><option>Documentary</option></select></label>
-                <label>Camera angle<select value={imageSettings.cameraAngle} onChange={(event) => updateImageSetting("cameraAngle", event.target.value)}><option>Wide establishing</option><option>Medium shot</option><option>Close-up</option><option>Overhead</option></select></label>
-                <label>Mood<select value={imageSettings.mood} onChange={(event) => updateImageSetting("mood", event.target.value)}><option>Cinematic</option><option>Mysterious</option><option>Calm</option><option>Dramatic</option></select></label>
-                <label>Lighting<select value={imageSettings.lighting} onChange={(event) => updateImageSetting("lighting", event.target.value)}><option>Natural</option><option>Volumetric</option><option>Low key</option><option>Studio</option></select></label>
-                <label>Depth of field<select value={imageSettings.depthOfField} onChange={(event) => updateImageSetting("depthOfField", event.target.value)}><option>Deep focus</option><option>Shallow</option><option>Natural</option></select></label>
+                <SettingSelect label="Aspect ratio" value={imageSettings.aspectRatio} options={["16:9","9:16"]} onChange={(value) => updateImageSetting("aspectRatio", value)} />
+                <SettingSelect label="Shot type" value={imageSettings.shotType} options={["Undefined","Extreme close up","Close up","Medium shot","Wide shot","Establishing shot","Custom..."]} onChange={(value) => updateImageSetting("shotType", value)} />
+                <SettingSelect label="Camera angle" value={imageSettings.cameraAngle} options={["Undefined","Eye level","Low angle","High angle","Over the shoulder","Top down","Dutch angle","Custom..."]} onChange={(value) => updateImageSetting("cameraAngle", value)} />
+                <SettingSelect label="Lighting" value={imageSettings.lighting} options={["Undefined","Soft natural","Cinematic","Dramatic","Studio","Low key","High contrast","Custom..."]} onChange={(value) => updateImageSetting("lighting", value)} />
+                <SettingSelect label="Mood" value={imageSettings.mood} options={["Undefined","Calm","Tense","Emotional","Mysterious","Educational","Dramatic","Custom..."]} onChange={(value) => updateImageSetting("mood", value)} />
+                <SettingSelect label="Composition" value={imageSettings.composition} options={["Undefined","Centered subject","Rule of thirds","Negative space","Thumbnail style","Symmetrical","Custom..."]} onChange={(value) => updateImageSetting("composition", value)} />
+                <SettingSelect label="Visual style" value={imageSettings.visualStyle} options={["Undefined","Near photorealistic illustration","Cinematic still","Editorial digital painting","Semi realistic animation","Natural history illustration","Custom..."]} onChange={(value) => updateImageSetting("visualStyle", value)} />
+                <SettingSelect label="Color palette" value={imageSettings.colorPalette} options={["Undefined","Warm","Cool","Neutral","Muted","Pastel","High contrast","Custom..."]} onChange={(value) => updateImageSetting("colorPalette", value)} />
               </div>
-              <details className="advanced-settings"><summary>Advanced settings <span>＋</span></summary><div className="setting-grid">
-                <label>Composition<input value={imageSettings.composition} onChange={(event) => updateImageSetting("composition", event.target.value)} /></label>
-                <label>Lens<input value={imageSettings.lens} onChange={(event) => updateImageSetting("lens", event.target.value)} /></label>
-                <label>Color grade<input value={imageSettings.colorGrade} onChange={(event) => updateImageSetting("colorGrade", event.target.value)} /></label>
-                <label>Texture<input value={imageSettings.texture} onChange={(event) => updateImageSetting("texture", event.target.value)} /></label>
-              </div><label>Negative prompt<textarea value={imageSettings.negativePrompt} onChange={(event) => updateImageSetting("negativePrompt", event.target.value)} /></label></details>
-              <label>Image model<select value={geminiModel} onChange={(event) => setGeminiModel(event.target.value)}><option value="gemini-2.5-flash-image">Gemini 2.5 Flash Image</option><option value="gemini-3.1-flash-image">Gemini 3.1 Flash Image</option></select></label>
+              <details className="advanced-settings"><summary><span><strong>Advanced settings</strong><small>Fine-tune camera and rendering</small></span><b>＋</b></summary><div className="setting-grid">
+                {([
+                  ["lensFeel","Lens feel",["Undefined","Wide angle","Portrait lens","Telephoto compression","Macro","Custom..."]],
+                  ["depthOfField","Depth of field",["Undefined","Shallow","Medium","Deep","Custom..."]],
+                  ["backgroundComplexity","Background complexity",["Undefined","Plain","Minimal","Environmental","Detailed","Custom..."]],
+                  ["subjectDistance","Subject distance",["Undefined","Very close","Close","Medium","Far","Custom..."]],
+                  ["motionFeel","Motion feel",["Undefined","Static","Subtle motion","Dynamic action","Custom..."]],
+                  ["textureDetail","Texture detail",["Undefined","Soft","Detailed","Highly detailed","Custom..."]],
+                  ["realismLevel","Realism level",["Undefined","Stylized","Semi realistic","Near photorealistic","Custom..."]],
+                  ["negativePromptStrength","Negative prompt strength",["Undefined","Low","Medium","High","Custom..."]],
+                  ["referenceAdherence","Reference adherence",["Undefined","Loose","Balanced","Strict","Custom..."]],
+                ] as [keyof ImageSettings,string,string[]][]).map(([key,label,options]) => <SettingSelect key={key} label={label} value={imageSettings[key]} options={options} onChange={(value) => updateImageSetting(key, value)} />)}
+              </div></details>
+              <label className="model-setting"><span>Image model</span><select value={geminiModel} onChange={(event) => setGeminiModel(event.target.value)}><option value="gemini-3.1-flash-image">Gemini Nano Banana 2</option></select></label>
               <div className={keyStatus.gemini ? "provider-status ready" : "provider-status"}>
                 <strong>Generation service</strong><span>{keyStatus.gemini ? "Configured securely in Windows Credential Manager" : "Not configured. Add the Gemini credential on the backend."}</span>
               </div>
               <div className="reference-manager">
                 <div><strong>Visual references</strong><span>Optional style or subject guidance for image work.</span></div>
-                <button className="secondary" onClick={() => void importReference()}><Plus size={14} />Add image</button>
-                {references.map((reference) => <div className="reference-item" key={reference.id}><span>IMG</span><p>{reference.originalName}</p><button onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button></div>)}
+                {!references.length && <button className="secondary" onClick={() => void importReference()}><Plus size={14} />Add image</button>}
+                {references.map((reference) => <div className="reference-item" key={reference.id}>{referenceUrl ? <img src={referenceUrl} alt="Visual reference" /> : <span>IMG</span>}<button title="Extract Style" onClick={() => void extractStyle(reference.id)}><Sparkles size={13} />Extract Style</button><button onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button></div>)}
               </div>
               <button className="primary full" onClick={() => void saveSettings()} disabled={loading}>Apply settings</button>
             </>
+          ) : (
+            <div className="edit-panel">
+              <h3>Edit existing image</h3>
+              <p>The actual selected image is sent back to Gemini. Paint a mask for localized changes.</p>
+              <button className="primary full" onClick={() => { clearMask(); setEditOpen(true); }} disabled={!selectedRenderId}>Edit / Inpaint</button>
+            </div>
           )}
         </aside>
       </div>
+      {zoomOpen && selectedRenderId && renderUrls[selectedRenderId] && <div className="modal-backdrop image-lightbox" onClick={() => setZoomOpen(false)}>
+        <div className="lightbox-shell" onClick={(event) => event.stopPropagation()}>
+          <div className="lightbox-toolbar"><strong>Image inspection</strong><button onClick={() => setZoom((value) => Math.max(.25, value - .25))}><ZoomOut size={17} /></button><button onClick={() => setZoom(1)}>Reset</button><button onClick={() => setZoom((value) => Math.min(5, value + .25))}><ZoomIn size={17} /></button><button onClick={() => { setZoom(1); }}>Fit</button><button onClick={() => setZoomOpen(false)}><X size={17} /></button></div>
+          <div className="lightbox-canvas"><img src={renderUrls[selectedRenderId]} alt="Zoomed selected version" style={{ transform: `scale(${zoom})` }} /></div>
+        </div>
+      </div>}
+      {editOpen && selectedRenderId && renderUrls[selectedRenderId] && <div className="modal-backdrop image-lightbox">
+        <div className="edit-modal">
+          <div className="lightbox-toolbar"><strong>Edit / Inpaint</strong><button className={!eraseMask ? "active" : ""} onClick={() => setEraseMask(false)}>Brush mask</button><button className={eraseMask ? "active" : ""} onClick={() => setEraseMask(true)}>Erase mask</button><button onClick={clearMask}>Clear mask</button><button onClick={() => setEditOpen(false)}><X size={17} /></button></div>
+          <div className="edit-body">
+            <div className="mask-stage" style={{ backgroundImage: `url(${renderUrls[selectedRenderId]})` }}>
+              <canvas ref={maskCanvasRef} width={1280} height={720} onPointerDown={(event) => { paintingRef.current = true; event.currentTarget.setPointerCapture(event.pointerId); paintMask(event); }} onPointerMove={paintMask} onPointerUp={() => { paintingRef.current = false; }} />
+            </div>
+            <aside>
+              <p>Paint only the area you want changed. Gemini uses the source image plus this mask as visual context and is instructed to preserve everything else.</p>
+              <label>Brush size<input type="range" min="8" max="140" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} /></label>
+              <label>Edit instruction<textarea value={editInstruction} onChange={(event) => setEditInstruction(event.target.value)} placeholder="Describe the exact localized change." /></label>
+              <label>Edit Strength<select value={editStrength} onChange={(event) => setEditStrength(event.target.value)}><option>Low</option><option>Medium</option><option>High</option></select></label>
+              <button className="primary full" onClick={() => void editSelectedRender()} disabled={!editInstruction.trim() || loading}>Apply Edit</button>
+              <button className="secondary full" onClick={() => setEditOpen(false)}>Cancel</button>
+            </aside>
+          </div>
+        </div>
+      </div>}
+      {bulkOpen && <div className="modal-backdrop">
+        <div className="modal bulk-modal">
+          <h2>Bulk Gen Config</h2>
+          <>
+            <label>Style Directive<textarea value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} /></label>
+            <div className="reference-manager"><button className="secondary" onClick={() => void importReference()}>Upload reference image</button>{references.map((reference) => <button className="secondary" key={reference.id} onClick={() => void extractStyle(reference.id)}><Sparkles size={14} />Extract Style · {reference.originalName}</button>)}</div>
+            <label className="diversity-control"><span>Diversity</span><strong>{bulkDiversity}%</strong><input type="range" min="0" max="100" value={bulkDiversity} onChange={(event) => setBulkDiversity(Number(event.target.value))} /></label>
+            <p>Bulk settings use the current image settings. Diversity varies framing factors only; aspect ratio, core style, identity, and realism remain fixed.</p>
+            <button className="primary full" onClick={() => void prepareBulkPrompts()}>Save & Generate Prompts</button>
+          </>
+          <button className="secondary full" onClick={() => setBulkOpen(false)}>Cancel</button>
+        </div>
+      </div>}
     </section>
   );
 }

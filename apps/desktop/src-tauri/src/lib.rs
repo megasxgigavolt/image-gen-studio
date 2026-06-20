@@ -236,6 +236,14 @@ fn create_prompt_version(
 }
 
 #[tauri::command]
+fn delete_prompt_version(
+    state: State<'_, RepositoryState>,
+    prompt_version_id: String,
+) -> Result<(), String> {
+    with_repository(state, |repository| repository.delete_prompt_version(&prompt_version_id))
+}
+
+#[tauri::command]
 fn list_image_renders(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -283,10 +291,54 @@ fn edit_image_render(
     state: State<'_, RepositoryState>,
     source_render_id: String,
     instruction: String,
+    mask_data_url: Option<String>,
+    edit_strength: String,
 ) -> Result<ImageRender, String> {
     with_repository(state, |repository| {
-        repository.edit_image_render(&source_render_id, &instruction)
+        repository.edit_image_render(&source_render_id, &instruction, mask_data_url.as_deref(), &edit_strength)
     })
+}
+
+#[tauri::command]
+fn set_final_render(
+    state: State<'_, RepositoryState>,
+    render_id: String,
+    is_final: bool,
+) -> Result<ImageRender, String> {
+    with_repository(state, |repository| repository.set_final_render(&render_id, is_final))
+}
+
+#[tauri::command]
+fn delete_image_render(
+    state: State<'_, RepositoryState>,
+    render_id: String,
+) -> Result<(), String> {
+    with_repository(state, |repository| repository.delete_image_render(&render_id))
+}
+
+#[tauri::command]
+async fn suggest_image_prompt(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_id: String,
+    settings_json: String,
+    style_directive: String,
+) -> Result<String, String> {
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.suggest_image_prompt(&video_id, &group_id, &settings_json, &style_directive)
+    })
+    .await
+    .map_err(|error| format!("Prompt worker stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
+fn extract_reference_style(
+    state: State<'_, RepositoryState>,
+    asset_id: String,
+) -> Result<projects::StyleExtraction, String> {
+    with_repository(state, |repository| repository.extract_reference_style(&asset_id))
 }
 
 #[tauri::command]
@@ -296,6 +348,17 @@ fn get_render_data_url(
 ) -> Result<String, String> {
     with_repository(state, |repository| {
         let (mime, data) = repository.read_render_file(&render_id)?;
+        Ok(format!("data:{mime};base64,{data}"))
+    })
+}
+
+#[tauri::command]
+fn get_asset_data_url(
+    state: State<'_, RepositoryState>,
+    asset_id: String,
+) -> Result<String, String> {
+    with_repository(state, |repository| {
+        let (mime, data) = repository.read_asset_file(&asset_id)?;
         Ok(format!("data:{mime};base64,{data}"))
     })
 }
@@ -399,7 +462,9 @@ fn spawn_job_workers(
     projects_dir: std::path::PathBuf,
     job_id: String,
 ) {
-    for _ in 0..2 {
+    // Vertex image quotas are commonly burst-limited. A single paced worker avoids
+    // parallel 429 storms while still allowing the batch to continue after failures.
+    for _ in 0..1 {
         let database_path = database_path.clone();
         let projects_dir = projects_dir.clone();
         let job_id = job_id.clone();
@@ -415,7 +480,7 @@ fn spawn_job_workers(
                 };
                 let mut last_error = String::new();
                 let mut render_id = None;
-                for attempt in 0..3 {
+                for attempt in 0..5 {
                     match repository.generate_image_render(
                         &video_id,
                         &group_id,
@@ -430,14 +495,18 @@ fn spawn_job_workers(
                         }
                         Err(error) => {
                             last_error = error;
-                            if attempt < 2 {
-                                thread::sleep(Duration::from_secs(2_u64.pow(attempt + 1)));
+                            if attempt < 4 {
+                                let rate_limited = last_error.contains("429")
+                                    || last_error.to_ascii_lowercase().contains("resource exhausted");
+                                let delay = if rate_limited { 30 * 2_u64.pow(attempt) } else { 3 * 2_u64.pow(attempt) };
+                                thread::sleep(Duration::from_secs(delay.min(240)));
                             }
                         }
                     }
                 }
                 let result = render_id.ok_or(last_error);
                 let _ = repository.finish_job_item(&job_id, &item_id, result);
+                thread::sleep(Duration::from_secs(8));
             }
         });
     }
@@ -614,8 +683,10 @@ pub fn run() {
         .setup(|app| {
             let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../../services/python-engine");
-            let local_env = engine_dir.join(".env");
-            if let Ok(contents) = fs::read_to_string(&local_env) {
+            let workspace_env = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../.env");
+            for local_env in [workspace_env, engine_dir.join(".env")] {
+            if let Ok(contents) = fs::read_to_string(local_env) {
                 for line in contents.lines() {
                     let Some((key, value)) = line.split_once('=') else {
                         continue;
@@ -627,6 +698,7 @@ pub fn run() {
                         std::env::set_var(key, value.trim().trim_matches(['"', '\'']));
                     }
                 }
+            }
             }
             let google_credentials = engine_dir.join("google-service-account.json");
             if google_credentials.exists()
@@ -643,6 +715,12 @@ pub fn run() {
             repository
                 .recover_image_jobs()
                 .map_err(std::io::Error::other)?;
+            if repository.get_app_setting("gemini_model").map_err(std::io::Error::other)?
+                .as_deref() != Some("gemini-3.1-flash-image")
+            {
+                repository.save_app_setting("gemini_model", "gemini-3.1-flash-image")
+                    .map_err(std::io::Error::other)?;
+            }
             for (provider, variable) in [("gemini", "GEMINI_API_KEY"), ("openai", "OPENAI_API_KEY")]
             {
                 if let Ok(secret) = std::env::var(variable) {
@@ -688,6 +766,7 @@ pub fn run() {
             save_provider_key,
             list_prompt_versions,
             create_prompt_version,
+            delete_prompt_version,
             list_image_renders,
             generate_image_render,
             get_image_workspace,
@@ -695,7 +774,12 @@ pub fn run() {
             get_latest_image_job,
             control_image_job,
             edit_image_render,
+            set_final_render,
+            delete_image_render,
+            suggest_image_prompt,
+            extract_reference_style,
             get_render_data_url,
+            get_asset_data_url,
             export_latest_stills,
             export_project_bundle,
             import_project_bundle,

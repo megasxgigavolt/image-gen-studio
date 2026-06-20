@@ -15,6 +15,28 @@ use std::os::windows::process::CommandExt;
 use uuid::Uuid;
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
+#[derive(Deserialize)]
+struct GoogleServiceAccount {
+    project_id: String,
+    client_email: String,
+    private_key: String,
+    token_uri: String,
+}
+
+#[derive(Serialize)]
+struct GoogleJwtClaims {
+    iss: String,
+    scope: String,
+    aud: String,
+    exp: usize,
+    iat: usize,
+}
+
+enum GeminiAuth {
+    ApiKey(String),
+    Vertex { access_token: String, project_id: String },
+}
+
 const MIGRATION_001: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -198,6 +220,15 @@ ALTER TABLE video_inputs ADD COLUMN pacing_min_seconds INTEGER NOT NULL DEFAULT 
 ALTER TABLE video_inputs ADD COLUMN pacing_max_seconds INTEGER NOT NULL DEFAULT 10;
 "#;
 
+const MIGRATION_009: &str = r#"
+ALTER TABLE image_renders ADD COLUMN is_final INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE image_renders ADD COLUMN edit_strength TEXT;
+ALTER TABLE image_renders ADD COLUMN mask_path TEXT;
+ALTER TABLE image_renders ADD COLUMN mask_used INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE visual_plan_groups ADD COLUMN plan_signature TEXT;
+CREATE INDEX IF NOT EXISTS idx_image_renders_final ON image_renders(video_id, group_id, is_final);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -283,6 +314,10 @@ pub struct ImageRender {
     pub parent_render_id: Option<String>,
     pub edit_instruction: Option<String>,
     pub kind: String,
+    pub is_final: bool,
+    pub edit_strength: Option<String>,
+    pub mask_path: Option<String>,
+    pub mask_used: bool,
     pub created_at: String,
 }
 
@@ -298,6 +333,13 @@ pub struct AppSetting {
 pub struct ProviderKeyStatus {
     pub provider: String,
     pub configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleExtraction {
+    pub style_directive: String,
+    pub image_settings: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -478,7 +520,7 @@ impl ProjectRepository {
         fs::create_dir_all(projects_dir).map_err(|error| error.to_string())?;
         let connection = Connection::open(database_path).map_err(|error| error.to_string())?;
         connection
-            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 30000;")
             .map_err(|error| error.to_string())?;
         let repository = Self {
             connection,
@@ -590,6 +632,17 @@ impl ProjectRepository {
                 [Utc::now().to_rfc3339()],
             )
             .map_err(|error| error.to_string())?;
+        let has_is_final: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('image_renders') WHERE name='is_final')",
+            [], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !has_is_final {
+            self.connection.execute_batch(MIGRATION_009).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(9, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -971,6 +1024,10 @@ impl ProjectRepository {
             if let Some(existing) = self.get_video_inputs(video_id)?.audio {
                 self.remove_asset(&existing.id)?;
             }
+        } else if kind == "reference" {
+            for existing in self.get_video_inputs(video_id)?.references {
+                self.remove_asset(&existing.id)?;
+            }
         }
         self.connection.execute(
             "INSERT INTO input_assets(id, video_id, kind, original_name, relative_path, media_type, size_bytes, created_at)
@@ -1170,13 +1227,28 @@ impl ProjectRepository {
         })
     }
 
+    pub fn delete_prompt_version(&self, prompt_version_id: &str) -> Result<(), String> {
+        let render_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM image_renders WHERE prompt_version_id=?1",
+            [prompt_version_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if render_count > 0 {
+            return Err("This prompt version is used by an image version. Delete that image version first.".into());
+        }
+        let deleted = self.connection.execute(
+            "DELETE FROM prompt_versions WHERE id=?1", [prompt_version_id],
+        ).map_err(|e| e.to_string())?;
+        if deleted == 0 { return Err("Prompt version was not found.".into()); }
+        Ok(())
+    }
+
     pub fn list_image_renders(
         &self,
         video_id: &str,
         group_id: &str,
     ) -> Result<Vec<ImageRender>, String> {
         let mut statement = self.connection.prepare(
-            "SELECT id, video_id, group_id, version, prompt_version_id, file_name, relative_path, parent_render_id, edit_instruction, kind, created_at
+            "SELECT id, video_id, group_id, version, prompt_version_id, file_name, relative_path, parent_render_id, edit_instruction, kind, is_final, edit_strength, mask_path, mask_used, created_at
              FROM image_renders WHERE video_id = ?1 AND group_id = ?2 ORDER BY version DESC",
         ).map_err(|e| e.to_string())?;
         let rows = statement
@@ -1192,7 +1264,11 @@ impl ProjectRepository {
                     parent_render_id: row.get(7)?,
                     edit_instruction: row.get(8)?,
                     kind: row.get(9)?,
-                    created_at: row.get(10)?,
+                    is_final: row.get::<_, i64>(10)? != 0,
+                    edit_strength: row.get(11)?,
+                    mask_path: row.get(12)?,
+                    mask_used: row.get::<_, i64>(13)? != 0,
+                    created_at: row.get(14)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1216,11 +1292,26 @@ impl ProjectRepository {
         let created_at = Utc::now().to_rfc3339();
         self.connection
             .execute(
-                "INSERT INTO image_renders(id, video_id, group_id, version, prompt_version_id, file_name, relative_path, parent_render_id, edit_instruction, kind, created_at)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "UPDATE image_renders SET is_final=0 WHERE video_id=?1 AND group_id=?2",
+                params![video_id, group_id],
+            )
+            .map_err(|e| e.to_string())?;
+        self.connection
+            .execute(
+                "INSERT INTO image_renders(id, video_id, group_id, version, prompt_version_id, file_name, relative_path, parent_render_id, edit_instruction, kind, is_final, mask_used, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, 0, ?11)",
                 params![id, video_id, group_id, version, prompt_version_id, file_name, relative_path, parent_render_id, edit_instruction, kind, created_at],
             )
             .map_err(|e| e.to_string())?;
+        let stale: Vec<ImageRender> = self.list_image_renders(video_id, group_id)?
+            .into_iter().filter(|render| !render.is_final).skip(10).collect();
+        for render in stale {
+            if let Ok(path) = self.render_absolute_path(&render) {
+                let _ = fs::remove_file(path);
+            }
+            self.connection.execute("DELETE FROM image_renders WHERE id=?1", [&render.id])
+                .map_err(|e| e.to_string())?;
+        }
         Ok(ImageRender {
             id: id.into(),
             video_id: video_id.into(),
@@ -1232,8 +1323,110 @@ impl ProjectRepository {
             parent_render_id: parent_render_id.map(str::to_string),
             edit_instruction: edit_instruction.map(str::to_string),
             kind: kind.into(),
+            is_final: true,
+            edit_strength: None,
+            mask_path: None,
+            mask_used: false,
             created_at,
         })
+    }
+
+    pub fn set_final_render(&self, render_id: &str, is_final: bool) -> Result<ImageRender, String> {
+        let (video_id, group_id): (String, String) = self.connection.query_row(
+            "SELECT video_id,group_id FROM image_renders WHERE id=?1", [render_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(|_| "Image version was not found.".to_string())?;
+        if is_final {
+            self.connection.execute(
+                "UPDATE image_renders SET is_final=0 WHERE video_id=?1 AND group_id=?2",
+                params![video_id, group_id],
+            ).map_err(|e| e.to_string())?;
+        }
+        self.connection.execute(
+            "UPDATE image_renders SET is_final=?2 WHERE id=?1",
+            params![render_id, is_final as i64],
+        ).map_err(|e| e.to_string())?;
+        self.list_image_renders(&video_id, &group_id)?.into_iter()
+            .find(|render| render.id == render_id)
+            .ok_or_else(|| "Image version was not found.".to_string())
+    }
+
+    pub fn delete_image_render(&self, render_id: &str) -> Result<(), String> {
+        let render = self.connection.query_row(
+            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,is_final,edit_strength,mask_path,mask_used,created_at FROM image_renders WHERE id=?1",
+            [render_id], |row| Ok(ImageRender {
+                id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?,
+                version: row.get(3)?, prompt_version_id: row.get(4)?, file_name: row.get(5)?,
+                relative_path: row.get(6)?, parent_render_id: row.get(7)?,
+                edit_instruction: row.get(8)?, kind: row.get(9)?,
+                is_final: row.get::<_, i64>(10)? != 0, edit_strength: row.get(11)?,
+                mask_path: row.get(12)?, mask_used: row.get::<_, i64>(13)? != 0,
+                created_at: row.get(14)?,
+            }),
+        ).map_err(|_| "Image version was not found.".to_string())?;
+        let path = self.render_absolute_path(&render)?;
+        self.connection.execute(
+            "UPDATE image_renders SET parent_render_id=NULL WHERE parent_render_id=?1", [render_id],
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM image_renders WHERE id=?1", [render_id])
+            .map_err(|e| e.to_string())?;
+        let _ = fs::remove_file(path);
+        if let Some(mask_path) = render.mask_path {
+            let channel_id: String = self.connection.query_row(
+                "SELECT channel_id FROM videos WHERE id=?1", [&render.video_id], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            let _ = fs::remove_file(self.projects_dir.join(channel_id).join(&render.video_id).join(mask_path));
+        }
+        if render.is_final {
+            if let Some(next) = self.list_image_renders(&render.video_id, &render.group_id)?.first() {
+                self.set_final_render(&next.id, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn suggest_image_prompt(
+        &self,
+        video_id: &str,
+        group_id: &str,
+        settings_json: &str,
+        style_directive: &str,
+    ) -> Result<String, String> {
+        let plan = self.get_visual_plan(video_id)?;
+        let group = plan.groups.iter().find(|item| item.id == group_id)
+            .ok_or("Visual plan still was not found.")?;
+        let members: Vec<_> = group.sentence_ids.iter()
+            .filter_map(|id| plan.sentences.iter().find(|sentence| &sentence.id == id))
+            .collect();
+        let start = members.first().map(|item| item.start_seconds).unwrap_or(0.0);
+        let end = members.last().map(|item| item.end_seconds).unwrap_or(start);
+        let voiceover = members.iter().map(|item| item.text.as_str()).collect::<Vec<_>>().join(" ");
+        let api_key = self.get_provider_key("openai")?
+            .ok_or("Add an OpenAI API key before suggesting prompts.")?;
+        let request = format!(
+            "Create one concise, production-ready image prompt for this narration still.\n\
+             Voiceover: {voiceover}\nType: {}\nTimestamp: {:.1}-{:.1}s (duration {:.1}s)\n\
+             Image settings: {settings_json}\nStyle directive: {style_directive}\n\
+             Describe the main subject, action/emotion, relevant setting, framing, mood, and directly supportive visual details. \
+             Be literal and hyper-relevant. Avoid generic cinematic filler, unrelated metaphors, random people or objects, overcrowding, and text in the image. Return only the prompt.",
+            group.kind, start, end, end - start
+        );
+        request_openai_text(&api_key, &request)
+    }
+
+    pub fn extract_reference_style(&self, asset_id: &str) -> Result<StyleExtraction, String> {
+        let (video_id, relative_path, media_type): (String, String, String) = self.connection.query_row(
+            "SELECT video_id,relative_path,media_type FROM input_assets WHERE id=?1 AND kind='reference'",
+            [asset_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(|_| "Reference image was not found.".to_string())?;
+        let channel_id: String = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1", [&video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let bytes = fs::read(self.projects_dir.join(channel_id).join(video_id).join(relative_path))
+            .map_err(|_| "Reference image file is missing.".to_string())?;
+        let api_key = self.get_provider_key("openai")?
+            .ok_or("Add an OpenAI API key before extracting style.")?;
+        request_openai_style(&api_key, &media_type, &bytes)
     }
 
     pub fn generate_image_render(
@@ -1255,14 +1448,12 @@ impl ProjectRepository {
         }
         let settings: serde_json::Value = serde_json::from_str(settings_json)
             .map_err(|_| "Image settings must be valid JSON.".to_string())?;
-        let api_key = self
-            .get_provider_key("gemini")?
-            .ok_or("Add a Gemini API key in Settings before generating an image.")?;
+        let auth = self.gemini_auth()?;
         let model = self
             .get_app_setting("gemini_model")?
-            .unwrap_or_else(|| "gemini-2.5-flash-image".into());
+            .unwrap_or_else(|| "gemini-3.1-flash-image".into());
         let prompt = assemble_image_prompt(system_prompt, user_prompt, &settings);
-        let (image_bytes, extension) = request_gemini_image(&api_key, &model, &prompt)?;
+        let (image_bytes, extension) = request_gemini_image(&auth, &model, &prompt)?;
         let channel_id: String = self
             .connection
             .query_row(
@@ -1321,18 +1512,23 @@ impl ProjectRepository {
         &self,
         source_render_id: &str,
         instruction: &str,
+        mask_data_url: Option<&str>,
+        edit_strength: &str,
     ) -> Result<ImageRender, String> {
         if instruction.trim().is_empty() {
             return Err("Describe the requested image change.".into());
         }
         let source: ImageRender = self.connection.query_row(
-            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,created_at FROM image_renders WHERE id=?1",
+            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,is_final,edit_strength,mask_path,mask_used,created_at FROM image_renders WHERE id=?1",
             [source_render_id],
             |row| Ok(ImageRender {
                 id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?,
                 version: row.get(3)?, prompt_version_id: row.get(4)?, file_name: row.get(5)?,
                 relative_path: row.get(6)?, parent_render_id: row.get(7)?,
-                edit_instruction: row.get(8)?, kind: row.get(9)?, created_at: row.get(10)?,
+                edit_instruction: row.get(8)?, kind: row.get(9)?,
+                is_final: row.get::<_, i64>(10)? != 0, edit_strength: row.get(11)?,
+                mask_path: row.get(12)?, mask_used: row.get::<_, i64>(13)? != 0,
+                created_at: row.get(14)?,
             }),
         ).map_err(|_| "Source image version was not found.".to_string())?;
         let channel_id: String = self
@@ -1370,22 +1566,22 @@ impl ProjectRepository {
                 },
             )
             .map_err(|e| e.to_string())?;
+        let mask = mask_data_url.map(decode_data_url).transpose()?;
         let edit_prompt = format!(
-            "Edit the provided image according to the user request.\n\nUse the input image as the visual source of truth. Preserve camera angle, composition, lighting, colors, subject identity, background, and every unrelated detail. Only modify what the request requires. Do not add text or watermarks.\n\nExisting style directive:\n{}\n\nOriginal prompt context:\n{}\n\nOriginal settings:\n{}\n\nUser edit request:\n{}",
-            prompt.0, prompt.1, prompt.2, instruction.trim()
+            "Edit the provided image according to the user request.\n\nUser request:\n{}\n\nEdit strength: {}\n\nRules:\n1. Only change the white painted area shown in the mask image when a mask is provided.\n2. Preserve the rest of the image as much as possible.\n3. Preserve camera angle, lighting, colors, composition, character identity, subject identity, and visual style.\n4. Do not restyle or recreate the full image.\n5. Keep all unrelated objects unchanged.\n6. Return a natural looking edited image.\n\nExisting style directive:\n{}\n\nOriginal prompt context:\n{}\n\nOriginal settings:\n{}",
+            instruction.trim(), edit_strength, prompt.0, prompt.1, prompt.2
         );
-        let api_key = self
-            .get_provider_key("gemini")?
-            .ok_or("Add a Gemini API key in Settings before editing an image.")?;
+        let auth = self.gemini_auth()?;
         let model = self
             .get_app_setting("gemini_model")?
-            .unwrap_or_else(|| "gemini-2.5-flash-image".into());
+            .unwrap_or_else(|| "gemini-3.1-flash-image".into());
         let (image_bytes, extension) = request_gemini_image_with_source(
-            &api_key,
+            &auth,
             &model,
             &edit_prompt,
             &source_bytes,
             mime_type,
+            mask.as_ref().map(|(_, bytes)| bytes.as_slice()),
         )?;
         let render_dir = self
             .projects_dir
@@ -1401,7 +1597,7 @@ impl ProjectRepository {
         let file_name = format!("render-v{version}.{extension}");
         let relative_path = format!("renders/{}/{}", source.group_id, file_name);
         fs::write(render_dir.join(&file_name), image_bytes).map_err(|e| e.to_string())?;
-        self.insert_image_render(
+        let mut render = self.insert_image_render(
             &Uuid::new_v4().to_string(),
             &source.video_id,
             &source.group_id,
@@ -1412,7 +1608,20 @@ impl ProjectRepository {
             Some(&source.id),
             Some(instruction.trim()),
             "edit",
-        )
+        )?;
+        let mask_path = if let Some((_, bytes)) = mask {
+            let path = render_dir.join(format!("mask-v{version}.png"));
+            fs::write(&path, bytes).map_err(|e| e.to_string())?;
+            Some(format!("renders/{}/mask-v{version}.png", source.group_id))
+        } else { None };
+        self.connection.execute(
+            "UPDATE image_renders SET edit_strength=?2,mask_path=?3,mask_used=?4 WHERE id=?1",
+            params![render.id, edit_strength, mask_path, mask_path.is_some() as i64],
+        ).map_err(|e| e.to_string())?;
+        render.edit_strength = Some(edit_strength.into());
+        render.mask_path = mask_path;
+        render.mask_used = render.mask_path.is_some();
+        Ok(render)
     }
 
     pub fn read_render_file(&self, render_id: &str) -> Result<(String, String), String> {
@@ -1449,6 +1658,16 @@ impl ProjectRepository {
         ))
     }
 
+    pub fn read_asset_file(&self, asset_id: &str) -> Result<(String, String), String> {
+        let asset = self.asset_by_id(asset_id)?.ok_or("Asset was not found.")?;
+        let channel_id: String = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1", [&asset.video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let bytes = fs::read(self.projects_dir.join(channel_id).join(&asset.video_id).join(&asset.relative_path))
+            .map_err(|_| "Asset file is missing.".to_string())?;
+        Ok((asset.media_type, base64::engine::general_purpose::STANDARD.encode(bytes)))
+    }
+
     pub fn export_latest_stills(
         &self,
         video_id: &str,
@@ -1458,11 +1677,8 @@ impl ProjectRepository {
         let plan = self.get_visual_plan(video_id)?;
         let mut files = Vec::new();
         for group in plan.groups {
-            if let Some(render) = self
-                .list_image_renders(video_id, &group.id)?
-                .into_iter()
-                .next()
-            {
+            if let Some(render) = self.list_image_renders(video_id, &group.id)?
+                .into_iter().find(|render| render.is_final) {
                 let source = self.render_absolute_path(&render)?;
                 let extension = source
                     .extension()
@@ -1768,10 +1984,66 @@ impl ProjectRepository {
         }
     }
 
+    fn gemini_auth(&self) -> Result<GeminiAuth, String> {
+        if let Some(key) = self.get_provider_key("gemini")? {
+            if !key.trim().is_empty() {
+                return Ok(GeminiAuth::ApiKey(key));
+            }
+        }
+        let credentials_path = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+            .map_err(|_| "Configure GEMINI_API_KEY or GOOGLE_APPLICATION_CREDENTIALS.".to_string())?;
+        let account: GoogleServiceAccount = serde_json::from_slice(
+            &fs::read(&credentials_path)
+                .map_err(|_| "Google Cloud credentials JSON could not be read.".to_string())?,
+        ).map_err(|_| "Google Cloud credentials JSON is invalid.".to_string())?;
+        let now = Utc::now().timestamp() as usize;
+        let assertion = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+            &GoogleJwtClaims {
+                iss: account.client_email,
+                scope: "https://www.googleapis.com/auth/cloud-platform".into(),
+                aud: account.token_uri.clone(),
+                iat: now,
+                exp: now + 3600,
+            },
+            &jsonwebtoken::EncodingKey::from_rsa_pem(account.private_key.as_bytes())
+                .map_err(|_| "Google service-account private key is invalid.".to_string())?,
+        ).map_err(|error| format!("Could not sign Google authentication request: {error}"))?;
+        let response = reqwest::blocking::Client::new()
+            .post(&account.token_uri)
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+                ("assertion", assertion.as_str()),
+            ])
+            .send()
+            .map_err(|error| format!("Could not authenticate with Google Cloud: {error}"))?;
+        let status = response.status();
+        let body: serde_json::Value = response.json()
+            .map_err(|_| "Google Cloud returned an unreadable authentication response.".to_string())?;
+        if !status.is_success() {
+            return Err(format!(
+                "Google Cloud authentication failed ({status}): {}",
+                body.pointer("/error_description").and_then(|value| value.as_str()).unwrap_or("unknown error")
+            ));
+        }
+        Ok(GeminiAuth::Vertex {
+            access_token: body.get("access_token").and_then(|value| value.as_str())
+                .ok_or("Google Cloud returned no access token.")?.to_string(),
+            project_id: account.project_id,
+        })
+    }
+
     pub fn get_provider_key_status(&self, provider: &str) -> Result<ProviderKeyStatus, String> {
+        let configured = if provider == "gemini" {
+            self.get_provider_key(provider)?.is_some()
+                || std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok()
+                    .is_some_and(|path| Path::new(&path).exists())
+        } else {
+            self.get_provider_key(provider)?.is_some()
+        };
         Ok(ProviderKeyStatus {
             provider: provider.to_string(),
-            configured: self.get_provider_key(provider)?.is_some(),
+            configured,
         })
     }
 
@@ -2509,8 +2781,58 @@ fn assemble_image_prompt(
     )
 }
 
+fn request_openai_text(api_key: &str, prompt: &str) -> Result<String, String> {
+    let response = reqwest::blocking::Client::new()
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": prompt,
+            "max_output_tokens": 500
+        }))
+        .send()
+        .map_err(|error| format!("Could not reach OpenAI: {error}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response.json()
+        .map_err(|error| format!("OpenAI returned an unreadable response: {error}"))?;
+    if !status.is_success() {
+        let message = body.pointer("/error/message").and_then(|value| value.as_str())
+            .unwrap_or("Prompt suggestion failed.");
+        return Err(format!("OpenAI error ({status}): {message}"));
+    }
+    body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
+        .map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
+        .ok_or_else(|| "OpenAI returned no prompt text.".to_string())
+}
+
+fn request_openai_style(api_key: &str, mime: &str, bytes: &[u8]) -> Result<StyleExtraction, String> {
+    let image_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+    let response = reqwest::blocking::Client::new()
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": [{"role":"user","content":[
+                {"type":"input_text","text":"Analyze this image as a reusable production style reference. Return only JSON with styleDirective and imageSettings. imageSettings may contain shotType, cameraAngle, lighting, mood, composition, visualStyle, colorPalette, lensFeel, depthOfField, backgroundComplexity, subjectDistance, motionFeel, textureDetail, realismLevel, negativePromptStrength, and referenceAdherence. Use only concise values strongly supported by the image."},
+                {"type":"input_image","image_url":image_url}
+            ]}],
+            "max_output_tokens": 900
+        }))
+        .send().map_err(|error| format!("Could not reach OpenAI: {error}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response.json()
+        .map_err(|error| format!("OpenAI returned an unreadable response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("OpenAI style extraction failed ({status}): {}", body.pointer("/error/message").and_then(|value| value.as_str()).unwrap_or("unknown error")));
+    }
+    let text = body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
+        .ok_or("OpenAI returned no style analysis.")?;
+    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    serde_json::from_str(cleaned).map_err(|_| "OpenAI style analysis was not valid JSON.".to_string())
+}
+
 fn request_gemini_image(
-    api_key: &str,
+    auth: &GeminiAuth,
     model: &str,
     prompt: &str,
 ) -> Result<(Vec<u8>, &'static str), String> {
@@ -2522,13 +2844,19 @@ fn request_gemini_image(
     {
         return Err("Gemini model name is invalid.".into());
     }
-    let response = reqwest::blocking::Client::new()
-        .post(format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        ))
-        .header("x-goog-api-key", api_key)
+    let client = reqwest::blocking::Client::new();
+    let request = match auth {
+        GeminiAuth::ApiKey(api_key) => client
+            .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"))
+            .header("x-goog-api-key", api_key),
+        GeminiAuth::Vertex { access_token, project_id } => {
+            let url = format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model}:generateContent");
+            client.post(url).bearer_auth(access_token)
+        }
+    };
+    let response = request
         .json(&json!({
-            "contents": [{"parts": [{"text": prompt}]}],
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
         }))
         .send()
@@ -2575,11 +2903,12 @@ fn request_gemini_image(
 }
 
 fn request_gemini_image_with_source(
-    api_key: &str,
+    auth: &GeminiAuth,
     model: &str,
     prompt: &str,
     source_bytes: &[u8],
     mime_type: &str,
+    mask_bytes: Option<&[u8]>,
 ) -> Result<(Vec<u8>, &'static str), String> {
     let model = model.trim();
     if model.is_empty()
@@ -2589,19 +2918,40 @@ fn request_gemini_image_with_source(
     {
         return Err("Gemini model name is invalid.".into());
     }
-    let response = reqwest::blocking::Client::new()
-        .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"))
-        .header("x-goog-api-key", api_key)
+    let client = reqwest::blocking::Client::new();
+    let request = match auth {
+        GeminiAuth::ApiKey(api_key) => client
+            .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"))
+            .header("x-goog-api-key", api_key),
+        GeminiAuth::Vertex { access_token, project_id } => client
+            .post(format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model}:generateContent"))
+            .bearer_auth(access_token),
+    };
+    let mut parts = vec![
+        json!({"inlineData": {"mimeType": mime_type, "data": base64::engine::general_purpose::STANDARD.encode(source_bytes)}}),
+    ];
+    if let Some(mask) = mask_bytes {
+        parts.push(json!({"inlineData": {"mimeType": "image/png", "data": base64::engine::general_purpose::STANDARD.encode(mask)}}));
+    }
+    parts.push(json!({"text": prompt}));
+    let response = request
         .json(&json!({
-            "contents": [{"parts": [
-                {"inlineData": {"mimeType": mime_type, "data": base64::engine::general_purpose::STANDARD.encode(source_bytes)}},
-                {"text": prompt}
-            ]}],
+            "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {"responseModalities": ["IMAGE"]}
         }))
         .send()
         .map_err(|error| format!("Could not reach Gemini: {error}"))?;
     parse_gemini_image_response(response)
+}
+
+fn decode_data_url(value: &str) -> Result<(String, Vec<u8>), String> {
+    let (header, data) = value.split_once(',')
+        .ok_or("Mask image data is invalid.")?;
+    let mime = header.strip_prefix("data:").and_then(|item| item.split(';').next())
+        .unwrap_or("image/png").to_string();
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data)
+        .map_err(|_| "Mask image data is invalid.".to_string())?;
+    Ok((mime, bytes))
 }
 
 fn parse_gemini_image_response(

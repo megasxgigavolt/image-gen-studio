@@ -825,30 +825,35 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../services/python-engine");
-            let workspace_env = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../.env");
-            for local_env in [workspace_env, engine_dir.join(".env")] {
-            if let Ok(contents) = fs::read_to_string(local_env) {
-                for line in contents.lines() {
-                    let Some((key, value)) = line.split_once('=') else {
-                        continue;
-                    };
-                    let key = key.trim();
-                    if ["OPENAI_API_KEY", "GEMINI_API_KEY"].contains(&key)
-                        && std::env::var_os(key).is_none()
-                    {
-                        std::env::set_var(key, value.trim().trim_matches(['"', '\'']));
+            // Load dev-only .env files and service account credentials from the
+            // local workspace. In release builds keys come from the keyring only.
+            #[cfg(debug_assertions)]
+            {
+                let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../services/python-engine");
+                let workspace_env = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../.env");
+                for local_env in [workspace_env, engine_dir.join(".env")] {
+                    if let Ok(contents) = fs::read_to_string(local_env) {
+                        for line in contents.lines() {
+                            let Some((key, value)) = line.split_once('=') else {
+                                continue;
+                            };
+                            let key = key.trim();
+                            if ["OPENAI_API_KEY", "GEMINI_API_KEY"].contains(&key)
+                                && std::env::var_os(key).is_none()
+                            {
+                                std::env::set_var(key, value.trim().trim_matches(['"', '\'']));
+                            }
+                        }
                     }
                 }
-            }
-            }
-            let google_credentials = engine_dir.join("google-service-account.json");
-            if google_credentials.exists()
-                && std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").is_none()
-            {
-                std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &google_credentials);
+                let google_credentials = engine_dir.join("google-service-account.json");
+                if google_credentials.exists()
+                    && std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").is_none()
+                {
+                    std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &google_credentials);
+                }
             }
             let data_dir = app.path().app_local_data_dir()?;
             let (repository, recovery_backup) = ProjectRepository::open_with_recovery(

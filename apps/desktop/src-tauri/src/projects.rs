@@ -37,7 +37,7 @@ enum GeminiAuth {
     Vertex { access_token: String, project_id: String },
 }
 
-pub const EDUCATIONAL_VISUAL_PLANNER_VERSION: &str = "2.1.0-prompt-fit-settings";
+pub const EDUCATIONAL_VISUAL_PLANNER_VERSION: &str = "3.0.0-bulk-plan-v2";
 
 const MIGRATION_001: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -251,6 +251,11 @@ CREATE INDEX IF NOT EXISTS idx_educational_plans_video ON educational_visual_pla
 const MIGRATION_011: &str = r#"
 ALTER TABLE educational_visual_plans ADD COLUMN visual_strategy_mode TEXT NOT NULL DEFAULT 'Auto Educational';
 ALTER TABLE educational_visual_plans ADD COLUMN planner_version TEXT NOT NULL DEFAULT '1.0.0-legacy';
+"#;
+
+const MIGRATION_012: &str = r#"
+ALTER TABLE visual_plan_groups ADD COLUMN settings_locked INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE visual_plan_groups ADD COLUMN prompt_locked INTEGER NOT NULL DEFAULT 0;
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -498,6 +503,40 @@ pub struct PlanGroup {
     pub label: String,
     pub kind: String,
     pub sentence_ids: Vec<String>,
+    pub settings_locked: bool,
+    pub prompt_locked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkPlanSummary {
+    pub total_stills: usize,
+    pub visual_type_counts: std::collections::HashMap<String, usize>,
+    pub short_overview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkPlannedStill {
+    pub visual_plan_row_id: String,
+    pub ordinal: i64,
+    pub narration_preview: String,
+    pub timestamp_start: f64,
+    pub timestamp_end: f64,
+    pub visual_type: String,
+    pub image_settings: serde_json::Value,
+    pub user_prompt: String,
+    pub reason: String,
+    pub settings_locked: bool,
+    pub prompt_locked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkPlanResult {
+    pub planner_version: u32,
+    pub summary: BulkPlanSummary,
+    pub stills: Vec<BulkPlannedStill>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -707,6 +746,17 @@ impl ProjectRepository {
         }
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(11, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_still_locks: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('visual_plan_groups') WHERE name='settings_locked')",
+            [], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !has_still_locks {
+            self.connection.execute_batch(MIGRATION_012).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(12, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -1599,9 +1649,12 @@ Rules:
 - Keep the scene directly grounded in the narration.
 - Choose image settings only after writing the scene concept, so every choice supports the userPrompt.
 - Preserve the supplied aspectRatio. Do not invent a different aspect ratio.
-- imageSettings must include every variable key: shotType, cameraAngle, lighting, mood, composition, visualStyle, colorPalette, lensFeel, depthOfField, backgroundComplexity, subjectDistance, motionFeel, textureDetail, realismLevel, negativePromptStrength, and referenceAdherence.
-- Use the best-fit concrete value for every variable setting. Do not return Undefined, empty values, or generic defaults.
-- Vary settings when the teaching purpose and scene call for it; do not rotate settings mechanically.
+- imageSettings must include these keys: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, composition, contrast, saturation, motion. Use concrete values only; never Undefined.
+- cameraAngle MUST reflect the narration's spatial perspective: detail/examination → Close Up or Extreme Close Up; wide environment → Wide Shot or Birds Eye View; dramatic → Dutch Angle or Low Angle; following → Over the Shoulder; neutral explanation → Eye Level only.
+- colorTemperature sets tonal warmth (Very Warm Golden / Warm / Neutral / Cool / Very Cool Blue Tinted / Mixed Contrasting Warm Cool).
+- weatherAtmosphere sets environment context (Clear / Foggy Misty / Rainy / Overcast Sky / Snowy / Hazy Dusty / Stormy, etc.).
+- saturation controls color intensity (Highly Saturated Vivid / Natural / Muted / Desaturated / Black and White Greyscale).
+- At least 4 of the 10 required settings must be actively driven by this specific narration (not generic defaults): cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, composition, contrast, saturation, motion.
 - userPrompt must be a production-ready, textless image prompt implementing the educational plan.
 
 Return JSON only:
@@ -1703,6 +1756,14 @@ Anti-repetition:
 - Never assign more than 3 consecutive identical visual intents.
 - Avoid repetitive subject strategies when another teaching structure communicates the idea better.
 
+Image settings rules:
+- imageSettings must include: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, composition, contrast, saturation, motion. Use concrete values only; never Undefined.
+- cameraAngle MUST vary based on spatial perspective. Do NOT default to Eye Level. Choose: detail/examination → Close Up or Extreme Close Up; wide environment → Wide Shot or Birds Eye View; dramatic → Dutch Angle or Low Angle; following action → Over the Shoulder; neutral explanation → Eye Level only.
+- colorTemperature: Very Warm Golden, Warm, Neutral, Cool, Very Cool Blue Tinted, Mixed Contrasting Warm Cool.
+- weatherAtmosphere: Clear, Foggy Misty, Rainy, Overcast Sky, Snowy, Hazy Dusty, Stormy, etc.
+- saturation: Highly Saturated Vivid, Natural, Muted, Desaturated, Black and White Greyscale.
+- Across consecutive stills, at least 4 of these must differ from the immediately prior still: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, composition, contrast, saturation, motion.
+
 Core rule: ask “What image teaches the concept best?”, never merely “What image matches the sentence?”
 Avoid humans unless narration requires them. Prefer one primary subject.
 
@@ -1772,6 +1833,338 @@ Return exactly one plan for every supplied row, in the same order."#,
             planner_version: EDUCATIONAL_VISUAL_PLANNER_VERSION.into(),
             plans: saved,
         })
+    }
+
+    pub fn set_still_lock(&self, video_id: &str, group_id: &str, settings_locked: bool, prompt_locked: bool) -> Result<(), String> {
+        self.connection.execute(
+            "UPDATE visual_plan_groups SET settings_locked=?1, prompt_locked=?2 WHERE video_id=?3 AND (id LIKE ?4 OR id=?4)",
+            params![settings_locked as i64, prompt_locked as i64, video_id, format!("%::{group_id}")],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn extract_image_settings_from_directive(&self, directive: &str) -> Result<StyleExtraction, String> {
+        let api_key = self.get_provider_key("openai")?
+            .ok_or("Add an OpenAI API key before extracting image settings.")?;
+        request_openai_directive_extract(&api_key, directive)
+    }
+
+    pub fn plan_bulk_visuals<F: Fn(usize, usize)>(&self, video_id: &str, style_directive: &str, base_settings_json: &str, creative_instruction: &str, on_progress: F) -> Result<BulkPlanResult, String> {
+        let api_key = self.get_provider_key("openai")?
+            .ok_or("Add an OpenAI API key before bulk planning.")?;
+        let visual_plan = self.get_visual_plan(video_id)?;
+        if visual_plan.groups.is_empty() {
+            return Err("No stills found. Generate a visual plan first.".into());
+        }
+        let mut row_data: Vec<serde_json::Value> = Vec::with_capacity(visual_plan.groups.len());
+        for group in &visual_plan.groups {
+            let members: Vec<_> = group.sentence_ids.iter()
+                .filter_map(|id| visual_plan.sentences.iter().find(|s| &s.id == id)).collect();
+            let narration = members.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+            let start = members.first().map(|s| s.start_seconds).unwrap_or(0.0);
+            let end = members.last().map(|s| s.end_seconds).unwrap_or(start);
+            let existing_prompt = self.list_prompt_versions(video_id, &group.id)?.into_iter().next();
+            row_data.push(json!({
+                "visualPlanRowId": group.id,
+                "ordinal": group.ordinal,
+                "type": group.kind,
+                "startSeconds": start,
+                "endSeconds": end,
+                "narration": narration,
+                "settingsLocked": group.settings_locked,
+                "promptLocked": group.prompt_locked,
+                "existingSettings": existing_prompt.as_ref()
+                    .and_then(|p| serde_json::from_str::<serde_json::Value>(&p.settings_json).ok()),
+                "existingPrompt": existing_prompt.as_ref().map(|p| p.user_prompt.as_str()),
+            }));
+        }
+        let total = row_data.len();
+        let mut planned: Vec<V2PlanStillResponse> = Vec::with_capacity(total);
+        let chunk_size: usize = 6;
+        let total_batches = total.div_ceil(chunk_size);
+        let mut next_to_plan: usize = 0;
+        let mut chunk_index: usize = 0;
+        let mut api_calls: usize = 0;
+        let max_api_calls = total_batches * 5;
+        while next_to_plan < total && api_calls < max_api_calls {
+            api_calls += 1;
+            let chunk_end = (next_to_plan + chunk_size).min(total);
+            let chunk = &row_data[next_to_plan..chunk_end];
+            let prior_context: Vec<_> = planned.iter().rev().take(3).map(|s| json!({
+                "visualPlanRowId": s.visual_plan_row_id,
+                "visualType": s.visual_type,
+            })).collect();
+            let director_note = if creative_instruction.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\nDirector's creative instruction (apply to all stills): {}\n", creative_instruction.trim())
+            };
+            let prompt = format!(
+                r#"You are an Educational Visual Director planning an entire video, not isolated stills.
+
+Style directive: {style_directive}
+Base image settings: {base_settings_json}{director_note}
+Total stills in video: {total}. This is planning batch {} of {total_batches}.
+Previously planned (last 3, newest first): {}
+
+Current batch rows to plan:
+{}
+
+CORE GOAL: Ask "What image best helps the viewer understand this concept?" — never "What literally matches the sentence?"
+
+INTERNAL TARGET DISTRIBUTION (soft targets; do not force inappropriate visuals):
+Character Scene 25-35%; Behavioral Demonstration 10-15%; Close Detail 10-15%; Environmental Scene 5-10%; Object Focus 5-10%; Comparison 10-15%; Process Illustration 5-10%; Timeline 2-5%; Textless Infographic 5-10%; Scientific Diagram 2-8%; Geographic Map 0-5%; Concept Visualization 2-8%; POV Scene 0-5%; Symbolic Representation 2-8%; Documentary Frame 5-15%.
+
+ANTI-REPETITION (enforce strictly):
+- Never assign the same visualType to more than 3 consecutive stills.
+- Vary subject framing, environment structure, and subject count across stills.
+- For animal/nature/documentary videos: mix types — character scene, close detail, object focus, environment only, comparison, diagram — do not show only character portraits.
+
+IMAGE SETTINGS RULES — provide ALL of the following keys; never leave any as "Undefined":
+BASIC: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere
+ADVANCED: lensType, lightDirection, lightQuality, shadowType, contrast, focusType, exposure, motion, composition, saturation, vignette, grainIntensity, colorCastTint, surfaceEffects
+
+Field value guidance:
+- cameraAngle: Wide Shot | Medium Shot | Close Up | Extreme Close Up | Birds Eye View | Worms Eye View | Low Angle | High Angle | Eye Level | Over the Shoulder | Dutch Angle | Establishing Shot | Point of View POV
+- lighting: Natural Daylight | Golden Hour | Blue Hour Dusk | Overcast Soft Diffused | Studio Lighting | Backlit Silhouette | Low Key Dark | High Key Bright | Night Moonlit | Candlelight Firelight | Window Light | Neon Lit
+- mood: Serene Peaceful | Tense Anxious | Dramatic Intense | Warm and Cozy | Cold Distant | Mysterious | Cheerful Upbeat | Melancholic | Hopeful | Playful | Triumphant
+- depthOfField: Shallow Blurred Background | Deep Everything Sharp | Medium | Macro Extreme Close Focus | Bokeh Heavy
+- colorTemperature: Very Warm Golden | Warm | Neutral | Cool | Very Cool Blue Tinted | Mixed Contrasting Warm Cool
+- weatherAtmosphere: Clear | Foggy Misty | Rainy | Overcast Sky | Snowy | Hazy Dusty | Stormy | Steamy Humid
+- lensType: Wide Angle | Standard Normal | Telephoto | Macro | Fisheye | Tilt Shift Lens | Anamorphic
+- lightDirection: Front Lighting | Backlighting | Side Lighting | Top Lighting | Rim Lighting | Bottom Underlighting
+- lightQuality: Hard Direct Light | Soft Diffused Light | Dappled Light | Reflected Bounced Light | Mixed
+- shadowType: Hard Defined Shadows | Soft Graduated Shadows | No Shadow | Long Dramatic Shadows | Subtle Ambient
+- contrast: High Contrast | Medium Contrast | Low Contrast | Flat | Cinematic S-Curve
+- focusType: Sharp Overall | Selective Focus | Rack Focus Effect | Soft Focus Dreamy
+- exposure: Standard | Slightly Overexposed | Slightly Underexposed | High Key | Low Key | HDR Look
+- motion: Static | Slight Motion Blur | Dynamic Motion Blur | Frozen Action | Long Exposure Light Trail
+- composition: Rule of Thirds | Center Symmetry | Leading Lines | Framing Within Frame | Negative Space | Diagonal Tension | Golden Ratio
+- saturation: Highly Saturated Vivid | Natural | Muted | Desaturated | Black and White Greyscale
+- vignette: None | Subtle Vignette | Strong Vignette | Bright Center Vignette
+- grainIntensity: None | Light Film Grain | Medium Film Grain | Heavy Film Grain | Digital Noise
+- colorCastTint: None | Warm Orange Tint | Cool Blue Tint | Teal and Orange | Green Tint | Sepia | Cross Processed
+- surfaceEffects: None | Lens Flare | Chromatic Aberration | Anamorphic Flare | Dust and Scratches | Wet Glass | Fog Layer
+
+Rule: at least 6 of the 20 non-aspect settings must differ between consecutive stills.
+
+USER PROMPT RULES — critical, zero overlap with the other two components:
+The image is assembled from three SEPARATE layers: Style Directive (global look) + Image Settings (camera/light data) + User Prompt (scene content).
+- userPrompt MUST contain ONLY: subjects, objects, actions, environment, spatial relationships — the WHAT of this specific scene
+- userPrompt must NOT contain: cinematography style, color grade, film look, rendering style, visual treatment → those live in the Style Directive
+- userPrompt must NOT contain: camera angle, lighting type, depth of field, lens, exposure, saturation, or any image-settings term → those live in imageSettings
+- Ask yourself: "What is physically in this image?" — write exactly that, nothing more
+- ✓ CORRECT: "A wolf pack crossing a frozen river at dusk, pine forest on both banks, snow-covered rocks in the foreground"
+- ✗ WRONG: "A cinematic wide shot of a wolf pack with warm golden color grading and shallow depth of field crossing a river"
+
+TEXTLESS VISUAL RULE (Textless Infographic, Timeline, Geographic Map, Scientific Diagram, Process Illustration):
+- Use arrows, icons, silhouettes, spatial layout, visual contrast, before/after, symbolic shapes.
+- Do NOT include readable text, labels, words, signs, or fake text in userPrompt.
+
+Allowed visualType values: Character Scene; Behavioral Demonstration; Close Detail; Environmental Scene; Object Focus; Comparison; Process Illustration; Timeline; Textless Infographic; Scientific Diagram; Geographic Map; Concept Visualization; POV Scene; Symbolic Representation; Documentary Frame.
+
+You MUST return exactly one plan for every row in the current batch. Return JSON only:
+{{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content only — no style or camera words","reason":"1-2 sentences"}}]}}"#,
+                chunk_index + 1,
+                serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
+                serde_json::to_string_pretty(chunk).unwrap_or_default(),
+            );
+            let response = request_openai_v2_plan(&api_key, &prompt)?;
+            let valid_count = {
+                let mut count = 0;
+                for (i, plan) in response.plans.iter().enumerate() {
+                    if i >= chunk.len() { break; }
+                    if plan.visual_plan_row_id == chunk[i]["visualPlanRowId"].as_str().unwrap_or_default() {
+                        count += 1;
+                    } else {
+                        break;
+                    }
+                }
+                count
+            };
+            if valid_count == 0 {
+                return Err(format!(
+                    "OpenAI returned no usable plans for stills {}-{} (batch {}). Please retry.",
+                    next_to_plan + 1, chunk_end, chunk_index + 1
+                ));
+            }
+            for (offset, mut plan) in response.plans.into_iter().take(valid_count).enumerate() {
+                let row = &chunk[offset];
+                if row["settingsLocked"].as_bool().unwrap_or(false) {
+                    if let Some(obj) = row["existingSettings"].as_object() {
+                        plan.image_settings = serde_json::Value::Object(obj.clone());
+                    }
+                }
+                if row["promptLocked"].as_bool().unwrap_or(false) {
+                    if let Some(existing) = row["existingPrompt"].as_str() {
+                        plan.user_prompt = existing.to_string();
+                    }
+                }
+                planned.push(plan);
+            }
+            next_to_plan += valid_count;
+            on_progress(next_to_plan, total);
+            chunk_index += 1;
+        }
+        if next_to_plan < total {
+            return Err(format!("Planning incomplete after {api_calls} API calls: only {next_to_plan} of {total} stills planned."));
+        }
+        for window in planned.windows(4) {
+            if window.iter().all(|p| p.visual_type == window[0].visual_type) {
+                return Err(format!("Planner produced more than 3 consecutive '{}' stills. Please retry.", window[0].visual_type));
+            }
+        }
+        let mut visual_type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for p in &planned { *visual_type_counts.entry(p.visual_type.clone()).or_insert(0) += 1; }
+        let short_overview = {
+            let mut top: Vec<_> = visual_type_counts.iter().collect();
+            top.sort_by(|a, b| b.1.cmp(a.1));
+            let parts: Vec<_> = top.iter().take(4).map(|(k, v)| format!("{} {} ({}%)", v, k, (*v * 100) / total.max(1))).collect();
+            format!("{} stills planned. Leading types: {}.", total, parts.join(", "))
+        };
+        let stills = planned.into_iter().zip(row_data.iter()).zip(visual_plan.groups.iter()).map(|((plan, row), group)| {
+            let narration = row["narration"].as_str().unwrap_or_default().to_string();
+            BulkPlannedStill {
+                visual_plan_row_id: plan.visual_plan_row_id,
+                ordinal: row["ordinal"].as_i64().unwrap_or(0),
+                narration_preview: narration.chars().take(110).collect::<String>(),
+                timestamp_start: row["startSeconds"].as_f64().unwrap_or(0.0),
+                timestamp_end: row["endSeconds"].as_f64().unwrap_or(0.0),
+                visual_type: plan.visual_type,
+                image_settings: plan.image_settings,
+                user_prompt: plan.user_prompt,
+                reason: plan.reason,
+                settings_locked: group.settings_locked,
+                prompt_locked: group.prompt_locked,
+            }
+        }).collect();
+        Ok(BulkPlanResult {
+            planner_version: 2,
+            summary: BulkPlanSummary { total_stills: total, visual_type_counts, short_overview },
+            stills,
+        })
+    }
+
+    pub fn suggest_still_prompt(&self, video_id: &str, group_id: &str, style_directive: &str, base_settings_json: &str) -> Result<BulkPlannedStill, String> {
+        let api_key = self.get_provider_key("openai")?
+            .ok_or("Add an OpenAI API key before suggesting a prompt.")?;
+        let visual_plan = self.get_visual_plan(video_id)?;
+        let group = visual_plan.groups.iter().find(|g| g.id == group_id)
+            .ok_or("Still not found in visual plan.")?;
+        let members: Vec<_> = group.sentence_ids.iter()
+            .filter_map(|id| visual_plan.sentences.iter().find(|s| &s.id == id)).collect();
+        let narration = members.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+        let start = members.first().map(|s| s.start_seconds).unwrap_or(0.0);
+        let end = members.last().map(|s| s.end_seconds).unwrap_or(start);
+        let existing_prompt = self.list_prompt_versions(video_id, group_id)?.into_iter().next();
+        let row = json!({
+            "visualPlanRowId": group.id,
+            "ordinal": group.ordinal,
+            "type": group.kind,
+            "startSeconds": start,
+            "endSeconds": end,
+            "narration": narration,
+            "existingSettings": existing_prompt.as_ref()
+                .and_then(|p| serde_json::from_str::<serde_json::Value>(&p.settings_json).ok()),
+            "existingPrompt": existing_prompt.as_ref().map(|p| p.user_prompt.as_str()),
+        });
+        let prompt = format!(
+            r#"You are an Educational Visual Director suggesting a prompt for a single still image.
+
+Style directive: {style_directive}
+Base image settings: {base_settings_json}
+
+Still to plan:
+{}
+
+CORE GOAL: Ask "What image best helps the viewer understand this concept?" — never "What literally matches the sentence?"
+
+IMAGE SETTINGS RULES — provide ALL of the following keys; never leave any as "Undefined":
+BASIC: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere
+ADVANCED: lensType, lightDirection, lightQuality, shadowType, contrast, focusType, exposure, motion, composition, saturation, vignette, grainIntensity, colorCastTint, surfaceEffects
+
+USER PROMPT RULES:
+- Describe ONLY the WHAT: subjects, objects, actions, environment for THIS specific narration
+- NO cinematography style, color grade, rendering style (those go in Style Directive)
+- NO camera angle, lighting type, depth of field, or image-settings terms (those go in imageSettings)
+- Ask: "What is physically in this image?" — write exactly that
+
+Allowed visualType values: Character Scene; Behavioral Demonstration; Close Detail; Environmental Scene; Object Focus; Comparison; Process Illustration; Timeline; Textless Infographic; Scientific Diagram; Geographic Map; Concept Visualization; POV Scene; Symbolic Representation; Documentary Frame.
+
+Return JSON only — one plan object:
+{{"plans":[{{"visualPlanRowId":"{}","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content only","reason":"1-2 sentences"}}]}}"#,
+            serde_json::to_string(&row).unwrap_or_default(),
+            group.id,
+        );
+        let text = request_openai_text(&api_key, &prompt)?;
+        let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+        let parsed: serde_json::Value = serde_json::from_str(cleaned)
+            .map_err(|e| format!("OpenAI suggestion was not valid JSON: {e}"))?;
+        let plan = parsed.pointer("/plans/0")
+            .ok_or("OpenAI returned no plan.")?;
+        let response: V2PlanStillResponse = serde_json::from_value(plan.clone())
+            .map_err(|e| format!("OpenAI plan had unexpected structure: {e}"))?;
+        Ok(BulkPlannedStill {
+            visual_plan_row_id: response.visual_plan_row_id,
+            ordinal: group.ordinal as i64,
+            narration_preview: narration.chars().take(110).collect(),
+            timestamp_start: start,
+            timestamp_end: end,
+            visual_type: response.visual_type,
+            image_settings: response.image_settings,
+            user_prompt: response.user_prompt,
+            reason: response.reason,
+            settings_locked: group.settings_locked,
+            prompt_locked: group.prompt_locked,
+        })
+    }
+
+    pub fn approve_bulk_plan(&self, video_id: &str, style_directive: &str, stills: &[BulkPlannedStill]) -> Result<usize, String> {
+        let now = Utc::now().to_rfc3339();
+        let mut saved = 0usize;
+        for still in stills {
+            let group_id = &still.visual_plan_row_id;
+            let (settings_locked, prompt_locked): (bool, bool) = self.connection.query_row(
+                "SELECT COALESCE(settings_locked,0), COALESCE(prompt_locked,0) FROM visual_plan_groups WHERE video_id=?1 AND (id LIKE ?2 OR id=?2)",
+                params![video_id, format!("%::{group_id}")],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+            ).unwrap_or((false, false));
+            if settings_locked && prompt_locked { continue; }
+            let settings_json = if settings_locked {
+                self.list_prompt_versions(video_id, group_id)?
+                    .into_iter().next().map(|p| p.settings_json).unwrap_or_else(|| "{}".into())
+            } else {
+                still.image_settings.to_string()
+            };
+            let user_prompt = if prompt_locked {
+                self.list_prompt_versions(video_id, group_id)?
+                    .into_iter().next().map(|p| p.user_prompt).unwrap_or_default()
+            } else {
+                still.user_prompt.clone()
+            };
+            if user_prompt.trim().is_empty() { continue; }
+            let next_version: i64 = self.connection.query_row(
+                "SELECT COALESCE(MAX(version),0)+1 FROM prompt_versions WHERE video_id=?1 AND group_id=?2",
+                params![video_id, group_id],
+                |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            let pv_id = Uuid::new_v4().to_string();
+            self.connection.execute(
+                "INSERT INTO prompt_versions(id,video_id,group_id,version,settings_json,system_prompt,user_prompt,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![pv_id, video_id, group_id, next_version, settings_json, style_directive, user_prompt, now],
+            ).map_err(|e| e.to_string())?;
+            let still_id = self.get_educational_visual_plan(video_id, group_id)?
+                .map(|p| p.still_id).unwrap_or_else(|| Uuid::new_v4().to_string());
+            let signature = format!("v2-bulk|{}|{}|{}", EDUCATIONAL_VISUAL_PLANNER_VERSION, video_id, group_id);
+            self.connection.execute(
+                "INSERT INTO educational_visual_plans(still_id,video_id,visual_plan_row_id,educational_objective,visual_intent,subject_strategy,image_settings_json,user_prompt,plan_signature,visual_strategy_mode,planner_version,created_at,updated_at)
+                 VALUES(?1,?2,?3,'Planned',?4,'Single Subject',?5,?6,?7,'Auto Educational',?8,?9,?9)
+                 ON CONFLICT(still_id) DO UPDATE SET educational_objective='Planned',visual_intent=excluded.visual_intent,subject_strategy='Single Subject',image_settings_json=excluded.image_settings_json,user_prompt=excluded.user_prompt,plan_signature=excluded.plan_signature,updated_at=excluded.updated_at",
+                params![still_id, video_id, group_id, still.visual_type, settings_json, user_prompt, signature, EDUCATIONAL_VISUAL_PLANNER_VERSION, now],
+            ).map_err(|e| e.to_string())?;
+            saved += 1;
+        }
+        Ok(saved)
     }
 
     pub fn extract_reference_style(&self, asset_id: &str) -> Result<StyleExtraction, String> {
@@ -2830,6 +3223,8 @@ Return exactly one plan for every supplied row, in the same order."#,
                             .to_string(),
                         kind: item["scene_type"].as_str().unwrap_or("still").to_string(),
                         sentence_ids: (start..=end).map(|id| format!("s{id}")).collect(),
+                        settings_locked: false,
+                        prompt_locked: false,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -2989,6 +3384,8 @@ Return exactly one plan for every supplied row, in the same order."#,
                 label: "New scene".into(),
                 kind: "custom".into(),
                 sentence_ids: vec![sentence_id.into()],
+                settings_locked: false,
+                prompt_locked: false,
             },
         );
         for (index, group) in groups.iter_mut().enumerate() {
@@ -3065,7 +3462,7 @@ Return exactly one plan for every supplied row, in the same order."#,
     }
 
     fn load_groups(&self, video_id: &str, original: bool) -> Result<Vec<PlanGroup>, String> {
-        let mut statement = self.connection.prepare("SELECT id, ordinal, label, kind, sentence_ids_json FROM visual_plan_groups WHERE video_id = ?1 AND is_original = ?2 ORDER BY ordinal").map_err(|e| e.to_string())?;
+        let mut statement = self.connection.prepare("SELECT id, ordinal, label, kind, sentence_ids_json, COALESCE(settings_locked,0), COALESCE(prompt_locked,0) FROM visual_plan_groups WHERE video_id = ?1 AND is_original = ?2 ORDER BY ordinal").map_err(|e| e.to_string())?;
         let rows = statement
             .query_map(params![video_id, original as i64], |row| {
                 let stored_id: String = row.get(0)?;
@@ -3084,6 +3481,8 @@ Return exactly one plan for every supplied row, in the same order."#,
                     kind: row.get(3)?,
                     sentence_ids: serde_json::from_str(&row.get::<_, String>(4)?)
                         .unwrap_or_default(),
+                    settings_locked: row.get::<_, i64>(5)? != 0,
+                    prompt_locked: row.get::<_, i64>(6)? != 0,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -3149,17 +3548,17 @@ fn assemble_image_prompt(
 ) -> String {
     let settings = public_image_settings(settings);
     format!(
-        "SYSTEM DIRECTION:\n{}\n\nSCENE REQUEST:\n{}\n\nIMAGE SETTINGS:\n{}",
+        "STYLE DIRECTIVE:\n{}\n\nIMAGE SETTINGS:\n{}\n\nUSER PROMPT:\n{}",
         system_prompt.trim(),
+        serde_json::to_string_pretty(&settings).unwrap_or_else(|_| "{}".into()),
         user_prompt.trim(),
-        serde_json::to_string_pretty(&settings).unwrap_or_else(|_| "{}".into())
     )
 }
 
 fn public_image_settings(settings: &serde_json::Value) -> serde_json::Value {
     let mut cleaned = settings.clone();
     if let Some(object) = cleaned.as_object_mut() {
-        object.retain(|key, _| !key.starts_with('_'));
+        object.retain(|key, _| !key.starts_with('_') && key != "aspectRatio");
     }
     cleaned
 }
@@ -3193,6 +3592,91 @@ fn request_openai_text(api_key: &str, prompt: &str) -> Result<String, String> {
     body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
         .map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
         .ok_or_else(|| "OpenAI returned no prompt text.".to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct V2PlanStillResponse {
+    visual_plan_row_id: String,
+    #[serde(alias = "visual_type", alias = "type")]
+    visual_type: String,
+    #[serde(alias = "image_settings", alias = "settings")]
+    image_settings: serde_json::Value,
+    #[serde(alias = "user_prompt", alias = "prompt", alias = "scene_prompt", alias = "image_prompt", default)]
+    user_prompt: String,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2PlanChunkResponse {
+    plans: Vec<V2PlanStillResponse>,
+}
+
+fn request_openai_v2_plan(api_key: &str, prompt: &str) -> Result<V2PlanChunkResponse, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build().map_err(|e| format!("Could not initialize OpenAI client: {e}"))?;
+    let mut last_err = String::new();
+    let response = loop {
+        let attempt = last_err.matches("attempt").count();
+        match client.post("https://api.openai.com/v1/responses")
+            .bearer_auth(api_key)
+            .json(&json!({"model":"gpt-4.1-mini","input":prompt,"max_output_tokens":18000}))
+            .send() {
+            Ok(r) => break r,
+            Err(e) if attempt < 3 => {
+                last_err.push_str(&format!(" attempt {attempt}: {e}"));
+                std::thread::sleep(std::time::Duration::from_secs(4 * 2_u64.pow(attempt as u32)));
+            }
+            Err(e) => return Err(format!("Could not reach OpenAI after retries: {e}")),
+        }
+    };
+    let status = response.status();
+    let body: serde_json::Value = response.json().map_err(|e| format!("OpenAI returned unreadable response: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("OpenAI bulk planning failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
+    }
+    let text = body.pointer("/output/0/content/0/text").and_then(|v| v.as_str())
+        .ok_or("OpenAI returned no bulk plan.")?;
+    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    serde_json::from_str(cleaned).map_err(|e| format!("OpenAI bulk plan was not valid JSON: {e}"))
+}
+
+fn request_openai_directive_extract(api_key: &str, directive: &str) -> Result<StyleExtraction, String> {
+    let prompt = format!(
+        r#"You are a visual production assistant. Your job is to clean up a Style Directive so it contains ONLY global visual style rules — nothing about specific subjects, characters, objects, or scene content.
+
+Style Directive to clean:
+{directive}
+
+WHAT TO KEEP in the cleaned styleDirective (global aesthetics that apply to every still):
+- Art style name / brand (e.g. "Pixar 3D animation", "photorealistic", "watercolor illustration")
+- Color palette description (e.g. "warm oranges and browns", "desaturated cool tones")
+- Color grading (e.g. "teal and orange", "vintage film grain", "high saturation")
+- Rendering quality / medium (e.g. "polished 3D render", "oil painting texture", "cel-shaded")
+- Detail level and texture rules (e.g. "highly detailed", "smooth surfaces", "grainy film look")
+- Global mood / atmosphere (e.g. "cozy and heartwarming", "dark and moody") — only if NOT tied to a specific scene subject
+- Genre or era style (e.g. "cyberpunk", "fantasy", "retro 1980s")
+- Lighting style as a global rule (e.g. "cinematic lighting overall", "soft diffused look") — only very general rules, not per-shot specifics
+- Visual consistency rules, brand rules, exclusion rules (e.g. "no text", "always soft shadows")
+
+WHAT TO REMOVE from the styleDirective (these go in the User Prompt per still, NOT here):
+- Any specific characters: named people, animals, creatures (e.g. "a young woman", "a cute cat", "a wizard")
+- Any physical descriptions of subjects (e.g. "large eyes", "soft smile", "fluffy fur")
+- Any scene-specific content (e.g. "sitting on a chair", "in a forest")
+- Anything that answers "WHO is in the image" or "WHAT specific object/creature"
+
+Per-still structured fields to extract from imageSettings:
+Available fields: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, lensType, lightDirection, lightQuality, shadowType, contrast, focusType, exposure, motion, composition, saturation, vignette, grainIntensity, colorCastTint, surfaceEffects.
+Only populate imageSettings if the directive specifies a concrete per-shot value (e.g. "shallow depth of field" → depthOfField). Leave imageSettings as {{}} if nothing concrete is specified.
+
+Return JSON only — no markdown, no explanation:
+{{"styleDirective":"<global style rules only — no subjects, no scene content>","imageSettings":{{"<field>":"<value>"}}}}"#
+    );
+    let text = request_openai_text(api_key, &prompt)?;
+    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    serde_json::from_str(cleaned).map_err(|_| "OpenAI directive extraction was not valid JSON.".to_string())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -3268,7 +3752,7 @@ fn request_openai_style(api_key: &str, mime: &str, bytes: &[u8]) -> Result<Style
         .json(&json!({
             "model": "gpt-4.1-mini",
             "input": [{"role":"user","content":[
-                {"type":"input_text","text":"Analyze this image as a reusable production style reference. Return only JSON with styleDirective and imageSettings. imageSettings may contain shotType, cameraAngle, lighting, mood, composition, visualStyle, colorPalette, lensFeel, depthOfField, backgroundComplexity, subjectDistance, motionFeel, textureDetail, realismLevel, negativePromptStrength, and referenceAdherence. Use only concise values strongly supported by the image."},
+                {"type":"input_text","text":"Analyze this image as a reusable production style reference. Return only JSON with styleDirective (string describing art style, rendering, color language, recurring subjects, and visual consistency rules) and imageSettings (object with any of: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, lensType, lightDirection, lightQuality, shadowType, contrast, saturation, composition, motion — use only values strongly supported by the image)."},
                 {"type":"input_image","image_url":image_url}
             ]}],
             "max_output_tokens": 900
@@ -3580,6 +4064,8 @@ fn make_group(ordinal: usize, sentences: &[&PlanSentence]) -> PlanGroup {
             .iter()
             .map(|sentence| sentence.id.clone())
             .collect(),
+        settings_locked: false,
+        prompt_locked: false,
     }
 }
 

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
+use serde_json::json;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
@@ -390,6 +391,72 @@ fn extract_reference_style(
     asset_id: String,
 ) -> Result<projects::StyleExtraction, String> {
     with_repository(state, |repository| repository.extract_reference_style(&asset_id))
+}
+
+#[tauri::command]
+fn set_still_lock(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_id: String,
+    settings_locked: bool,
+    prompt_locked: bool,
+) -> Result<(), String> {
+    with_repository(state, |repository| repository.set_still_lock(&video_id, &group_id, settings_locked, prompt_locked))
+}
+
+#[tauri::command]
+fn extract_image_settings_from_directive(
+    state: State<'_, RepositoryState>,
+    directive: String,
+) -> Result<projects::StyleExtraction, String> {
+    with_repository(state, |repository| repository.extract_image_settings_from_directive(&directive))
+}
+
+#[tauri::command]
+async fn suggest_still_prompt(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_id: String,
+    style_directive: String,
+    base_settings_json: String,
+) -> Result<projects::BulkPlannedStill, String> {
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.suggest_still_prompt(&video_id, &group_id, &style_directive, &base_settings_json)
+    }).await.map_err(|e| format!("Prompt suggestion stopped unexpectedly: {e}"))?
+}
+
+#[tauri::command]
+async fn plan_bulk_visuals(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    style_directive: String,
+    base_settings_json: String,
+    creative_instruction: String,
+) -> Result<projects::BulkPlanResult, String> {
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.plan_bulk_visuals(&video_id, &style_directive, &base_settings_json, &creative_instruction, |planned, total| {
+            let _ = app.emit("bulk_plan_progress", serde_json::json!({ "planned": planned, "total": total }));
+        })
+    }).await.map_err(|e| format!("Bulk planner stopped unexpectedly: {e}"))?
+}
+
+#[tauri::command]
+async fn approve_bulk_plan(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    style_directive: String,
+    stills: Vec<projects::BulkPlannedStill>,
+) -> Result<usize, String> {
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.approve_bulk_plan(&video_id, &style_directive, &stills)
+    }).await.map_err(|e| format!("Bulk plan approval stopped unexpectedly: {e}"))?
 }
 
 #[tauri::command]
@@ -850,6 +917,11 @@ pub fn run() {
             plan_educational_visual,
             plan_whole_video_educational_visuals,
             extract_reference_style,
+            set_still_lock,
+            extract_image_settings_from_directive,
+            suggest_still_prompt,
+            plan_bulk_visuals,
+            approve_bulk_plan,
             get_render_data_url,
             get_asset_data_url,
             export_latest_stills,

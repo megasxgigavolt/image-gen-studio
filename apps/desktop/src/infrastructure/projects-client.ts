@@ -51,7 +51,7 @@ export type VideoInputsRecord = {
 };
 
 export type PlanSentenceRecord = { id: string; ordinal: number; text: string; startSeconds: number; endSeconds: number };
-export type PlanGroupRecord = { id: string; ordinal: number; label: string; kind: string; sentenceIds: string[] };
+export type PlanGroupRecord = { id: string; ordinal: number; label: string; kind: string; sentenceIds: string[]; settingsLocked: boolean; promptLocked: boolean };
 export type VisualPlanRecord = { videoId: string; timingSource: string; sentences: PlanSentenceRecord[]; groups: PlanGroupRecord[]; updatedAt: string };
 
 export type PromptVersionRecord = {
@@ -127,6 +127,30 @@ export type WholeVideoEducationalPlanRecord = {
   plans: EducationalVisualPlanRecord[];
 };
 export type StyleExtractionRecord = { styleDirective: string; imageSettings: Partial<Record<string, string>> };
+
+export type BulkPlannedStillRecord = {
+  visualPlanRowId: string;
+  ordinal: number;
+  narrationPreview: string;
+  timestampStart: number;
+  timestampEnd: number;
+  visualType: string;
+  imageSettings: Partial<Record<string, string>>;
+  userPrompt: string;
+  reason: string;
+  settingsLocked: boolean;
+  promptLocked: boolean;
+};
+export type BulkPlanSummaryRecord = {
+  totalStills: number;
+  visualTypeCounts: Record<string, number>;
+  shortOverview: string;
+};
+export type BulkPlanResultRecord = {
+  plannerVersion: number;
+  summary: BulkPlanSummaryRecord;
+  stills: BulkPlannedStillRecord[];
+};
 
 export type ImageJobRecord = {
   id: string;
@@ -497,6 +521,22 @@ export const projectsClient = {
     if (isTauri()) return invoke("extract_reference_style", { assetId });
     throw new Error("Style extraction requires the native application.");
   },
+  async extractImageSettingsFromDirective(directive: string): Promise<StyleExtractionRecord> {
+    if (isTauri()) return invoke("extract_image_settings_from_directive", { directive });
+    throw new Error("Image settings extraction requires the native application.");
+  },
+  async suggestStillPrompt(videoId: string, groupId: string, styleDirective: string, baseSettingsJson: string): Promise<BulkPlannedStillRecord> {
+    if (isTauri()) return invoke("suggest_still_prompt", { videoId, groupId, styleDirective, baseSettingsJson });
+    throw new Error("Prompt suggestion requires the native application.");
+  },
+  async planBulkVisuals(videoId: string, styleDirective: string, baseSettingsJson: string, creativeInstruction: string): Promise<BulkPlanResultRecord> {
+    if (isTauri()) return invoke("plan_bulk_visuals", { videoId, styleDirective, baseSettingsJson, creativeInstruction });
+    throw new Error("Bulk planning requires the native application.");
+  },
+  async approveBulkPlan(videoId: string, styleDirective: string, stills: BulkPlannedStillRecord[]): Promise<number> {
+    if (isTauri()) return invoke("approve_bulk_plan", { videoId, styleDirective, stills });
+    throw new Error("Bulk plan approval requires the native application.");
+  },
   async importBrowserAsset(videoId: string, kind: "audio" | "reference", file: File) {
     if (isTauri()) throw new Error("Browser-file import is only available in the web preview.");
     const data = readBrowserData();
@@ -543,7 +583,7 @@ export const projectsClient = {
       const sentence = { id: `s${index + 1}`, ordinal: index + 1, text, startSeconds: cursor, endSeconds: cursor + duration };
       cursor += duration; return sentence;
     });
-    const groups = sentences.map((sentence, index) => ({ id: `g${index + 1}`, ordinal: index + 1, label: `Scene ${index + 1}`, kind: index ? "subject" : "establishing", sentenceIds: [sentence.id] }));
+    const groups = sentences.map((sentence, index) => ({ id: `g${index + 1}`, ordinal: index + 1, label: `Scene ${index + 1}`, kind: index ? "subject" : "establishing", sentenceIds: [sentence.id], settingsLocked: false, promptLocked: false }));
     const plan = { videoId, timingSource: "estimated", sentences, groups, updatedAt: now() };
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
     localStorage.setItem(`${STORAGE_KEY}.plan.original.${videoId}`, JSON.stringify(plan));
@@ -575,7 +615,7 @@ export const projectsClient = {
     plan.groups[source].sentenceIds = plan.groups[source].sentenceIds.filter((id) => id !== sentenceId);
     plan.groups = plan.groups.filter((group) => group.sentenceIds.length);
     plan.groups.splice(Math.min(insertIndex, plan.groups.length), 0, {
-      id: crypto.randomUUID(), ordinal: 0, label: "New scene", kind: "custom", sentenceIds: [sentenceId],
+      id: crypto.randomUUID(), ordinal: 0, label: "New scene", kind: "custom", sentenceIds: [sentenceId], settingsLocked: false, promptLocked: false,
     });
     plan.groups.sort((a, b) => Number(a.sentenceIds[0].slice(1)) - Number(b.sentenceIds[0].slice(1)));
     plan.groups.forEach((group, index) => { group.ordinal = index + 1; });

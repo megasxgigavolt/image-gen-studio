@@ -487,7 +487,7 @@ function InputsView() {
         </article>
         <div className="panel-stack">
           <article className="panel"><div className="panel-heading"><div><h2>Narration audio</h2><p>Used for word-level timing.</p></div><button className="secondary" onClick={() => void importAsset("audio")}><Upload size={15} />{audio ? "Replace" : "Import"}</button></div>{audio ? <div className="file-row"><span>♪</span><div><strong>{audio.originalName}</strong><small>{(audio.sizeBytes / 1024 / 1024).toFixed(1)} MB</small></div><button className="icon-button" onClick={() => void removeAsset(audio.id)}><X size={15} /></button></div> : <div className="asset-empty">WAV, MP3, M4A, AAC, or FLAC</div>}</article>
-          <article className="panel"><div className="pacing-heading"><div><h2>Scene pacing</h2><p>Preferred duration range per still</p></div><strong>{pacingMin}–{pacingMax} sec</strong></div><div className="pacing-options">{([["calm","Calm","10–16s"],["balanced","Balanced","6–10s"],["fast","Fast","3–6s"],["custom","Custom","Choose range"]] as const).map(([value,label,detail]) => <button key={value} className={pacingPreset === value ? "active" : ""} onClick={() => void choosePacing(value)}><strong>{label}</strong><small>{detail}</small></button>)}</div><div className="custom-pacing"><label>Minimum<input type="number" min="2" max="30" value={pacingMin} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMin(Number(event.target.value))} /></label><label>Maximum<input type="number" min="2" max="30" value={pacingMax} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMax(Number(event.target.value))} /></label><button className="secondary" disabled={pacingPreset !== "custom"} onClick={() => void choosePacing("custom", pacingMin, pacingMax)}>Apply</button></div></article>
+          <article className="panel"><div className="pacing-heading"><div><h2>Scene pacing</h2><p>Preferred duration range per still</p></div><strong>{pacingMin}–{pacingMax} sec</strong></div><div className="pacing-options">{([["calm","Calm","10–16s"],["balanced","Balanced","6–10s"],["fast","Fast","3–6s"],["custom","Custom","Choose range"]] as const).map(([value,label,detail]) => <button key={value} className={pacingPreset === value ? "active" : ""} onClick={() => void choosePacing(value)}><strong>{label}</strong><small>{detail}</small></button>)}</div><div className="custom-pacing"><label>Minimum<input type="number" min="2" max="30" value={pacingMin} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMin(Number(event.target.value))} onBlur={(event) => { if (pacingPreset === "custom") void choosePacing("custom", Number(event.target.value), pacingMax); }} /></label><label>Maximum<input type="number" min="2" max="30" value={pacingMax} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMax(Number(event.target.value))} onBlur={(event) => { if (pacingPreset === "custom") void choosePacing("custom", pacingMin, Number(event.target.value)); }} /></label></div></article>
           <article className={ready ? "readiness ready" : "readiness"}><strong>{ready ? "Ready for visual planning" : "Source material incomplete"}</strong><span>{ready ? "Script and narration audio are available." : "Add a script and narration audio to continue."}</span></article>
         </div>
       </div>
@@ -634,24 +634,39 @@ function ProductionView() {
 
 type ImageSettings = {
   aspectRatio: string;
-  shotType: string;
+  // Basic
   cameraAngle: string;
   lighting: string;
   mood: string;
-  composition: string;
-  visualStyle: string;
-  colorPalette: string;
-  lensFeel: string;
   depthOfField: string;
-  backgroundComplexity: string;
-  subjectDistance: string;
-  motionFeel: string;
-  textureDetail: string;
-  realismLevel: string;
-  negativePromptStrength: string;
-  referenceAdherence: string;
+  colorTemperature: string;
+  weatherAtmosphere: string;
+  // Advanced
+  lensType: string;
+  lightDirection: string;
+  lightQuality: string;
+  shadowType: string;
+  contrast: string;
+  focusType: string;
+  exposure: string;
+  motion: string;
+  composition: string;
+  saturation: string;
+  vignette: string;
+  grainIntensity: string;
+  colorCastTint: string;
+  surfaceEffects: string;
 };
-const defaultImageSettings: ImageSettings = { aspectRatio: "16:9", shotType: "Undefined", cameraAngle: "Undefined", lighting: "Undefined", mood: "Undefined", composition: "Undefined", visualStyle: "Undefined", colorPalette: "Undefined", lensFeel: "Undefined", depthOfField: "Undefined", backgroundComplexity: "Undefined", subjectDistance: "Undefined", motionFeel: "Undefined", textureDetail: "Undefined", realismLevel: "Undefined", negativePromptStrength: "Undefined", referenceAdherence: "Undefined" };
+const defaultImageSettings: ImageSettings = {
+  aspectRatio: "16:9",
+  cameraAngle: "Undefined", lighting: "Undefined", mood: "Undefined",
+  depthOfField: "Undefined", colorTemperature: "Undefined", weatherAtmosphere: "Undefined",
+  lensType: "Undefined", lightDirection: "Undefined", lightQuality: "Undefined",
+  shadowType: "Undefined", contrast: "Undefined", focusType: "Undefined",
+  exposure: "Undefined", motion: "Undefined", composition: "Undefined",
+  saturation: "Undefined", vignette: "Undefined", grainIntensity: "Undefined",
+  colorCastTint: "Undefined", surfaceEffects: "Undefined",
+};
 function parseImageSettings(value?: string): ImageSettings {
   try { return { ...defaultImageSettings, ...(value ? JSON.parse(value) : {}) }; }
   catch { return defaultImageSettings; }
@@ -659,26 +674,36 @@ function parseImageSettings(value?: string): ImageSettings {
 
 function mergeExtractedSettings(current: ImageSettings, extracted: Partial<Record<string, string>>): ImageSettings {
   const aliases: Record<string, keyof ImageSettings> = {
-    artStyle: "visualStyle", style: "visualStyle", lens: "lensFeel",
-    colorGrade: "colorPalette", texture: "textureDetail",
+    // old field names → new equivalents for backward compat
+    shotType: "cameraAngle",
+    lensFeel: "lensType",
+    motionFeel: "motion",
+    colorPalette: "colorTemperature",
+    colorTreatment: "saturation",
+    lens: "lensType",
+    colorGrade: "saturation",
   };
   const presets: Partial<Record<keyof ImageSettings, string[]>> = {
-    shotType: ["Extreme close up","Close up","Medium shot","Wide shot","Establishing shot"],
-    cameraAngle: ["Eye level","Low angle","High angle","Over the shoulder","Top down","Dutch angle"],
-    lighting: ["Soft natural","Cinematic","Dramatic","Studio","Low key","High contrast"],
-    mood: ["Calm","Tense","Emotional","Mysterious","Educational","Dramatic"],
-    composition: ["Centered subject","Rule of thirds","Negative space","Thumbnail style","Symmetrical"],
-    visualStyle: ["Near photorealistic illustration","Cinematic still","Editorial digital painting","Semi realistic animation","Natural history illustration"],
-    colorPalette: ["Warm","Cool","Neutral","Muted","Pastel","High contrast"],
-    lensFeel: ["Wide angle","Portrait lens","Telephoto compression","Macro"],
-    depthOfField: ["Shallow","Medium","Deep"],
-    backgroundComplexity: ["Plain","Minimal","Environmental","Detailed"],
-    subjectDistance: ["Very close","Close","Medium","Far"],
-    motionFeel: ["Static","Subtle motion","Dynamic action"],
-    textureDetail: ["Soft","Detailed","Highly detailed"],
-    realismLevel: ["Stylized","Semi realistic","Near photorealistic"],
-    negativePromptStrength: ["Low","Medium","High"],
-    referenceAdherence: ["Loose","Balanced","Strict"],
+    cameraAngle: ["Wide Shot","Medium Shot","Close Up","Extreme Close Up","Birds Eye View","Worms Eye View","Low Angle","High Angle","Eye Level","Over the Shoulder","Dutch Angle","Establishing Shot","Point of View POV"],
+    lighting: ["Natural Daylight","Golden Hour","Blue Hour Dusk","Overcast Soft Diffused","Studio Lighting","Backlit Silhouette","Low Key Dark","High Key Bright","Night Moonlit","Candlelight Firelight","Underwater Light Rays","Window Light","Neon Lit"],
+    mood: ["Serene Peaceful","Tense Anxious","Dramatic Intense","Warm and Cozy","Cold Distant","Mysterious","Cheerful Upbeat","Melancholic","Eerie Unsettling","Nostalgic","Hopeful","Playful","Lonely Isolated","Triumphant"],
+    depthOfField: ["Shallow Blurred Background","Deep Everything Sharp","Medium","Macro Extreme Close Focus","Tilt Shift","Bokeh Heavy"],
+    colorTemperature: ["Very Warm Golden","Warm","Neutral","Cool","Very Cool Blue Tinted","Mixed Contrasting Warm Cool"],
+    weatherAtmosphere: ["Clear","Foggy Misty","Rainy","Overcast Sky","Snowy","Hazy Dusty","Underwater Haze","Steamy Humid","Stormy"],
+    lensType: ["Wide Angle","Standard Normal","Telephoto","Macro","Fisheye","Tilt Shift Lens","Anamorphic"],
+    lightDirection: ["Front Lighting","Backlighting","Side Lighting","Top Lighting","Bottom Underlighting","Rim Lighting"],
+    lightQuality: ["Soft Light","Hard Light","Diffused Light","Dappled Through Leaves or Water"],
+    shadowType: ["Sharp Shadows","Soft Shadows","Long Shadows","No Shadows","Dappled Shadows"],
+    contrast: ["High Contrast","Balanced Contrast","Low Contrast"],
+    focusType: ["Sharp Focus","Soft Focus","Selective Focus","Rack Focus","Motion Tracked Focus"],
+    exposure: ["Underexposed","Balanced Exposure","Overexposed","High Key Overexposure Stylistic"],
+    motion: ["Static No Motion","Motion Blur","Freeze Frame","Long Exposure Effect","Panning Blur"],
+    composition: ["Rule of Thirds","Center Composition","Symmetry","Asymmetry","Leading Lines","Diagonal Composition","Negative Space","Golden Ratio Spiral","Framed Layered Depth","Tight Framing","Open Airy Framing"],
+    saturation: ["Highly Saturated Vivid","Natural","Muted","Desaturated","Black and White Greyscale"],
+    vignette: ["None","Light Vignette","Heavy Vignette"],
+    grainIntensity: ["None","Subtle","Moderate","Heavy"],
+    colorCastTint: ["None","Green Tint","Blue Tint","Red Pink Tint","Purple Tint","Yellow Tint","Sepia Tint"],
+    surfaceEffects: ["None","Reflections","Glare Lens Flare","Water Droplets Condensation","Glass Glare"],
   };
   const next = { ...current };
   for (const [rawKey, rawValue] of Object.entries(extracted)) {
@@ -696,9 +721,30 @@ function mergeExtractedSettings(current: ImageSettings, extracted: Partial<Recor
 }
 
 function SettingSelect({ label, value, options, onChange }: { label: string; value: string; options: string[]; onChange: (value: string) => void }) {
-  const listId = `setting-${label.toLowerCase().replace(/\s+/g, "-")}`;
-  const displayValue = value.startsWith("Custom: ") ? value.slice(8) : value === "Custom..." ? "" : value;
-  return <label className="setting-control"><span>{label}</span><input list={listId} value={displayValue} placeholder={`Choose or type ${label.toLowerCase()}`} onChange={(event) => { const next = event.target.value; onChange(options.includes(next) ? next : `Custom: ${next}`); }} /><datalist id={listId}>{options.filter((option) => option !== "Custom...").map((option) => <option key={option} value={option} />)}</datalist></label>;
+  const presetValues = options.filter((opt) => opt !== "Custom...");
+  const isCustom = !presetValues.includes(value);
+  const customText = value.startsWith("Custom: ") ? value.slice(8) : value;
+  const lastCustomRef = useRef<string>("");
+  if (isCustom) {
+    lastCustomRef.current = customText;
+    return (
+      <label className="setting-control">
+        <span>{label}</span>
+        <div className="custom-control">
+          <input value={customText} onChange={(e) => onChange(e.target.value ? `Custom: ${e.target.value}` : "Custom: ")} placeholder={`Type ${label.toLowerCase()}`} />
+          <button type="button" title="Back to options" onClick={() => onChange(presetValues[0] ?? "Undefined")}>×</button>
+        </div>
+      </label>
+    );
+  }
+  return (
+    <label className="setting-control">
+      <span>{label}</span>
+      <select value={value} onChange={(e) => { if (e.target.value === "Custom...") onChange(lastCustomRef.current ? `Custom: ${lastCustomRef.current}` : "Custom: "); else onChange(e.target.value); }}>
+        {options.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+      </select>
+    </label>
+  );
 }
 
 function ImagesView() {
@@ -734,7 +780,10 @@ function ImagesView() {
   const [zoom, setZoom] = useState(1);
   const [references, setReferences] = useState<import("./infrastructure/projects-client").InputAssetRecord[]>([]);
   const [bulkOpen, setBulkOpen] = useState(false);
-  const [visualStrategyMode, setVisualStrategyMode] = useState<import("./infrastructure/projects-client").VisualStrategyMode>("Auto Educational");
+  const [bulkPlan, setBulkPlan] = useState<import("./infrastructure/projects-client").BulkPlanResultRecord | null>(null);
+  const [bulkPlanLoading, setBulkPlanLoading] = useState(false);
+  const [bulkInstruction, setBulkInstruction] = useState("");
+  const [bulkOverviewOpen, setBulkOverviewOpen] = useState(false);
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null);
   const [preparingGroupIds, setPreparingGroupIds] = useState<Set<string>>(new Set());
   const [promptPrepStatus, setPromptPrepStatus] = useState<"running" | "paused" | null>(null);
@@ -776,7 +825,7 @@ function ImagesView() {
         setSelectedGroupId(loaded.groups[0]?.group.id ?? null);
         setImageSettings(parseImageSettings(loaded.settings.find((setting) => setting.key === "image_settings")?.value));
         setGeminiModel(loaded.settings.find((setting) => setting.key === "gemini_model")?.value ?? "gemini-3.1-flash-image");
-        setVisualStrategyMode((loaded.settings.find((setting) => setting.key === "visual_strategy_mode")?.value as import("./infrastructure/projects-client").VisualStrategyMode) ?? "Auto Educational");
+        /* visual_strategy_mode is deprecated — planner now always uses Auto Educational */
         const [geminiStatus, openAiStatus, inputs] = await Promise.all([
           projectsClient.getProviderKeyStatus("gemini"),
           projectsClient.getProviderKeyStatus("openai"),
@@ -788,7 +837,7 @@ function ImagesView() {
         setJob(latestJob && ["queued", "running", "paused"].includes(latestJob.status) ? latestJob : null);
         const latest = loaded.groups[0]?.promptVersions[0];
         setActivePromptVersionId(latest?.id ?? null);
-        setSystemPrompt(latest?.systemPrompt ?? "");
+        setSystemPrompt(loaded.settings.find((s) => s.key === "system_prompt")?.value ?? latest?.systemPrompt ?? "");
         setUserPrompt(latest?.userPrompt ?? "");
         const latestRender = loaded.groups[0]?.imageRenders[0];
         setSelectedRenderId(latestRender?.id ?? null);
@@ -796,9 +845,8 @@ function ImagesView() {
         const savedPrep = loaded.settings.find((setting) => setting.key === `prompt_prep.${activeVideoId}`)?.value;
         if (savedPrep) {
           try {
-            const saved = JSON.parse(savedPrep) as { status: string; index: number; strategyMode: import("./infrastructure/projects-client").VisualStrategyMode; settings: ImageSettings; styleDirective: string };
+            const saved = JSON.parse(savedPrep) as { status: string; index: number; settings: ImageSettings; styleDirective: string };
             if (saved.status === "paused" && saved.index < loaded.groups.length) {
-              setVisualStrategyMode(saved.strategyMode);
               setImageSettings(saved.settings);
               setSystemPrompt(saved.styleDirective);
               promptPrepTask.current = { items: loaded.groups, index: saved.index };
@@ -856,7 +904,9 @@ function ImagesView() {
     if (!activeVideoId || !selectedGroupId) return;
     const latest = selectedGroup?.promptVersions[0];
     const style = systemPrompt || "Preserve a coherent visual style.";
-    if (!userPrompt.trim() || (latest?.userPrompt === userPrompt && latest?.systemPrompt === style && latest?.settingsJson === settingsJson)) return;
+    const normalizeSettings = (json: string) => { try { return JSON.stringify(parseImageSettings(json)); } catch { return json; } };
+    const sameSettings = latest ? normalizeSettings(latest.settingsJson) === normalizeSettings(settingsJson) : false;
+    if (!userPrompt.trim() || (latest?.userPrompt === userPrompt && latest?.systemPrompt === style && sameSettings)) return;
     try {
       const version = await projectsClient.createPromptVersion(
         activeVideoId,
@@ -928,7 +978,8 @@ function ImagesView() {
     setSelectedGroupId(groupId);
     const latest = workspace?.groups.find((item) => item.group.id === groupId)?.promptVersions[0];
     setActivePromptVersionId(latest?.id ?? null);
-    setSystemPrompt(latest?.systemPrompt ?? "");
+    const globalDirective = workspace?.settings.find((s) => s.key === "system_prompt")?.value;
+    setSystemPrompt(globalDirective ?? latest?.systemPrompt ?? "");
     setUserPrompt(latest?.userPrompt ?? "");
     setImageSettings(parseImageSettings(latest?.settingsJson));
     const latestRender = workspace?.groups.find((item) => item.group.id === groupId)?.imageRenders[0];
@@ -999,7 +1050,7 @@ function ImagesView() {
         });
         setBulkProgress({ current: index + 1, total: task.items.length, label: `Prompt ready for Still ${item.group.ordinal}` });
         if (promptPrepSettingKey) await projectsClient.saveAppSetting(promptPrepSettingKey, JSON.stringify({
-          status: "running", index: index + 1, strategyMode: visualStrategyMode,
+          status: "running", index: index + 1, strategyMode: "Auto Educational",
           settings: imageSettings, styleDirective: systemPrompt,
         }));
       }
@@ -1016,7 +1067,7 @@ function ImagesView() {
       } else if (finalControl === "paused") {
         setPromptPrepStatus("paused");
         if (promptPrepSettingKey) await projectsClient.saveAppSetting(promptPrepSettingKey, JSON.stringify({
-          status: "paused", index: task.index, strategyMode: visualStrategyMode,
+          status: "paused", index: task.index, strategyMode: "Auto Educational",
           settings: imageSettings, styleDirective: systemPrompt,
         }));
       } else if (finalControl === "stopped") {
@@ -1031,28 +1082,10 @@ function ImagesView() {
       promptPrepControl.current = "paused";
       setPromptPrepStatus("paused");
       if (promptPrepSettingKey && promptPrepTask.current) await projectsClient.saveAppSetting(promptPrepSettingKey, JSON.stringify({
-        status: "paused", index: promptPrepTask.current.index, strategyMode: visualStrategyMode,
+        status: "paused", index: promptPrepTask.current.index, strategyMode: "Auto Educational",
         settings: imageSettings, styleDirective: systemPrompt,
       }));
     }
-  }
-
-  async function prepareBulkPrompts() {
-    if (!activeVideoId || !workspace) return;
-    setError(null);
-    await projectsClient.saveAppSetting("image_settings", settingsJson);
-    await projectsClient.saveAppSetting("gemini_model", "gemini-3.1-flash-image");
-    await projectsClient.saveAppSetting("visual_strategy_mode", visualStrategyMode);
-    setBulkOpen(false);
-    setJob(null);
-    setPreparingGroupIds(new Set(workspace.groups.map((item) => item.group.id)));
-    setBulkProgress({ current: 0, total: workspace.groups.length, label: "Preparing prompts" });
-    promptPrepTask.current = { items: workspace.groups, index: 0 };
-    if (promptPrepSettingKey) await projectsClient.saveAppSetting(promptPrepSettingKey, JSON.stringify({
-      status: "running", index: 0, strategyMode: visualStrategyMode,
-      settings: imageSettings, styleDirective: systemPrompt,
-    }));
-    await runPromptPreparation();
   }
 
   function controlPromptPreparation(action: "pause" | "resume" | "stop") {
@@ -1060,7 +1093,7 @@ function ImagesView() {
       promptPrepControl.current = "paused";
       setPromptPrepStatus("paused");
       if (promptPrepSettingKey && promptPrepTask.current) void projectsClient.saveAppSetting(promptPrepSettingKey, JSON.stringify({
-        status: "paused", index: promptPrepTask.current.index, strategyMode: visualStrategyMode,
+        status: "paused", index: promptPrepTask.current.index, strategyMode: "Auto Educational",
         settings: imageSettings, styleDirective: systemPrompt,
       }));
     } else if (action === "stop") {
@@ -1079,12 +1112,78 @@ function ImagesView() {
     setLoading(true);
     setError(null);
     try {
-      const whole = await projectsClient.planWholeVideoEducationalVisuals(activeVideoId, settingsJson, systemPrompt, visualStrategyMode);
-      const planned = whole.plans.find((item) => item.visualPlanRowId === selectedGroupId);
-      if (!planned) throw new Error("The whole-video plan did not include the selected still.");
+      const planned = await projectsClient.suggestStillPrompt(activeVideoId, selectedGroupId, systemPrompt, settingsJson);
       setUserPrompt(planned.userPrompt);
       setImageSettings((current) => mergeExtractedSettings(current, planned.imageSettings));
       await refreshWorkspace();
+    } catch (caught) { setError(String(caught)); }
+    finally { setLoading(false); }
+  }
+
+  async function extractImageSettingsFromDirective() {
+    if (!systemPrompt.trim()) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await projectsClient.extractImageSettingsFromDirective(systemPrompt);
+      setSystemPrompt(result.styleDirective);
+      setImageSettings((current) => mergeExtractedSettings(current, result.imageSettings));
+      setTab("settings");
+    } catch (caught) { setError(String(caught)); }
+    finally { setLoading(false); }
+  }
+
+  useEffect(() => {
+    const unlisten = listen<{ planned: number; total: number }>("bulk_plan_progress", (event) => {
+      setBulkProgress((prev) => prev ? { ...prev, current: event.payload.planned, total: event.payload.total } : null);
+    });
+    return () => { void unlisten.then((fn) => fn()); };
+  }, []);
+
+  async function runBulkPlan() {
+    if (!activeVideoId || !workspace) return;
+    const total = workspace.groups.length;
+    setBulkOpen(false);
+    setBulkPlanLoading(true);
+    setBulkProgress({ current: 0, total, label: `Planning ${total} stills…` });
+    setError(null);
+    try {
+      await projectsClient.saveAppSetting("system_prompt", systemPrompt);
+      const plan = await projectsClient.planBulkVisuals(activeVideoId, systemPrompt, settingsJson, bulkInstruction);
+      setBulkPlan(plan);
+      setBulkOverviewOpen(true);
+    } catch (caught) {
+      setError(String(caught));
+      setBulkOpen(true);
+    } finally {
+      setBulkPlanLoading(false);
+      setBulkProgress(null);
+    }
+  }
+
+  async function approveBulkPlan() {
+    if (!activeVideoId || !bulkPlan) return;
+    setLoading(true);
+    setError(null);
+    try {
+      setBulkOverviewOpen(false);
+      await projectsClient.approveBulkPlan(activeVideoId, systemPrompt, bulkPlan.stills);
+      const live = await projectsClient.getImageWorkspace(activeVideoId);
+      imageWorkspaceCache.set(activeVideoId, live);
+      setWorkspace(live);
+      if (selectedGroupId) {
+        const group = live.groups.find((g) => g.group.id === selectedGroupId);
+        const pv = group?.promptVersions[0];
+        if (pv) {
+          setImageSettings(parseImageSettings(pv.settingsJson));
+          setUserPrompt(pv.userPrompt);
+          const globalDirective = live.settings.find((s) => s.key === "system_prompt")?.value;
+          setSystemPrompt(globalDirective ?? pv.systemPrompt ?? systemPrompt);
+        }
+      }
+      const job = await projectsClient.createImageJob(activeVideoId);
+      setJob(job);
+      setBulkPlan(null);
     } catch (caught) { setError(String(caught)); }
     finally { setLoading(false); }
   }
@@ -1151,6 +1250,7 @@ function ImagesView() {
 
   async function editSelectedRender() {
     if (!selectedRenderId || !editInstruction.trim()) return;
+    setEditOpen(false);
     setLoading(true);
     setError(null);
     try {
@@ -1160,7 +1260,6 @@ function ImagesView() {
       setCompareRenderId(selectedRenderId);
       setSelectedRenderId(edited.id);
       setEditInstruction("");
-      setEditOpen(false);
       await refreshWorkspace();
     } catch (caught) {
       setError(String(caught));
@@ -1244,6 +1343,7 @@ function ImagesView() {
       setActivePromptVersionId(null);
       setUserPrompt("");
       setSystemPrompt("");
+      setImageSettings(defaultImageSettings);
       const loaded = await projectsClient.getImageWorkspace(activeVideoId);
       imageWorkspaceCache.set(activeVideoId, loaded);
       setWorkspace(loaded);
@@ -1297,7 +1397,7 @@ function ImagesView() {
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <div className="heading-actions"><button className="secondary danger-action" onClick={() => void resetImages()} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Final output folder</button><button className="secondary" onClick={() => void exportBundle()}><Download size={16} />Project bundle</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} />Bulk Gen Config</button></div>
+        <div className="heading-actions"><button className="secondary danger-action" onClick={() => void resetImages()} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Final output folder</button><button className="secondary" onClick={() => void exportBundle()}><Download size={16} />Project bundle</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} />Bulk Generate</button></div>
       </div>
       {error && <div className="error-toast" role="alert"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
       {job && !bulkProgress && (
@@ -1311,16 +1411,12 @@ function ImagesView() {
           </div>
         </div>
       )}
-      {bulkProgress && <div className="bulk-live-progress"><div><strong>{bulkProgress.label}</strong><span>{bulkProgress.current} / {bulkProgress.total}</span></div><progress value={bulkProgress.current} max={bulkProgress.total} /><div className="prompt-progress-actions">{promptPrepStatus === "running" && <button className="secondary" onClick={() => controlPromptPreparation("pause")}>Pause</button>}{promptPrepStatus === "paused" && <button className="secondary" onClick={() => controlPromptPreparation("resume")}>Resume</button>}<button className="secondary" onClick={() => controlPromptPreparation("stop")}>Stop</button></div></div>}
+      {bulkProgress && <div className="bulk-live-progress"><div><strong>{bulkProgress.label}</strong>{bulkProgress.total > 0 && <span>{bulkProgress.current} / {bulkProgress.total}</span>}</div>{bulkProgress.total > 0 ? <progress value={bulkProgress.current} max={bulkProgress.total} /> : <progress />}{bulkProgress.total > 0 && <div className="prompt-progress-actions">{promptPrepStatus === "running" && <button className="secondary" onClick={() => controlPromptPreparation("pause")}>Pause</button>}{promptPrepStatus === "paused" && <button className="secondary" onClick={() => controlPromptPreparation("resume")}>Resume</button>}<button className="secondary" onClick={() => controlPromptPreparation("stop")}>Stop</button></div>}</div>}
       <div className="image-workspace">
         <aside className="stills">
           <strong>Stills <span>{stillCount}</span></strong>
           {workspace?.groups.map((group) => (
-            <button
-              key={group.group.id}
-              className={group.group.id === selectedGroupId ? "active" : ""}
-              onClick={() => selectGroup(group.group.id)}
-            >
+            <button key={group.group.id} className={`still-select${group.group.id === selectedGroupId ? " active" : ""}`} onClick={() => selectGroup(group.group.id)}>
               <div><strong>Still {group.group.ordinal}</strong>{group.imageRenders.length > 0 && <Check size={14} />}</div>
               <small>{(() => { const rows = group.group.sentenceIds.map((id) => workspace.sentences.find((s) => s.id === id)).filter(Boolean) as PlanSentenceRecord[]; return rows.length ? `${formatTime(rows[0].startSeconds)} – ${formatTime(rows.at(-1)!.endSeconds)}` : ""; })()}</small>
               <p>{group.group.sentenceIds.map((id) => workspace.sentences.find((s) => s.id === id)?.text).filter(Boolean).join(" ").slice(0, 72)}</p>
@@ -1358,23 +1454,13 @@ function ImagesView() {
                 <div><span>Subject strategy</span><strong>{educationalPlan.subjectStrategy}</strong></div>
               </div>}
               <label>
-                <span className="field-heading">User prompt</span>
-                <textarea className="production-copy"
-                  value={userPrompt}
-                  onChange={(event) => setUserPrompt(event.target.value)}
-                  onBlur={() => void createVersion()}
-                  placeholder="Describe the scene that directly supports this narration."
-                />
+                <span className="field-heading">User Prompt</span>
+                <textarea className="production-copy" value={userPrompt} onChange={(event) => setUserPrompt(event.target.value)} onBlur={() => void createVersion()} placeholder="Describe the scene that directly supports this narration." />
               </label>
               <button className="secondary full" onClick={() => void suggestPrompt()} disabled={!selectedGroupId || loading || !keyStatus.openai}><Sparkles size={15} />Suggest Prompt</button>
               <label>
                 <span className="field-heading">Style Directive <small>Optional</small></span>
-                <textarea className="production-copy"
-                  value={systemPrompt}
-                  onChange={(event) => setSystemPrompt(event.target.value)}
-                  onBlur={() => void createVersion()}
-                  placeholder="Reusable visual style, medium, rendering, and color treatment."
-                />
+                <textarea className="production-copy" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="Art style, rendering, color language, recurring subjects, visual consistency rules..." />
               </label>
               <button className="primary full" onClick={() => void generateRender()} disabled={!selectedGroupId || !userPrompt.trim() || loading}>Generate Image</button>
               {promptVersions.length > 0 && (
@@ -1396,28 +1482,32 @@ function ImagesView() {
             </>
           ) : tab === "settings" ? (
             <>
-              <div className="panel-section-heading"><h3>Image settings</h3><small>Saved per still</small></div>
-              <div className="setting-grid">
-                <SettingSelect label="Aspect ratio" value={imageSettings.aspectRatio} options={["16:9","9:16"]} onChange={(value) => updateImageSetting("aspectRatio", value)} />
-                <SettingSelect label="Shot type" value={imageSettings.shotType} options={["Undefined","Extreme close up","Close up","Medium shot","Wide shot","Establishing shot","Custom..."]} onChange={(value) => updateImageSetting("shotType", value)} />
-                <SettingSelect label="Camera angle" value={imageSettings.cameraAngle} options={["Undefined","Eye level","Low angle","High angle","Over the shoulder","Top down","Dutch angle","Custom..."]} onChange={(value) => updateImageSetting("cameraAngle", value)} />
-                <SettingSelect label="Lighting" value={imageSettings.lighting} options={["Undefined","Soft natural","Cinematic","Dramatic","Studio","Low key","High contrast","Custom..."]} onChange={(value) => updateImageSetting("lighting", value)} />
-                <SettingSelect label="Mood" value={imageSettings.mood} options={["Undefined","Calm","Tense","Emotional","Mysterious","Educational","Dramatic","Custom..."]} onChange={(value) => updateImageSetting("mood", value)} />
-                <SettingSelect label="Composition" value={imageSettings.composition} options={["Undefined","Centered subject","Rule of thirds","Negative space","Thumbnail style","Symmetrical","Custom..."]} onChange={(value) => updateImageSetting("composition", value)} />
-                <SettingSelect label="Visual style" value={imageSettings.visualStyle} options={["Undefined","Near photorealistic illustration","Cinematic still","Editorial digital painting","Semi realistic animation","Natural history illustration","Custom..."]} onChange={(value) => updateImageSetting("visualStyle", value)} />
-                <SettingSelect label="Color palette" value={imageSettings.colorPalette} options={["Undefined","Warm","Cool","Neutral","Muted","Pastel","High contrast","Custom..."]} onChange={(value) => updateImageSetting("colorPalette", value)} />
+              <div className="panel-section-heading"><h3>Image settings</h3><small>Per still</small></div>
+              <SettingSelect label="Aspect Ratio" value={imageSettings.aspectRatio} options={["16:9","9:16"]} onChange={(value) => updateImageSetting("aspectRatio", value)} />
+              <div className="setting-grid" style={{marginTop:"10px"}}>
+                <SettingSelect label="Camera Angle" value={imageSettings.cameraAngle} options={["Undefined","Wide Shot","Medium Shot","Close Up","Extreme Close Up","Birds Eye View","Worms Eye View","Low Angle","High Angle","Eye Level","Over the Shoulder","Dutch Angle","Establishing Shot","Point of View POV","Custom..."]} onChange={(value) => updateImageSetting("cameraAngle", value)} />
+                <SettingSelect label="Lighting" value={imageSettings.lighting} options={["Undefined","Natural Daylight","Golden Hour","Blue Hour Dusk","Overcast Soft Diffused","Studio Lighting","Backlit Silhouette","Low Key Dark","High Key Bright","Night Moonlit","Candlelight Firelight","Underwater Light Rays","Window Light","Neon Lit","Custom..."]} onChange={(value) => updateImageSetting("lighting", value)} />
+                <SettingSelect label="Mood" value={imageSettings.mood} options={["Undefined","Serene Peaceful","Tense Anxious","Dramatic Intense","Warm and Cozy","Cold Distant","Mysterious","Cheerful Upbeat","Melancholic","Eerie Unsettling","Nostalgic","Hopeful","Playful","Lonely Isolated","Triumphant","Custom..."]} onChange={(value) => updateImageSetting("mood", value)} />
+                <SettingSelect label="Depth of Field" value={imageSettings.depthOfField} options={["Undefined","Shallow Blurred Background","Deep Everything Sharp","Medium","Macro Extreme Close Focus","Tilt Shift","Bokeh Heavy","Custom..."]} onChange={(value) => updateImageSetting("depthOfField", value)} />
+                <SettingSelect label="Color Temperature" value={imageSettings.colorTemperature} options={["Undefined","Very Warm Golden","Warm","Neutral","Cool","Very Cool Blue Tinted","Mixed Contrasting Warm Cool","Custom..."]} onChange={(value) => updateImageSetting("colorTemperature", value)} />
+                <SettingSelect label="Weather / Atmosphere" value={imageSettings.weatherAtmosphere} options={["Undefined","Clear","Foggy Misty","Rainy","Overcast Sky","Snowy","Hazy Dusty","Underwater Haze","Steamy Humid","Stormy","Custom..."]} onChange={(value) => updateImageSetting("weatherAtmosphere", value)} />
               </div>
-              <details className="advanced-settings"><summary><span><strong>Advanced settings</strong><small>Fine-tune camera and rendering</small></span><b>＋</b></summary><div className="setting-grid">
+              <details className="advanced-settings"><summary><span><strong>Advanced</strong><small>Lens, light, composition, effects</small></span><b>＋</b></summary><div className="setting-grid">
                 {([
-                  ["lensFeel","Lens feel",["Undefined","Wide angle","Portrait lens","Telephoto compression","Macro","Custom..."]],
-                  ["depthOfField","Depth of field",["Undefined","Shallow","Medium","Deep","Custom..."]],
-                  ["backgroundComplexity","Background complexity",["Undefined","Plain","Minimal","Environmental","Detailed","Custom..."]],
-                  ["subjectDistance","Subject distance",["Undefined","Very close","Close","Medium","Far","Custom..."]],
-                  ["motionFeel","Motion feel",["Undefined","Static","Subtle motion","Dynamic action","Custom..."]],
-                  ["textureDetail","Texture detail",["Undefined","Soft","Detailed","Highly detailed","Custom..."]],
-                  ["realismLevel","Realism level",["Undefined","Stylized","Semi realistic","Near photorealistic","Custom..."]],
-                  ["negativePromptStrength","Negative prompt strength",["Undefined","Low","Medium","High","Custom..."]],
-                  ["referenceAdherence","Reference adherence",["Undefined","Loose","Balanced","Strict","Custom..."]],
+                  ["lensType","Lens Type",["Undefined","Wide Angle","Standard Normal","Telephoto","Macro","Fisheye","Tilt Shift Lens","Anamorphic","Custom..."]],
+                  ["lightDirection","Light Direction",["Undefined","Front Lighting","Backlighting","Side Lighting","Top Lighting","Bottom Underlighting","Rim Lighting","Custom..."]],
+                  ["lightQuality","Light Quality",["Undefined","Soft Light","Hard Light","Diffused Light","Dappled Through Leaves or Water","Custom..."]],
+                  ["shadowType","Shadow Type",["Undefined","Sharp Shadows","Soft Shadows","Long Shadows","No Shadows","Dappled Shadows","Custom..."]],
+                  ["contrast","Contrast",["Undefined","High Contrast","Balanced Contrast","Low Contrast","Custom..."]],
+                  ["focusType","Focus Type",["Undefined","Sharp Focus","Soft Focus","Selective Focus","Rack Focus","Motion Tracked Focus","Custom..."]],
+                  ["exposure","Exposure",["Undefined","Underexposed","Balanced Exposure","Overexposed","High Key Overexposure Stylistic","Custom..."]],
+                  ["motion","Motion",["Undefined","Static No Motion","Motion Blur","Freeze Frame","Long Exposure Effect","Panning Blur","Custom..."]],
+                  ["composition","Composition",["Undefined","Rule of Thirds","Center Composition","Symmetry","Asymmetry","Leading Lines","Diagonal Composition","Negative Space","Golden Ratio Spiral","Framed Layered Depth","Tight Framing","Open Airy Framing","Custom..."]],
+                  ["saturation","Saturation",["Undefined","Highly Saturated Vivid","Natural","Muted","Desaturated","Black and White Greyscale","Custom..."]],
+                  ["vignette","Vignette",["Undefined","None","Light Vignette","Heavy Vignette","Custom..."]],
+                  ["grainIntensity","Grain Intensity",["Undefined","None","Subtle","Moderate","Heavy","Custom..."]],
+                  ["colorCastTint","Color Cast / Tint",["Undefined","None","Green Tint","Blue Tint","Red Pink Tint","Purple Tint","Yellow Tint","Sepia Tint","Custom..."]],
+                  ["surfaceEffects","Surface Effects",["Undefined","None","Reflections","Glare Lens Flare","Water Droplets Condensation","Glass Glare","Custom..."]],
                 ] as [keyof ImageSettings,string,string[]][]).map(([key,label,options]) => <SettingSelect key={key} label={label} value={imageSettings[key]} options={options} onChange={(value) => updateImageSetting(key, value)} />)}
               </div></details>
               <label className="model-setting"><span>Image model</span><select value={geminiModel} onChange={(event) => setGeminiModel(event.target.value)}><option value="gemini-3.1-flash-image">Gemini Nano Banana 2</option></select></label>
@@ -1425,11 +1515,11 @@ function ImagesView() {
                 <strong>Generation service</strong><span>{keyStatus.gemini ? "Configured securely in Windows Credential Manager" : "Not configured. Add the Gemini credential on the backend."}</span>
               </div>
               <div className="reference-manager">
-                <div><strong>Visual references</strong><span>Optional style or subject guidance for image work.</span></div>
+                <div><strong>Visual references</strong><span>Style or subject guidance — Extract Style updates the Style Directive.</span></div>
                 {!references.length && <button className="secondary" onClick={() => void importReference()}><Plus size={14} />Add image</button>}
                 {references.map((reference) => <div className="reference-item" key={reference.id}>{referenceUrl ? <img src={referenceUrl} alt="Visual reference" /> : <span>IMG</span>}<button title="Extract Style" onClick={() => void extractStyle(reference.id)}><Sparkles size={13} />Extract Style</button><button onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button></div>)}
               </div>
-              <button className="primary full" onClick={() => void saveSettings()} disabled={loading}>Apply settings</button>
+              <button className="primary full" style={{marginTop:"8px"}} onClick={() => void saveSettings()} disabled={loading}>Apply settings</button>
             </>
           ) : (
             <div className="edit-panel">
@@ -1470,15 +1560,60 @@ function ImagesView() {
       </div>}
       {bulkOpen && <div className="modal-backdrop">
         <div className="modal bulk-modal">
-          <h2>Bulk Gen Config</h2>
-          <>
-            <label>Style Directive<textarea value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} /></label>
-            <div className="reference-manager"><button className="secondary" onClick={() => void importReference()}>Upload reference image</button>{references.map((reference) => <button className="secondary" key={reference.id} onClick={() => void extractStyle(reference.id)}><Sparkles size={14} />Extract Style · {reference.originalName}</button>)}</div>
-            <label className="strategy-mode-control"><span>Visual Strategy Mode</span><select value={visualStrategyMode} onChange={(event) => setVisualStrategyMode(event.target.value as import("./infrastructure/projects-client").VisualStrategyMode)}><option value="Auto Educational">Auto · Educational</option><option>Storytelling</option><option>Documentary</option><option>Scientific</option><option>Infographic Heavy</option></select><small>AI chooses visual types based on educational purpose while maintaining consistent style.</small></label>
-            <div className="planner-explainer"><strong>Educational Visual Planner</strong><span>Each still is planned by teaching objective, visual intent, and subject strategy. Camera settings are chosen afterward to support the lesson.</span></div>
-            <button className="primary full" onClick={() => void prepareBulkPrompts()}>Plan Visuals & Generate Prompts</button>
-          </>
-          <button className="secondary full" onClick={() => setBulkOpen(false)}>Cancel</button>
+          <h2>Bulk Generate</h2>
+          <div className="panel-section-heading" style={{marginTop:"4px"}}><h3>Style Directive</h3><small>Global visual style</small></div>
+          <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Describe overall cinematography and visual language. Avoid scene-specific details — the AI will handle those per still.</p>
+          <textarea className="bulk-directive" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="e.g. Cinematic documentary style, shallow depth of field, warm color grade, soft natural lighting…" rows={4} />
+          <button className="secondary full" style={{marginTop:"6px"}} onClick={() => void extractImageSettingsFromDirective()} disabled={loading || !systemPrompt.trim() || !keyStatus.openai}><Sparkles size={14} />Readjust to global settings only</button>
+          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Reference Image</h3><small>Optional</small></div>
+          <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Upload a reference to extract visual style and populate the directive automatically.</p>
+          <div className="reference-list bulk-ref-list">
+            {references.map((reference) => (
+              <div className="reference-item" key={reference.id}>
+                {referenceUrl ? <img src={referenceUrl} alt="Visual reference" /> : <span>IMG</span>}
+                <button onClick={() => void extractStyle(reference.id)}><Sparkles size={13} />Extract Style</button>
+                <button onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button>
+              </div>
+            ))}
+            <button className="secondary" onClick={() => void importReference()}><Plus size={14} />{references.length ? "Replace image" : "Upload reference image"}</button>
+          </div>
+          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
+          <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Any extra guidance the AI should follow when writing scene descriptions — e.g. "always include the orange cat", "show diversity in characters", "avoid close-ups on faces".</p>
+          <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => setBulkInstruction(e.target.value)} placeholder="e.g. Use the same cartoon cat character across all stills. Show a diverse cast of people. Avoid showing text or labels in any scene." rows={3} />
+          <button className="primary full" style={{marginTop:"16px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length || !keyStatus.openai}>
+            {bulkPlanLoading ? "Planning…" : <><WandSparkles size={16} />Plan Video</>}
+          </button>
+          <button className="secondary full" style={{marginTop:"8px"}} onClick={() => setBulkOpen(false)}>Cancel</button>
+        </div>
+      </div>}
+      {bulkOverviewOpen && bulkPlan && <div className="modal-backdrop">
+        <div className="modal bulk-overview-modal">
+          <h2>Visual Plan — {bulkPlan.summary.totalStills} Stills</h2>
+          <p className="overview-summary">{bulkPlan.summary.shortOverview}</p>
+          <div className="visual-type-counts">
+            {Object.entries(bulkPlan.summary.visualTypeCounts).sort((a, b) => b[1] - a[1]).map(([type, count]) => (
+              <span key={type} className="type-badge"><strong>{count}</strong>{type}</span>
+            ))}
+          </div>
+          <div className="bulk-overview-table">
+            <div className="overview-table-head">
+              <span>#</span><span>Timestamp</span><span>Narration</span><span>Visual Type</span><span>Scene Description</span>
+            </div>
+            {bulkPlan.stills.map((still) => (
+              <div key={still.visualPlanRowId} className="overview-table-row">
+                <span>{still.ordinal}</span>
+                <span>{formatTime(still.timestampStart)}–{formatTime(still.timestampEnd)}</span>
+                <span title={still.narrationPreview}>{still.narrationPreview.slice(0, 60)}{still.narrationPreview.length > 60 ? "…" : ""}</span>
+                <span>{still.visualType}</span>
+                <span title={still.userPrompt}>{still.userPrompt.slice(0, 70)}{still.userPrompt.length > 70 ? "…" : ""}</span>
+              </div>
+            ))}
+          </div>
+          <div className="overview-actions">
+            <button className="primary" onClick={() => void approveBulkPlan()} disabled={loading}>Apply to All Stills</button>
+            <button className="secondary" onClick={() => { setBulkOverviewOpen(false); setBulkOpen(true); }}>Back</button>
+            <button className="secondary" onClick={() => { setBulkOverviewOpen(false); setBulkPlan(null); }}>Cancel</button>
+          </div>
         </div>
       </div>}
     </section>

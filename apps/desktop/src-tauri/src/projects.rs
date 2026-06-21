@@ -3008,13 +3008,14 @@ Return JSON only — one plan object:
             .map_err(|e| e.to_string())
     }
 
-    pub fn generate_visual_plan(&self, video_id: &str) -> Result<VisualPlan, String> {
-        self.generate_visual_plan_with_progress(video_id, |_, _, _| {})
+    pub fn generate_visual_plan(&self, video_id: &str, engine_dir: &Path) -> Result<VisualPlan, String> {
+        self.generate_visual_plan_with_progress(video_id, engine_dir, |_, _, _| {})
     }
 
     pub fn generate_visual_plan_with_progress<F>(
         &self,
         video_id: &str,
+        engine_dir: &Path,
         mut progress: F,
     ) -> Result<VisualPlan, String>
     where
@@ -3097,8 +3098,6 @@ Return JSON only — one plan object:
             let output_path = work_dir.join("visual-plan.xlsx");
             let (clean_script, _) = remove_tts_pause_markers(&inputs.script_text);
             fs::write(&script_path, clean_script).map_err(|e| e.to_string())?;
-            let engine_dir =
-                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../services/python-engine");
             let grouping_engine = engine_dir.join("auto_gen_engine/scene_grouping_engine.py");
             if !grouping_engine.exists() {
                 return Err(format!(

@@ -753,10 +753,18 @@ async fn generate_visual_plan(
             .map_err(|_| "Project database lock was poisoned.".to_string())?;
         repository.paths()
     };
+    let engine_dir = if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../services/python-engine")
+    } else {
+        app.path()
+            .resource_dir()
+            .map_err(|e| format!("Could not locate app resource directory: {e}"))?
+            .join("python-engine")
+    };
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
         let event_video_id = video_id.clone();
-        repository.generate_visual_plan_with_progress(&video_id, |percent, stage, detail| {
+        repository.generate_visual_plan_with_progress(&video_id, &engine_dir, |percent, stage, detail| {
             let _ = app.emit(
                 "visual-plan-progress",
                 serde_json::json!({

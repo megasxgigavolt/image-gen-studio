@@ -255,7 +255,7 @@ fn list_image_renders(
 }
 
 #[tauri::command]
-fn generate_image_render(
+async fn generate_image_render(
     state: State<'_, RepositoryState>,
     video_id: String,
     group_id: String,
@@ -264,16 +264,27 @@ fn generate_image_render(
     user_prompt: String,
     settings_json: String,
 ) -> Result<ImageRender, String> {
-    with_repository(state, |repository| {
-        repository.generate_image_render(
-            &video_id,
-            &group_id,
-            &prompt_version_id,
-            &system_prompt,
-            &user_prompt,
-            &settings_json,
-        )
-    })
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        let mut last_error = String::new();
+        for attempt in 0..4 {
+            match repository.generate_image_render(
+                &video_id, &group_id, &prompt_version_id, &system_prompt, &user_prompt, &settings_json,
+            ) {
+                Ok(render) => return Ok(render),
+                Err(error) => {
+                    last_error = error;
+                    if attempt < 3 {
+                        let rate_limited = last_error.contains("429") || last_error.to_ascii_lowercase().contains("resource exhausted");
+                        let delay = if rate_limited { 20 * 2_u64.pow(attempt) } else { 2 * 2_u64.pow(attempt) };
+                        thread::sleep(Duration::from_secs(delay.min(120)));
+                    }
+                }
+            }
+        }
+        Err(last_error)
+    }).await.map_err(|error| format!("Image generation worker stopped unexpectedly: {error}"))?
 }
 
 #[tauri::command]
@@ -287,16 +298,18 @@ fn get_image_workspace(
 }
 
 #[tauri::command]
-fn edit_image_render(
+async fn edit_image_render(
     state: State<'_, RepositoryState>,
     source_render_id: String,
     instruction: String,
     mask_data_url: Option<String>,
     edit_strength: String,
 ) -> Result<ImageRender, String> {
-    with_repository(state, |repository| {
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
         repository.edit_image_render(&source_render_id, &instruction, mask_data_url.as_deref(), &edit_strength)
-    })
+    }).await.map_err(|error| format!("Image editing worker stopped unexpectedly: {error}"))?
 }
 
 #[tauri::command]
@@ -317,6 +330,14 @@ fn delete_image_render(
 }
 
 #[tauri::command]
+fn reset_image_workflow(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<(), String> {
+    with_repository(state, |repository| repository.reset_image_workflow(&video_id))
+}
+
+#[tauri::command]
 async fn suggest_image_prompt(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -331,6 +352,36 @@ async fn suggest_image_prompt(
     })
     .await
     .map_err(|error| format!("Prompt worker stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
+async fn plan_educational_visual(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_id: String,
+    settings_json: String,
+    style_directive: String,
+) -> Result<projects::EducationalVisualPlan, String> {
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.plan_educational_visual(&video_id, &group_id, &settings_json, &style_directive)
+    }).await.map_err(|error| format!("Educational planner stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
+async fn plan_whole_video_educational_visuals(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    settings_json: String,
+    style_directive: String,
+    strategy_mode: String,
+) -> Result<projects::WholeVideoEducationalPlan, String> {
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.plan_whole_video_educational_visuals(&video_id, &settings_json, &style_directive, &strategy_mode)
+    }).await.map_err(|error| format!("Whole-video planner stopped unexpectedly: {error}"))?
 }
 
 #[tauri::command]
@@ -481,6 +532,9 @@ fn spawn_job_workers(
                 let mut last_error = String::new();
                 let mut render_id = None;
                 for attempt in 0..5 {
+                    if repository.image_job_status(&job_id).ok().as_deref() == Some("stopped") {
+                        break;
+                    }
                     match repository.generate_image_render(
                         &video_id,
                         &group_id,
@@ -499,14 +553,29 @@ fn spawn_job_workers(
                                 let rate_limited = last_error.contains("429")
                                     || last_error.to_ascii_lowercase().contains("resource exhausted");
                                 let delay = if rate_limited { 30 * 2_u64.pow(attempt) } else { 3 * 2_u64.pow(attempt) };
-                                thread::sleep(Duration::from_secs(delay.min(240)));
+                                let mut remaining = delay.min(240);
+                                while remaining > 0 {
+                                    if repository.image_job_status(&job_id).ok().as_deref() == Some("stopped") {
+                                        break;
+                                    }
+                                    thread::sleep(Duration::from_secs(1));
+                                    remaining -= 1;
+                                }
                             }
                         }
                     }
                 }
+                if repository.image_job_status(&job_id).ok().as_deref() == Some("stopped") {
+                    break;
+                }
                 let result = render_id.ok_or(last_error);
                 let _ = repository.finish_job_item(&job_id, &item_id, result);
-                thread::sleep(Duration::from_secs(8));
+                for _ in 0..8 {
+                    if repository.image_job_status(&job_id).ok().as_deref() == Some("stopped") {
+                        break;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
             }
         });
     }
@@ -776,7 +845,10 @@ pub fn run() {
             edit_image_render,
             set_final_render,
             delete_image_render,
+            reset_image_workflow,
             suggest_image_prompt,
+            plan_educational_visual,
+            plan_whole_video_educational_visuals,
             extract_reference_style,
             get_render_data_url,
             get_asset_data_url,

@@ -15,7 +15,7 @@ use std::os::windows::process::CommandExt;
 use uuid::Uuid;
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct GoogleServiceAccount {
     project_id: String,
     client_email: String,
@@ -36,6 +36,8 @@ enum GeminiAuth {
     ApiKey(String),
     Vertex { access_token: String, project_id: String },
 }
+
+pub const EDUCATIONAL_VISUAL_PLANNER_VERSION: &str = "2.1.0-prompt-fit-settings";
 
 const MIGRATION_001: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -229,6 +231,28 @@ ALTER TABLE visual_plan_groups ADD COLUMN plan_signature TEXT;
 CREATE INDEX IF NOT EXISTS idx_image_renders_final ON image_renders(video_id, group_id, is_final);
 "#;
 
+const MIGRATION_010: &str = r#"
+CREATE TABLE IF NOT EXISTS educational_visual_plans (
+    still_id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    visual_plan_row_id TEXT NOT NULL,
+    educational_objective TEXT NOT NULL,
+    visual_intent TEXT NOT NULL,
+    subject_strategy TEXT NOT NULL,
+    image_settings_json TEXT NOT NULL,
+    user_prompt TEXT NOT NULL,
+    plan_signature TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_educational_plans_video ON educational_visual_plans(video_id);
+"#;
+
+const MIGRATION_011: &str = r#"
+ALTER TABLE educational_visual_plans ADD COLUMN visual_strategy_mode TEXT NOT NULL DEFAULT 'Auto Educational';
+ALTER TABLE educational_visual_plans ADD COLUMN planner_version TEXT NOT NULL DEFAULT '1.0.0-legacy';
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -344,8 +368,34 @@ pub struct StyleExtraction {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct EducationalVisualPlan {
+    pub still_id: String,
+    pub visual_plan_row_id: String,
+    pub educational_objective: String,
+    pub visual_intent: String,
+    pub subject_strategy: String,
+    pub image_settings: serde_json::Value,
+    pub user_prompt: String,
+    pub plan_signature: String,
+    pub visual_strategy_mode: String,
+    pub planner_version: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WholeVideoEducationalPlan {
+    pub strategy_mode: String,
+    pub planner_version: String,
+    pub plans: Vec<EducationalVisualPlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageWorkspaceGroup {
     pub group: PlanGroup,
+    pub educational_plan: Option<EducationalVisualPlan>,
     pub prompt_versions: Vec<PromptVersion>,
     pub image_renders: Vec<ImageRender>,
 }
@@ -641,6 +691,22 @@ impl ProjectRepository {
         }
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(9, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        self.connection.execute_batch(MIGRATION_010).map_err(|error| error.to_string())?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(10, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_strategy_mode: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('educational_visual_plans') WHERE name='visual_strategy_mode')",
+            [], |row| row.get(0),
+        ).map_err(|error| error.to_string())?;
+        if !has_strategy_mode {
+            self.connection.execute_batch(MIGRATION_011).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(11, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -1138,10 +1204,12 @@ impl ProjectRepository {
             .groups
             .into_iter()
             .map(|group| {
+                let educational_plan = self.get_educational_visual_plan(video_id, &group.id)?;
                 let prompt_versions = self.list_prompt_versions(video_id, &group.id)?;
                 let image_renders = self.list_image_renders(video_id, &group.id)?;
                 Ok(ImageWorkspaceGroup {
                     group,
+                    educational_plan,
                     prompt_versions,
                     image_renders,
                 })
@@ -1215,6 +1283,23 @@ impl ProjectRepository {
                 params![id, video_id, group_id, version, settings_json, system_prompt, user_prompt, created_at],
             )
             .map_err(|e| e.to_string())?;
+        let stale_prompts: Vec<String> = self.connection.prepare(
+            "SELECT id FROM prompt_versions WHERE video_id=?1 AND group_id=?2 ORDER BY version DESC LIMIT -1 OFFSET 5"
+        ).map_err(|e| e.to_string())?
+            .query_map(params![video_id, group_id], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        for stale_id in stale_prompts {
+            let used: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM image_renders WHERE prompt_version_id=?1)",
+                [&stale_id], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if !used {
+                self.connection.execute("DELETE FROM prompt_versions WHERE id=?1", [&stale_id])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         Ok(PromptVersion {
             id,
             video_id: video_id.into(),
@@ -1304,7 +1389,7 @@ impl ProjectRepository {
             )
             .map_err(|e| e.to_string())?;
         let stale: Vec<ImageRender> = self.list_image_renders(video_id, group_id)?
-            .into_iter().filter(|render| !render.is_final).skip(10).collect();
+            .into_iter().filter(|render| !render.is_final).skip(4).collect();
         for render in stale {
             if let Ok(path) = self.render_absolute_path(&render) {
                 let _ = fs::remove_file(path);
@@ -1385,6 +1470,29 @@ impl ProjectRepository {
         Ok(())
     }
 
+    pub fn reset_image_workflow(&self, video_id: &str) -> Result<(), String> {
+        let renders = self.get_visual_plan(video_id)?.groups.into_iter()
+            .map(|group| self.list_image_renders(video_id, &group.id))
+            .collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect::<Vec<_>>();
+        self.connection.execute("UPDATE timeline_clips SET render_id=NULL WHERE video_id=?1", [video_id]).map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM image_job_items WHERE video_id=?1", [video_id]).map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM image_jobs WHERE video_id=?1", [video_id]).map_err(|e| e.to_string())?;
+        self.connection.execute("UPDATE image_renders SET parent_render_id=NULL WHERE video_id=?1", [video_id]).map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM image_renders WHERE video_id=?1", [video_id]).map_err(|e| e.to_string())?;
+        for render in renders {
+            if let Ok(path) = self.render_absolute_path(&render) { let _ = fs::remove_file(path); }
+            if let Some(mask_path) = render.mask_path {
+                if let Ok(channel_id) = self.connection.query_row("SELECT channel_id FROM videos WHERE id=?1", [video_id], |row| row.get::<_, String>(0)) {
+                    let _ = fs::remove_file(self.projects_dir.join(channel_id).join(video_id).join(mask_path));
+                }
+            }
+        }
+        self.connection.execute("DELETE FROM prompt_versions WHERE video_id=?1", [video_id]).map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM educational_visual_plans WHERE video_id=?1", [video_id]).map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM app_settings WHERE key=?1", [format!("prompt_prep.{video_id}")]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn suggest_image_prompt(
         &self,
         video_id: &str,
@@ -1412,6 +1520,258 @@ impl ProjectRepository {
             group.kind, start, end, end - start
         );
         request_openai_text(&api_key, &request)
+    }
+
+    pub fn get_educational_visual_plan(
+        &self,
+        video_id: &str,
+        group_id: &str,
+    ) -> Result<Option<EducationalVisualPlan>, String> {
+        self.connection.query_row(
+            "SELECT still_id,visual_plan_row_id,educational_objective,visual_intent,subject_strategy,image_settings_json,user_prompt,plan_signature,visual_strategy_mode,planner_version,created_at,updated_at
+             FROM educational_visual_plans WHERE video_id=?1 AND visual_plan_row_id=?2",
+            params![video_id, group_id],
+            |row| {
+                Ok(EducationalVisualPlan {
+                    still_id: row.get(0)?,
+                    visual_plan_row_id: row.get(1)?,
+                    educational_objective: row.get(2)?,
+                    visual_intent: row.get(3)?,
+                    subject_strategy: row.get(4)?,
+                    image_settings: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_else(|_| json!({})),
+                    user_prompt: row.get(6)?,
+                    plan_signature: row.get(7)?,
+                    visual_strategy_mode: row.get(8)?,
+                    planner_version: row.get(9)?,
+                    created_at: row.get(10)?,
+                    updated_at: row.get(11)?,
+                })
+            },
+        ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn plan_educational_visual(
+        &self,
+        video_id: &str,
+        group_id: &str,
+        base_settings_json: &str,
+        style_directive: &str,
+    ) -> Result<EducationalVisualPlan, String> {
+        let plan = self.get_visual_plan(video_id)?;
+        let group = plan.groups.iter().find(|item| item.id == group_id)
+            .ok_or("Visual plan still was not found.")?;
+        let members: Vec<_> = group.sentence_ids.iter()
+            .filter_map(|id| plan.sentences.iter().find(|sentence| &sentence.id == id)).collect();
+        let voiceover = members.iter().map(|item| item.text.as_str()).collect::<Vec<_>>().join(" ");
+        let start = members.first().map(|item| item.start_seconds).unwrap_or(0.0);
+        let end = members.last().map(|item| item.end_seconds).unwrap_or(start);
+        let signature = format!("{}|{}|{}|{}|{}|{}", EDUCATIONAL_VISUAL_PLANNER_VERSION, voiceover, group.kind, base_settings_json, style_directive, end - start);
+        if let Some(existing) = self.get_educational_visual_plan(video_id, group_id)? {
+            if existing.plan_signature == signature {
+                return Ok(existing);
+            }
+        }
+        let api_key = self.get_provider_key("openai")?
+            .ok_or("Add an OpenAI API key before planning educational visuals.")?;
+        let request = format!(
+            r#"You are an Educational Visual Planner. Do not ask what image merely matches the sentence. Decide what image teaches the concept best.
+
+Narration: {voiceover}
+Visual plan type: {}
+Timestamp: {:.1}-{:.1}s
+Base image settings: {base_settings_json}
+Style directive: {style_directive}
+
+Choose exactly one educationalObjective from:
+Introduce Subject; Show Relationship; Explain Process; Explain Sequence; Explain Location; Explain Structure; Highlight Detail; Show Environment; Explain Concept; Show Evidence; Compare Alternatives; Explain Cause Effect; Demonstrate Behavior; Clarify Misconception.
+
+Choose exactly one visualIntent from:
+Character Scene; Behavioral Demonstration; Close Detail; Environmental Scene; Object Focus; Comparison; Process Illustration; Timeline; Textless Infographic; Scientific Diagram; Geographic Map; Concept Visualization; POV Scene; Symbolic Representation; Documentary Frame.
+
+Choose exactly one subjectStrategy from:
+Single Subject; Subject Plus Object; Object Only; Environment Only; Split Comparison; Diagram Subject; Map Subject; Abstract Subject.
+
+Rules:
+- Prefer the visual structure that teaches the idea best.
+- Avoid humans unless narration requires them.
+- Prefer one primary subject.
+- For relationships or ancestry, prefer comparison/relationship visuals over a random portrait.
+- Keep the scene directly grounded in the narration.
+- Choose image settings only after writing the scene concept, so every choice supports the userPrompt.
+- Preserve the supplied aspectRatio. Do not invent a different aspect ratio.
+- imageSettings must include every variable key: shotType, cameraAngle, lighting, mood, composition, visualStyle, colorPalette, lensFeel, depthOfField, backgroundComplexity, subjectDistance, motionFeel, textureDetail, realismLevel, negativePromptStrength, and referenceAdherence.
+- Use the best-fit concrete value for every variable setting. Do not return Undefined, empty values, or generic defaults.
+- Vary settings when the teaching purpose and scene call for it; do not rotate settings mechanically.
+- userPrompt must be a production-ready, textless image prompt implementing the educational plan.
+
+Return JSON only:
+{{"educationalObjective":"...","visualIntent":"...","subjectStrategy":"...","imageSettings":{{...}},"userPrompt":"..."}}"#,
+            group.kind, start, end
+        );
+        let planned = request_openai_educational_plan(&api_key, &request)?;
+        validate_educational_plan(&planned)?;
+        let now = Utc::now().to_rfc3339();
+        let still_id = self.get_educational_visual_plan(video_id, group_id)?
+            .map(|item| item.still_id).unwrap_or_else(|| Uuid::new_v4().to_string());
+        self.connection.execute(
+            "INSERT INTO educational_visual_plans(still_id,video_id,visual_plan_row_id,educational_objective,visual_intent,subject_strategy,image_settings_json,user_prompt,plan_signature,visual_strategy_mode,planner_version,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'Auto Educational',?10,?11,?11)
+             ON CONFLICT(still_id) DO UPDATE SET educational_objective=excluded.educational_objective,visual_intent=excluded.visual_intent,subject_strategy=excluded.subject_strategy,image_settings_json=excluded.image_settings_json,user_prompt=excluded.user_prompt,plan_signature=excluded.plan_signature,updated_at=excluded.updated_at",
+            params![still_id,video_id,group_id,planned.educational_objective,planned.visual_intent,planned.subject_strategy,planned.image_settings.to_string(),planned.user_prompt,signature,EDUCATIONAL_VISUAL_PLANNER_VERSION,now],
+        ).map_err(|e| e.to_string())?;
+        self.get_educational_visual_plan(video_id, group_id)?
+            .ok_or_else(|| "Educational visual plan was not saved.".to_string())
+    }
+
+    pub fn plan_whole_video_educational_visuals(
+        &self,
+        video_id: &str,
+        base_settings_json: &str,
+        style_directive: &str,
+        strategy_mode: &str,
+    ) -> Result<WholeVideoEducationalPlan, String> {
+        const MODES: &[&str] = &["Auto Educational", "Storytelling", "Documentary", "Scientific", "Infographic Heavy"];
+        if !MODES.contains(&strategy_mode) {
+            return Err("Unsupported visual strategy mode.".into());
+        }
+        let visual_plan = self.get_visual_plan(video_id)?;
+        let rows = visual_plan.groups.iter().map(|group| {
+            let members: Vec<_> = group.sentence_ids.iter()
+                .filter_map(|id| visual_plan.sentences.iter().find(|sentence| &sentence.id == id)).collect();
+            json!({
+                "visualPlanRowId": group.id,
+                "ordinal": group.ordinal,
+                "type": group.kind,
+                "startSeconds": members.first().map(|item| item.start_seconds).unwrap_or(0.0),
+                "endSeconds": members.last().map(|item| item.end_seconds).unwrap_or(0.0),
+                "narration": members.iter().map(|item| item.text.as_str()).collect::<Vec<_>>().join(" ")
+            })
+        }).collect::<Vec<_>>();
+        let global_signature = format!(
+            "{}|{}|{}|{}|{}",
+            EDUCATIONAL_VISUAL_PLANNER_VERSION,
+            strategy_mode,
+            style_directive,
+            base_settings_json,
+            serde_json::to_string(&rows).unwrap_or_default()
+        );
+        let existing = visual_plan.groups.iter()
+            .map(|group| self.get_educational_visual_plan(video_id, &group.id))
+            .collect::<Result<Vec<_>, _>>()?;
+        if existing.iter().all(|item| item.as_ref().is_some_and(|plan| plan.plan_signature.starts_with(&global_signature))) {
+            return Ok(WholeVideoEducationalPlan {
+                strategy_mode: strategy_mode.into(),
+                planner_version: EDUCATIONAL_VISUAL_PLANNER_VERSION.into(),
+                plans: existing.into_iter().flatten().collect(),
+            });
+        }
+        let weights = match strategy_mode {
+            "Storytelling" => "Favor Character Scene, Behavioral Demonstration, POV Scene, Environmental Scene, and Documentary Frame while retaining educational clarity.",
+            "Documentary" => "Favor Documentary Frame, Environmental Scene, Object Focus, Close Detail, and evidence-based Comparison.",
+            "Scientific" => "Favor Scientific Diagram, Process Illustration, Close Detail, Comparison, Textless Infographic, and Geographic Map.",
+            "Infographic Heavy" => "Favor Textless Infographic, Scientific Diagram, Timeline, Comparison, Process Illustration, and Geographic Map.",
+            _ => "Use this approximate whole-video distribution: Character Scene 30-40%; Behavioral Demonstration 10-15%; Close Detail 10-15%; Comparison 10-15%; Environmental Scene 5-10%; Object Focus 5-10%; Process Illustration 5-10%; Timeline 2-5%; Textless Infographic 2-8%; Scientific Diagram 2-8%; Geographic Map 0-5%; Concept Visualization 2-8%; Documentary Frame 5-15%.",
+        };
+        let api_key = self.get_provider_key("openai")?
+            .ok_or("Add an OpenAI API key before planning educational visuals.")?;
+        let mut planned_rows = Vec::with_capacity(rows.len());
+        for (chunk_index, chunk) in rows.chunks(12).enumerate() {
+            let prior_context = planned_rows.iter().rev().take(3).cloned().collect::<Vec<EducationalPlanResponse>>();
+            let request = format!(
+            r#"You are an Educational Visual Director planning an entire video, not isolated stills.
+
+Strategy mode: {strategy_mode}
+Planner version: {EDUCATIONAL_VISUAL_PLANNER_VERSION}
+Style directive: {style_directive}
+Base image settings: {base_settings_json}
+This is planning batch {} of {}. The full video has {} stills.
+The current chronological rows are:
+{}
+
+The most recent assigned plans (newest first) are:
+{}
+
+Work in three internal phases:
+A. Analyze each supplied still and its educational role in the video.
+B. Assign visual intents while considering previous stills, upcoming stills, educational flow, and visual rhythm.
+C. Generate image settings and a production-ready user prompt for every still.
+
+{weights}
+
+Anti-repetition:
+- Track the last 3 visual intents, objectives, and subject strategies.
+- Never assign more than 3 consecutive identical visual intents.
+- Avoid repetitive subject strategies when another teaching structure communicates the idea better.
+
+Core rule: ask “What image teaches the concept best?”, never merely “What image matches the sentence?”
+Avoid humans unless narration requires them. Prefer one primary subject.
+
+Allowed educationalObjective values:
+Introduce Subject; Show Relationship; Explain Process; Explain Sequence; Explain Location; Explain Structure; Highlight Detail; Show Environment; Explain Concept; Show Evidence; Compare Alternatives; Explain Cause Effect; Demonstrate Behavior; Clarify Misconception.
+
+Allowed visualIntent values:
+Character Scene; Behavioral Demonstration; Close Detail; Environmental Scene; Object Focus; Comparison; Process Illustration; Timeline; Textless Infographic; Scientific Diagram; Geographic Map; Concept Visualization; POV Scene; Symbolic Representation; Documentary Frame.
+
+Allowed subjectStrategy values:
+Single Subject; Subject Plus Object; Object Only; Environment Only; Split Comparison; Diagram Subject; Map Subject; Abstract Subject.
+
+Return JSON only:
+{{"plans":[{{"visualPlanRowId":"exact row id","educationalObjective":"...","visualIntent":"...","subjectStrategy":"...","imageSettings":{{...}},"userPrompt":"..."}}]}}
+
+Return exactly one plan for every supplied row, in the same order."#,
+                chunk_index + 1,
+                rows.len().div_ceil(12),
+                rows.len(),
+                serde_json::to_string_pretty(chunk).unwrap_or_default(),
+                serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
+            );
+            let response = request_openai_whole_video_plan(&api_key, &request)?;
+            if response.plans.len() != chunk.len() {
+                return Err(format!(
+                    "OpenAI returned {} plans for planning batch {} ({} stills expected).",
+                    response.plans.len(),
+                    chunk_index + 1,
+                    chunk.len()
+                ));
+            }
+            for (offset, plan) in response.plans.iter().enumerate() {
+                let expected_id = chunk[offset].get("visualPlanRowId").and_then(|value| value.as_str()).unwrap_or_default();
+                if plan.visual_plan_row_id != expected_id {
+                    return Err(format!("OpenAI planning batch {} returned rows out of order.", chunk_index + 1));
+                }
+            }
+            planned_rows.extend(response.plans);
+        }
+        for window in planned_rows.windows(4) {
+            if window.iter().all(|plan| plan.visual_intent == window[0].visual_intent) {
+                return Err(format!("Whole-video planner repeated visual intent '{}' more than three times consecutively.", window[0].visual_intent));
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut saved = Vec::with_capacity(planned_rows.len());
+        for (index, planned) in planned_rows.into_iter().enumerate() {
+            validate_educational_plan(&planned)?;
+            let group = &visual_plan.groups[index];
+            if planned.visual_plan_row_id != group.id {
+                return Err("OpenAI whole-video plan row order did not match the visual plan.".into());
+            }
+            let row_signature = format!("{}|{}", global_signature, group.id);
+            let still_id = self.get_educational_visual_plan(video_id, &group.id)?
+                .map(|item| item.still_id).unwrap_or_else(|| Uuid::new_v4().to_string());
+            self.connection.execute(
+                "INSERT INTO educational_visual_plans(still_id,video_id,visual_plan_row_id,educational_objective,visual_intent,subject_strategy,image_settings_json,user_prompt,plan_signature,visual_strategy_mode,planner_version,created_at,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)
+                 ON CONFLICT(still_id) DO UPDATE SET educational_objective=excluded.educational_objective,visual_intent=excluded.visual_intent,subject_strategy=excluded.subject_strategy,image_settings_json=excluded.image_settings_json,user_prompt=excluded.user_prompt,plan_signature=excluded.plan_signature,visual_strategy_mode=excluded.visual_strategy_mode,planner_version=excluded.planner_version,updated_at=excluded.updated_at",
+                params![still_id,video_id,group.id,planned.educational_objective,planned.visual_intent,planned.subject_strategy,planned.image_settings.to_string(),planned.user_prompt,row_signature,strategy_mode,EDUCATIONAL_VISUAL_PLANNER_VERSION,now],
+            ).map_err(|e| e.to_string())?;
+            saved.push(self.get_educational_visual_plan(video_id, &group.id)?
+                .ok_or("Educational visual plan was not saved.")?);
+        }
+        Ok(WholeVideoEducationalPlan {
+            strategy_mode: strategy_mode.into(),
+            planner_version: EDUCATIONAL_VISUAL_PLANNER_VERSION.into(),
+            plans: saved,
+        })
     }
 
     pub fn extract_reference_style(&self, asset_id: &str) -> Result<StyleExtraction, String> {
@@ -1453,7 +1813,9 @@ impl ProjectRepository {
             .get_app_setting("gemini_model")?
             .unwrap_or_else(|| "gemini-3.1-flash-image".into());
         let prompt = assemble_image_prompt(system_prompt, user_prompt, &settings);
-        let (image_bytes, extension) = request_gemini_image(&auth, &model, &prompt)?;
+        let (image_bytes, extension) = request_gemini_image(
+            &auth, &model, &prompt, requested_aspect_ratio(&settings),
+        )?;
         let channel_id: String = self
             .connection
             .query_row(
@@ -1566,6 +1928,8 @@ impl ProjectRepository {
                 },
             )
             .map_err(|e| e.to_string())?;
+        let original_settings: serde_json::Value = serde_json::from_str(&prompt.2)
+            .unwrap_or_else(|_| json!({}));
         let mask = mask_data_url.map(decode_data_url).transpose()?;
         let edit_prompt = format!(
             "Edit the provided image according to the user request.\n\nUser request:\n{}\n\nEdit strength: {}\n\nRules:\n1. Only change the white painted area shown in the mask image when a mask is provided.\n2. Preserve the rest of the image as much as possible.\n3. Preserve camera angle, lighting, colors, composition, character identity, subject identity, and visual style.\n4. Do not restyle or recreate the full image.\n5. Keep all unrelated objects unchanged.\n6. Return a natural looking edited image.\n\nExisting style directive:\n{}\n\nOriginal prompt context:\n{}\n\nOriginal settings:\n{}",
@@ -1582,6 +1946,7 @@ impl ProjectRepository {
             &source_bytes,
             mime_type,
             mask.as_ref().map(|(_, bytes)| bytes.as_slice()),
+            requested_aspect_ratio(&original_settings),
         )?;
         let render_dir = self
             .projects_dir
@@ -2051,17 +2416,18 @@ impl ProjectRepository {
         let plan = self.get_visual_plan(video_id)?;
         let mut prompts = Vec::new();
         for group in plan.groups {
-            if self.list_image_renders(video_id, &group.id)?.is_empty() {
-                let prompt = self
-                    .list_prompt_versions(video_id, &group.id)?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| {
-                        format!(
-                            "{} needs a saved prompt before bulk generation.",
-                            group.label
-                        )
-                    })?;
+            let prompt = self.list_prompt_versions(video_id, &group.id)?.into_iter().next()
+                .ok_or_else(|| format!("{} needs a saved prompt before bulk generation.", group.label))?;
+            let renders = self.list_image_renders(video_id, &group.id)?;
+            let educational_updated_at = self.get_educational_visual_plan(video_id, &group.id)?
+                .map(|plan| plan.updated_at);
+            let needs_generation = renders.first()
+                .map(|render| {
+                    render.prompt_version_id != prompt.id
+                        || educational_updated_at.as_ref().is_some_and(|updated| updated > &render.created_at)
+                })
+                .unwrap_or(true);
+            if needs_generation {
                 prompts.push((group.id, prompt.id));
             }
         }
@@ -2110,6 +2476,14 @@ impl ProjectRepository {
         Ok(job)
     }
 
+    pub fn image_job_status(&self, job_id: &str) -> Result<String, String> {
+        self.connection.query_row(
+            "SELECT status FROM image_jobs WHERE id=?1",
+            [job_id],
+            |row| row.get(0),
+        ).map_err(|_| "Image job was not found.".to_string())
+    }
+
     pub fn latest_image_job(&self, video_id: &str) -> Result<Option<ImageJob>, String> {
         let id: Option<String> = self
             .connection
@@ -2133,7 +2507,7 @@ impl ProjectRepository {
         ).map_err(|e| e.to_string())?;
         if status == "stopped" {
             self.connection.execute(
-                "UPDATE image_job_items SET status='stopped',updated_at=?1 WHERE job_id=?2 AND status='queued'",
+                "UPDATE image_job_items SET status='stopped',updated_at=?1 WHERE job_id=?2 AND status IN ('queued','running')",
                 params![Utc::now().to_rfc3339(), job_id],
             ).map_err(|e| e.to_string())?;
         }
@@ -2205,8 +2579,8 @@ impl ProjectRepository {
     ) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
         match result {
-            Ok(render_id) => self.connection.execute("UPDATE image_job_items SET status='completed',render_id=?1,last_error=NULL,updated_at=?2 WHERE id=?3", params![render_id, now, item_id]),
-            Err(error) => self.connection.execute("UPDATE image_job_items SET status='failed',last_error=?1,updated_at=?2 WHERE id=?3", params![error, now, item_id]),
+            Ok(render_id) => self.connection.execute("UPDATE image_job_items SET status='completed',render_id=?1,last_error=NULL,updated_at=?2 WHERE id=?3 AND status='running'", params![render_id, now, item_id]),
+            Err(error) => self.connection.execute("UPDATE image_job_items SET status='failed',last_error=?1,updated_at=?2 WHERE id=?3 AND status='running'", params![error, now, item_id]),
         }.map_err(|e| e.to_string())?;
         self.connection.execute(
             "UPDATE image_jobs SET completed_items=(SELECT COUNT(*) FROM image_job_items WHERE job_id=?1 AND status='completed'),failed_items=(SELECT COUNT(*) FROM image_job_items WHERE job_id=?1 AND status='failed'),updated_at=?2 WHERE id=?1",
@@ -2773,12 +3147,28 @@ fn assemble_image_prompt(
     user_prompt: &str,
     settings: &serde_json::Value,
 ) -> String {
+    let settings = public_image_settings(settings);
     format!(
         "SYSTEM DIRECTION:\n{}\n\nSCENE REQUEST:\n{}\n\nIMAGE SETTINGS:\n{}",
         system_prompt.trim(),
         user_prompt.trim(),
-        serde_json::to_string_pretty(settings).unwrap_or_else(|_| "{}".into())
+        serde_json::to_string_pretty(&settings).unwrap_or_else(|_| "{}".into())
     )
+}
+
+fn public_image_settings(settings: &serde_json::Value) -> serde_json::Value {
+    let mut cleaned = settings.clone();
+    if let Some(object) = cleaned.as_object_mut() {
+        object.retain(|key, _| !key.starts_with('_'));
+    }
+    cleaned
+}
+
+fn requested_aspect_ratio(settings: &serde_json::Value) -> &'static str {
+    match settings.get("aspectRatio").and_then(|value| value.as_str()) {
+        Some("9:16") => "9:16",
+        _ => "16:9",
+    }
 }
 
 fn request_openai_text(api_key: &str, prompt: &str) -> Result<String, String> {
@@ -2788,7 +3178,7 @@ fn request_openai_text(api_key: &str, prompt: &str) -> Result<String, String> {
         .json(&json!({
             "model": "gpt-4.1-mini",
             "input": prompt,
-            "max_output_tokens": 500
+            "max_output_tokens": 1200
         }))
         .send()
         .map_err(|error| format!("Could not reach OpenAI: {error}"))?;
@@ -2803,6 +3193,71 @@ fn request_openai_text(api_key: &str, prompt: &str) -> Result<String, String> {
     body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
         .map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
         .ok_or_else(|| "OpenAI returned no prompt text.".to_string())
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EducationalPlanResponse {
+    #[serde(default)]
+    visual_plan_row_id: String,
+    educational_objective: String,
+    visual_intent: String,
+    subject_strategy: String,
+    image_settings: serde_json::Value,
+    user_prompt: String,
+}
+
+#[derive(Deserialize)]
+struct WholeVideoPlanResponse {
+    plans: Vec<EducationalPlanResponse>,
+}
+
+fn request_openai_educational_plan(api_key: &str, prompt: &str) -> Result<EducationalPlanResponse, String> {
+    let text = request_openai_text(api_key, prompt)?;
+    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    serde_json::from_str(cleaned).map_err(|_| "OpenAI educational plan was not valid JSON.".to_string())
+}
+
+fn request_openai_whole_video_plan(api_key: &str, prompt: &str) -> Result<WholeVideoPlanResponse, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(240))
+        .build().map_err(|error| format!("Could not initialize OpenAI client: {error}"))?;
+    let mut last_transport_error = String::new();
+    let response = loop {
+        let attempt = last_transport_error.matches("attempt").count();
+        match client.post("https://api.openai.com/v1/responses")
+            .bearer_auth(api_key)
+            .json(&json!({"model":"gpt-4.1-mini","input":prompt,"max_output_tokens":16000}))
+            .send() {
+                Ok(response) => break response,
+                Err(error) if attempt < 3 => {
+                    last_transport_error.push_str(&format!(" attempt {attempt}: {error}"));
+                    std::thread::sleep(std::time::Duration::from_secs(3 * 2_u64.pow(attempt as u32)));
+                }
+                Err(error) => return Err(format!("Could not reach OpenAI after retries: {error}")),
+            }
+    };
+    let status = response.status();
+    let body: serde_json::Value = response.json()
+        .map_err(|error| format!("OpenAI returned an unreadable response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("OpenAI whole-video planning failed ({status}): {}", body.pointer("/error/message").and_then(|value| value.as_str()).unwrap_or("unknown error")));
+    }
+    let text = body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
+        .ok_or("OpenAI returned no whole-video plan.")?;
+    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    serde_json::from_str(cleaned).map_err(|_| "OpenAI whole-video plan was not valid JSON.".to_string())
+}
+
+fn validate_educational_plan(plan: &EducationalPlanResponse) -> Result<(), String> {
+    const OBJECTIVES: &[&str] = &["Introduce Subject","Show Relationship","Explain Process","Explain Sequence","Explain Location","Explain Structure","Highlight Detail","Show Environment","Explain Concept","Show Evidence","Compare Alternatives","Explain Cause Effect","Demonstrate Behavior","Clarify Misconception"];
+    const INTENTS: &[&str] = &["Character Scene","Behavioral Demonstration","Close Detail","Environmental Scene","Object Focus","Comparison","Process Illustration","Timeline","Textless Infographic","Scientific Diagram","Geographic Map","Concept Visualization","POV Scene","Symbolic Representation","Documentary Frame"];
+    const STRATEGIES: &[&str] = &["Single Subject","Subject Plus Object","Object Only","Environment Only","Split Comparison","Diagram Subject","Map Subject","Abstract Subject"];
+    if !OBJECTIVES.contains(&plan.educational_objective.as_str()) { return Err("OpenAI returned an unsupported educational objective.".into()); }
+    if !INTENTS.contains(&plan.visual_intent.as_str()) { return Err("OpenAI returned an unsupported visual intent.".into()); }
+    if !STRATEGIES.contains(&plan.subject_strategy.as_str()) { return Err("OpenAI returned an unsupported subject strategy.".into()); }
+    if !plan.image_settings.is_object() || plan.user_prompt.trim().is_empty() { return Err("OpenAI returned an incomplete educational visual plan.".into()); }
+    Ok(())
 }
 
 fn request_openai_style(api_key: &str, mime: &str, bytes: &[u8]) -> Result<StyleExtraction, String> {
@@ -2835,6 +3290,7 @@ fn request_gemini_image(
     auth: &GeminiAuth,
     model: &str,
     prompt: &str,
+    aspect_ratio: &str,
 ) -> Result<(Vec<u8>, &'static str), String> {
     let model = model.trim();
     if model.is_empty()
@@ -2845,22 +3301,40 @@ fn request_gemini_image(
         return Err("Gemini model name is invalid.".into());
     }
     let client = reqwest::blocking::Client::new();
-    let request = match auth {
-        GeminiAuth::ApiKey(api_key) => client
+    let (request, aspect_ratio, image_size) = match auth {
+        GeminiAuth::ApiKey(api_key) => (client
             .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"))
-            .header("x-goog-api-key", api_key),
+            .header("x-goog-api-key", api_key), aspect_ratio, "1K"),
         GeminiAuth::Vertex { access_token, project_id } => {
             let url = format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model}:generateContent");
-            client.post(url).bearer_auth(access_token)
+            let vertex_ratio = if aspect_ratio == "9:16" { "ASPECT_RATIO_9_16" } else { "ASPECT_RATIO_16_9" };
+            (client.post(url).bearer_auth(access_token), vertex_ratio, "IMAGE_SIZE_1K")
         }
     };
     let response = request
         .json(&json!({
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
+            "generationConfig": {
+                "responseModalities": ["TEXT", "IMAGE"],
+                "responseFormat": {"image": {"aspectRatio": aspect_ratio, "imageSize": image_size}}
+            }
         }))
         .send()
         .map_err(|error| format!("Could not reach Gemini: {error}"))?;
+    let response = if response.status() == reqwest::StatusCode::BAD_REQUEST {
+        let fallback_request = match auth {
+            GeminiAuth::ApiKey(api_key) => client
+                .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"))
+                .header("x-goog-api-key", api_key),
+            GeminiAuth::Vertex { access_token, project_id } => client
+                .post(format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model}:generateContent"))
+                .bearer_auth(access_token),
+        };
+        fallback_request.json(&json!({
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
+        })).send().map_err(|error| format!("Could not reach Gemini: {error}"))?
+    } else { response };
     let status = response.status();
     let body: serde_json::Value = response
         .json()
@@ -2909,6 +3383,7 @@ fn request_gemini_image_with_source(
     source_bytes: &[u8],
     mime_type: &str,
     mask_bytes: Option<&[u8]>,
+    aspect_ratio: &str,
 ) -> Result<(Vec<u8>, &'static str), String> {
     let model = model.trim();
     if model.is_empty()
@@ -2919,13 +3394,16 @@ fn request_gemini_image_with_source(
         return Err("Gemini model name is invalid.".into());
     }
     let client = reqwest::blocking::Client::new();
-    let request = match auth {
-        GeminiAuth::ApiKey(api_key) => client
+    let (request, aspect_ratio, image_size) = match auth {
+        GeminiAuth::ApiKey(api_key) => (client
             .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"))
-            .header("x-goog-api-key", api_key),
-        GeminiAuth::Vertex { access_token, project_id } => client
-            .post(format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model}:generateContent"))
-            .bearer_auth(access_token),
+            .header("x-goog-api-key", api_key), aspect_ratio, "1K"),
+        GeminiAuth::Vertex { access_token, project_id } => {
+            let vertex_ratio = if aspect_ratio == "9:16" { "ASPECT_RATIO_9_16" } else { "ASPECT_RATIO_16_9" };
+            (client
+                .post(format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model}:generateContent"))
+                .bearer_auth(access_token), vertex_ratio, "IMAGE_SIZE_1K")
+        },
     };
     let mut parts = vec![
         json!({"inlineData": {"mimeType": mime_type, "data": base64::engine::general_purpose::STANDARD.encode(source_bytes)}}),
@@ -2936,11 +3414,28 @@ fn request_gemini_image_with_source(
     parts.push(json!({"text": prompt}));
     let response = request
         .json(&json!({
-            "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {"responseModalities": ["IMAGE"]}
+            "contents": [{"role": "user", "parts": parts.clone()}],
+            "generationConfig": {
+                "responseModalities": ["IMAGE"],
+                "responseFormat": {"image": {"aspectRatio": aspect_ratio, "imageSize": image_size}}
+            }
         }))
         .send()
         .map_err(|error| format!("Could not reach Gemini: {error}"))?;
+    let response = if response.status() == reqwest::StatusCode::BAD_REQUEST {
+        let fallback_request = match auth {
+            GeminiAuth::ApiKey(api_key) => client
+                .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"))
+                .header("x-goog-api-key", api_key),
+            GeminiAuth::Vertex { access_token, project_id } => client
+                .post(format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model}:generateContent"))
+                .bearer_auth(access_token),
+        };
+        fallback_request.json(&json!({
+            "contents": [{"role": "user", "parts": parts}],
+            "generationConfig": {"responseModalities": ["IMAGE"]}
+        })).send().map_err(|error| format!("Could not reach Gemini: {error}"))?
+    } else { response };
     parse_gemini_image_response(response)
 }
 
@@ -3359,9 +3854,27 @@ mod tests {
             "queued"
         );
         let claimed = repo.claim_job_item(&job.id).unwrap().unwrap();
-        repo.finish_job_item(&job.id, &claimed.0, Err("provider unavailable".into()))
+        let stopped = repo.set_image_job_status(&job.id, "stopped").unwrap();
+        assert_eq!(stopped.status, "stopped");
+        assert!(stopped.items.iter().all(|item| item.status == "stopped"));
+        repo.finish_job_item(&job.id, &claimed.0, Err("late provider response".into()))
             .unwrap();
-        assert_eq!(repo.get_image_job(&job.id).unwrap().failed_items, 1);
+        let after_late_result = repo.get_image_job(&job.id).unwrap();
+        assert_eq!(after_late_result.status, "stopped");
+        assert_eq!(after_late_result.failed_items, 0);
+        assert!(repo.claim_job_item(&job.id).unwrap().is_none());
+        let refreshed_plan = repo.get_visual_plan(&video.id).unwrap();
+        let group = &refreshed_plan.groups[0];
+        let prompt = repo.list_prompt_versions(&video.id, &group.id).unwrap()[0].clone();
+        let render_dir = temp.path().join("Projects").join(&channel.id).join(&video.id).join("renders").join(&group.id);
+        fs::create_dir_all(&render_dir).unwrap();
+        fs::write(render_dir.join("reset-test.png"), b"image").unwrap();
+        repo.insert_image_render("reset-render", &video.id, &group.id, 1, &prompt.id, "reset-test.png", &format!("renders/{}/reset-test.png", group.id), None, None, "generation").unwrap();
+        repo.build_timeline(&video.id).unwrap();
+        repo.reset_image_workflow(&video.id).unwrap();
+        let workspace = repo.get_image_workspace(&video.id).unwrap();
+        assert!(workspace.groups.iter().all(|group| group.prompt_versions.is_empty() && group.image_renders.is_empty() && group.educational_plan.is_none()));
+        assert!(repo.latest_image_job(&video.id).unwrap().is_none());
     }
 
     #[test]

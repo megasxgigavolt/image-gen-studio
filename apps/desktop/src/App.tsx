@@ -55,6 +55,7 @@ const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
   { stage: "inputs", label: "Production", icon: Upload },
   { stage: "images", label: "Images", icon: Image },
 ];
+const imageWorkspaceCache = new Map<string, ImageWorkspaceRecord>();
 
 function formatTime(seconds: number) {
   const minutes = Math.floor(seconds / 60);
@@ -401,7 +402,9 @@ function InputsView() {
     try {
       setAudio(await projectsClient.importBrowserAsset(activeVideoId, "audio", file));
       setStatus("Saved locally");
-    } catch (caught) { setError(String(caught)); }
+    } catch (caught) {
+      setError(String(caught));
+    }
   }
 
   async function importScript() {
@@ -409,7 +412,9 @@ function InputsView() {
       const text = await projectsClient.pickScriptText();
       if (text !== null) setScript(text);
       else scriptFileRef.current?.click();
-    } catch (caught) { setError(String(caught)); }
+    } catch (caught) {
+      setError(String(caught));
+    }
   }
 
   async function importBrowserScript(event: ChangeEvent<HTMLInputElement>) {
@@ -691,9 +696,9 @@ function mergeExtractedSettings(current: ImageSettings, extracted: Partial<Recor
 }
 
 function SettingSelect({ label, value, options, onChange }: { label: string; value: string; options: string[]; onChange: (value: string) => void }) {
-  const custom = value.startsWith("Custom: ") || !options.includes(value);
-  const customValue = value.startsWith("Custom: ") ? value.slice(8) : custom ? value : "";
-  return <label className="setting-control"><span>{label}</span>{custom ? <div className="custom-control"><input autoFocus value={customValue} placeholder={`Custom ${label.toLowerCase()}`} onChange={(event) => onChange(`Custom: ${event.target.value}`)} /><button type="button" onClick={() => onChange("Undefined")} title="Choose a preset">×</button></div> : <select value={value} onChange={(event) => onChange(event.target.value)}>{options.map((option) => <option key={option}>{option}</option>)}</select>}</label>;
+  const listId = `setting-${label.toLowerCase().replace(/\s+/g, "-")}`;
+  const displayValue = value.startsWith("Custom: ") ? value.slice(8) : value === "Custom..." ? "" : value;
+  return <label className="setting-control"><span>{label}</span><input list={listId} value={displayValue} placeholder={`Choose or type ${label.toLowerCase()}`} onChange={(event) => { const next = event.target.value; onChange(options.includes(next) ? next : `Custom: ${next}`); }} /><datalist id={listId}>{options.filter((option) => option !== "Custom...").map((option) => <option key={option} value={option} />)}</datalist></label>;
 }
 
 function ImagesView() {
@@ -719,19 +724,24 @@ function ImagesView() {
   const [editOpen, setEditOpen] = useState(false);
   const [brushSize, setBrushSize] = useState(36);
   const [eraseMask, setEraseMask] = useState(false);
+  const [editPanMode, setEditPanMode] = useState(false);
+  const [editZoom, setEditZoom] = useState(1);
+  const [editPan, setEditPan] = useState({ x: 0, y: 0 });
+  const panStartRef = useRef<{ x: number; y: number; originX: number; originY: number } | null>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement>(null);
   const paintingRef = useRef(false);
   const [zoomOpen, setZoomOpen] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [references, setReferences] = useState<import("./infrastructure/projects-client").InputAssetRecord[]>([]);
   const [bulkOpen, setBulkOpen] = useState(false);
-  const [bulkDiversity, setBulkDiversity] = useState(25);
+  const [visualStrategyMode, setVisualStrategyMode] = useState<import("./infrastructure/projects-client").VisualStrategyMode>("Auto Educational");
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null);
   const [preparingGroupIds, setPreparingGroupIds] = useState<Set<string>>(new Set());
   const [promptPrepStatus, setPromptPrepStatus] = useState<"running" | "paused" | null>(null);
   const promptPrepControl = useRef<"running" | "paused" | "stopped">("stopped");
   const promptPrepTask = useRef<{ items: ImageWorkspaceRecord["groups"]; index: number } | null>(null);
   const [referenceUrl, setReferenceUrl] = useState("");
+  const promptPrepSettingKey = activeVideoId ? `prompt_prep.${activeVideoId}` : "";
 
   const selectedGroup = useMemo(
     () => workspace?.groups.find((group) => group.group.id === selectedGroupId) ?? null,
@@ -747,18 +757,26 @@ function ImagesView() {
     start: selectedSentences[0].startSeconds,
     end: selectedSentences.at(-1)!.endSeconds,
   } : null;
+  const educationalPlan = selectedGroup?.educationalPlan ?? null;
 
   useEffect(() => {
     async function loadWorkspace() {
       if (!activeVideoId) return;
-      setLoading(true);
+      const cached = imageWorkspaceCache.get(activeVideoId);
+      if (cached) {
+        setWorkspace(cached);
+        setSelectedGroupId((current) => current ?? cached.groups[0]?.group.id ?? null);
+      }
+      setLoading(!cached);
       setError(null);
       try {
         const loaded = await projectsClient.getImageWorkspace(activeVideoId);
+        imageWorkspaceCache.set(activeVideoId, loaded);
         setWorkspace(loaded);
         setSelectedGroupId(loaded.groups[0]?.group.id ?? null);
         setImageSettings(parseImageSettings(loaded.settings.find((setting) => setting.key === "image_settings")?.value));
         setGeminiModel(loaded.settings.find((setting) => setting.key === "gemini_model")?.value ?? "gemini-3.1-flash-image");
+        setVisualStrategyMode((loaded.settings.find((setting) => setting.key === "visual_strategy_mode")?.value as import("./infrastructure/projects-client").VisualStrategyMode) ?? "Auto Educational");
         const [geminiStatus, openAiStatus, inputs] = await Promise.all([
           projectsClient.getProviderKeyStatus("gemini"),
           projectsClient.getProviderKeyStatus("openai"),
@@ -775,6 +793,22 @@ function ImagesView() {
         const latestRender = loaded.groups[0]?.imageRenders[0];
         setSelectedRenderId(latestRender?.id ?? null);
         setCompareRenderId(latestRender?.parentRenderId ?? loaded.groups[0]?.imageRenders[1]?.id ?? null);
+        const savedPrep = loaded.settings.find((setting) => setting.key === `prompt_prep.${activeVideoId}`)?.value;
+        if (savedPrep) {
+          try {
+            const saved = JSON.parse(savedPrep) as { status: string; index: number; strategyMode: import("./infrastructure/projects-client").VisualStrategyMode; settings: ImageSettings; styleDirective: string };
+            if (saved.status === "paused" && saved.index < loaded.groups.length) {
+              setVisualStrategyMode(saved.strategyMode);
+              setImageSettings(saved.settings);
+              setSystemPrompt(saved.styleDirective);
+              promptPrepTask.current = { items: loaded.groups, index: saved.index };
+              promptPrepControl.current = "paused";
+              setPromptPrepStatus("paused");
+              setBulkProgress({ current: saved.index, total: loaded.groups.length, label: "Prompt preparation paused — ready to resume" });
+              setPreparingGroupIds(new Set(loaded.groups.slice(saved.index).map((item) => item.group.id)));
+            }
+          } catch { /* Ignore malformed legacy preparation state. */ }
+        }
       } catch (caught) {
         setError(String(caught));
       } finally {
@@ -802,6 +836,7 @@ function ImagesView() {
     if (!activeVideoId) return;
     try {
       const loaded = await projectsClient.getImageWorkspace(activeVideoId);
+      imageWorkspaceCache.set(activeVideoId, loaded);
       setWorkspace(loaded);
       const selected = loaded.groups.find((group) => group.group.id === selectedGroupId);
       const newest = selected?.imageRenders[0];
@@ -819,22 +854,21 @@ function ImagesView() {
 
   async function createVersion() {
     if (!activeVideoId || !selectedGroupId) return;
-    setLoading(true);
-    setError(null);
+    const latest = selectedGroup?.promptVersions[0];
+    const style = systemPrompt || "Preserve a coherent visual style.";
+    if (!userPrompt.trim() || (latest?.userPrompt === userPrompt && latest?.systemPrompt === style && latest?.settingsJson === settingsJson)) return;
     try {
       const version = await projectsClient.createPromptVersion(
         activeVideoId,
         selectedGroupId,
         settingsJson,
-        systemPrompt || "Preserve a coherent visual style.",
+        style,
         userPrompt,
       );
       setActivePromptVersionId(version.id);
       await refreshWorkspace();
     } catch (caught) {
       setError(String(caught));
-    } finally {
-      setLoading(false);
     }
   }
 
@@ -927,50 +961,47 @@ function ImagesView() {
     setPromptPrepStatus("running");
     const task = promptPrepTask.current;
     try {
-      const varied = ["shotType", "cameraAngle", "lighting", "composition", "subjectDistance", "depthOfField", "backgroundComplexity"] as (keyof ImageSettings)[];
       for (; task.index < task.items.length; task.index++) {
         if (promptPrepControl.current !== "running") break;
         const index = task.index;
         const item = task.items[index];
-        const perStill = { ...imageSettings };
-        if (bulkDiversity > 0) {
-          const changes = Math.max(1, Math.round((bulkDiversity / 100) * 3));
-          for (let change = 0; change < changes; change++) {
-            const key = varied[(index + change * 3) % varied.length];
-            const values: Partial<Record<keyof ImageSettings, string[]>> = {
-              shotType: ["Close up","Medium shot","Wide shot","Establishing shot"],
-              cameraAngle: ["Eye level","Low angle","High angle","Top down"],
-              lighting: ["Soft natural","Cinematic","Dramatic","High contrast"],
-              composition: ["Centered subject","Rule of thirds","Negative space","Symmetrical"],
-              subjectDistance: ["Close","Medium","Far"],
-              depthOfField: ["Shallow","Medium","Deep"],
-              backgroundComplexity: ["Minimal","Environmental","Detailed"],
-            };
-            const choices = values[key];
-            if (choices) perStill[key] = choices[index % choices.length];
-          }
-        }
-        const narration = item.group.sentenceIds.map((id) => workspace?.sentences.find((sentence) => sentence.id === id)?.text ?? "").join(" ");
-        const signature = JSON.stringify({ perStill, style: systemPrompt, narration, kind: item.group.kind });
-        const storedSettings = (() => { try { return JSON.parse(item.promptVersions[0]?.settingsJson ?? "{}") as { _bulkSignature?: string }; } catch { return {}; } })();
-        setBulkProgress({ current: index, total: task.items.length, label: storedSettings._bulkSignature === signature ? `Reusing prompt for Still ${item.group.ordinal}` : `Generating prompt for Still ${item.group.ordinal}` });
-        if (storedSettings._bulkSignature !== signature) {
-          const perStillJson = JSON.stringify({ ...perStill, _bulkSignature: signature });
-          const prompt = await projectsClient.suggestImagePrompt(activeVideoId, item.group.id, perStillJson, systemPrompt);
-          await projectsClient.createPromptVersion(activeVideoId, item.group.id, perStillJson, systemPrompt || "Preserve a coherent visual style.", prompt);
+        setBulkProgress({ current: index, total: task.items.length, label: `Planning Still ${item.group.ordinal}` });
+        const planned = await projectsClient.planEducationalVisual(
+          activeVideoId, item.group.id, settingsJson, systemPrompt,
+        );
+        if (promptPrepControl.current !== "running") break;
+        const perStill = mergeExtractedSettings(imageSettings, planned.imageSettings);
+        const perStillJson = JSON.stringify({ ...perStill, _educationalPlanSignature: planned.planSignature });
+        const latest = item.promptVersions[0];
+        const latestMeta = (() => { try { return JSON.parse(latest?.settingsJson ?? "{}") as { _educationalPlanSignature?: string }; } catch { return {}; } })();
+        if (latestMeta._educationalPlanSignature !== planned.planSignature) {
+          const savedVersion = await projectsClient.createPromptVersion(activeVideoId, item.group.id, perStillJson, systemPrompt || "Preserve a coherent visual style.", planned.userPrompt);
           if (item.group.id === selectedGroupId) {
             setImageSettings(perStill);
-            setUserPrompt(prompt);
+            setUserPrompt(planned.userPrompt);
+            setActivePromptVersionId(savedVersion.id);
           }
         }
         const live = await projectsClient.getImageWorkspace(activeVideoId);
+        imageWorkspaceCache.set(activeVideoId, live);
         setWorkspace(live);
+        if (item.group.id === selectedGroupId) {
+          const livePrompt = live.groups.find((group) => group.group.id === item.group.id)?.promptVersions[0];
+          if (livePrompt) {
+            setImageSettings(parseImageSettings(livePrompt.settingsJson));
+            setUserPrompt(livePrompt.userPrompt);
+          }
+        }
         setPreparingGroupIds((current) => {
           const next = new Set(current);
           next.delete(item.group.id);
           return next;
         });
         setBulkProgress({ current: index + 1, total: task.items.length, label: `Prompt ready for Still ${item.group.ordinal}` });
+        if (promptPrepSettingKey) await projectsClient.saveAppSetting(promptPrepSettingKey, JSON.stringify({
+          status: "running", index: index + 1, strategyMode: visualStrategyMode,
+          settings: imageSettings, styleDirective: systemPrompt,
+        }));
       }
       const finalControl = promptPrepControl.current as "running" | "paused" | "stopped";
       if (finalControl === "running" && task.index >= task.items.length) {
@@ -981,15 +1012,29 @@ function ImagesView() {
         setPromptPrepStatus(null);
         setBulkProgress(null);
         setPreparingGroupIds(new Set());
+        if (promptPrepSettingKey) await projectsClient.saveAppSetting(promptPrepSettingKey, "");
       } else if (finalControl === "paused") {
         setPromptPrepStatus("paused");
+        if (promptPrepSettingKey) await projectsClient.saveAppSetting(promptPrepSettingKey, JSON.stringify({
+          status: "paused", index: task.index, strategyMode: visualStrategyMode,
+          settings: imageSettings, styleDirective: systemPrompt,
+        }));
       } else if (finalControl === "stopped") {
         setPromptPrepStatus(null);
         setBulkProgress(null);
         setPreparingGroupIds(new Set());
         promptPrepTask.current = null;
+        if (promptPrepSettingKey) await projectsClient.saveAppSetting(promptPrepSettingKey, "");
       }
-    } catch (caught) { setError(String(caught)); }
+    } catch (caught) {
+      setError(String(caught));
+      promptPrepControl.current = "paused";
+      setPromptPrepStatus("paused");
+      if (promptPrepSettingKey && promptPrepTask.current) await projectsClient.saveAppSetting(promptPrepSettingKey, JSON.stringify({
+        status: "paused", index: promptPrepTask.current.index, strategyMode: visualStrategyMode,
+        settings: imageSettings, styleDirective: systemPrompt,
+      }));
+    }
   }
 
   async function prepareBulkPrompts() {
@@ -997,12 +1042,16 @@ function ImagesView() {
     setError(null);
     await projectsClient.saveAppSetting("image_settings", settingsJson);
     await projectsClient.saveAppSetting("gemini_model", "gemini-3.1-flash-image");
-    await projectsClient.saveAppSetting("bulk_diversity", String(bulkDiversity));
+    await projectsClient.saveAppSetting("visual_strategy_mode", visualStrategyMode);
     setBulkOpen(false);
     setJob(null);
     setPreparingGroupIds(new Set(workspace.groups.map((item) => item.group.id)));
     setBulkProgress({ current: 0, total: workspace.groups.length, label: "Preparing prompts" });
     promptPrepTask.current = { items: workspace.groups, index: 0 };
+    if (promptPrepSettingKey) await projectsClient.saveAppSetting(promptPrepSettingKey, JSON.stringify({
+      status: "running", index: 0, strategyMode: visualStrategyMode,
+      settings: imageSettings, styleDirective: systemPrompt,
+    }));
     await runPromptPreparation();
   }
 
@@ -1010,9 +1059,16 @@ function ImagesView() {
     if (action === "pause") {
       promptPrepControl.current = "paused";
       setPromptPrepStatus("paused");
+      if (promptPrepSettingKey && promptPrepTask.current) void projectsClient.saveAppSetting(promptPrepSettingKey, JSON.stringify({
+        status: "paused", index: promptPrepTask.current.index, strategyMode: visualStrategyMode,
+        settings: imageSettings, styleDirective: systemPrompt,
+      }));
     } else if (action === "stop") {
       promptPrepControl.current = "stopped";
       setPromptPrepStatus(null);
+      setBulkProgress(null);
+      setPreparingGroupIds(new Set());
+      if (promptPrepSettingKey) void projectsClient.saveAppSetting(promptPrepSettingKey, "");
     } else if (promptPrepTask.current) {
       void runPromptPreparation();
     }
@@ -1023,9 +1079,12 @@ function ImagesView() {
     setLoading(true);
     setError(null);
     try {
-      setUserPrompt(await projectsClient.suggestImagePrompt(
-        activeVideoId, selectedGroupId, settingsJson, systemPrompt,
-      ));
+      const whole = await projectsClient.planWholeVideoEducationalVisuals(activeVideoId, settingsJson, systemPrompt, visualStrategyMode);
+      const planned = whole.plans.find((item) => item.visualPlanRowId === selectedGroupId);
+      if (!planned) throw new Error("The whole-video plan did not include the selected still.");
+      setUserPrompt(planned.userPrompt);
+      setImageSettings((current) => mergeExtractedSettings(current, planned.imageSettings));
+      await refreshWorkspace();
     } catch (caught) { setError(String(caught)); }
     finally { setLoading(false); }
   }
@@ -1165,6 +1224,37 @@ function ImagesView() {
     } catch (caught) { setError(String(caught)); }
   }
 
+  async function resetImages() {
+    if (!activeVideoId || !window.confirm("Clear all image prompts, image versions, planner results, and still statuses for this video? This cannot be undone.")) return;
+    setLoading(true);
+    setError(null);
+    try {
+      if (job && ["queued", "running", "paused"].includes(job.status)) {
+        await projectsClient.controlImageJob(job.id, "stop");
+      }
+      promptPrepControl.current = "stopped";
+      await projectsClient.resetImageWorkflow(activeVideoId);
+      imageWorkspaceCache.delete(activeVideoId);
+      setJob(null);
+      setBulkProgress(null);
+      setPromptPrepStatus(null);
+      setPreparingGroupIds(new Set());
+      setRenderUrls({});
+      setSelectedRenderId(null);
+      setActivePromptVersionId(null);
+      setUserPrompt("");
+      setSystemPrompt("");
+      const loaded = await projectsClient.getImageWorkspace(activeVideoId);
+      imageWorkspaceCache.set(activeVideoId, loaded);
+      setWorkspace(loaded);
+      setSelectedGroupId(loaded.groups[0]?.group.id ?? null);
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   function moveVersion(delta: number) {
     const index = imageRenders.findIndex((render) => render.id === selectedRenderId);
     const next = imageRenders[index + delta];
@@ -1207,9 +1297,9 @@ function ImagesView() {
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <div className="heading-actions"><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Final output folder</button><button className="secondary" onClick={() => void exportBundle()}><Download size={16} />Project bundle</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} />Bulk Gen Config</button></div>
+        <div className="heading-actions"><button className="secondary danger-action" onClick={() => void resetImages()} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Final output folder</button><button className="secondary" onClick={() => void exportBundle()}><Download size={16} />Project bundle</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} />Bulk Gen Config</button></div>
       </div>
-      {error && <div className="inline-error">{error}</div>}
+      {error && <div className="error-toast" role="alert"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
       {job && !bulkProgress && (
         <div className="job-status">
           <div><strong>Bulk job: {job.status}</strong><span>{job.completedItems}/{job.totalItems} completed · {job.failedItems} failed</span></div>
@@ -1234,7 +1324,7 @@ function ImagesView() {
               <div><strong>Still {group.group.ordinal}</strong>{group.imageRenders.length > 0 && <Check size={14} />}</div>
               <small>{(() => { const rows = group.group.sentenceIds.map((id) => workspace.sentences.find((s) => s.id === id)).filter(Boolean) as PlanSentenceRecord[]; return rows.length ? `${formatTime(rows[0].startSeconds)} – ${formatTime(rows.at(-1)!.endSeconds)}` : ""; })()}</small>
               <p>{group.group.sentenceIds.map((id) => workspace.sentences.find((s) => s.id === id)?.text).filter(Boolean).join(" ").slice(0, 72)}</p>
-              {(() => { const item = job?.items.find((candidate) => candidate.groupId === group.group.id); const status = group.imageRenders.length ? "Generated" : preparingGroupIds.has(group.group.id) ? "Preparing prompt" : item?.status === "running" ? "Generating" : item?.status === "failed" ? "Failed" : group.promptVersions[0] ? "Prompt ready" : "No prompt"; return <span className={`still-status ${status.toLowerCase().replace(" ","-")}`}>{status}</span>; })()}
+              {(() => { const item = job?.items.find((candidate) => candidate.groupId === group.group.id); const newestPrompt = group.promptVersions[0]; const newestRender = group.imageRenders[0]; const status = preparingGroupIds.has(group.group.id) ? "Preparing prompt" : item?.status === "running" ? "Generating" : item?.status === "failed" ? "Failed" : newestRender && newestPrompt && newestRender.promptVersionId !== newestPrompt.id ? "Outdated" : newestRender ? "Generated" : newestPrompt ? "Prompt ready" : "No prompt"; return <span className={`still-status ${status.toLowerCase().replace(" ","-")}`}>{status}</span>; })()}
             </button>
           ))}
           {!workspace && <div className="empty-state">Loading stills…</div>}
@@ -1262,11 +1352,17 @@ function ImagesView() {
           {tab === "prompt" ? (
             <>
               <div className="panel-section-heading"><h3>Scene prompt</h3><small>Still {selectedGroup?.group.ordinal ?? "—"}</small></div>
+              {educationalPlan && <div className="educational-plan-card">
+                <div><span>Educational objective</span><strong>{educationalPlan.educationalObjective}</strong></div>
+                <div><span>Visual intent</span><strong>{educationalPlan.visualIntent}</strong></div>
+                <div><span>Subject strategy</span><strong>{educationalPlan.subjectStrategy}</strong></div>
+              </div>}
               <label>
                 <span className="field-heading">User prompt</span>
                 <textarea className="production-copy"
                   value={userPrompt}
                   onChange={(event) => setUserPrompt(event.target.value)}
+                  onBlur={() => void createVersion()}
                   placeholder="Describe the scene that directly supports this narration."
                 />
               </label>
@@ -1276,21 +1372,19 @@ function ImagesView() {
                 <textarea className="production-copy"
                   value={systemPrompt}
                   onChange={(event) => setSystemPrompt(event.target.value)}
+                  onBlur={() => void createVersion()}
                   placeholder="Reusable visual style, medium, rendering, and color treatment."
                 />
               </label>
-              <button className="primary full" onClick={() => void createVersion()} disabled={!selectedGroupId || loading}>
-                Save prompt version
-              </button>
               <button className="primary full" onClick={() => void generateRender()} disabled={!selectedGroupId || !userPrompt.trim() || loading}>Generate Image</button>
               {promptVersions.length > 0 && (
                 <div className="version-history"><strong>Prompt versions</strong>
-                  {promptVersions.map((version) => (
+                  {promptVersions.slice(0, 5).map((version) => (
                     <div className="version-row" key={version.id}><button className={version.id === activePromptVersionId ? "active" : ""} onClick={() => selectVersion(version)}><span>v{version.version}</span><small>{new Date(version.createdAt).toLocaleString()}</small></button><button className="delete-version" onClick={() => void deletePromptVersion(version)} title="Delete prompt version"><Trash2 size={14} /></button></div>
                   ))}
                 </div>
               )}
-              {imageRenders.length > 0 && <div className="version-history"><strong>Image versions</strong>{imageRenders.map((render) => (
+              {imageRenders.length > 0 && <div className="version-history"><strong>Image versions</strong>{imageRenders.slice(0, 5).map((render) => (
                 <div className="version-row" key={render.id}>
                   <button type="button" className={render.id === selectedRenderId ? "active" : ""} onClick={() => selectRender(render)}>
                     <span>Version {render.version} · {render.kind}{render.isFinal ? " · Final" : ""}</span>
@@ -1354,14 +1448,18 @@ function ImagesView() {
       </div>}
       {editOpen && selectedRenderId && renderUrls[selectedRenderId] && <div className="modal-backdrop image-lightbox">
         <div className="edit-modal">
-          <div className="lightbox-toolbar"><strong>Edit / Inpaint</strong><button className={!eraseMask ? "active" : ""} onClick={() => setEraseMask(false)}>Brush mask</button><button className={eraseMask ? "active" : ""} onClick={() => setEraseMask(true)}>Erase mask</button><button onClick={clearMask}>Clear mask</button><button onClick={() => setEditOpen(false)}><X size={17} /></button></div>
+          <div className="lightbox-toolbar"><strong>Edit / Inpaint</strong><button className={eraseMask && !editPanMode ? "active" : ""} onClick={() => { setEraseMask((current) => !current); setEditPanMode(false); }}>{eraseMask ? "Paint mask" : "Erase mask"}</button><button className={editPanMode ? "active" : ""} onClick={() => setEditPanMode((current) => !current)}>Pan</button><button onClick={() => setEditZoom((value) => Math.max(.5, value - .25))}><ZoomOut size={16} /></button><button onClick={() => { setEditZoom(1); setEditPan({ x: 0, y: 0 }); }}>Fit</button><button onClick={() => setEditZoom((value) => Math.min(4, value + .25))}><ZoomIn size={16} /></button><button onClick={clearMask}>Clear mask</button><button onClick={() => setEditOpen(false)}><X size={17} /></button></div>
           <div className="edit-body">
-            <div className="mask-stage" style={{ backgroundImage: `url(${renderUrls[selectedRenderId]})` }}>
-              <canvas ref={maskCanvasRef} width={1280} height={720} onPointerDown={(event) => { paintingRef.current = true; event.currentTarget.setPointerCapture(event.pointerId); paintMask(event); }} onPointerMove={paintMask} onPointerUp={() => { paintingRef.current = false; }} />
+            <div className={editPanMode ? "mask-stage panning" : "mask-stage"} onPointerDown={(event) => { if (editPanMode) panStartRef.current = { x: event.clientX, y: event.clientY, originX: editPan.x, originY: editPan.y }; }} onPointerMove={(event) => { const start = panStartRef.current; if (editPanMode && start) setEditPan({ x: start.originX + event.clientX - start.x, y: start.originY + event.clientY - start.y }); }} onPointerUp={() => { panStartRef.current = null; }}>
+              <div className={`mask-transform ${imageSettings.aspectRatio === "9:16" ? "portrait" : ""}`} style={{ transform: `translate(${editPan.x}px, ${editPan.y}px) scale(${editZoom})` }}>
+                <img src={renderUrls[selectedRenderId]} alt="Source image for editing" />
+                <canvas ref={maskCanvasRef} width={imageSettings.aspectRatio === "9:16" ? 720 : 1280} height={imageSettings.aspectRatio === "9:16" ? 1280 : 720} onPointerDown={(event) => { if (editPanMode) return; paintingRef.current = true; event.currentTarget.setPointerCapture(event.pointerId); paintMask(event); }} onPointerMove={(event) => { if (!editPanMode) paintMask(event); }} onPointerUp={() => { paintingRef.current = false; }} />
+              </div>
             </div>
             <aside>
-              <p>Paint only the area you want changed. Gemini uses the source image plus this mask as visual context and is instructed to preserve everything else.</p>
+              <p>Paint only the area you want changed. Gemini receives the source image, mask image, and instruction together. Its API does not expose a dedicated mask parameter, so preservation is enforced through visual context and strict edit rules.</p>
               <label>Brush size<input type="range" min="8" max="140" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} /></label>
+              <button className="secondary full clear-mask-action" type="button" onClick={clearMask}>Clear painted mask</button>
               <label>Edit instruction<textarea value={editInstruction} onChange={(event) => setEditInstruction(event.target.value)} placeholder="Describe the exact localized change." /></label>
               <label>Edit Strength<select value={editStrength} onChange={(event) => setEditStrength(event.target.value)}><option>Low</option><option>Medium</option><option>High</option></select></label>
               <button className="primary full" onClick={() => void editSelectedRender()} disabled={!editInstruction.trim() || loading}>Apply Edit</button>
@@ -1376,9 +1474,9 @@ function ImagesView() {
           <>
             <label>Style Directive<textarea value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} /></label>
             <div className="reference-manager"><button className="secondary" onClick={() => void importReference()}>Upload reference image</button>{references.map((reference) => <button className="secondary" key={reference.id} onClick={() => void extractStyle(reference.id)}><Sparkles size={14} />Extract Style · {reference.originalName}</button>)}</div>
-            <label className="diversity-control"><span>Diversity</span><strong>{bulkDiversity}%</strong><input type="range" min="0" max="100" value={bulkDiversity} onChange={(event) => setBulkDiversity(Number(event.target.value))} /></label>
-            <p>Bulk settings use the current image settings. Diversity varies framing factors only; aspect ratio, core style, identity, and realism remain fixed.</p>
-            <button className="primary full" onClick={() => void prepareBulkPrompts()}>Save & Generate Prompts</button>
+            <label className="strategy-mode-control"><span>Visual Strategy Mode</span><select value={visualStrategyMode} onChange={(event) => setVisualStrategyMode(event.target.value as import("./infrastructure/projects-client").VisualStrategyMode)}><option value="Auto Educational">Auto · Educational</option><option>Storytelling</option><option>Documentary</option><option>Scientific</option><option>Infographic Heavy</option></select><small>AI chooses visual types based on educational purpose while maintaining consistent style.</small></label>
+            <div className="planner-explainer"><strong>Educational Visual Planner</strong><span>Each still is planned by teaching objective, visual intent, and subject strategy. Camera settings are chosen afterward to support the lesson.</span></div>
+            <button className="primary full" onClick={() => void prepareBulkPrompts()}>Plan Visuals & Generate Prompts</button>
           </>
           <button className="secondary full" onClick={() => setBulkOpen(false)}>Cancel</button>
         </div>

@@ -95,6 +95,7 @@ export type ProviderKeyStatusRecord = {
 
 export type ImageWorkspaceGroupRecord = {
   group: PlanGroupRecord;
+  educationalPlan: EducationalVisualPlanRecord | null;
   promptVersions: PromptVersionRecord[];
   imageRenders: ImageRenderRecord[];
 };
@@ -104,6 +105,26 @@ export type ImageWorkspaceRecord = {
   sentences: PlanSentenceRecord[];
   groups: ImageWorkspaceGroupRecord[];
   settings: AppSettingRecord[];
+};
+export type EducationalVisualPlanRecord = {
+  stillId: string;
+  visualPlanRowId: string;
+  educationalObjective: string;
+  visualIntent: string;
+  subjectStrategy: string;
+  imageSettings: Partial<Record<string, string>>;
+  userPrompt: string;
+  planSignature: string;
+  visualStrategyMode: VisualStrategyMode;
+  plannerVersion: string;
+  createdAt: string;
+  updatedAt: string;
+};
+export type VisualStrategyMode = "Auto Educational" | "Storytelling" | "Documentary" | "Scientific" | "Infographic Heavy";
+export type WholeVideoEducationalPlanRecord = {
+  strategyMode: VisualStrategyMode;
+  plannerVersion: string;
+  plans: EducationalVisualPlanRecord[];
 };
 export type StyleExtractionRecord = { styleDirective: string; imageSettings: Partial<Record<string, string>> };
 
@@ -262,7 +283,7 @@ export const projectsClient = {
     return {
       videoId,
       sentences: plan.sentences,
-      groups: plan.groups.map((group) => ({ group, promptVersions: [], imageRenders: [] })),
+      groups: plan.groups.map((group) => ({ group, educationalPlan: null, promptVersions: [], imageRenders: [] })),
       settings: [],
     };
   },
@@ -439,6 +460,9 @@ export const projectsClient = {
   async deleteImageRender(renderId: string): Promise<void> {
     if (isTauri()) return invoke("delete_image_render", { renderId });
   },
+  async resetImageWorkflow(videoId: string): Promise<void> {
+    if (isTauri()) return invoke("reset_image_workflow", { videoId });
+  },
   async suggestImagePrompt(
     videoId: string,
     groupId: string,
@@ -450,6 +474,24 @@ export const projectsClient = {
     const group = plan.groups.find((item) => item.id === groupId);
     const text = group?.sentenceIds.map((sentenceId) => plan.sentences.find((sentence) => sentence.id === sentenceId)?.text).filter(Boolean).join(" ");
     return `Create a direct visual depiction of: ${text ?? "this narration"}.`;
+  },
+  async planEducationalVisual(
+    videoId: string,
+    groupId: string,
+    settingsJson: string,
+    styleDirective: string,
+  ): Promise<EducationalVisualPlanRecord> {
+    if (isTauri()) return invoke("plan_educational_visual", { videoId, groupId, settingsJson, styleDirective });
+    throw new Error("Educational visual planning requires the native application.");
+  },
+  async planWholeVideoEducationalVisuals(
+    videoId: string,
+    settingsJson: string,
+    styleDirective: string,
+    strategyMode: VisualStrategyMode,
+  ): Promise<WholeVideoEducationalPlanRecord> {
+    if (isTauri()) return invoke("plan_whole_video_educational_visuals", { videoId, settingsJson, styleDirective, strategyMode });
+    throw new Error("Whole-video educational planning requires the native application.");
   },
   async extractReferenceStyle(assetId: string): Promise<StyleExtractionRecord> {
     if (isTauri()) return invoke("extract_reference_style", { assetId });

@@ -3833,7 +3833,8 @@ fn request_openai_style(api_key: &str, mime: &str, bytes: &[u8]) -> Result<Style
 fn gemini_generatecontent_url(auth: &GeminiAuth, model: &str) -> String {
     match auth {
         GeminiAuth::ApiKey(_) => format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"),
-        GeminiAuth::Vertex { project_id, .. } => format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model}:generateContent"),
+        // Imagen models are served from global; Gemini text/vision models require a regional endpoint.
+        GeminiAuth::Vertex { project_id, .. } => format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/us-central1/publishers/google/models/{model}:generateContent"),
     }
 }
 

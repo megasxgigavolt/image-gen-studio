@@ -3855,8 +3855,11 @@ fn gemini_client_request(client: &reqwest::blocking::Client, auth: &GeminiAuth, 
 }
 
 fn gemini_extract_text(body: &serde_json::Value) -> Option<String> {
-    body.pointer("/candidates/0/content/parts/0/text")
-        .and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+    let parts = body.pointer("/candidates/0/content/parts")?.as_array()?;
+    let text: String = parts.iter()
+        .filter_map(|p| p.get("text").and_then(|v| v.as_str()))
+        .collect();
+    if text.trim().is_empty() { None } else { Some(text) }
 }
 
 fn request_gemini_text(auth: &GeminiAuth, prompt: &str) -> Result<String, String> {
@@ -3864,7 +3867,7 @@ fn request_gemini_text(auth: &GeminiAuth, prompt: &str) -> Result<String, String
     let response = gemini_client_request(&client, auth, gemini_text_model(auth))
         .json(&json!({
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 2000}
+            "generationConfig": {"maxOutputTokens": 4000, "responseMimeType": "application/json"}
         }))
         .send().map_err(|e| format!("Could not reach Gemini: {e}"))?;
     let status = response.status();
@@ -3884,7 +3887,7 @@ fn request_gemini_vision(auth: &GeminiAuth, prompt: &str, mime: &str, bytes: &[u
                 {"inlineData": {"mimeType": mime, "data": image_data}},
                 {"text": prompt}
             ]}],
-            "generationConfig": {"maxOutputTokens": 900}
+            "generationConfig": {"maxOutputTokens": 2000, "responseMimeType": "application/json"}
         }))
         .send().map_err(|e| format!("Could not reach Gemini: {e}"))?;
     let status = response.status();
@@ -3906,7 +3909,7 @@ fn request_gemini_v2_plan(auth: &GeminiAuth, prompt: &str) -> Result<V2PlanChunk
         match gemini_client_request(&client, auth, model)
             .json(&json!({
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": 18000}
+                "generationConfig": {"maxOutputTokens": 18000, "responseMimeType": "application/json"}
             })).send() {
             Ok(r) => break r,
             Err(e) if attempt < 3 => {

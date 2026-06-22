@@ -3864,18 +3864,28 @@ fn gemini_extract_text(body: &serde_json::Value) -> Option<String> {
 
 fn request_gemini_text(auth: &GeminiAuth, prompt: &str) -> Result<String, String> {
     let client = reqwest::blocking::Client::new();
-    let response = gemini_client_request(&client, auth, gemini_text_model(auth))
-        .json(&json!({
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 4000, "responseMimeType": "application/json"}
-        }))
-        .send().map_err(|e| format!("Could not reach Gemini: {e}"))?;
-    let status = response.status();
-    let body: serde_json::Value = response.json().map_err(|e| format!("Gemini returned an unreadable response: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("Gemini error ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("request failed")));
+    for attempt in 0u32..3 {
+        let response = gemini_client_request(&client, auth, gemini_text_model(auth))
+            .json(&json!({
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 4000, "responseMimeType": "application/json"}
+            }))
+            .send().map_err(|e| format!("Could not reach Gemini: {e}"))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if attempt < 2 {
+                std::thread::sleep(std::time::Duration::from_secs(20 * 2_u64.pow(attempt)));
+                continue;
+            }
+            return Err("Gemini rate limit hit. Wait a minute and try again.".to_string());
+        }
+        let body: serde_json::Value = response.json().map_err(|e| format!("Gemini returned an unreadable response: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("Gemini error ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("request failed")));
+        }
+        return gemini_extract_text(&body).ok_or_else(|| "Gemini returned no text.".to_string());
     }
-    gemini_extract_text(&body).ok_or_else(|| "Gemini returned no text.".to_string())
+    Err("Gemini rate limit persists after retries.".to_string())
 }
 
 fn request_gemini_vision(auth: &GeminiAuth, prompt: &str, mime: &str, bytes: &[u8]) -> Result<String, String> {
@@ -3902,31 +3912,33 @@ fn request_gemini_v2_plan(auth: &GeminiAuth, prompt: &str) -> Result<V2PlanChunk
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build().map_err(|e| format!("Could not initialize Gemini client: {e}"))?;
-    let mut last_err = String::new();
     let model = gemini_text_model(auth);
-    let response = loop {
-        let attempt = last_err.matches("attempt").count();
-        match gemini_client_request(&client, auth, model)
+    for attempt in 0u32..4 {
+        let response = gemini_client_request(&client, auth, model)
             .json(&json!({
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {"maxOutputTokens": 18000, "responseMimeType": "application/json"}
-            })).send() {
-            Ok(r) => break r,
-            Err(e) if attempt < 3 => {
-                last_err.push_str(&format!(" attempt {attempt}: {e}"));
-                std::thread::sleep(std::time::Duration::from_secs(4 * 2_u64.pow(attempt as u32)));
+            }))
+            .send()
+            .map_err(|e| format!("Could not reach Gemini: {e}"))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if attempt < 3 {
+                let delay = 20 * 2_u64.pow(attempt); // 20s, 40s, 80s
+                std::thread::sleep(std::time::Duration::from_secs(delay));
+                continue;
             }
-            Err(e) => return Err(format!("Could not reach Gemini after retries: {e}")),
+            return Err("Gemini rate limit hit. Wait a minute and try again.".to_string());
         }
-    };
-    let status = response.status();
-    let body: serde_json::Value = response.json().map_err(|e| format!("Gemini returned unreadable response: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("Gemini bulk planning failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
+        let body: serde_json::Value = response.json().map_err(|e| format!("Gemini returned unreadable response: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("Gemini bulk planning failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
+        }
+        let text = gemini_extract_text(&body).ok_or("Gemini returned no bulk plan.")?;
+        let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+        return serde_json::from_str(cleaned).map_err(|e| format!("Gemini bulk plan was not valid JSON: {e}"));
     }
-    let text = gemini_extract_text(&body).ok_or("Gemini returned no bulk plan.")?;
-    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
-    serde_json::from_str(cleaned).map_err(|e| format!("Gemini bulk plan was not valid JSON: {e}"))
+    Err("Gemini rate limit persists after retries.".to_string())
 }
 
 fn request_gemini_image(

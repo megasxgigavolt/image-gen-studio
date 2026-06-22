@@ -57,6 +57,7 @@ const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
   { stage: "images", label: "Images", icon: Image },
 ];
 const imageWorkspaceCache = new Map<string, ImageWorkspaceRecord>();
+const lastSelectedStill = new Map<string, string>(); // videoId → groupId
 
 function formatTime(seconds: number) {
   const minutes = Math.floor(seconds / 60);
@@ -90,8 +91,8 @@ function Sidebar() {
           <button
             className={(itemStage === "inputs" ? ["inputs", "visual-plan"].includes(stage) : stage === itemStage) ? "nav-item active" : "nav-item"}
             key={itemStage}
-            onClick={() => setStage(itemStage === "inputs" && stage === "images" ? "visual-plan" : itemStage)}
-            disabled={(itemStage !== "home" && !activeVideoId) || (itemStage === "images" && stage === "inputs")}
+            onClick={() => setStage(itemStage)}
+            disabled={itemStage !== "home" && !activeVideoId}
           >
             <Icon size={18} />
             <span>{label}</span>
@@ -505,7 +506,7 @@ function InputsView() {
           <article className={ready ? "readiness ready" : "readiness"}><strong>{ready ? "Ready for visual planning" : "Source material incomplete"}</strong><span>{ready ? "Script and narration audio are available." : "Add a script and narration audio to continue."}</span></article>
         </div>
       </div>
-      <div className="footer-actions"><button className="secondary" onClick={() => setStage("home")}>Back</button><button className="primary" disabled={!ready || !activeVideoId || generating || (hasPlan && inputSignature === generatedInputSignature)} onClick={() => void generatePlan()}>{generating ? <><LoaderCircle className="spin" size={16} />Generating…</> : "Generate visual plan →"}</button></div>
+      <div className="footer-actions"><button className="secondary" onClick={() => setStage("home")}>Back</button>{hasPlan && inputSignature === generatedInputSignature ? <button className="primary" onClick={() => setStage("visual-plan")}>View visual plan →</button> : <button className="primary" disabled={!ready || !activeVideoId || generating} onClick={() => void generatePlan()}>{generating ? <><LoaderCircle className="spin" size={16} />Generating…</> : "Generate visual plan →"}</button>}</div>
     </section>
   );
 }
@@ -828,7 +829,11 @@ function ImagesView() {
       const cached = imageWorkspaceCache.get(activeVideoId);
       if (cached) {
         setWorkspace(cached);
-        setSelectedGroupId((current) => current ?? cached.groups[0]?.group.id ?? null);
+        setSelectedGroupId((current) => {
+          const restore = lastSelectedStill.get(activeVideoId);
+          if (restore && cached.groups.some((g) => g.group.id === restore)) return restore;
+          return current ?? cached.groups[0]?.group.id ?? null;
+        });
       }
       setLoading(!cached);
       setError(null);
@@ -836,7 +841,12 @@ function ImagesView() {
         const loaded = await projectsClient.getImageWorkspace(activeVideoId);
         imageWorkspaceCache.set(activeVideoId, loaded);
         setWorkspace(loaded);
-        setSelectedGroupId(loaded.groups[0]?.group.id ?? null);
+        setSelectedGroupId((current) => {
+          const restore = lastSelectedStill.get(activeVideoId);
+          if (restore && loaded.groups.some((g) => g.group.id === restore)) return restore;
+          if (current && loaded.groups.some((g) => g.group.id === current)) return current;
+          return loaded.groups[0]?.group.id ?? null;
+        });
         setImageSettings(parseImageSettings(loaded.settings.find((setting) => setting.key === "image_settings")?.value));
         setGeminiModel(loaded.settings.find((setting) => setting.key === "gemini_model")?.value ?? "gemini-3.1-flash-image");
         /* visual_strategy_mode is deprecated — planner now always uses Auto Educational */
@@ -989,7 +999,9 @@ function ImagesView() {
   }
 
   function selectGroup(groupId: string) {
+    setError(null);
     setSelectedGroupId(groupId);
+    if (activeVideoId) lastSelectedStill.set(activeVideoId, groupId);
     const latest = workspace?.groups.find((item) => item.group.id === groupId)?.promptVersions[0];
     setActivePromptVersionId(latest?.id ?? null);
     const globalDirective = workspace?.settings.find((s) => s.key === "system_prompt")?.value;

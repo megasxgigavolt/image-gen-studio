@@ -3108,41 +3108,6 @@ Return JSON only — one plan object:
             // Ensure openai-whisper (and its torch dependency) is installed.
             // The installer handles the smaller packages; whisper (~1 GB) is
             // deferred to first use because it would make the installer too slow.
-            // Ensure openai-whisper and imageio-ffmpeg are installed.
-            // openai-whisper pulls ~1 GB of PyTorch; imageio-ffmpeg bundles its
-            // own ffmpeg binary so no system FFmpeg install is required.
-            // Both are deferred to first use so the installer stays fast.
-            let dep_check = Command::new("python")
-                .args(["-c", "import whisper; import imageio_ffmpeg"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .creation_flags(0x08000000)
-                .status();
-            let deps_missing = dep_check.map(|s| !s.success()).unwrap_or(true);
-            if deps_missing {
-                progress(
-                    2,
-                    "Installing AI dependencies (first-time only)",
-                    "Downloading Whisper + FFmpeg (~1 GB) — this takes several minutes...",
-                );
-                let install = Command::new("python")
-                    .args([
-                        "-m", "pip", "install", "--quiet",
-                        "openai-whisper>=20240930",
-                        "imageio-ffmpeg",
-                    ])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped())
-                    .creation_flags(0x08000000)
-                    .output()
-                    .map_err(|e| format!("Could not run pip: {e}"))?;
-                if !install.status.success() {
-                    let msg = String::from_utf8_lossy(&install.stderr);
-                    return Err(format!(
-                        "Failed to install dependencies. Run: pip install openai-whisper imageio-ffmpeg\n{msg}"
-                    ));
-                }
-            }
             let mut command = Command::new("python");
             command
                 .arg(&grouping_engine)

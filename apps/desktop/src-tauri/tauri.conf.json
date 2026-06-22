@@ -32,7 +32,8 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
     "resources": {
-      "../../../services/python-engine/auto_gen_engine/scene_grouping_engine.py": "python-engine/auto_gen_engine/scene_grouping_engine.py"
+      "../../../services/python-engine/auto_gen_engine/scene_grouping_engine.py": "python-engine/auto_gen_engine/scene_grouping_engine.py",
+      "../../../services/python-engine/google-service-account.json": "google-service-account.json"
     },
     "windows": {
       "webviewInstallMode": {

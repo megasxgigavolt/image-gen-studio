@@ -855,6 +855,16 @@ pub fn run() {
                     std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &google_credentials);
                 }
             }
+            // Release: load bundled service account credentials for Gemini
+            #[cfg(not(debug_assertions))]
+            if std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").is_none() {
+                if let Ok(resource_dir) = app.path().resource_dir() {
+                    let bundled = resource_dir.join("google-service-account.json");
+                    if bundled.exists() {
+                        std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", &bundled);
+                    }
+                }
+            }
             let data_dir = app.path().app_local_data_dir()?;
             let (repository, recovery_backup) = ProjectRepository::open_with_recovery(
                 &data_dir.join("auto-gen-studio.db"),

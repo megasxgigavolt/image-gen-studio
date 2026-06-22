@@ -1457,7 +1457,7 @@ function ImagesView() {
                 <span className="field-heading">User Prompt</span>
                 <textarea className="production-copy" value={userPrompt} onChange={(event) => setUserPrompt(event.target.value)} onBlur={() => void createVersion()} placeholder="Describe the scene that directly supports this narration." />
               </label>
-              <button className="secondary full" onClick={() => void suggestPrompt()} disabled={!selectedGroupId || loading || !keyStatus.openai}><Sparkles size={15} />Suggest Prompt</button>
+              <button className="secondary full" onClick={() => void suggestPrompt()} disabled={!selectedGroupId || loading || !keyStatus.gemini}><Sparkles size={15} />Suggest Prompt</button>
               <label>
                 <span className="field-heading">Style Directive <small>Optional</small></span>
                 <textarea className="production-copy" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="Art style, rendering, color language, recurring subjects, visual consistency rules..." />

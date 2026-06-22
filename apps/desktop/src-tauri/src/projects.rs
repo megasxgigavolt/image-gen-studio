@@ -1559,8 +1559,7 @@ impl ProjectRepository {
         let start = members.first().map(|item| item.start_seconds).unwrap_or(0.0);
         let end = members.last().map(|item| item.end_seconds).unwrap_or(start);
         let voiceover = members.iter().map(|item| item.text.as_str()).collect::<Vec<_>>().join(" ");
-        let api_key = self.get_provider_key("openai")?
-            .ok_or("Add an OpenAI API key before suggesting prompts.")?;
+        let auth = self.gemini_auth()?;
         let request = format!(
             "Create one concise, production-ready image prompt for this narration still.\n\
              Voiceover: {voiceover}\nType: {}\nTimestamp: {:.1}-{:.1}s (duration {:.1}s)\n\
@@ -1569,7 +1568,7 @@ impl ProjectRepository {
              Be literal and hyper-relevant. Avoid generic cinematic filler, unrelated metaphors, random people or objects, overcrowding, and text in the image. Return only the prompt.",
             group.kind, start, end, end - start
         );
-        request_openai_text(&api_key, &request)
+        request_gemini_text(&auth, &request)
     }
 
     pub fn get_educational_visual_plan(
@@ -1621,8 +1620,7 @@ impl ProjectRepository {
                 return Ok(existing);
             }
         }
-        let api_key = self.get_provider_key("openai")?
-            .ok_or("Add an OpenAI API key before planning educational visuals.")?;
+        let auth = self.gemini_auth()?;
         let request = format!(
             r#"You are an Educational Visual Planner. Do not ask what image merely matches the sentence. Decide what image teaches the concept best.
 
@@ -1661,7 +1659,10 @@ Return JSON only:
 {{"educationalObjective":"...","visualIntent":"...","subjectStrategy":"...","imageSettings":{{...}},"userPrompt":"..."}}"#,
             group.kind, start, end
         );
-        let planned = request_openai_educational_plan(&api_key, &request)?;
+        let text = request_gemini_text(&auth, &request)?;
+        let cleaned_plan = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+        let planned: EducationalPlanResponse = serde_json::from_str(cleaned_plan)
+            .map_err(|e| format!("Educational plan was not valid JSON: {e}"))?;
         validate_educational_plan(&planned)?;
         let now = Utc::now().to_rfc3339();
         let still_id = self.get_educational_visual_plan(video_id, group_id)?
@@ -1725,8 +1726,7 @@ Return JSON only:
             "Infographic Heavy" => "Favor Textless Infographic, Scientific Diagram, Timeline, Comparison, Process Illustration, and Geographic Map.",
             _ => "Use this approximate whole-video distribution: Character Scene 30-40%; Behavioral Demonstration 10-15%; Close Detail 10-15%; Comparison 10-15%; Environmental Scene 5-10%; Object Focus 5-10%; Process Illustration 5-10%; Timeline 2-5%; Textless Infographic 2-8%; Scientific Diagram 2-8%; Geographic Map 0-5%; Concept Visualization 2-8%; Documentary Frame 5-15%.",
         };
-        let api_key = self.get_provider_key("openai")?
-            .ok_or("Add an OpenAI API key before planning educational visuals.")?;
+        let auth = self.gemini_auth()?;
         let mut planned_rows = Vec::with_capacity(rows.len());
         for (chunk_index, chunk) in rows.chunks(12).enumerate() {
             let prior_context = planned_rows.iter().rev().take(3).cloned().collect::<Vec<EducationalPlanResponse>>();
@@ -1786,10 +1786,13 @@ Return exactly one plan for every supplied row, in the same order."#,
                 serde_json::to_string_pretty(chunk).unwrap_or_default(),
                 serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
             );
-            let response = request_openai_whole_video_plan(&api_key, &request)?;
+            let text = request_gemini_text(&auth, &request)?;
+            let cleaned_wvp = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+            let response: WholeVideoPlanResponse = serde_json::from_str(cleaned_wvp)
+                .map_err(|e| format!("Whole-video plan was not valid JSON: {e}"))?;
             if response.plans.len() != chunk.len() {
                 return Err(format!(
-                    "OpenAI returned {} plans for planning batch {} ({} stills expected).",
+                    "Planner returned {} plans for batch {} ({} stills expected).",
                     response.plans.len(),
                     chunk_index + 1,
                     chunk.len()
@@ -2076,8 +2079,7 @@ You MUST return exactly one plan for every row in the current batch. Return JSON
     }
 
     pub fn suggest_still_prompt(&self, video_id: &str, group_id: &str, style_directive: &str, base_settings_json: &str) -> Result<BulkPlannedStill, String> {
-        let api_key = self.get_provider_key("openai")?
-            .ok_or("Add an OpenAI API key before suggesting a prompt.")?;
+        let auth = self.gemini_auth()?;
         let visual_plan = self.get_visual_plan(video_id)?;
         let group = visual_plan.groups.iter().find(|g| g.id == group_id)
             .ok_or("Still not found in visual plan.")?;
@@ -2126,14 +2128,14 @@ Return JSON only — one plan object:
             serde_json::to_string(&row).unwrap_or_default(),
             group.id,
         );
-        let text = request_openai_text(&api_key, &prompt)?;
+        let text = request_gemini_text(&auth, &prompt)?;
         let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
         let parsed: serde_json::Value = serde_json::from_str(cleaned)
-            .map_err(|e| format!("OpenAI suggestion was not valid JSON: {e}"))?;
+            .map_err(|e| format!("Prompt suggestion was not valid JSON: {e}"))?;
         let plan = parsed.pointer("/plans/0")
-            .ok_or("OpenAI returned no plan.")?;
+            .ok_or("No plan returned.")?;
         let response: V2PlanStillResponse = serde_json::from_value(plan.clone())
-            .map_err(|e| format!("OpenAI plan had unexpected structure: {e}"))?;
+            .map_err(|e| format!("Plan had unexpected structure: {e}"))?;
         Ok(BulkPlannedStill {
             visual_plan_row_id: response.visual_plan_row_id,
             ordinal: group.ordinal as i64,

@@ -63,19 +63,29 @@ except ImportError:
     pass
 
 
-# Fail immediately if required packages are missing so we don't waste time
-# running whisper for minutes before hitting an import error at the write step.
+# Check required packages. If any are missing, auto-install them using the
+# exact Python that's running this script (sys.executable) so we always
+# install to the right environment regardless of how Python was set up.
+# whisper is excluded here — it's a large optional install handled by setup.
 def _check_deps():
+    import subprocess as _sp
+    _required = [("openai", "openai"), ("pydantic", "pydantic"),
+                 ("xlsxwriter", "xlsxwriter"), ("imageio-ffmpeg", "imageio_ffmpeg")]
     missing = []
-    for pkg, mod in [("openai", "openai"), ("pydantic", "pydantic"),
-                     ("xlsxwriter", "xlsxwriter"), ("imageio-ffmpeg", "imageio_ffmpeg")]:
+    for pkg, mod in _required:
         try:
             __import__(mod)
         except ImportError:
             missing.append(pkg)
     if missing:
-        print(f"Error: Missing required packages. Run:\npip install {' '.join(missing)}", flush=True)
-        sys.exit(1)
+        print(f"Auto-installing missing packages: {' '.join(missing)}", flush=True)
+        result = _sp.run(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + missing,
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"Error: Could not install required packages.\nRun manually: pip install {' '.join(missing)}", flush=True)
+            sys.exit(1)
 
 _check_deps()
 

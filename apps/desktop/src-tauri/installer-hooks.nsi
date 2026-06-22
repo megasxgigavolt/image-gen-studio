@@ -23,14 +23,18 @@
     ${EndIf}
   ${EndIf}
 
-  ; ── All Python packages ───────────────────────────────────────────────────
-  ; openai-whisper pulls PyTorch (~1 GB). imageio-ffmpeg bundles its own
-  ; ffmpeg binary so no separate FFmpeg install is needed.
-  ; This step can take several minutes on a fresh machine.
-  DetailPrint "Installing Python packages (Whisper AI + FFmpeg included)..."
-  DetailPrint "This may take several minutes on first install — please wait..."
-  nsExec::ExecToLog '"python" "-m" "pip" "install" "--upgrade" "openai>=1.68" "pydantic>=2.10" "python-dotenv>=1.0" "xlsxwriter>=3.2" "openai-whisper>=20240930" "imageio-ffmpeg"'
+  ; ── Python packages ───────────────────────────────────────────────────────
+  ; Check if all packages are already importable — if so, skip pip entirely.
+  DetailPrint "Checking Python packages..."
+  nsExec::ExecToLog '"python" "-c" "import openai, pydantic, dotenv, xlsxwriter, whisper, imageio_ffmpeg"'
   Pop $R0
+  ${If} $R0 != 0
+    DetailPrint "Installing Python packages (may take several minutes on first install)..."
+    nsExec::ExecToLog '"python" "-m" "pip" "install" "openai>=1.68" "pydantic>=2.10" "python-dotenv>=1.0" "xlsxwriter>=3.2" "openai-whisper>=20240930" "imageio-ffmpeg"'
+    Pop $R0
+  ${Else}
+    DetailPrint "Python packages already installed — skipping."
+  ${EndIf}
 
   ; ── Set up FFmpeg alias ────────────────────────────────────────────────────
   ; imageio-ffmpeg ships a versioned binary (ffmpeg-win64-vX.exe), not ffmpeg.exe.

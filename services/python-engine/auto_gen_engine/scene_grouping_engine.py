@@ -63,6 +63,23 @@ except ImportError:
     pass
 
 
+# Fail immediately if required packages are missing so we don't waste time
+# running whisper for minutes before hitting an import error at the write step.
+def _check_deps():
+    missing = []
+    for pkg, mod in [("openai", "openai"), ("pydantic", "pydantic"),
+                     ("xlsxwriter", "xlsxwriter"), ("imageio-ffmpeg", "imageio_ffmpeg")]:
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        print(f"Error: Missing required packages. Run:\npip install {' '.join(missing)}", flush=True)
+        sys.exit(1)
+
+_check_deps()
+
+
 # FFmpeg discovery: imageio-ffmpeg → winget fallback → system PATH
 # imageio-ffmpeg ships a versioned binary (e.g. ffmpeg-win64-v7.1.exe), NOT
 # ffmpeg.exe, so we copy it once to a stable location named ffmpeg.exe and

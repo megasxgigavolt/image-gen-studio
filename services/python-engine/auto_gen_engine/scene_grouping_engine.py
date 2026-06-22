@@ -63,15 +63,23 @@ except ImportError:
     pass
 
 
-# FFmpeg discovery: imageio-ffmpeg bundled binary → winget fallback → system PATH
+# FFmpeg discovery: imageio-ffmpeg → winget fallback → system PATH
+# imageio-ffmpeg ships a versioned binary (e.g. ffmpeg-win64-v7.1.exe), NOT
+# ffmpeg.exe, so we copy it once to a stable location named ffmpeg.exe and
+# add that directory to PATH so whisper can find it.
 import shutil as _shutil
 if not _shutil.which("ffmpeg"):
     try:
         import imageio_ffmpeg as _imageio_ffmpeg
-        _ffmpeg_dir = str(Path(_imageio_ffmpeg.get_ffmpeg_exe()).parent)
-        os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
-    except ImportError:
-        # imageio-ffmpeg not installed yet; try common winget install locations
+        _ffmpeg_src = Path(_imageio_ffmpeg.get_ffmpeg_exe())
+        _ffmpeg_bin = Path(os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))) / "AutoGenStudio" / "bin"
+        _ffmpeg_bin.mkdir(parents=True, exist_ok=True)
+        _ffmpeg_exe = _ffmpeg_bin / "ffmpeg.exe"
+        if not _ffmpeg_exe.exists():
+            _shutil.copy2(str(_ffmpeg_src), str(_ffmpeg_exe))
+        os.environ["PATH"] = str(_ffmpeg_bin) + os.pathsep + os.environ.get("PATH", "")
+    except Exception:
+        # Fallback: winget install locations
         _winget_base = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/WinGet/Packages"
         for _candidate in _winget_base.glob("Gyan.FFmpeg_*/*/bin"):
             os.environ["PATH"] = str(_candidate) + os.pathsep + os.environ.get("PATH", "")

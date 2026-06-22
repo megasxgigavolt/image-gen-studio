@@ -38,6 +38,9 @@ Example:
 
 from __future__ import annotations
 
+import warnings
+warnings.filterwarnings("ignore")  # suppress FP16/CPU and other torch/whisper noise
+
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import difflib

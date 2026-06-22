@@ -3105,6 +3105,36 @@ Return JSON only — one plan object:
                     grouping_engine.display()
                 ));
             }
+            // Ensure openai-whisper (and its torch dependency) is installed.
+            // The installer handles the smaller packages; whisper (~1 GB) is
+            // deferred to first use because it would make the installer too slow.
+            let whisper_check = Command::new("python")
+                .args(["-c", "import whisper"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(0x08000000)
+                .status();
+            let whisper_missing = whisper_check.map(|s| !s.success()).unwrap_or(true);
+            if whisper_missing {
+                progress(
+                    2,
+                    "Installing Whisper AI (first-time only)",
+                    "Downloading ~1 GB — this takes several minutes...",
+                );
+                let install = Command::new("python")
+                    .args(["-m", "pip", "install", "--quiet", "openai-whisper>=20240930"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .creation_flags(0x08000000)
+                    .output()
+                    .map_err(|e| format!("Could not run pip: {e}"))?;
+                if !install.status.success() {
+                    let msg = String::from_utf8_lossy(&install.stderr);
+                    return Err(format!(
+                        "Failed to install openai-whisper. Run: pip install openai-whisper\n{msg}"
+                    ));
+                }
+            }
             let mut command = Command::new("python");
             command
                 .arg(&grouping_engine)
@@ -3176,13 +3206,37 @@ Return JSON only — one plan object:
             let status = child
                 .wait()
                 .map_err(|e| format!("Could not wait for visual-plan engine: {e}"))?;
-            let stderr = stderr_thread.join().unwrap_or_default();
+            let raw_stderr = stderr_thread.join().unwrap_or_default();
             if !status.success() {
-                return Err(format!(
-                    "Visual-plan engine failed. {}{}",
-                    output_lines.join("\n"),
-                    stderr
-                ));
+                // Strip tqdm progress bars, Python UserWarning blocks, and blank
+                // lines so the message shown to the user is concise and actionable.
+                let clean_stdout: Vec<&str> = output_lines
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|l| {
+                        !l.is_empty()
+                            && !l.chars().all(|c| "#|-% \t".contains(c))
+                            && !l.contains("iB/s")
+                            && !l.contains("eta 0:")
+                    })
+                    .collect();
+                let clean_stderr: Vec<&str> = raw_stderr
+                    .lines()
+                    .filter(|l| {
+                        !l.is_empty()
+                            && !l.contains("UserWarning")
+                            && !l.contains("warnings.warn")
+                            && !l.contains("FP16")
+                    })
+                    .collect();
+                let mut parts = clean_stdout.join("\n");
+                if !clean_stderr.is_empty() {
+                    if !parts.is_empty() {
+                        parts.push('\n');
+                    }
+                    parts.push_str(&clean_stderr.join("\n"));
+                }
+                return Err(format!("Visual-plan engine failed. {parts}"));
             }
             let audit_path = output_path.with_extension("json");
             let audit: serde_json::Value = serde_json::from_slice(

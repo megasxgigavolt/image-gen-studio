@@ -3833,8 +3833,16 @@ fn request_openai_style(api_key: &str, mime: &str, bytes: &[u8]) -> Result<Style
 fn gemini_generatecontent_url(auth: &GeminiAuth, model: &str) -> String {
     match auth {
         GeminiAuth::ApiKey(_) => format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"),
-        // Imagen models are served from global; Gemini text/vision models require a regional endpoint.
-        GeminiAuth::Vertex { project_id, .. } => format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/us-central1/publishers/google/models/{model}:generateContent"),
+        GeminiAuth::Vertex { project_id, .. } => format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model}:generateContent"),
+    }
+}
+
+// Returns the model to use for text/vision tasks. The project may only have
+// access to the image model (gemini-3.1-flash-image), which also handles text.
+fn gemini_text_model(auth: &GeminiAuth) -> &'static str {
+    match auth {
+        GeminiAuth::ApiKey(_) => "gemini-2.0-flash",
+        GeminiAuth::Vertex { .. } => "gemini-3.1-flash-image",
     }
 }
 
@@ -3853,7 +3861,7 @@ fn gemini_extract_text(body: &serde_json::Value) -> Option<String> {
 
 fn request_gemini_text(auth: &GeminiAuth, prompt: &str) -> Result<String, String> {
     let client = reqwest::blocking::Client::new();
-    let response = gemini_client_request(&client, auth, "gemini-2.0-flash")
+    let response = gemini_client_request(&client, auth, gemini_text_model(auth))
         .json(&json!({
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {"maxOutputTokens": 2000}
@@ -3870,7 +3878,7 @@ fn request_gemini_text(auth: &GeminiAuth, prompt: &str) -> Result<String, String
 fn request_gemini_vision(auth: &GeminiAuth, prompt: &str, mime: &str, bytes: &[u8]) -> Result<String, String> {
     let client = reqwest::blocking::Client::new();
     let image_data = base64::engine::general_purpose::STANDARD.encode(bytes);
-    let response = gemini_client_request(&client, auth, "gemini-2.0-flash")
+    let response = gemini_client_request(&client, auth, gemini_text_model(auth))
         .json(&json!({
             "contents": [{"role": "user", "parts": [
                 {"inlineData": {"mimeType": mime, "data": image_data}},
@@ -3892,9 +3900,10 @@ fn request_gemini_v2_plan(auth: &GeminiAuth, prompt: &str) -> Result<V2PlanChunk
         .timeout(std::time::Duration::from_secs(300))
         .build().map_err(|e| format!("Could not initialize Gemini client: {e}"))?;
     let mut last_err = String::new();
+    let model = gemini_text_model(auth);
     let response = loop {
         let attempt = last_err.matches("attempt").count();
-        match gemini_client_request(&client, auth, "gemini-2.0-flash")
+        match gemini_client_request(&client, auth, model)
             .json(&json!({
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {"maxOutputTokens": 18000}

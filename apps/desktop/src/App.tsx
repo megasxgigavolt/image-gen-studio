@@ -24,6 +24,7 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   DndContext,
   PointerSensor,
@@ -61,6 +62,19 @@ function formatTime(seconds: number) {
   const minutes = Math.floor(seconds / 60);
   const remainder = (seconds % 60).toFixed(1).padStart(4, "0");
   return `${String(minutes).padStart(2, "0")}:${remainder}`;
+}
+
+function TitleBar() {
+  const win = getCurrentWindow();
+  return (
+    <div className="titlebar" data-tauri-drag-region>
+      <span className="titlebar-title" data-tauri-drag-region>Auto Gen Studio</span>
+      <div className="titlebar-controls">
+        <button className="titlebar-btn minimize" onClick={() => void win.minimize()} aria-label="Minimize">&#8211;</button>
+        <button className="titlebar-btn close" onClick={() => void win.close()} aria-label="Close">&#10005;</button>
+      </div>
+    </div>
+  );
 }
 
 function Sidebar() {
@@ -1715,6 +1729,7 @@ export function App() {
   }, [activeVideoId]);
   return (
     <div className="app-shell">
+      <TitleBar />
       <Sidebar />
       <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
     </div>

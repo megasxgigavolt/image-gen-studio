@@ -68,11 +68,12 @@ function formatTime(seconds: number) {
 function TitleBar() {
   const win = getCurrentWindow();
   return (
-    <div className="titlebar" data-tauri-drag-region>
+    <div className="titlebar">
       <span className="titlebar-title" data-tauri-drag-region>Auto Gen Studio</span>
       <div className="titlebar-controls">
-        <button className="titlebar-btn minimize" onClick={() => void win.minimize()} aria-label="Minimize">&#8211;</button>
-        <button className="titlebar-btn close" onClick={() => void win.close()} aria-label="Close">&#10005;</button>
+        <button className="titlebar-btn minimize" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.minimize()} aria-label="Minimize">&#8211;</button>
+        <button className="titlebar-btn maximize" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.toggleMaximize()} aria-label="Maximize">&#9633;</button>
+        <button className="titlebar-btn close" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.close()} aria-label="Close">&#10005;</button>
       </div>
     </div>
   );
@@ -91,7 +92,7 @@ function Sidebar() {
           <button
             className={(itemStage === "inputs" ? ["inputs", "visual-plan"].includes(stage) : stage === itemStage) ? "nav-item active" : "nav-item"}
             key={itemStage}
-            onClick={() => setStage(itemStage)}
+            onClick={() => setStage(itemStage === "inputs" && stage === "images" ? "visual-plan" : itemStage)}
             disabled={itemStage !== "home" && !activeVideoId}
           >
             <Icon size={18} />
@@ -1171,7 +1172,7 @@ function ImagesView() {
     const total = workspace.groups.length;
     setBulkOpen(false);
     setBulkPlanLoading(true);
-    setBulkProgress({ current: 0, total, label: `Planning ${total} stills…` });
+    setBulkProgress({ current: 0, total: 0, label: `Planning ${total} stills with AI…` });
     setError(null);
     try {
       await projectsClient.saveAppSetting("system_prompt", systemPrompt);

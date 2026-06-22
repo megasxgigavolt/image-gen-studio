@@ -1564,14 +1564,14 @@ function ImagesView() {
           <div className="panel-section-heading" style={{marginTop:"4px"}}><h3>Style Directive</h3><small>Global visual style</small></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Describe overall cinematography and visual language. Avoid scene-specific details — the AI will handle those per still.</p>
           <textarea className="bulk-directive" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="e.g. Cinematic documentary style, shallow depth of field, warm color grade, soft natural lighting…" rows={4} />
-          <button className="secondary full" style={{marginTop:"6px"}} onClick={() => void extractImageSettingsFromDirective()} disabled={loading || !systemPrompt.trim() || !keyStatus.openai}><Sparkles size={14} />Readjust to global settings only</button>
+          <button className="secondary full" style={{marginTop:"6px"}} onClick={() => void extractImageSettingsFromDirective()} disabled={loading || !systemPrompt.trim() || !keyStatus.gemini}><Sparkles size={14} />Readjust to global settings only</button>
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Reference Image</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Upload a reference to extract visual style and populate the directive automatically.</p>
           <div className="reference-list bulk-ref-list">
             {references.map((reference) => (
               <div className="reference-item" key={reference.id}>
                 {referenceUrl ? <img src={referenceUrl} alt="Visual reference" /> : <span>IMG</span>}
-                <button onClick={() => void extractStyle(reference.id)}><Sparkles size={13} />Extract Style</button>
+                <button onClick={() => void extractStyle(reference.id)} disabled={loading || !keyStatus.gemini}><Sparkles size={13} />Extract Style</button>
                 <button onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button>
               </div>
             ))}
@@ -1580,7 +1580,7 @@ function ImagesView() {
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Any extra guidance the AI should follow when writing scene descriptions — e.g. "always include the orange cat", "show diversity in characters", "avoid close-ups on faces".</p>
           <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => setBulkInstruction(e.target.value)} placeholder="e.g. Use the same cartoon cat character across all stills. Show a diverse cast of people. Avoid showing text or labels in any scene." rows={3} />
-          <button className="primary full" style={{marginTop:"16px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length || !keyStatus.openai}>
+          <button className="primary full" style={{marginTop:"16px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length || !keyStatus.gemini}>
             {bulkPlanLoading ? "Planning…" : <><WandSparkles size={16} />Plan Video</>}
           </button>
           <button className="secondary full" style={{marginTop:"8px"}} onClick={() => setBulkOpen(false)}>Cancel</button>

@@ -1844,14 +1844,44 @@ Return exactly one plan for every supplied row, in the same order."#,
     }
 
     pub fn extract_image_settings_from_directive(&self, directive: &str) -> Result<StyleExtraction, String> {
-        let api_key = self.get_provider_key("openai")?
-            .ok_or("Add an OpenAI API key before extracting image settings.")?;
-        request_openai_directive_extract(&api_key, directive)
+        let auth = self.gemini_auth()?;
+        let prompt = format!(
+            r#"You are a visual production assistant. Your job is to clean up a Style Directive so it contains ONLY global visual style rules — nothing about specific subjects, characters, objects, or scene content.
+
+Style Directive to clean:
+{directive}
+
+WHAT TO KEEP in the cleaned styleDirective (global aesthetics that apply to every still):
+- Art style name / brand (e.g. "Pixar 3D animation", "photorealistic", "watercolor illustration")
+- Color palette description (e.g. "warm oranges and browns", "desaturated cool tones")
+- Color grading (e.g. "teal and orange", "vintage film grain", "high saturation")
+- Rendering quality / medium (e.g. "polished 3D render", "oil painting texture", "cel-shaded")
+- Detail level and texture rules (e.g. "highly detailed", "smooth surfaces", "grainy film look")
+- Global mood / atmosphere (e.g. "cozy and heartwarming", "dark and moody") — only if NOT tied to a specific scene subject
+- Genre or era style (e.g. "cyberpunk", "fantasy", "retro 1980s")
+- Lighting style as a global rule (e.g. "cinematic lighting overall", "soft diffused look") — only very general rules, not per-shot specifics
+- Visual consistency rules, brand rules, exclusion rules (e.g. "no text", "always soft shadows")
+
+WHAT TO REMOVE from the styleDirective (these go in the User Prompt per still, NOT here):
+- Any specific characters: named people, animals, creatures
+- Any physical descriptions of subjects
+- Any scene-specific content
+- Anything that answers "WHO is in the image" or "WHAT specific object/creature"
+
+Per-still structured fields to extract from imageSettings:
+Available fields: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, lensType, lightDirection, lightQuality, shadowType, contrast, focusType, exposure, motion, composition, saturation, vignette, grainIntensity, colorCastTint, surfaceEffects.
+Only populate imageSettings if the directive specifies a concrete per-shot value. Leave imageSettings as {{}} if nothing concrete is specified.
+
+Return JSON only — no markdown, no explanation:
+{{"styleDirective":"<global style rules only>","imageSettings":{{"<field>":"<value>"}}}}"#
+        );
+        let text = request_gemini_text(&auth, &prompt)?;
+        let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+        serde_json::from_str(cleaned).map_err(|_| "Style extraction was not valid JSON.".to_string())
     }
 
     pub fn plan_bulk_visuals<F: Fn(usize, usize)>(&self, video_id: &str, style_directive: &str, base_settings_json: &str, creative_instruction: &str, on_progress: F) -> Result<BulkPlanResult, String> {
-        let api_key = self.get_provider_key("openai")?
-            .ok_or("Add an OpenAI API key before bulk planning.")?;
+        let auth = self.gemini_auth()?;
         let visual_plan = self.get_visual_plan(video_id)?;
         if visual_plan.groups.is_empty() {
             return Err("No stills found. Generate a visual plan first.".into());
@@ -1969,7 +1999,7 @@ You MUST return exactly one plan for every row in the current batch. Return JSON
                 serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
                 serde_json::to_string_pretty(chunk).unwrap_or_default(),
             );
-            let response = request_openai_v2_plan(&api_key, &prompt)?;
+            let response = request_gemini_v2_plan(&auth, &prompt)?;
             let valid_count = {
                 let mut count = 0;
                 for (i, plan) in response.plans.iter().enumerate() {
@@ -1984,7 +2014,7 @@ You MUST return exactly one plan for every row in the current batch. Return JSON
             };
             if valid_count == 0 {
                 return Err(format!(
-                    "OpenAI returned no usable plans for stills {}-{} (batch {}). Please retry.",
+                    "No usable plans returned for stills {}-{} (batch {}). Please retry.",
                     next_to_plan + 1, chunk_end, chunk_index + 1
                 ));
             }
@@ -2177,9 +2207,11 @@ Return JSON only — one plan object:
         ).map_err(|e| e.to_string())?;
         let bytes = fs::read(self.projects_dir.join(channel_id).join(video_id).join(relative_path))
             .map_err(|_| "Reference image file is missing.".to_string())?;
-        let api_key = self.get_provider_key("openai")?
-            .ok_or("Add an OpenAI API key before extracting style.")?;
-        request_openai_style(&api_key, &media_type, &bytes)
+        let auth = self.gemini_auth()?;
+        let prompt = "Analyze this image as a reusable production style reference. Return only JSON with styleDirective (string describing art style, rendering, color language, recurring subjects, and visual consistency rules) and imageSettings (object with any of: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, lensType, lightDirection, lightQuality, shadowType, contrast, saturation, composition, motion — use only values strongly supported by the image).";
+        let text = request_gemini_vision(&auth, prompt, &media_type, &bytes)?;
+        let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+        serde_json::from_str(cleaned).map_err(|_| "Style analysis was not valid JSON.".to_string())
     }
 
     pub fn generate_image_render(
@@ -3794,6 +3826,92 @@ fn request_openai_style(api_key: &str, mime: &str, bytes: &[u8]) -> Result<Style
         .ok_or("OpenAI returned no style analysis.")?;
     let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
     serde_json::from_str(cleaned).map_err(|_| "OpenAI style analysis was not valid JSON.".to_string())
+}
+
+fn gemini_generatecontent_url(auth: &GeminiAuth, model: &str) -> String {
+    match auth {
+        GeminiAuth::ApiKey(_) => format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"),
+        GeminiAuth::Vertex { project_id, .. } => format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model}:generateContent"),
+    }
+}
+
+fn gemini_client_request(client: &reqwest::blocking::Client, auth: &GeminiAuth, model: &str) -> reqwest::blocking::RequestBuilder {
+    let url = gemini_generatecontent_url(auth, model);
+    match auth {
+        GeminiAuth::ApiKey(key) => client.post(url).header("x-goog-api-key", key),
+        GeminiAuth::Vertex { access_token, .. } => client.post(url).bearer_auth(access_token),
+    }
+}
+
+fn gemini_extract_text(body: &serde_json::Value) -> Option<String> {
+    body.pointer("/candidates/0/content/parts/0/text")
+        .and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+}
+
+fn request_gemini_text(auth: &GeminiAuth, prompt: &str) -> Result<String, String> {
+    let client = reqwest::blocking::Client::new();
+    let response = gemini_client_request(&client, auth, "gemini-2.0-flash")
+        .json(&json!({
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 2000}
+        }))
+        .send().map_err(|e| format!("Could not reach Gemini: {e}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().map_err(|e| format!("Gemini returned an unreadable response: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("Gemini error ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("request failed")));
+    }
+    gemini_extract_text(&body).ok_or_else(|| "Gemini returned no text.".to_string())
+}
+
+fn request_gemini_vision(auth: &GeminiAuth, prompt: &str, mime: &str, bytes: &[u8]) -> Result<String, String> {
+    let client = reqwest::blocking::Client::new();
+    let image_data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let response = gemini_client_request(&client, auth, "gemini-2.0-flash")
+        .json(&json!({
+            "contents": [{"role": "user", "parts": [
+                {"inlineData": {"mimeType": mime, "data": image_data}},
+                {"text": prompt}
+            ]}],
+            "generationConfig": {"maxOutputTokens": 900}
+        }))
+        .send().map_err(|e| format!("Could not reach Gemini: {e}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().map_err(|e| format!("Gemini returned an unreadable response: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("Gemini vision error ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("request failed")));
+    }
+    gemini_extract_text(&body).ok_or_else(|| "Gemini returned no vision analysis.".to_string())
+}
+
+fn request_gemini_v2_plan(auth: &GeminiAuth, prompt: &str) -> Result<V2PlanChunkResponse, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build().map_err(|e| format!("Could not initialize Gemini client: {e}"))?;
+    let mut last_err = String::new();
+    let response = loop {
+        let attempt = last_err.matches("attempt").count();
+        match gemini_client_request(&client, auth, "gemini-2.0-flash")
+            .json(&json!({
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 18000}
+            })).send() {
+            Ok(r) => break r,
+            Err(e) if attempt < 3 => {
+                last_err.push_str(&format!(" attempt {attempt}: {e}"));
+                std::thread::sleep(std::time::Duration::from_secs(4 * 2_u64.pow(attempt as u32)));
+            }
+            Err(e) => return Err(format!("Could not reach Gemini after retries: {e}")),
+        }
+    };
+    let status = response.status();
+    let body: serde_json::Value = response.json().map_err(|e| format!("Gemini returned unreadable response: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("Gemini bulk planning failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
+    }
+    let text = gemini_extract_text(&body).ok_or("Gemini returned no bulk plan.")?;
+    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    serde_json::from_str(cleaned).map_err(|e| format!("Gemini bulk plan was not valid JSON: {e}"))
 }
 
 fn request_gemini_image(

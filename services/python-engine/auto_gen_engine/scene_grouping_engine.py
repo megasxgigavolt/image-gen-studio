@@ -63,11 +63,19 @@ except ImportError:
     pass
 
 
-# Windows FFmpeg discovery for common winget installations.
-_FFMPEG_WINGET = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/WinGet/Packages"
-for _candidate in _FFMPEG_WINGET.glob("Gyan.FFmpeg_*/*/bin"):
-    if str(_candidate) not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = str(_candidate) + os.pathsep + os.environ.get("PATH", "")
+# FFmpeg discovery: imageio-ffmpeg bundled binary → winget fallback → system PATH
+import shutil as _shutil
+if not _shutil.which("ffmpeg"):
+    try:
+        import imageio_ffmpeg as _imageio_ffmpeg
+        _ffmpeg_dir = str(Path(_imageio_ffmpeg.get_ffmpeg_exe()).parent)
+        os.environ["PATH"] = _ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+    except ImportError:
+        # imageio-ffmpeg not installed yet; try common winget install locations
+        _winget_base = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft/WinGet/Packages"
+        for _candidate in _winget_base.glob("Gyan.FFmpeg_*/*/bin"):
+            os.environ["PATH"] = str(_candidate) + os.pathsep + os.environ.get("PATH", "")
+            break
 
 
 SENTENCE_END_RE = re.compile(r'[.!?]+[“\’”’)]*$')

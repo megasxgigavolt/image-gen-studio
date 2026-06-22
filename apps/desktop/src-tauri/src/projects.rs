@@ -3108,21 +3108,29 @@ Return JSON only — one plan object:
             // Ensure openai-whisper (and its torch dependency) is installed.
             // The installer handles the smaller packages; whisper (~1 GB) is
             // deferred to first use because it would make the installer too slow.
-            let whisper_check = Command::new("python")
-                .args(["-c", "import whisper"])
+            // Ensure openai-whisper and imageio-ffmpeg are installed.
+            // openai-whisper pulls ~1 GB of PyTorch; imageio-ffmpeg bundles its
+            // own ffmpeg binary so no system FFmpeg install is required.
+            // Both are deferred to first use so the installer stays fast.
+            let dep_check = Command::new("python")
+                .args(["-c", "import whisper; import imageio_ffmpeg"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .creation_flags(0x08000000)
                 .status();
-            let whisper_missing = whisper_check.map(|s| !s.success()).unwrap_or(true);
-            if whisper_missing {
+            let deps_missing = dep_check.map(|s| !s.success()).unwrap_or(true);
+            if deps_missing {
                 progress(
                     2,
-                    "Installing Whisper AI (first-time only)",
-                    "Downloading ~1 GB — this takes several minutes...",
+                    "Installing AI dependencies (first-time only)",
+                    "Downloading Whisper + FFmpeg (~1 GB) — this takes several minutes...",
                 );
                 let install = Command::new("python")
-                    .args(["-m", "pip", "install", "--quiet", "openai-whisper>=20240930"])
+                    .args([
+                        "-m", "pip", "install", "--quiet",
+                        "openai-whisper>=20240930",
+                        "imageio-ffmpeg",
+                    ])
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())
                     .creation_flags(0x08000000)
@@ -3131,7 +3139,7 @@ Return JSON only — one plan object:
                 if !install.status.success() {
                     let msg = String::from_utf8_lossy(&install.stderr);
                     return Err(format!(
-                        "Failed to install openai-whisper. Run: pip install openai-whisper\n{msg}"
+                        "Failed to install dependencies. Run: pip install openai-whisper imageio-ffmpeg\n{msg}"
                     ));
                 }
             }

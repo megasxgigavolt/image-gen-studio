@@ -1446,7 +1446,7 @@ impl ProjectRepository {
             .collect();
         for stale_id in stale_prompts {
             let used: bool = self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM image_renders WHERE prompt_version_id=?1)",
+                "SELECT EXISTS(SELECT 1 FROM image_renders WHERE prompt_version_id=?1 UNION ALL SELECT 1 FROM image_job_items WHERE prompt_version_id=?1)",
                 [&stale_id], |row| row.get(0),
             ).map_err(|e| e.to_string())?;
             if !used {
@@ -1473,6 +1473,13 @@ impl ProjectRepository {
         ).map_err(|e| e.to_string())?;
         if render_count > 0 {
             return Err("This prompt version is used by an image version. Delete that image version first.".into());
+        }
+        let job_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM image_job_items WHERE prompt_version_id=?1",
+            [prompt_version_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if job_count > 0 {
+            return Err("This prompt version is queued in an active bulk job. Stop the job before deleting.".into());
         }
         let deleted = self.connection.execute(
             "DELETE FROM prompt_versions WHERE id=?1", [prompt_version_id],

@@ -1891,185 +1891,562 @@ function ImagesView() {
   );
 }
 
+// ─── Thumbnail Editor types ──────────────────────────────────────────────────
+type TEditorTool = "eraser" | "text";
+type TxtStyle = {
+  fontFamily: string; fontSize: number; bold: boolean; italic: boolean;
+  color: string; opacity: number;
+  bgEnabled: boolean; bgColor: string; bgOpacity: number; bgPadding: number;
+  shadowEnabled: boolean; shadowColor: string; shadowBlur: number; shadowOffsetX: number; shadowOffsetY: number;
+  strokeEnabled: boolean; strokeColor: string; strokeWidth: number;
+  align: "left" | "center" | "right"; letterSpacing: number;
+  gradient: boolean; gradientColor2: string;
+};
+type TxtDraft = { dx: number; dy: number; cx: number; cy: number; text: string; scale: number };
+const THUMB_FONTS = ["Inter", "Arial", "Georgia", "Impact", "Verdana", "Courier New", "Times New Roman", "Comic Sans MS", "Trebuchet MS"];
+const DEFAULT_TXT: TxtStyle = {
+  fontFamily: "Inter", fontSize: 72, bold: false, italic: false,
+  color: "#ffffff", opacity: 1,
+  bgEnabled: false, bgColor: "#000000", bgOpacity: 0.5, bgPadding: 8,
+  shadowEnabled: false, shadowColor: "#000000", shadowBlur: 8, shadowOffsetX: 2, shadowOffsetY: 2,
+  strokeEnabled: false, strokeColor: "#000000", strokeWidth: 2,
+  align: "left", letterSpacing: 0,
+  gradient: false, gradientColor2: "#ff6b00",
+};
+
 function ThumbnailEditorPane() {
   const { addToast } = useAppStore();
-  const [sourceDataUrl, setSourceDataUrl] = useState<string | null>(null);
+  // Canvas refs
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const maskRef = useRef<HTMLCanvasElement>(null);
+  const erasing = useRef(false);
+  const masking = useRef(false);
+  const undoStack = useRef<ImageData[]>([]);
+  const redoStack = useRef<ImageData[]>([]);
+  // Core state
+  const [loaded, setLoaded] = useState(false);
   const [fileName, setFileName] = useState("thumbnail");
-  const [resultDataUrl, setResultDataUrl] = useState<string | null>(null);
-  const [instruction, setInstruction] = useState("");
-  const [editStrength, setEditStrength] = useState("Low");
-  const [aspectRatio, setAspectRatio] = useState("16:9");
+  const [ar, setAr] = useState<"16:9" | "9:16">("16:9");
+  const [edTab, setEdTab] = useState<"draw" | "ai">("draw");
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+  // Draw tool state
+  const [tool, setTool] = useState<TEditorTool>("eraser");
   const [brushSize, setBrushSize] = useState(36);
-  const [eraseMask, setEraseMask] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const maskCanvasRef = useRef<HTMLCanvasElement>(null);
-  const paintingRef = useRef(false);
+  const [txtStyle, setTxtStyle] = useState<TxtStyle>(DEFAULT_TXT);
+  const [draft, setDraft] = useState<TxtDraft | null>(null);
+  // AI edit state
+  const [mBrush, setMBrush] = useState(36);
+  const [mErase, setMErase] = useState(false);
+  const [instr, setInstr] = useState("");
+  const [strength, setStrength] = useState("Low");
+  const [result, setResult] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
 
+  const cw = ar === "9:16" ? 720 : 1280;
+  const ch = ar === "9:16" ? 1280 : 720;
+
+  // ── History ────────────────────────────────────────────────────────────────
+  function snap() {
+    const c = canvasRef.current; if (!c) return;
+    const ctx = c.getContext("2d"); if (!ctx) return;
+    undoStack.current.push(ctx.getImageData(0, 0, c.width, c.height));
+    if (undoStack.current.length > 25) undoStack.current.shift();
+    redoStack.current = [];
+    setCanUndo(true); setCanRedo(false);
+  }
+  function applySnapshot(from: ImageData[], to: ImageData[], setFrom: (v: boolean) => void, setTo: (v: boolean) => void) {
+    const c = canvasRef.current; if (!c || !from.length) return;
+    const ctx = c.getContext("2d"); if (!ctx) return;
+    to.push(ctx.getImageData(0, 0, c.width, c.height));
+    ctx.putImageData(from.pop()!, 0, 0);
+    setFrom(from.length > 0); setTo(true);
+  }
+  function undo() { applySnapshot(undoStack.current, redoStack.current, setCanUndo, setCanRedo); }
+  function redo() { applySnapshot(redoStack.current, undoStack.current, setCanRedo, setCanUndo); }
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const fn = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
+      if (e.key === "z" && e.shiftKey) { e.preventDefault(); redo(); }
+      if (e.key === "y") { e.preventDefault(); redo(); }
+    };
+    window.addEventListener("keydown", fn);
+    return () => window.removeEventListener("keydown", fn);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Image loading ──────────────────────────────────────────────────────────
   async function loadImage() {
     const picked = await projectsClient.pickThumbnailImage();
     if (!picked) return;
-    setSourceDataUrl(picked.dataUrl);
-    setResultDataUrl(null);
+    const c = canvasRef.current; if (!c) return;
+    const ctx = c.getContext("2d"); if (!ctx) return;
+    c.width = cw; c.height = ch;
+    const img = document.createElement("img");
+    img.onload = () => {
+      ctx.clearRect(0, 0, c.width, c.height);
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      undoStack.current = []; redoStack.current = [];
+      setCanUndo(false); setCanRedo(false);
+      setLoaded(true); setResult(null); setDraft(null);
+      clearMask();
+    };
+    img.src = picked.dataUrl;
     setFileName(picked.fileName.replace(/\.[^.]+$/, "") + "-edited");
-    clearMask();
+  }
+
+  function changeAr(newAr: "16:9" | "9:16") {
+    if (newAr === ar) return;
+    const nw = newAr === "9:16" ? 720 : 1280;
+    const nh = newAr === "9:16" ? 1280 : 720;
+    const c = canvasRef.current;
+    if (c && loaded) {
+      const snap64 = c.toDataURL("image/png");
+      const ctx = c.getContext("2d")!;
+      const img = document.createElement("img");
+      img.onload = () => { c.width = nw; c.height = nh; ctx.drawImage(img, 0, 0, nw, nh); clearMask(); };
+      img.src = snap64;
+      undoStack.current = []; redoStack.current = [];
+      setCanUndo(false); setCanRedo(false);
+    }
+    const m = maskRef.current;
+    if (m) { m.width = nw; m.height = nh; }
+    setAr(newAr);
+  }
+
+  // ── Eraser ─────────────────────────────────────────────────────────────────
+  function eraseAt(e: ReactPointerEvent<HTMLCanvasElement>) {
+    if (!erasing.current) return;
+    const c = e.currentTarget;
+    const r = c.getBoundingClientRect();
+    const x = (e.clientX - r.left) * c.width / r.width;
+    const y = (e.clientY - r.top) * c.height / r.height;
+    const ctx = c.getContext("2d")!;
+    ctx.globalCompositeOperation = "destination-out";
+    ctx.beginPath(); ctx.arc(x, y, brushSize / 2, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,1)"; ctx.fill();
+    ctx.globalCompositeOperation = "source-over";
+  }
+
+  // ── Text tool ──────────────────────────────────────────────────────────────
+  function handleCanvasClick(e: React.MouseEvent<HTMLCanvasElement>) {
+    if (tool !== "text" || edTab !== "draw") return;
+    const c = e.currentTarget;
+    const r = c.getBoundingClientRect();
+    const dx = e.clientX - r.left;
+    const dy = e.clientY - r.top;
+    setDraft({ dx, dy, cx: dx * c.width / r.width, cy: dy * c.height / r.height, text: "", scale: r.width / c.width });
+  }
+
+  function commitText() {
+    if (!draft) return;
+    if (!draft.text.trim()) { setDraft(null); return; }
+    const c = canvasRef.current; if (!c) return;
+    snap();
+    const ctx = c.getContext("2d")!;
+    const s = txtStyle;
+    ctx.save();
+    ctx.font = `${s.italic ? "italic " : ""}${s.bold ? "bold " : ""}${s.fontSize}px "${s.fontFamily}"`;
+    try { (ctx as unknown as { letterSpacing: string }).letterSpacing = `${s.letterSpacing}px`; } catch {}
+    ctx.textAlign = s.align;
+    ctx.textBaseline = "top";
+    ctx.globalAlpha = s.opacity;
+    const lh = s.fontSize * 1.3;
+    const lines = draft.text.split("\n");
+    // Background box
+    if (s.bgEnabled) {
+      const maxW = Math.max(...lines.map((l) => ctx.measureText(l).width));
+      const ox = s.align === "center" ? -maxW / 2 : s.align === "right" ? -maxW : 0;
+      const savedAlpha = ctx.globalAlpha;
+      ctx.globalAlpha = s.bgOpacity;
+      ctx.fillStyle = s.bgColor;
+      ctx.shadowColor = "transparent";
+      ctx.fillRect(draft.cx + ox - s.bgPadding, draft.cy - s.bgPadding, maxW + s.bgPadding * 2, lines.length * lh + s.bgPadding * 2);
+      ctx.globalAlpha = savedAlpha;
+    }
+    if (s.shadowEnabled) {
+      ctx.shadowColor = s.shadowColor; ctx.shadowBlur = s.shadowBlur;
+      ctx.shadowOffsetX = s.shadowOffsetX; ctx.shadowOffsetY = s.shadowOffsetY;
+    }
+    lines.forEach((line, i) => {
+      const y = draft.cy + i * lh;
+      if (s.strokeEnabled && s.strokeWidth > 0) {
+        ctx.shadowColor = "transparent";
+        ctx.strokeStyle = s.strokeColor; ctx.lineWidth = s.strokeWidth * 2; ctx.lineJoin = "round";
+        ctx.strokeText(line, draft.cx, y);
+        if (s.shadowEnabled) { ctx.shadowColor = s.shadowColor; ctx.shadowBlur = s.shadowBlur; ctx.shadowOffsetX = s.shadowOffsetX; ctx.shadowOffsetY = s.shadowOffsetY; }
+      }
+      if (s.gradient) {
+        const g = ctx.createLinearGradient(draft.cx, y, draft.cx, y + s.fontSize);
+        g.addColorStop(0, s.color); g.addColorStop(1, s.gradientColor2);
+        ctx.fillStyle = g;
+      } else {
+        ctx.fillStyle = s.color;
+      }
+      ctx.fillText(line, draft.cx, y);
+    });
+    ctx.restore();
+    setDraft(null);
+  }
+
+  // ── AI Edit (mask painting) ────────────────────────────────────────────────
+  function paintMask(e: ReactPointerEvent<HTMLCanvasElement>) {
+    if (!masking.current) return;
+    const c = e.currentTarget;
+    const r = c.getBoundingClientRect();
+    const x = (e.clientX - r.left) * c.width / r.width;
+    const y = (e.clientY - r.top) * c.height / r.height;
+    const ctx = c.getContext("2d")!;
+    ctx.globalCompositeOperation = mErase ? "destination-out" : "source-over";
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(x, y, mBrush / 2, 0, Math.PI * 2); ctx.fill();
+    ctx.globalCompositeOperation = "source-over";
+    c.dataset.painted = "true";
   }
 
   function clearMask() {
-    const canvas = maskCanvasRef.current;
-    if (canvas) {
-      canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
-      canvas.dataset.painted = "false";
-    }
-  }
-
-  function paintMask(event: ReactPointerEvent<HTMLCanvasElement>) {
-    if (!paintingRef.current) return;
-    const canvas = event.currentTarget;
-    const rect = canvas.getBoundingClientRect();
-    const x = (event.clientX - rect.left) * canvas.width / rect.width;
-    const y = (event.clientY - rect.top) * canvas.height / rect.height;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.globalCompositeOperation = eraseMask ? "destination-out" : "source-over";
-    ctx.fillStyle = "#fff";
-    ctx.beginPath();
-    ctx.arc(x, y, brushSize / 2, 0, Math.PI * 2);
-    ctx.fill();
-    canvas.dataset.painted = "true";
+    const m = maskRef.current; if (!m) return;
+    m.getContext("2d")?.clearRect(0, 0, m.width, m.height);
+    m.dataset.painted = "false";
   }
 
   async function applyEdit() {
-    if (!sourceDataUrl || !instruction.trim()) return;
-    setLoading(true);
-    setError(null);
+    const c = canvasRef.current; if (!c || !instr.trim()) return;
+    setBusy(true); setErr(null);
     try {
-      const canvas = maskCanvasRef.current;
-      const maskDataUrl = canvas?.dataset.painted === "true" ? canvas.toDataURL("image/png") : null;
-      const edited = await projectsClient.editThumbnailImage(
-        sourceDataUrl,
-        instruction.trim(),
-        maskDataUrl,
-        editStrength,
-        aspectRatio,
-      );
-      setResultDataUrl(edited);
-      addToast("Edit applied successfully.", "success");
-    } catch (caught) {
-      setError(String(caught));
-    } finally {
-      setLoading(false);
-    }
+      const src = c.toDataURL("image/png");
+      const m = maskRef.current;
+      const maskUrl = m?.dataset.painted === "true" ? m.toDataURL("image/png") : null;
+      const edited = await projectsClient.editThumbnailImage(src, instr.trim(), maskUrl, strength, ar);
+      setResult(edited);
+      addToast("Edit applied.", "success");
+    } catch (caught) { setErr(String(caught)); }
+    finally { setBusy(false); }
   }
 
-  async function saveResult() {
-    if (!resultDataUrl) return;
+  function useAsSource() {
+    if (!result) return;
+    const c = canvasRef.current; if (!c) return;
+    const ctx = c.getContext("2d")!;
+    const img = document.createElement("img");
+    img.onload = () => {
+      snap();
+      ctx.clearRect(0, 0, c.width, c.height);
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      setResult(null); clearMask();
+    };
+    img.src = result;
+  }
+
+  async function saveCanvas() {
+    const c = canvasRef.current; if (!c) return;
     try {
-      const saved = await projectsClient.saveThumbnailImage(resultDataUrl, `${fileName}.png`);
+      const dataUrl = result ?? c.toDataURL("image/png");
+      const saved = await projectsClient.saveThumbnailImage(dataUrl, `${fileName}.png`);
       if (saved) addToast(`Saved: ${saved}`, "success");
-    } catch (caught) {
-      setError(String(caught));
-    }
+    } catch (caught) { setErr(String(caught)); }
   }
 
-  function useResultAsSource() {
-    if (!resultDataUrl) return;
-    setSourceDataUrl(resultDataUrl);
-    setResultDataUrl(null);
-    clearMask();
-  }
-
-  const canvasWidth = aspectRatio === "9:16" ? 720 : 1280;
-  const canvasHeight = aspectRatio === "9:16" ? 1280 : 720;
-
+  // ── Render ─────────────────────────────────────────────────────────────────
+  const ts = txtStyle;
   return (
-    <div className="thumbnail-editor">
-      <div className="thumbnail-canvas-area">
-        {sourceDataUrl ? (
-          <div className={`thumb-frame ${aspectRatio === "9:16" ? "portrait" : ""}`}>
-            <img src={sourceDataUrl} alt="Source thumbnail" />
-            <canvas
-              ref={maskCanvasRef}
-              width={canvasWidth}
-              height={canvasHeight}
-              className="thumb-mask-canvas"
-              onPointerDown={(e) => { paintingRef.current = true; e.currentTarget.setPointerCapture(e.pointerId); paintMask(e); }}
-              onPointerMove={paintMask}
-              onPointerUp={() => { paintingRef.current = false; }}
-            />
-          </div>
-        ) : (
-          <div className="thumb-empty" onClick={() => void loadImage()}>
-            <Image size={36} />
-            <strong>Load an image to edit</strong>
-            <span>Click to pick a PNG, JPG, or WEBP file</span>
-          </div>
-        )}
-        {resultDataUrl && (
-          <div className={`thumb-frame result-frame ${aspectRatio === "9:16" ? "portrait" : ""}`}>
-            <span className="result-label">Result</span>
-            <img src={resultDataUrl} alt="Edited thumbnail" />
-          </div>
-        )}
+    <div className="thumb-root">
+      {/* Tab bar */}
+      <div className="thumb-tab-bar">
+        <button className={edTab === "draw" ? "thumb-tab active" : "thumb-tab"} onClick={() => setEdTab("draw")}>Draw &amp; Text</button>
+        <button className={edTab === "ai" ? "thumb-tab active" : "thumb-tab"} onClick={() => setEdTab("ai")}>AI Edit (Inpaint)</button>
       </div>
-      <aside className="thumbnail-controls">
-        <div className="thumb-section">
-          <strong>Source Image</strong>
-          <button className="secondary full" onClick={() => void loadImage()}><Upload size={15} />{sourceDataUrl ? "Replace image" : "Load image"}</button>
-          {sourceDataUrl && <button className="secondary full" style={{ marginTop: "6px" }} onClick={clearMask}>Clear painted mask</button>}
-        </div>
-        {sourceDataUrl && (
-          <>
-            <div className="thumb-section">
-              <strong>Aspect Ratio</strong>
-              <div className="thumb-ratio-toggle">
-                <button className={aspectRatio === "16:9" ? "active" : ""} onClick={() => setAspectRatio("16:9")}>16:9</button>
-                <button className={aspectRatio === "9:16" ? "active" : ""} onClick={() => setAspectRatio("9:16")}>9:16</button>
-              </div>
+      <div className="thumb-body">
+        {/* Canvas column */}
+        <div className="thumb-canvas-col">
+          {/* Draw toolbar */}
+          {edTab === "draw" && loaded && (
+            <div className="thumb-toolbar">
+              <button className="tbar-btn" onClick={undo} disabled={!canUndo} title="Undo (Ctrl+Z)"><Undo2 size={13} />Undo</button>
+              <button className="tbar-btn" onClick={redo} disabled={!canRedo} title="Redo (Ctrl+Shift+Z)"><Undo2 size={13} style={{ transform: "scaleX(-1)" }} />Redo</button>
+              <div className="tbar-sep" />
+              <button className={tool === "eraser" ? "tbar-btn active" : "tbar-btn"} onClick={() => { setTool("eraser"); setDraft(null); }} title="Eraser tool">✕ Erase</button>
+              <button className={tool === "text" ? "tbar-btn active" : "tbar-btn"} onClick={() => setTool("text")} title="Text tool">T&nbsp;Text</button>
             </div>
-            <div className="thumb-section">
-              <strong>Brush</strong>
-              <label style={{ fontSize: "11px", fontWeight: 600 }}>
-                Size — {brushSize}px
-                <input type="range" min="8" max="140" value={brushSize} onChange={(e) => setBrushSize(Number(e.target.value))} style={{ margin: "6px 0 0" }} />
-              </label>
-              <button className={`secondary full${eraseMask ? " active-mode" : ""}`} style={{ marginTop: "8px" }} onClick={() => setEraseMask((v) => !v)}>
-                {eraseMask ? "Mode: Erase" : "Mode: Paint"}
-              </button>
+          )}
+          {/* Canvas / empty state */}
+          {!loaded ? (
+            <div className="thumb-empty" onClick={() => void loadImage()}>
+              <Image size={36} />
+              <strong>Load an image to edit</strong>
+              <span>Click to pick a PNG, JPG, or WEBP file</span>
             </div>
-            <div className="thumb-section">
-              <strong>Edit Instruction</strong>
-              <textarea
-                className="thumb-instruction"
-                value={instruction}
-                onChange={(e) => setInstruction(e.target.value)}
-                placeholder="Describe exactly what to change in the painted area…"
-                rows={4}
+          ) : (
+            <div className="thumb-cv-area">
+            <div className="thumb-canvas-wrap" style={{ aspectRatio: ar === "9:16" ? "9/16" : "16/9" }}>
+              {/* Main canvas */}
+              <canvas
+                ref={canvasRef}
+                width={cw}
+                height={ch}
+                className={`thumb-main-cv${tool === "text" && edTab === "draw" ? " cv-text" : tool === "eraser" && edTab === "draw" ? " cv-erase" : ""}`}
+                onClick={handleCanvasClick}
+                onPointerDown={(e) => {
+                  if (tool !== "eraser" || edTab !== "draw") return;
+                  snap();
+                  erasing.current = true;
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  eraseAt(e);
+                }}
+                onPointerMove={eraseAt}
+                onPointerUp={() => { erasing.current = false; }}
               />
-              <label style={{ fontSize: "11px", fontWeight: 600, display: "grid", gap: "5px", marginTop: "8px" }}>
-                Edit Strength
-                <select value={editStrength} onChange={(e) => setEditStrength(e.target.value)} style={{ height: "38px", padding: "0 10px", border: "1px solid var(--line)", borderRadius: "6px", background: "var(--surface)", color: "var(--text)" }}>
-                  <option>Low</option>
-                  <option>Medium</option>
-                  <option>High</option>
-                </select>
-              </label>
+              {/* Mask overlay – AI tab only */}
+              <canvas
+                ref={maskRef}
+                width={cw}
+                height={ch}
+                className="thumb-mask-cv"
+                style={{ display: edTab === "ai" ? "block" : "none" }}
+                onPointerDown={(e) => { masking.current = true; e.currentTarget.setPointerCapture(e.pointerId); paintMask(e); }}
+                onPointerMove={paintMask}
+                onPointerUp={() => { masking.current = false; }}
+              />
+              {/* Text draft overlay */}
+              {draft && edTab === "draw" && (
+                <div className="txt-draft" style={{ left: draft.dx, top: draft.dy }}>
+                  <textarea
+                    autoFocus
+                    className="txt-draft-area"
+                    value={draft.text}
+                    onChange={(e) => setDraft((d) => d ? { ...d, text: e.target.value } : null)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") { e.stopPropagation(); setDraft(null); }
+                      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitText(); }
+                    }}
+                    rows={2}
+                    placeholder="Type text…"
+                    style={{
+                      fontFamily: ts.fontFamily,
+                      fontSize: `${Math.max(10, ts.fontSize * draft.scale)}px`,
+                      fontWeight: ts.bold ? "bold" : "normal",
+                      fontStyle: ts.italic ? "italic" : "normal",
+                      color: ts.color,
+                      textAlign: ts.align,
+                      letterSpacing: `${ts.letterSpacing * draft.scale}px`,
+                    }}
+                  />
+                  <div className="txt-draft-actions">
+                    <button className="tbar-btn" style={{ padding: "3px 10px", fontSize: "11px" }} onClick={commitText}>Place text</button>
+                    <span className="txt-draft-hint">Enter · Shift+Enter = newline · Esc = cancel</span>
+                  </div>
+                </div>
+              )}
             </div>
-            <div className="thumb-section">
-              {error && <div className="inline-error" style={{ marginBottom: "10px" }}>{error}<button type="button" style={{ float: "right", border: 0, background: "transparent", cursor: "pointer" }} onClick={() => setError(null)}>×</button></div>}
-              <button className="primary full" onClick={() => void applyEdit()} disabled={!instruction.trim() || loading}>
-                {loading ? <><LoaderCircle className="spin" size={15} />Applying edit…</> : <><Sparkles size={15} />Apply Edit</>}
-              </button>
-              {resultDataUrl && (
+            </div>
+          )}
+          {/* Result strip – AI tab */}
+          {result && edTab === "ai" && (
+            <div className="thumb-result-strip">
+              <div className="thumb-result-label">Result</div>
+              <img src={result} alt="Edited" className={`thumb-result-img${ar === "9:16" ? " portrait" : ""}`} />
+            </div>
+          )}
+        </div>
+
+        {/* ── Controls panel ───────────────────────────────────────────────── */}
+        <aside className="thumb-ctrl-panel">
+          {edTab === "draw" ? (
+            <div className="thumb-draw-ctrl">
+              {/* Image load */}
+              <div className="tcs">
+                <div className="tcs-label">Image</div>
+                <button className="secondary full" onClick={() => void loadImage()}><Upload size={14} />{loaded ? "Replace image" : "Load image"}</button>
+                {loaded && (
+                  <div className="tttoggle" style={{ marginTop: "8px" }}>
+                    <button className={ar === "16:9" ? "active" : ""} onClick={() => changeAr("16:9")}>16:9</button>
+                    <button className={ar === "9:16" ? "active" : ""} onClick={() => changeAr("9:16")}>9:16</button>
+                  </div>
+                )}
+              </div>
+              {loaded && (
                 <>
-                  <button className="secondary full" style={{ marginTop: "8px" }} onClick={() => void saveResult()}><Download size={15} />Save result</button>
-                  <button className="secondary full" style={{ marginTop: "6px" }} onClick={useResultAsSource}>Use result as source</button>
+                  {/* Tool selector */}
+                  <div className="tcs">
+                    <div className="tcs-label">Tool</div>
+                    <div className="tttoggle">
+                      <button className={tool === "eraser" ? "active" : ""} onClick={() => { setTool("eraser"); setDraft(null); }}>✕ Erase</button>
+                      <button className={tool === "text" ? "active" : ""} onClick={() => setTool("text")}>T Text</button>
+                    </div>
+                  </div>
+
+                  {/* Eraser controls */}
+                  {tool === "eraser" && (
+                    <div className="tcs">
+                      <div className="tcs-label">Brush Size — {brushSize}px</div>
+                      <input type="range" min="4" max="200" value={brushSize} onChange={(e) => setBrushSize(Number(e.target.value))} />
+                      <p className="tcs-note">Erased areas become transparent and are saved as PNG.</p>
+                    </div>
+                  )}
+
+                  {/* Text controls */}
+                  {tool === "text" && (
+                    <>
+                      <div className="tcs">
+                        <div className="tcs-label">Font</div>
+                        <select className="tsel" value={ts.fontFamily} onChange={(e) => setTxtStyle((s) => ({ ...s, fontFamily: e.target.value }))}>
+                          {THUMB_FONTS.map((f) => <option key={f} value={f} style={{ fontFamily: f }}>{f}</option>)}
+                        </select>
+                        <div className="trow" style={{ marginTop: "8px", gap: "6px", alignItems: "center" }}>
+                          <input type="number" min="8" max="600" value={ts.fontSize} onChange={(e) => setTxtStyle((s) => ({ ...s, fontSize: Number(e.target.value) }))} className="tnuminput" title="Size (px)" />
+                          <span className="tcs-note" style={{ margin: 0 }}>px</span>
+                          <button className={ts.bold ? "tfmtbtn active" : "tfmtbtn"} style={{ fontWeight: "bold" }} onClick={() => setTxtStyle((s) => ({ ...s, bold: !s.bold }))}>B</button>
+                          <button className={ts.italic ? "tfmtbtn active" : "tfmtbtn"} style={{ fontStyle: "italic" }} onClick={() => setTxtStyle((s) => ({ ...s, italic: !s.italic }))}>I</button>
+                        </div>
+                        <div className="trow" style={{ marginTop: "6px", gap: "4px" }}>
+                          {(["left", "center", "right"] as const).map((a) => (
+                            <button key={a} className={ts.align === a ? "tfmtbtn active" : "tfmtbtn"} onClick={() => setTxtStyle((s) => ({ ...s, align: a }))} title={a}>
+                              {a === "left" ? "L" : a === "center" ? "C" : "R"}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="tcs">
+                        <div className="tcs-label">Color &amp; Opacity</div>
+                        <div className="trow" style={{ gap: "8px", alignItems: "center" }}>
+                          <input type="color" value={ts.color} onChange={(e) => setTxtStyle((s) => ({ ...s, color: e.target.value }))} className="tcolorinput" title="Text color" />
+                          <label style={{ flex: 1, fontSize: "11px" }}>
+                            Opacity — {Math.round(ts.opacity * 100)}%
+                            <input type="range" min="0" max="100" value={Math.round(ts.opacity * 100)} onChange={(e) => setTxtStyle((s) => ({ ...s, opacity: Number(e.target.value) / 100 }))} />
+                          </label>
+                        </div>
+                        <label style={{ fontSize: "11px", marginTop: "8px", display: "block" }}>
+                          Letter spacing — {ts.letterSpacing}px
+                          <input type="range" min="-10" max="50" value={ts.letterSpacing} onChange={(e) => setTxtStyle((s) => ({ ...s, letterSpacing: Number(e.target.value) }))} />
+                        </label>
+                      </div>
+                      {/* Background */}
+                      <details className="tdetails">
+                        <summary>
+                          <span>Background</span>
+                          <input type="checkbox" checked={ts.bgEnabled} onChange={(e) => { e.stopPropagation(); setTxtStyle((s) => ({ ...s, bgEnabled: e.target.checked })); }} onClick={(e) => e.stopPropagation()} />
+                        </summary>
+                        <div className="tdetails-body">
+                          <div className="trow" style={{ gap: "8px", alignItems: "flex-end" }}>
+                            <label style={{ fontSize: "11px" }}>Color<br /><input type="color" value={ts.bgColor} onChange={(e) => setTxtStyle((s) => ({ ...s, bgColor: e.target.value }))} className="tcolorinput" /></label>
+                            <label style={{ fontSize: "11px", flex: 1 }}>Opacity — {Math.round(ts.bgOpacity * 100)}%<input type="range" min="0" max="100" value={Math.round(ts.bgOpacity * 100)} onChange={(e) => setTxtStyle((s) => ({ ...s, bgOpacity: Number(e.target.value) / 100 }))} /></label>
+                            <label style={{ fontSize: "11px" }}>Pad<br /><input type="number" min="0" max="60" value={ts.bgPadding} onChange={(e) => setTxtStyle((s) => ({ ...s, bgPadding: Number(e.target.value) }))} className="tnuminput" /></label>
+                          </div>
+                        </div>
+                      </details>
+                      {/* Shadow */}
+                      <details className="tdetails">
+                        <summary>
+                          <span>Shadow</span>
+                          <input type="checkbox" checked={ts.shadowEnabled} onChange={(e) => { e.stopPropagation(); setTxtStyle((s) => ({ ...s, shadowEnabled: e.target.checked })); }} onClick={(e) => e.stopPropagation()} />
+                        </summary>
+                        <div className="tdetails-body">
+                          <div className="trow" style={{ gap: "8px", flexWrap: "wrap" }}>
+                            <label style={{ fontSize: "11px" }}>Color<br /><input type="color" value={ts.shadowColor} onChange={(e) => setTxtStyle((s) => ({ ...s, shadowColor: e.target.value }))} className="tcolorinput" /></label>
+                            <label style={{ fontSize: "11px" }}>Blur<br /><input type="number" min="0" max="40" value={ts.shadowBlur} onChange={(e) => setTxtStyle((s) => ({ ...s, shadowBlur: Number(e.target.value) }))} className="tnuminput" /></label>
+                            <label style={{ fontSize: "11px" }}>X<br /><input type="number" min="-20" max="20" value={ts.shadowOffsetX} onChange={(e) => setTxtStyle((s) => ({ ...s, shadowOffsetX: Number(e.target.value) }))} className="tnuminput" /></label>
+                            <label style={{ fontSize: "11px" }}>Y<br /><input type="number" min="-20" max="20" value={ts.shadowOffsetY} onChange={(e) => setTxtStyle((s) => ({ ...s, shadowOffsetY: Number(e.target.value) }))} className="tnuminput" /></label>
+                          </div>
+                        </div>
+                      </details>
+                      {/* Outline */}
+                      <details className="tdetails">
+                        <summary>
+                          <span>Outline</span>
+                          <input type="checkbox" checked={ts.strokeEnabled} onChange={(e) => { e.stopPropagation(); setTxtStyle((s) => ({ ...s, strokeEnabled: e.target.checked })); }} onClick={(e) => e.stopPropagation()} />
+                        </summary>
+                        <div className="tdetails-body">
+                          <div className="trow" style={{ gap: "8px", alignItems: "flex-end" }}>
+                            <label style={{ fontSize: "11px" }}>Color<br /><input type="color" value={ts.strokeColor} onChange={(e) => setTxtStyle((s) => ({ ...s, strokeColor: e.target.value }))} className="tcolorinput" /></label>
+                            <label style={{ fontSize: "11px" }}>Width<br /><input type="number" min="1" max="20" value={ts.strokeWidth} onChange={(e) => setTxtStyle((s) => ({ ...s, strokeWidth: Number(e.target.value) }))} className="tnuminput" /></label>
+                          </div>
+                        </div>
+                      </details>
+                      {/* Gradient fill */}
+                      <details className="tdetails">
+                        <summary>
+                          <span>Gradient Fill</span>
+                          <input type="checkbox" checked={ts.gradient} onChange={(e) => { e.stopPropagation(); setTxtStyle((s) => ({ ...s, gradient: e.target.checked })); }} onClick={(e) => e.stopPropagation()} />
+                        </summary>
+                        <div className="tdetails-body">
+                          <label style={{ fontSize: "11px" }}>Bottom color<br /><input type="color" value={ts.gradientColor2} onChange={(e) => setTxtStyle((s) => ({ ...s, gradientColor2: e.target.value }))} className="tcolorinput" /></label>
+                          <p className="tcs-note" style={{ marginTop: "6px" }}>Top = Color (above) · Bottom = this color</p>
+                        </div>
+                      </details>
+                      <p className="tcs-note" style={{ padding: "0 0 4px" }}>Click the canvas to place text. Set style first, then click.</p>
+                    </>
+                  )}
+                  {/* Save */}
+                  <div className="tcs" style={{ marginTop: "auto" }}>
+                    <button className="secondary full" onClick={() => void saveCanvas()}><Download size={14} />Save canvas as PNG</button>
+                  </div>
                 </>
               )}
             </div>
-          </>
-        )}
-      </aside>
+          ) : (
+            /* AI Edit controls */
+            <div className="thumb-ai-ctrl">
+              <div className="tcs">
+                <div className="tcs-label">Image</div>
+                <button className="secondary full" onClick={() => void loadImage()}><Upload size={14} />{loaded ? "Replace image" : "Load image"}</button>
+                {!loaded && <p className="tcs-note">Load an image first to use AI editing.</p>}
+              </div>
+              {loaded && (
+                <>
+                  <div className="tcs">
+                    <div className="tcs-label">Mask Brush</div>
+                    <label style={{ fontSize: "11px" }}>Size — {mBrush}px<input type="range" min="4" max="200" value={mBrush} onChange={(e) => setMBrush(Number(e.target.value))} /></label>
+                    <div className="tttoggle" style={{ marginTop: "8px" }}>
+                      <button className={!mErase ? "active" : ""} onClick={() => setMErase(false)}>Paint</button>
+                      <button className={mErase ? "active" : ""} onClick={() => setMErase(true)}>Erase</button>
+                    </div>
+                    <button className="secondary full" style={{ marginTop: "8px" }} onClick={clearMask}>Clear mask</button>
+                    <p className="tcs-note">Paint white over the area to change; unpainted areas stay intact.</p>
+                  </div>
+                  <div className="tcs">
+                    <div className="tcs-label">Edit Instruction</div>
+                    <textarea className="thumb-instr" value={instr} onChange={(e) => setInstr(e.target.value)} placeholder="Describe the exact change to the painted area…" rows={4} />
+                    <label style={{ fontSize: "11px", fontWeight: 600, display: "grid", gap: "5px", marginTop: "8px" }}>
+                      Strength
+                      <select className="tsel" value={strength} onChange={(e) => setStrength(e.target.value)}>
+                        <option>Low</option><option>Medium</option><option>High</option>
+                      </select>
+                    </label>
+                  </div>
+                  {err && (
+                    <div className="inline-error">
+                      {err}
+                      <button type="button" style={{ float: "right", border: 0, background: "transparent", cursor: "pointer" }} onClick={() => setErr(null)}>×</button>
+                    </div>
+                  )}
+                  <div className="tcs">
+                    <button className="primary full" onClick={() => void applyEdit()} disabled={!instr.trim() || busy}>
+                      {busy ? <><LoaderCircle className="spin" size={14} />Applying…</> : <><Sparkles size={14} />Apply Edit</>}
+                    </button>
+                    {result && (
+                      <>
+                        <button className="secondary full" style={{ marginTop: "8px" }} onClick={() => void saveCanvas()}><Download size={14} />Save result</button>
+                        <button className="secondary full" style={{ marginTop: "6px" }} onClick={useAsSource}>Use result as source</button>
+                      </>
+                    )}
+                  </div>
+                  <div className="tcs">
+                    <div className="tcs-label">Aspect Ratio</div>
+                    <div className="tttoggle">
+                      <button className={ar === "16:9" ? "active" : ""} onClick={() => changeAr("16:9")}>16:9</button>
+                      <button className={ar === "9:16" ? "active" : ""} onClick={() => changeAr("9:16")}>9:16</button>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </aside>
+      </div>
     </div>
   );
 }
@@ -2101,7 +2478,7 @@ function ToolsView() {
             <>
               <div className="tool-heading">
                 <strong>Thumbnail Editor</strong>
-                <p>Load any image, paint a mask over the area to change, write an instruction, and let Gemini inpaint it — all on-screen, no windows.</p>
+                <p>Draw &amp; Text tab: erase areas, place styled text (fonts, shadows, gradients), undo/redo. AI Edit tab: paint a mask and let Gemini inpaint the change.</p>
               </div>
               <ThumbnailEditorPane />
             </>

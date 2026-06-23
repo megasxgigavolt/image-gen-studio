@@ -285,6 +285,32 @@ export const projectsClient = {
     data.trashedVideos = data.trashedVideos?.filter((candidate) => candidate.id !== videoId);
     writeBrowserData(data);
   },
+  async renameChannel(channelId: string, name: string): Promise<void> {
+    if (isTauri()) return invoke("rename_channel", { id: channelId, name });
+    const data = readBrowserData();
+    const channel = data.channels.find((c) => c.id === channelId);
+    if (channel) { channel.name = name; channel.updatedAt = now(); }
+    writeBrowserData(data);
+  },
+  async renameVideo(videoId: string, title: string): Promise<void> {
+    if (isTauri()) return invoke("rename_video", { id: videoId, title });
+    const data = readBrowserData();
+    const video = data.videos.find((v) => v.id === videoId);
+    if (video) { video.title = title; video.updatedAt = now(); }
+    writeBrowserData(data);
+  },
+  async permanentlyDeleteChannel(channelId: string): Promise<void> {
+    if (isTauri()) return invoke("permanent_delete_channel", { id: channelId });
+    const data = readBrowserData();
+    data.trashedChannels = data.trashedChannels?.filter((c) => c.id !== channelId);
+    writeBrowserData(data);
+  },
+  async permanentlyDeleteVideo(videoId: string): Promise<void> {
+    if (isTauri()) return invoke("permanent_delete_video", { id: videoId });
+    const data = readBrowserData();
+    data.trashedVideos = data.trashedVideos?.filter((v) => v.id !== videoId);
+    writeBrowserData(data);
+  },
   async createSnapshot(videoId: string, payload: unknown) {
     if (isTauri()) {
       return invoke<string>("create_video_snapshot", {
@@ -405,6 +431,14 @@ export const projectsClient = {
   async getRenderDataUrl(renderId: string): Promise<string> {
     if (isTauri()) return invoke("get_render_data_url", { renderId });
     return "";
+  },
+  async pickDownloadFolder(): Promise<string | null> {
+    if (isTauri()) return invoke("pick_download_folder");
+    return null;
+  },
+  async copyRenderToFolder(renderId: string, folderPath: string): Promise<string> {
+    if (isTauri()) return invoke("copy_render_to_folder", { renderId, folderPath });
+    throw new Error("Download requires the native application.");
   },
   async exportLatestStills(videoId: string): Promise<ExportResultRecord | null> {
     if (isTauri()) return invoke("export_latest_stills", { videoId });

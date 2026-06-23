@@ -2,7 +2,7 @@ mod projects;
 
 use projects::{
     Channel, ExportResult, ImageJob, ImageRender, ImageWorkspace, InputAsset, ProjectRepository,
-    PromptVersion, ProviderKeyStatus, ResumeState, Timeline, Video, VideoInputs, VisualPlan,
+    PromptVersion, ResumeState, Timeline, Video, VideoInputs, VisualPlan,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -35,9 +35,13 @@ fn with_repository<T>(
     state: State<'_, RepositoryState>,
     operation: impl FnOnce(&ProjectRepository) -> Result<T, String>,
 ) -> Result<T, String> {
+    // Recover the connection even if a previous command panicked while holding
+    // the lock. Without this, one panic would poison the mutex and make EVERY
+    // later database call fail until the app is restarted — which manifests as
+    // "navigation works once, then never again until relaunch".
     let repository = state
         .lock()
-        .map_err(|_| "Project database lock was poisoned.".to_string())?;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     operation(&repository)
 }
 
@@ -122,6 +126,26 @@ fn restore_video(state: State<'_, RepositoryState>, id: String) -> Result<(), St
 }
 
 #[tauri::command]
+fn rename_channel(state: State<'_, RepositoryState>, id: String, name: String) -> Result<(), String> {
+    with_repository(state, |repository| repository.rename_channel(&id, &name))
+}
+
+#[tauri::command]
+fn rename_video(state: State<'_, RepositoryState>, id: String, title: String) -> Result<(), String> {
+    with_repository(state, |repository| repository.rename_video(&id, &title))
+}
+
+#[tauri::command]
+fn permanent_delete_video(state: State<'_, RepositoryState>, id: String) -> Result<(), String> {
+    with_repository(state, |repository| repository.permanent_delete_video(&id))
+}
+
+#[tauri::command]
+fn permanent_delete_channel(state: State<'_, RepositoryState>, id: String) -> Result<(), String> {
+    with_repository(state, |repository| repository.permanent_delete_channel(&id))
+}
+
+#[tauri::command]
 fn create_video_snapshot(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -181,27 +205,6 @@ fn save_app_setting(
 ) -> Result<(), String> {
     with_repository(state, |repository| {
         repository.save_app_setting(&key, &value)
-    })
-}
-
-#[tauri::command]
-fn get_provider_key_status(
-    state: State<'_, RepositoryState>,
-    provider: String,
-) -> Result<ProviderKeyStatus, String> {
-    with_repository(state, |repository| {
-        repository.get_provider_key_status(&provider)
-    })
-}
-
-#[tauri::command]
-fn save_provider_key(
-    state: State<'_, RepositoryState>,
-    provider: String,
-    api_key: String,
-) -> Result<(), String> {
-    with_repository(state, |repository| {
-        repository.save_provider_key(&provider, &api_key)
     })
 }
 
@@ -482,6 +485,25 @@ fn get_asset_data_url(
 }
 
 #[tauri::command]
+fn pick_download_folder(app: tauri::AppHandle) -> Option<String> {
+    app.dialog()
+        .file()
+        .blocking_pick_folder()
+        .and_then(|value| value.as_path().map(|p| p.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+fn copy_render_to_folder(
+    state: State<'_, RepositoryState>,
+    render_id: String,
+    folder_path: String,
+) -> Result<String, String> {
+    with_repository(state, |repository| {
+        repository.copy_render_to_folder(&render_id, &folder_path)
+    })
+}
+
+#[tauri::command]
 fn export_latest_stills(
     app: tauri::AppHandle,
     state: State<'_, RepositoryState>,
@@ -750,7 +772,7 @@ async fn generate_visual_plan(
     let (database_path, projects_dir) = {
         let repository = state
             .lock()
-            .map_err(|_| "Project database lock was poisoned.".to_string())?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         repository.paths()
     };
     let engine_dir = if cfg!(debug_assertions) {
@@ -865,6 +887,23 @@ pub fn run() {
                     }
                 }
             }
+            // Release: inject API keys that were embedded at compile time from
+            // the workspace .env so users never need to configure credentials.
+            #[cfg(not(debug_assertions))]
+            {
+                const EMBEDDED_OPENAI: Option<&str> = option_env!("OPENAI_API_KEY");
+                const EMBEDDED_GEMINI: Option<&str> = option_env!("GEMINI_API_KEY");
+                for (var, key) in [
+                    ("OPENAI_API_KEY", EMBEDDED_OPENAI),
+                    ("GEMINI_API_KEY", EMBEDDED_GEMINI),
+                ] {
+                    if let Some(k) = key {
+                        if !k.is_empty() && std::env::var_os(var).is_none() {
+                            std::env::set_var(var, k);
+                        }
+                    }
+                }
+            }
             let data_dir = app.path().app_local_data_dir()?;
             let (repository, recovery_backup) = ProjectRepository::open_with_recovery(
                 &data_dir.join("auto-gen-studio.db"),
@@ -921,8 +960,6 @@ pub fn run() {
             reset_visual_plan,
             get_app_setting,
             save_app_setting,
-            get_provider_key_status,
-            save_provider_key,
             list_prompt_versions,
             create_prompt_version,
             delete_prompt_version,
@@ -947,13 +984,19 @@ pub fn run() {
             approve_bulk_plan,
             get_render_data_url,
             get_asset_data_url,
+            pick_download_folder,
+            copy_render_to_folder,
             export_latest_stills,
             export_project_bundle,
             import_project_bundle,
             build_timeline,
             get_timeline,
             update_timeline_view,
-            update_timeline_clip
+            update_timeline_clip,
+            rename_channel,
+            rename_video,
+            permanent_delete_video,
+            permanent_delete_channel
         ])
         .run(tauri::generate_context!())
         .expect("error while running Auto Gen Studio");

@@ -12,6 +12,30 @@ use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 #[cfg(all(not(test), windows))]
 use std::os::windows::process::CommandExt;
+
+// Cached Python executable name — probed once per process, tries the Windows
+// Python Launcher (py) first since it survives fresh installs before PATH reload.
+#[cfg(not(test))]
+static PYTHON_EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+#[cfg(not(test))]
+fn find_python() -> &'static str {
+    PYTHON_EXE.get_or_init(|| {
+        for candidate in ["py", "python", "python3"] {
+            let ok = std::process::Command::new(candidate)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok();
+            if ok {
+                return candidate.to_string();
+            }
+        }
+        "python".to_string()
+    })
+}
 use uuid::Uuid;
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
@@ -978,6 +1002,86 @@ impl ProjectRepository {
         Ok(())
     }
 
+    pub fn rename_channel(&self, id: &str, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Channel name is required.".into());
+        }
+        self.connection
+            .execute(
+                "UPDATE channels SET name = ?1, updated_at = ?2 WHERE id = ?3 AND trashed_at IS NULL",
+                params![name, Utc::now().to_rfc3339(), id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn rename_video(&self, id: &str, title: &str) -> Result<(), String> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err("Video title is required.".into());
+        }
+        self.connection
+            .execute(
+                "UPDATE videos SET title = ?1, updated_at = ?2 WHERE id = ?3 AND trashed_at IS NULL",
+                params![title, Utc::now().to_rfc3339(), id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn permanent_delete_video(&self, id: &str) -> Result<(), String> {
+        let tx = self.connection.unchecked_transaction().map_err(|e| e.to_string())?;
+        let stmts = [
+            "DELETE FROM timeline_clips WHERE timeline_id IN (SELECT id FROM timelines WHERE video_id = ?1)",
+            "DELETE FROM timelines WHERE video_id = ?1",
+            "DELETE FROM image_job_items WHERE job_id IN (SELECT id FROM image_jobs WHERE video_id = ?1)",
+            "DELETE FROM image_jobs WHERE video_id = ?1",
+            "DELETE FROM image_renders WHERE video_id = ?1",
+            "DELETE FROM educational_visual_plans WHERE video_id = ?1",
+            "DELETE FROM prompt_versions WHERE video_id = ?1",
+            "DELETE FROM visual_plan_sentences WHERE video_id = ?1",
+            "DELETE FROM visual_plan_groups WHERE video_id = ?1",
+            "DELETE FROM visual_plan_meta WHERE video_id = ?1",
+            "DELETE FROM input_assets WHERE video_id = ?1",
+            "DELETE FROM video_inputs WHERE video_id = ?1",
+            "DELETE FROM video_snapshots WHERE video_id = ?1",
+            "DELETE FROM videos WHERE id = ?1",
+        ];
+        for stmt in &stmts {
+            self.connection.execute(stmt, params![id]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn permanent_delete_channel(&self, id: &str) -> Result<(), String> {
+        let tx = self.connection.unchecked_transaction().map_err(|e| e.to_string())?;
+        let stmts = [
+            "DELETE FROM timeline_clips WHERE timeline_id IN (SELECT t.id FROM timelines t JOIN videos v ON v.id = t.video_id WHERE v.channel_id = ?1)",
+            "DELETE FROM timelines WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
+            "DELETE FROM image_job_items WHERE job_id IN (SELECT j.id FROM image_jobs j JOIN videos v ON v.id = j.video_id WHERE v.channel_id = ?1)",
+            "DELETE FROM image_jobs WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
+            "DELETE FROM image_renders WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
+            "DELETE FROM educational_visual_plans WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
+            "DELETE FROM prompt_versions WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
+            "DELETE FROM visual_plan_sentences WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
+            "DELETE FROM visual_plan_groups WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
+            "DELETE FROM visual_plan_meta WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
+            "DELETE FROM input_assets WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
+            "DELETE FROM video_inputs WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
+            "DELETE FROM video_snapshots WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
+            "DELETE FROM videos WHERE channel_id = ?1",
+            "DELETE FROM channels WHERE id = ?1",
+        ];
+        for stmt in &stmts {
+            self.connection.execute(stmt, params![id]).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        let _ = fs::remove_dir_all(self.projects_dir.join(id));
+        Ok(())
+    }
+
     pub fn create_snapshot(&self, video_id: &str, payload_json: &str) -> Result<String, String> {
         serde_json::from_str::<serde_json::Value>(payload_json)
             .map_err(|_| "Snapshot payload must be valid JSON.".to_string())?;
@@ -1500,8 +1604,15 @@ impl ProjectRepository {
             }),
         ).map_err(|_| "Image version was not found.".to_string())?;
         let path = self.render_absolute_path(&render)?;
+        // NULL out every FK that points at this render before deleting
         self.connection.execute(
             "UPDATE image_renders SET parent_render_id=NULL WHERE parent_render_id=?1", [render_id],
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "UPDATE image_job_items SET render_id=NULL WHERE render_id=?1", [render_id],
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "UPDATE timeline_clips SET render_id=NULL WHERE render_id=?1", [render_id],
         ).map_err(|e| e.to_string())?;
         self.connection.execute("DELETE FROM image_renders WHERE id=?1", [render_id])
             .map_err(|e| e.to_string())?;
@@ -1518,6 +1629,27 @@ impl ProjectRepository {
             }
         }
         Ok(())
+    }
+
+    pub fn copy_render_to_folder(&self, render_id: &str, dest_folder: &str) -> Result<String, String> {
+        let render: ImageRender = self.connection.query_row(
+            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,is_final,edit_strength,mask_path,mask_used,created_at FROM image_renders WHERE id=?1",
+            [render_id],
+            |row| Ok(ImageRender {
+                id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?,
+                version: row.get(3)?, prompt_version_id: row.get(4)?,
+                file_name: row.get(5)?, relative_path: row.get(6)?,
+                parent_render_id: row.get(7)?, edit_instruction: row.get(8)?,
+                kind: row.get(9)?, is_final: row.get(10)?,
+                edit_strength: row.get(11)?, mask_path: row.get(12)?,
+                mask_used: row.get(13)?, created_at: row.get(14)?,
+            }),
+        ).map_err(|_| "Render not found.".to_string())?;
+        let src = self.render_absolute_path(&render)?;
+        let dest_dir = std::path::Path::new(dest_folder);
+        let dest = dest_dir.join(&render.file_name);
+        fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+        Ok(render.file_name)
     }
 
     pub fn reset_image_workflow(&self, video_id: &str) -> Result<(), String> {
@@ -1847,6 +1979,10 @@ Return exactly one plan for every supplied row, in the same order."#,
     }
 
     pub fn extract_image_settings_from_directive(&self, directive: &str) -> Result<StyleExtraction, String> {
+        // Prefer OpenAI; fall back to Gemini if no OpenAI key is configured
+        if let Some(key) = self.get_provider_key("openai")? {
+            return request_openai_directive_extract(&key, directive);
+        }
         let auth = self.gemini_auth()?;
         let prompt = format!(
             r#"You are a visual production assistant. Your job is to clean up a Style Directive so it contains ONLY global visual style rules — nothing about specific subjects, characters, objects, or scene content.
@@ -1879,12 +2015,15 @@ Return JSON only — no markdown, no explanation:
 {{"styleDirective":"<global style rules only>","imageSettings":{{"<field>":"<value>"}}}}"#
         );
         let text = request_gemini_text(&auth, &prompt)?;
-        let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+        let cleaned = extract_json_from_text(&text);
         serde_json::from_str(cleaned).map_err(|_| "Style extraction was not valid JSON.".to_string())
     }
 
     pub fn plan_bulk_visuals<F: Fn(usize, usize)>(&self, video_id: &str, style_directive: &str, base_settings_json: &str, creative_instruction: &str, on_progress: F) -> Result<BulkPlanResult, String> {
-        let auth = self.gemini_auth()?;
+        let openai_key = self.get_provider_key("openai")?;
+        // Gemini Flash hard-caps output at ~8000 tokens; OpenAI gpt-4.1-mini supports 18000
+        let chunk_size_for_provider: usize = if openai_key.is_some() { 6 } else { 3 };
+        let gemini_auth = if openai_key.is_none() { Some(self.gemini_auth()?) } else { None };
         let visual_plan = self.get_visual_plan(video_id)?;
         if visual_plan.groups.is_empty() {
             return Err("No stills found. Generate a visual plan first.".into());
@@ -1913,7 +2052,7 @@ Return JSON only — no markdown, no explanation:
         }
         let total = row_data.len();
         let mut planned: Vec<V2PlanStillResponse> = Vec::with_capacity(total);
-        let chunk_size: usize = 6;
+        let chunk_size: usize = chunk_size_for_provider;
         let total_batches = total.div_ceil(chunk_size);
         let mut next_to_plan: usize = 0;
         let mut chunk_index: usize = 0;
@@ -1996,13 +2135,16 @@ TEXTLESS VISUAL RULE (Textless Infographic, Timeline, Geographic Map, Scientific
 
 Allowed visualType values: Character Scene; Behavioral Demonstration; Close Detail; Environmental Scene; Object Focus; Comparison; Process Illustration; Timeline; Textless Infographic; Scientific Diagram; Geographic Map; Concept Visualization; POV Scene; Symbolic Representation; Documentary Frame.
 
-You MUST return exactly one plan for every row in the current batch. Return JSON only:
-{{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content only — no style or camera words","reason":"1-2 sentences"}}]}}"#,
+You MUST return exactly one plan for every row in the current batch. Return JSON only — no explanation, no markdown:
+{{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content only — no style or camera words"}}]}}"#,
                 chunk_index + 1,
                 serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
                 serde_json::to_string_pretty(chunk).unwrap_or_default(),
             );
-            let response = request_gemini_v2_plan(&auth, &prompt)?;
+            let response = match &openai_key {
+                Some(key) => request_openai_v2_plan(key, &prompt)?,
+                None => request_gemini_v2_plan(gemini_auth.as_ref().unwrap(), &prompt)?,
+            };
             let valid_count = {
                 let mut count = 0;
                 for (i, plan) in response.plans.iter().enumerate() {
@@ -3139,10 +3281,7 @@ Return JSON only — one plan object:
                     grouping_engine.display()
                 ));
             }
-            // Ensure openai-whisper (and its torch dependency) is installed.
-            // The installer handles the smaller packages; whisper (~1 GB) is
-            // deferred to first use because it would make the installer too slow.
-            let mut command = Command::new("python");
+            let mut command = Command::new(find_python());
             command
                 .arg(&grouping_engine)
                 .arg(&audio_path)
@@ -3677,30 +3816,41 @@ fn request_openai_v2_plan(api_key: &str, prompt: &str) -> Result<V2PlanChunkResp
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build().map_err(|e| format!("Could not initialize OpenAI client: {e}"))?;
-    let mut last_err = String::new();
-    let response = loop {
-        let attempt = last_err.matches("attempt").count();
-        match client.post("https://api.openai.com/v1/responses")
-            .bearer_auth(api_key)
-            .json(&json!({"model":"gpt-4.1-mini","input":prompt,"max_output_tokens":18000}))
-            .send() {
-            Ok(r) => break r,
-            Err(e) if attempt < 3 => {
-                last_err.push_str(&format!(" attempt {attempt}: {e}"));
-                std::thread::sleep(std::time::Duration::from_secs(4 * 2_u64.pow(attempt as u32)));
-            }
-            Err(e) => return Err(format!("Could not reach OpenAI after retries: {e}")),
+    for attempt in 0u32..4 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(5 * 2_u64.pow(attempt - 1)));
         }
-    };
-    let status = response.status();
-    let body: serde_json::Value = response.json().map_err(|e| format!("OpenAI returned unreadable response: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("OpenAI bulk planning failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
+        // Chat Completions API with json_object mode guarantees syntactically valid JSON —
+        // the Responses API has no such enforcement and can emit unescaped quotes mid-string.
+        let response = match client.post("https://api.openai.com/v1/chat/completions")
+            .bearer_auth(api_key)
+            .json(&json!({
+                "model": "gpt-4.1-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 16000,
+                "response_format": {"type": "json_object"}
+            }))
+            .send() {
+            Ok(r) => r,
+            Err(_) if attempt < 3 => continue,
+            Err(e) => return Err(format!("Could not reach OpenAI: {e}")),
+        };
+        let status = response.status();
+        let body: serde_json::Value = response.json()
+            .map_err(|e| format!("OpenAI returned unreadable response: {e}"))?;
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            if attempt < 3 { continue; }
+            return Err(format!("OpenAI bulk planning failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("server error")));
+        }
+        if !status.is_success() {
+            return Err(format!("OpenAI bulk planning failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
+        }
+        let text = body.pointer("/choices/0/message/content").and_then(|v| v.as_str())
+            .ok_or("OpenAI returned no bulk plan.")?;
+        return normalize_bulk_plan_response(extract_json_from_text(text))
+            .map_err(|e| e.replace("Gemini", "OpenAI"));
     }
-    let text = body.pointer("/output/0/content/0/text").and_then(|v| v.as_str())
-        .ok_or("OpenAI returned no bulk plan.")?;
-    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
-    serde_json::from_str(cleaned).map_err(|e| format!("OpenAI bulk plan was not valid JSON: {e}"))
+    Err("OpenAI bulk planning failed after retries.".to_string())
 }
 
 fn request_openai_directive_extract(api_key: &str, directive: &str) -> Result<StyleExtraction, String> {
@@ -3734,9 +3884,28 @@ Only populate imageSettings if the directive specifies a concrete per-shot value
 Return JSON only — no markdown, no explanation:
 {{"styleDirective":"<global style rules only — no subjects, no scene content>","imageSettings":{{"<field>":"<value>"}}}}"#
     );
-    let text = request_openai_text(api_key, &prompt)?;
-    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
-    serde_json::from_str(cleaned).map_err(|_| "OpenAI directive extraction was not valid JSON.".to_string())
+    // Use Chat Completions with json_object mode to guarantee valid JSON output
+    let client = reqwest::blocking::Client::new();
+    let response = client.post("https://api.openai.com/v1/chat/completions")
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1200,
+            "response_format": {"type": "json_object"}
+        }))
+        .send()
+        .map_err(|e| format!("Could not reach OpenAI: {e}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response.json()
+        .map_err(|e| format!("OpenAI returned unreadable response: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("OpenAI style extraction failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
+    }
+    let text = body.pointer("/choices/0/message/content").and_then(|v| v.as_str())
+        .ok_or("OpenAI returned no style extraction.")?;
+    let cleaned = extract_json_from_text(text);
+    serde_json::from_str(cleaned).map_err(|_| "Style extraction was not valid JSON.".to_string())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -3862,6 +4031,29 @@ fn gemini_extract_text(body: &serde_json::Value) -> Option<String> {
     if text.trim().is_empty() { None } else { Some(text) }
 }
 
+// Extracts the first complete JSON object or array from a response that may
+// contain markdown fences or leading/trailing prose.
+fn extract_json_from_text(raw: &str) -> &str {
+    let s = raw.trim();
+    // Strip markdown fences
+    let s = s.strip_prefix("```json").unwrap_or(s);
+    let s = s.strip_prefix("```").unwrap_or(s);
+    let s = s.strip_suffix("```").unwrap_or(s);
+    let s = s.trim();
+    // Find the outermost JSON object or array bounds
+    let obj_start = s.find('{');
+    let arr_start = s.find('[');
+    let start = match (obj_start, arr_start) {
+        (Some(o), Some(a)) => Some(o.min(a)),
+        (Some(o), None) => Some(o),
+        (None, Some(a)) => Some(a),
+        (None, None) => return s,
+    };
+    let start = start.unwrap();
+    let end = s.rfind('}').or_else(|| s.rfind(']')).unwrap_or(s.len().saturating_sub(1));
+    if end >= start { &s[start..=end] } else { s }
+}
+
 fn request_gemini_text(auth: &GeminiAuth, prompt: &str) -> Result<String, String> {
     let client = reqwest::blocking::Client::new();
     for attempt in 0u32..3 {
@@ -3908,6 +4100,36 @@ fn request_gemini_vision(auth: &GeminiAuth, prompt: &str, mime: &str, bytes: &[u
     gemini_extract_text(&body).ok_or_else(|| "Gemini returned no vision analysis.".to_string())
 }
 
+// Gemini sometimes returns `"plans": {...}` (single object) instead of `"plans": [{...}]`,
+// or returns the array directly without a wrapper, or returns a bare single-plan object.
+// This normalises all of those into a V2PlanChunkResponse before deserialising.
+fn normalize_bulk_plan_response(cleaned: &str) -> Result<V2PlanChunkResponse, String> {
+    let mut value: serde_json::Value = serde_json::from_str(cleaned)
+        .map_err(|e| format!("Gemini bulk plan was not valid JSON: {e}"))?;
+
+    // Case: top-level array → wrap into {"plans": [...]}
+    if value.is_array() {
+        value = json!({"plans": value});
+    }
+
+    // Case: top-level object missing "plans" → treat the whole object as a single plan
+    if value.is_object() && value.get("plans").is_none() {
+        let single = value.clone();
+        value = json!({"plans": [single]});
+    }
+
+    // Case: "plans" is a single object (not array) → wrap in array
+    if let Some(plans) = value.get_mut("plans") {
+        if plans.is_object() {
+            let obj = plans.clone();
+            *plans = serde_json::Value::Array(vec![obj]);
+        }
+    }
+
+    serde_json::from_value(value)
+        .map_err(|e| format!("Gemini bulk plan was not valid JSON: {e}"))
+}
+
 fn request_gemini_v2_plan(auth: &GeminiAuth, prompt: &str) -> Result<V2PlanChunkResponse, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -3917,7 +4139,8 @@ fn request_gemini_v2_plan(auth: &GeminiAuth, prompt: &str) -> Result<V2PlanChunk
         let response = gemini_client_request(&client, auth, model)
             .json(&json!({
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": 18000, "responseMimeType": "application/json"}
+                // gemini-2.0-flash hard cap is 8192 output tokens; asking for more is silently clamped
+                "generationConfig": {"maxOutputTokens": 8000, "responseMimeType": "application/json"}
             }))
             .send()
             .map_err(|e| format!("Could not reach Gemini: {e}"))?;
@@ -3935,8 +4158,17 @@ fn request_gemini_v2_plan(auth: &GeminiAuth, prompt: &str) -> Result<V2PlanChunk
             return Err(format!("Gemini bulk planning failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
         }
         let text = gemini_extract_text(&body).ok_or("Gemini returned no bulk plan.")?;
-        let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
-        return serde_json::from_str(cleaned).map_err(|e| format!("Gemini bulk plan was not valid JSON: {e}"));
+        let cleaned = extract_json_from_text(&text);
+        match normalize_bulk_plan_response(cleaned) {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                // EOF = truncated response; retry and the model will usually complete it
+                if e.contains("EOF") && attempt < 3 {
+                    continue;
+                }
+                return Err(e);
+            }
+        }
     }
     Err("Gemini rate limit persists after retries.".to_string())
 }

@@ -2,10 +2,12 @@ import {
   FolderOpen,
   Home,
   Image,
+  Minus,
   Moon,
   Plus,
   Settings,
   Sparkles,
+  Square,
   Sun,
   Trash2,
   Undo2,
@@ -13,7 +15,6 @@ import {
   X,
   WandSparkles,
   Download,
-  PanelsTopLeft,
   LoaderCircle,
   GripVertical,
   Check,
@@ -25,6 +26,7 @@ import {
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   DndContext,
   PointerSensor,
@@ -56,8 +58,90 @@ const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
   { stage: "inputs", label: "Production", icon: Upload },
   { stage: "images", label: "Images", icon: Image },
 ];
+const MAX_CACHE_SIZE = 20;
 const imageWorkspaceCache = new Map<string, ImageWorkspaceRecord>();
 const lastSelectedStill = new Map<string, string>(); // videoId → groupId
+
+function setCached(key: string, value: ImageWorkspaceRecord) {
+  if (imageWorkspaceCache.size >= MAX_CACHE_SIZE) {
+    const oldest = imageWorkspaceCache.keys().next().value;
+    if (oldest !== undefined) imageWorkspaceCache.delete(oldest);
+  }
+  imageWorkspaceCache.set(key, value);
+}
+
+function getGreeting() {
+  const hour = new Date().getHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 17) return "Good afternoon";
+  return "Good evening";
+}
+
+function ConfirmDialog({
+  title,
+  message,
+  confirmLabel = "Confirm",
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === "Escape") onCancel(); };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onCancel]);
+  useEffect(() => {
+    const el = dialogRef.current;
+    if (!el) return;
+    const focusable = el.querySelectorAll<HTMLElement>(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    );
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    first?.focus();
+    const trap = (e: KeyboardEvent) => {
+      if (e.key !== "Tab") return;
+      if (e.shiftKey) { if (document.activeElement === first) { e.preventDefault(); last?.focus(); } }
+      else { if (document.activeElement === last) { e.preventDefault(); first?.focus(); } }
+    };
+    el.addEventListener("keydown", trap);
+    return () => el.removeEventListener("keydown", trap);
+  }, []);
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onCancel}>
+      <div ref={dialogRef} className="modal confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(e) => e.stopPropagation()}>
+        <h2 id="confirm-title">{title}</h2>
+        <p style={{ color: "var(--muted)", fontSize: "13px", lineHeight: 1.55, marginTop: "8px" }}>{message}</p>
+        <div className="footer-actions">
+          <button className="secondary" onClick={onCancel}>Cancel</button>
+          <button className="primary" onClick={onConfirm}>{confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ToastDisplay() {
+  const { toast, dismissToast } = useAppStore();
+  useEffect(() => {
+    if (!toast) return;
+    const timer = window.setTimeout(dismissToast, 4500);
+    return () => window.clearTimeout(timer);
+  }, [toast?.id, dismissToast]);
+  if (!toast) return null;
+  return (
+    <div className={`app-toast app-toast-${toast.kind}`} role="alert">
+      <span>{toast.message}</span>
+      <button type="button" onClick={dismissToast} aria-label="Dismiss">×</button>
+    </div>
+  );
+}
 
 function formatTime(seconds: number) {
   const minutes = Math.floor(seconds / 60);
@@ -71,16 +155,16 @@ function TitleBar() {
     <div className="titlebar">
       <span className="titlebar-title" data-tauri-drag-region>Auto Gen Studio</span>
       <div className="titlebar-controls">
-        <button className="titlebar-btn minimize" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.minimize()} aria-label="Minimize">&#8211;</button>
-        <button className="titlebar-btn maximize" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.toggleMaximize()} aria-label="Maximize">&#9633;</button>
-        <button className="titlebar-btn close" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.close()} aria-label="Close">&#10005;</button>
+        <button className="titlebar-btn minimize" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.minimize()} aria-label="Minimize"><Minus size={13} strokeWidth={2} /></button>
+        <button className="titlebar-btn maximize" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.toggleMaximize()} aria-label="Maximize"><Square size={11} strokeWidth={1.8} /></button>
+        <button className="titlebar-btn close" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.close()} aria-label="Close"><X size={13} strokeWidth={2} /></button>
       </div>
     </div>
   );
 }
 
 function Sidebar() {
-  const { stage, setStage, activeVideoId } = useAppStore();
+  const { stage, setStage, activeVideoId, lastProductionStage } = useAppStore();
   return (
     <aside className="sidebar">
       <button className="brand" onClick={() => setStage("home")}>
@@ -88,20 +172,27 @@ function Sidebar() {
         <span>Auto Gen <strong>Studio</strong></span>
       </button>
       <nav>
-        {navItems.map(({ stage: itemStage, label, icon: Icon }) => (
-          <button
-            className={(itemStage === "inputs" ? ["inputs", "visual-plan"].includes(stage) : stage === itemStage) ? "nav-item active" : "nav-item"}
-            key={itemStage}
-            onClick={() => setStage(itemStage === "inputs" && stage === "images" ? "visual-plan" : itemStage)}
-            disabled={itemStage !== "home" && !activeVideoId}
-          >
-            <Icon size={18} />
-            <span>{label}</span>
-          </button>
-        ))}
+        {navItems.map(({ stage: itemStage, label, icon: Icon }) => {
+          const isActive = itemStage === "inputs"
+            ? ["inputs", "visual-plan"].includes(stage)
+            : stage === itemStage;
+          const isDisabled = itemStage !== "home" && !activeVideoId;
+          return (
+            <button
+              className={isActive ? "nav-item active" : "nav-item"}
+              key={itemStage}
+              onClick={() => setStage(itemStage === "inputs" ? lastProductionStage : itemStage)}
+              disabled={isDisabled}
+              title={isDisabled ? "Open a video first" : undefined}
+              aria-current={isActive ? "page" : undefined}
+            >
+              <Icon size={18} />
+              <span>{label}</span>
+            </button>
+          );
+        })}
       </nav>
-      <button className="nav-item settings" disabled><Settings size={18} /><span>Preferences · soon</span></button>
-      <button className="nav-item" disabled><PanelsTopLeft size={18} /><span>Timeline · in production</span></button>
+      <button className="nav-item settings" disabled title="Coming soon"><Settings size={18} /><span>Preferences · soon</span></button>
     </aside>
   );
 }
@@ -113,6 +204,13 @@ function Header() {
     activeChannelName,
     activeVideoTitle,
   } = useAppStore();
+
+  function handleToggleTheme() {
+    toggleTheme();
+    const nextTheme = theme === "light" ? "dark" : "light";
+    void projectsClient.saveAppSetting("theme", nextTheme);
+  }
+
   return (
     <header className="topbar">
       <div>
@@ -121,7 +219,7 @@ function Header() {
       </div>
       <div className="top-actions">
         <span className="saved">Saved locally</span>
-        <button className="icon-button" onClick={toggleTheme} aria-label="Toggle theme">
+        <button className="icon-button" onClick={handleToggleTheme} aria-label="Toggle theme">
           {theme === "light" ? <Moon size={17} /> : <Sun size={17} />}
         </button>
       </div>
@@ -130,10 +228,10 @@ function Header() {
 }
 
 function HomeView() {
-  const { setStage, setActiveProject } = useAppStore();
+  const { setStage, setActiveProject, activeChannelId, addToast } = useAppStore();
   const [channels, setChannels] = useState<ChannelRecord[]>([]);
   const [videos, setVideos] = useState<VideoRecord[]>([]);
-  const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
+  const [selectedChannelId, setSelectedChannelId] = useState<string | null>(activeChannelId);
   const [resume, setResume] = useState<ResumeRecord | null>(null);
   const [dialog, setDialog] = useState<"channel" | "video" | "trash" | null>(null);
   const [trashedChannels, setTrashedChannels] = useState<ChannelRecord[]>([]);
@@ -141,6 +239,9 @@ function HomeView() {
   const [name, setName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [renamingChannelId, setRenamingChannelId] = useState<string | null>(null);
+  const [renamingVideoId, setRenamingVideoId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
 
   const loadWorkspace = useCallback(async () => {
     setLoading(true);
@@ -171,7 +272,11 @@ function HomeView() {
 
   async function selectChannel(channelId: string) {
     setSelectedChannelId(channelId);
-    setVideos(await projectsClient.listVideos(channelId));
+    try {
+      setVideos(await projectsClient.listVideos(channelId));
+    } catch (caught) {
+      setError(String(caught));
+    }
   }
 
   async function submitCreate(event: FormEvent) {
@@ -195,13 +300,19 @@ function HomeView() {
   async function openVideo(video: VideoRecord) {
     const channel = channels.find((candidate) => candidate.id === video.channelId);
     if (!channel) return;
+    // Navigate first; persisting resume/snapshot is best-effort and must never
+    // block or cancel navigation if a database write happens to fail.
     setActiveProject(channel.id, channel.name, video.id, video.title);
-    await projectsClient.setResume(channel.id, video.id, video.stage);
-    await projectsClient.createSnapshot(video.id, {
-      reason: "video-opened",
-      stage: video.stage,
-    });
     setStage(video.stage);
+    try {
+      await projectsClient.setResume(channel.id, video.id, video.stage);
+      await projectsClient.createSnapshot(video.id, {
+        reason: "video-opened",
+        stage: video.stage,
+      });
+    } catch (caught) {
+      log("error", "open_video_side_effects_failed", { message: String(caught) });
+    }
   }
 
   async function resumeVideo() {
@@ -255,11 +366,57 @@ function HomeView() {
     } catch (caught) { setError(String(caught)); }
   }
 
+  async function startRenameChannel(channel: ChannelRecord) {
+    setRenamingChannelId(channel.id);
+    setRenameValue(channel.name);
+  }
+
+  async function commitRenameChannel(channelId: string) {
+    const trimmed = renameValue.trim();
+    setRenamingChannelId(null);
+    if (!trimmed) return;
+    try {
+      await projectsClient.renameChannel(channelId, trimmed);
+      await loadWorkspace();
+    } catch (caught) { setError(String(caught)); }
+  }
+
+  async function startRenameVideo(video: VideoRecord) {
+    setRenamingVideoId(video.id);
+    setRenameValue(video.title);
+  }
+
+  async function commitRenameVideo(videoId: string) {
+    const trimmed = renameValue.trim();
+    setRenamingVideoId(null);
+    if (!trimmed) return;
+    try {
+      await projectsClient.renameVideo(videoId, trimmed);
+      await loadWorkspace();
+    } catch (caught) { setError(String(caught)); }
+  }
+
+  async function permanentlyDeleteChannel(channelId: string) {
+    try {
+      await projectsClient.permanentlyDeleteChannel(channelId);
+      setTrashedChannels((items) => items.filter((item) => item.id !== channelId));
+      addToast("Channel permanently deleted.", "success");
+    } catch (caught) { setError(String(caught)); }
+  }
+
+  async function permanentlyDeleteVideo(videoId: string) {
+    try {
+      await projectsClient.permanentlyDeleteVideo(videoId);
+      setTrashedVideos((items) => items.filter((item) => item.id !== videoId));
+      addToast("Video permanently deleted.", "success");
+    } catch (caught) { setError(String(caught)); }
+  }
+
   const resumeVideoRecord = videos.find((video) => video.id === resume?.videoId);
   return (
     <section className="view">
       <div className="page-heading">
-        <div><p className="eyebrow">Workspace</p><h1>Good evening, Ahmed</h1><p>Continue a video or begin a new production.</p></div>
+        <div><p className="eyebrow">Workspace</p><h1>{getGreeting()}</h1><p>Continue a video or begin a new production.</p></div>
         <button className="primary" disabled={!selectedChannelId} onClick={() => setDialog("video")}><Plus size={17} />New video</button>
       </div>
       {resume && (
@@ -279,21 +436,54 @@ function HomeView() {
         <div className="channel-list">
           {channels.map((channel) => (
             <div className={selectedChannelId === channel.id ? "channel active" : "channel"} key={channel.id}>
-              <button onClick={() => void selectChannel(channel.id)}>
-                <span>{channel.name.split(/\s+/).slice(0, 2).map((word) => word[0]).join("").toUpperCase()}</span>
-                <div><strong>{channel.name}</strong><small>{channel.videoCount} videos</small></div>
-              </button>
-              <button className="row-action" aria-label={`Move ${channel.name} to trash`} onClick={() => void deleteChannel(channel.id)}><Trash2 size={14} /></button>
+              {renamingChannelId === channel.id ? (
+                <div style={{ padding: "10px", display: "flex", gap: "6px", alignItems: "center", flex: 1 }}>
+                  <input
+                    autoFocus
+                    className="rename-input"
+                    value={renameValue}
+                    maxLength={80}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") void commitRenameChannel(channel.id); if (e.key === "Escape") setRenamingChannelId(null); }}
+                    onBlur={() => void commitRenameChannel(channel.id)}
+                  />
+                </div>
+              ) : (
+                <button onClick={() => void selectChannel(channel.id)}>
+                  <span>{channel.name.split(/\s+/).slice(0, 2).map((word) => ([...word][0] ?? "")).join("").toUpperCase()}</span>
+                  <div><strong>{channel.name}</strong><small>{channel.videoCount} videos</small></div>
+                </button>
+              )}
+              <div style={{ display: "flex" }}>
+                <button className="row-action" aria-label={`Rename ${channel.name}`} title="Rename" onClick={() => void startRenameChannel(channel)}><Check size={13} /></button>
+                <button className="row-action" aria-label={`Move ${channel.name} to trash`} onClick={() => void deleteChannel(channel.id)}><Trash2 size={14} /></button>
+              </div>
             </div>
           ))}
         </div>
         <div className="video-grid">
           {videos.map((video, index) => (
             <article className="video-card" key={video.id}>
-              <button className="video-open" onClick={() => void openVideo(video)}>
-                <div className={`video-art art-${(index % 3) + 1}`}><span>{video.progress}%</span></div>
-                <div><small>{video.stage.replace("-", " ").toUpperCase()}</small><h3>{video.title}</h3><p>Saved locally · {new Date(video.updatedAt).toLocaleDateString()}</p><i style={{ width: `${video.progress}%` }} /></div>
-              </button>
+              {renamingVideoId === video.id ? (
+                <div style={{ padding: "14px", display: "flex", gap: "6px", alignItems: "center" }}>
+                  <input
+                    autoFocus
+                    className="rename-input"
+                    value={renameValue}
+                    maxLength={80}
+                    onChange={(e) => setRenameValue(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") void commitRenameVideo(video.id); if (e.key === "Escape") setRenamingVideoId(null); }}
+                    onBlur={() => void commitRenameVideo(video.id)}
+                    style={{ flex: 1 }}
+                  />
+                </div>
+              ) : (
+                <button className="video-open" onClick={() => void openVideo(video)}>
+                  <div className={`video-art art-${(index % 3) + 1}`}><span>{video.progress}%</span></div>
+                  <div><small>{video.stage.replace("-", " ").toUpperCase()}</small><h3>{video.title}</h3><p>Saved locally · {new Date(video.updatedAt).toLocaleDateString()}</p><i style={{ width: `${video.progress}%` }} /></div>
+                </button>
+              )}
+              <button className="card-rename" aria-label={`Rename ${video.title}`} title="Rename" onClick={() => void startRenameVideo(video)}><Check size={13} /></button>
               <button className="card-trash" aria-label={`Move ${video.title} to trash`} onClick={() => void deleteVideo(video.id)}><Trash2 size={15} /></button>
             </article>
           ))}
@@ -306,21 +496,28 @@ function HomeView() {
           <section className="modal trash-modal" onMouseDown={(event) => event.stopPropagation()}>
             <p className="eyebrow">Recoverable items</p><h2>Trash</h2>
             {trashedChannels.length === 0 && trashedVideos.length === 0 && <p>Trash is empty.</p>}
-            {[...trashedChannels.map((channel) => ({ id: channel.id, label: channel.name, kind: "Channel" })),
-              ...trashedVideos.map((video) => ({ id: video.id, label: video.title, kind: "Video" }))].map((item) => (
-                <div className="trash-row" key={`${item.kind}-${item.id}`}><div><strong>{item.label}</strong><small>{item.kind}</small></div><button className="secondary" onClick={() => void (item.kind === "Channel" ? restoreChannel(item.id) : restoreVideo(item.id))}><Undo2 size={14} />Restore</button></div>
+            {[...trashedChannels.map((channel) => ({ id: channel.id, label: channel.name, kind: "Channel" as const })),
+              ...trashedVideos.map((video) => ({ id: video.id, label: video.title, kind: "Video" as const }))].map((item) => (
+                <div className="trash-row" key={`${item.kind}-${item.id}`}>
+                  <div><strong>{item.label}</strong><small>{item.kind}</small></div>
+                  <div style={{ display: "flex", gap: "8px" }}>
+                    <button className="secondary" onClick={() => void (item.kind === "Channel" ? restoreChannel(item.id) : restoreVideo(item.id))}><Undo2 size={14} />Restore</button>
+                    <button className="secondary danger-action" title="Permanently delete — cannot be undone" onClick={() => void (item.kind === "Channel" ? permanentlyDeleteChannel(item.id) : permanentlyDeleteVideo(item.id))}><Trash2 size={14} />Delete forever</button>
+                  </div>
+                </div>
               ))}
             <div className="footer-actions"><button className="secondary" onClick={() => setDialog(null)}>Close</button></div>
           </section>
         </div>
       )}
       {(dialog === "channel" || dialog === "video") && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setDialog(null)}>
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => { setDialog(null); setName(""); }}>
           <form className="modal" onSubmit={(event) => void submitCreate(event)} onMouseDown={(event) => event.stopPropagation()}>
             <p className="eyebrow">{dialog === "channel" ? "New workspace" : "New production"}</p>
             <h2>{dialog === "channel" ? "Create channel" : "Create video"}</h2>
-            <label>{dialog === "channel" ? "Channel name" : "Video title"}<input autoFocus value={name} onChange={(event) => setName(event.target.value)} /></label>
-            <div className="footer-actions"><button type="button" className="secondary" onClick={() => setDialog(null)}>Cancel</button><button className="primary" type="submit">Create</button></div>
+            <label>{dialog === "channel" ? "Channel name" : "Video title"}<input autoFocus value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(e) => { if (e.key === "Escape") { setDialog(null); setName(""); } }} /></label>
+            {!name.trim() && <p style={{ fontSize: "11px", color: "var(--muted)", marginTop: "4px" }}>Name cannot be empty.</p>}
+            <div className="footer-actions"><button type="button" className="secondary" onClick={() => { setDialog(null); setName(""); }}>Cancel</button><button className="primary" type="submit" disabled={!name.trim()}>Create</button></div>
           </form>
         </div>
       )}
@@ -352,10 +549,7 @@ function InputsView() {
   const inputSignature = useMemo(() => JSON.stringify({
     script,
     audioId: audio?.id ?? null,
-    pacingPreset,
-    pacingMin,
-    pacingMax,
-  }), [audio?.id, pacingMax, pacingMin, pacingPreset, script]);
+  }), [audio?.id, script]);
 
   useEffect(() => {
     if (!activeVideoId) return;
@@ -371,9 +565,6 @@ function InputsView() {
       const signature = JSON.stringify({
         script: inputs.scriptText,
         audioId: inputs.audio?.id ?? null,
-        pacingPreset: inputs.pacingPreset,
-        pacingMin: inputs.pacingMinSeconds,
-        pacingMax: inputs.pacingMaxSeconds,
       });
       void projectsClient.getVisualPlan(activeVideoId)
         .then(() => { setHasPlan(true); setGeneratedInputSignature(signature); })
@@ -393,7 +584,9 @@ function InputsView() {
 
   async function choosePacing(preset: "calm" | "balanced" | "fast" | "custom", min = pacingMin, max = pacingMax) {
     if (!activeVideoId) return;
-    const ranges = { calm: [10, 16], balanced: [6, 10], fast: [3, 6], custom: [min, max] } as const;
+    const safeMin = preset === "custom" ? Math.min(min, max) : min;
+    const safeMax = preset === "custom" ? Math.max(min, max) : max;
+    const ranges = { calm: [10, 16], balanced: [6, 10], fast: [3, 6], custom: [safeMin, safeMax] } as const;
     const [nextMin, nextMax] = ranges[preset];
     setPacingPreset(preset); setPacingMin(nextMin); setPacingMax(nextMax);
     setPacing(Math.round((nextMin + nextMax) / 2)); setStatus("Saving…");
@@ -491,7 +684,7 @@ function InputsView() {
       <input ref={scriptFileRef} className="visually-hidden" type="file" accept=".txt,text/plain" onChange={(event) => void importBrowserScript(event)} />
       <input ref={audioFileRef} className="visually-hidden" type="file" accept=".wav,.mp3,.m4a,.aac,.flac,audio/*" onChange={(event) => void importBrowserAudio(event)} />
       {generating && <GenerationProgress progress={generationProgress} />}
-      <div className="workflow-tabs"><button className="active">1 · Source & pacing</button><button disabled={!hasPlan} onClick={() => setStage("visual-plan")}>2 · Visual plan</button></div>
+      <div className="workflow-tabs" role="tablist"><button role="tab" aria-selected={true} className="active">1 · Source & pacing</button><button role="tab" aria-selected={false} disabled={!hasPlan} onClick={() => setStage("visual-plan")}>2 · Visual plan</button></div>
       <div className="page-heading"><div><p className="eyebrow">Stage 1 of 3</p><h1>Source material</h1><p>Add narration and references that will guide the visual plan.</p></div><span className="save-state">{status}</span></div>
       {!activeVideoId && <div className="inline-error">Open or create a video before adding source material.</div>}
       {error && <div className="inline-error">{error}</div>}
@@ -518,6 +711,7 @@ function VisualPlanView() {
   const [error, setError] = useState<string | null>(null);
   const [draggedSentenceId, setDraggedSentenceId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
   useEffect(() => {
     if (!activeVideoId) return;
@@ -556,15 +750,16 @@ function VisualPlanView() {
 
   return (
     <section className="view">
-      <div className="workflow-tabs"><button onClick={() => setStage("inputs")}>1 · Source & pacing</button><button className="active">2 · Visual plan</button></div>
+      <div className="workflow-tabs" role="tablist"><button role="tab" aria-selected={false} onClick={() => setStage("inputs")}>1 · Source & pacing</button><button role="tab" aria-selected={true} className="active">2 · Visual plan</button></div>
       <div className="page-heading">
         <div><p className="eyebrow">Stage 2 of 3</p><h1>Visual plan</h1><p>Drag a sentence into an adjacent still to regroup it. Chronological order remains enforced.</p></div>
-        <div className="heading-actions"><button className="secondary" disabled={!plan} onClick={() => void resetPlan()}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
+        <div className="heading-actions"><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
       </div>
       {error && <div className="inline-error">{error}</div>}
       {!plan && !error && <div className="empty-state">Loading visual plan…</div>}
+      {confirmReset && <ConfirmDialog title="Reset visual plan?" message="This restores the original AI-generated groupings. All custom drag-and-drop changes will be lost." confirmLabel="Reset" onConfirm={() => { setConfirmReset(false); void resetPlan(); }} onCancel={() => setConfirmReset(false)} />}
       {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{formatTime(plan.sentences.at(-1)?.endSeconds ?? 0)} total · Average {((plan.sentences.at(-1)?.endSeconds ?? 0) / plan.groups.length).toFixed(1)} sec · {plan.timingSource}</span></div>
-      <DndContext
+      <div className="plan-scroll"><DndContext
         sensors={sensors}
         onDragStart={(event) => setDraggedSentenceId(String(event.active.id).replace(/^sentence:/, ""))}
         onDragOver={(event) => setDropTarget(event.over ? String(event.over.id) : null)}
@@ -585,13 +780,12 @@ function VisualPlanView() {
                   <DraggableSentence key={sentence.id} sentence={sentence} active={draggedSentenceId === sentence.id} />
                 ))}
               </div>
-              <div className="scene-label"><span>{group.kind}</span><small>{group.label}</small></div>
             </DroppableStill>
             <StillDivider insertIndex={index + 1} active={dropTarget === `divider:${index + 1}`} />
           </div>;
         })}
       </div>
-      </DndContext></>}
+      </DndContext></div></>}
     </section>
   );
 }
@@ -763,8 +957,18 @@ function SettingSelect({ label, value, options, onChange }: { label: string; val
   );
 }
 
+// Module-level: survives ImagesView mount/unmount so navigation doesn't kill an in-flight plan
+let _planningVideoId: string | null = null;
+let _planningPromise: Promise<import("./infrastructure/projects-client").BulkPlanResultRecord> | null = null;
+
+// Bulk plan progress events forwarded outside component lifecycle
+void listen<{ planned: number; total: number }>("bulk_plan_progress", (event) => {
+  // Only used to update whichever ImagesView instance is mounted; the component's own listener handles this.
+  void event;
+});
+
 function ImagesView() {
-  const { activeVideoId } = useAppStore();
+  const { activeVideoId, addToast } = useAppStore();
   const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [activePromptVersionId, setActivePromptVersionId] = useState<string | null>(null);
@@ -772,15 +976,17 @@ function ImagesView() {
   const [userPrompt, setUserPrompt] = useState("");
   const [imageSettings, setImageSettings] = useState<ImageSettings>(defaultImageSettings);
   const settingsJson = JSON.stringify(imageSettings);
-  const [geminiModel, setGeminiModel] = useState("gemini-3.1-flash-image");
-  const [keyStatus, setKeyStatus] = useState({ gemini: false, openai: false });
   const [tab, setTab] = useState<"prompt" | "settings" | "edit">("prompt");
   const [loading, setLoading] = useState(false);
+  const [generatingGroupId, setGeneratingGroupId] = useState<string | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [job, setJob] = useState<ImageJobRecord | null>(null);
   const [selectedRenderId, setSelectedRenderId] = useState<string | null>(null);
-  const [compareRenderId, setCompareRenderId] = useState<string | null>(null);
   const [renderUrls, setRenderUrls] = useState<Record<string, string>>({});
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [confirmDeleteRender, setConfirmDeleteRender] = useState<ImageRenderRecord | null>(null);
+  const [confirmDeleteVersion, setConfirmDeleteVersion] = useState<PromptVersionRecord | null>(null);
   const [editInstruction, setEditInstruction] = useState("");
   const [editStrength, setEditStrength] = useState("Low");
   const [editOpen, setEditOpen] = useState(false);
@@ -807,6 +1013,8 @@ function ImagesView() {
   const promptPrepTask = useRef<{ items: ImageWorkspaceRecord["groups"]; index: number } | null>(null);
   const [referenceUrl, setReferenceUrl] = useState("");
   const promptPrepSettingKey = activeVideoId ? `prompt_prep.${activeVideoId}` : "";
+  const [showAllVersions, setShowAllVersions] = useState(false);
+  const [showAllRenders, setShowAllRenders] = useState(false);
 
   const selectedGroup = useMemo(
     () => workspace?.groups.find((group) => group.group.id === selectedGroupId) ?? null,
@@ -840,7 +1048,7 @@ function ImagesView() {
       setError(null);
       try {
         const loaded = await projectsClient.getImageWorkspace(activeVideoId);
-        imageWorkspaceCache.set(activeVideoId, loaded);
+        setCached(activeVideoId, loaded);
         setWorkspace(loaded);
         setSelectedGroupId((current) => {
           const restore = lastSelectedStill.get(activeVideoId);
@@ -849,24 +1057,16 @@ function ImagesView() {
           return loaded.groups[0]?.group.id ?? null;
         });
         setImageSettings(parseImageSettings(loaded.settings.find((setting) => setting.key === "image_settings")?.value));
-        setGeminiModel(loaded.settings.find((setting) => setting.key === "gemini_model")?.value ?? "gemini-3.1-flash-image");
-        /* visual_strategy_mode is deprecated — planner now always uses Auto Educational */
-        const [geminiStatus, openAiStatus, inputs] = await Promise.all([
-          projectsClient.getProviderKeyStatus("gemini"),
-          projectsClient.getProviderKeyStatus("openai"),
-          projectsClient.getVideoInputs(activeVideoId),
-        ]);
-        setKeyStatus({ gemini: geminiStatus.configured, openai: openAiStatus.configured });
+        const inputs = await projectsClient.getVideoInputs(activeVideoId);
         setReferences(inputs.references);
         const latestJob = await projectsClient.getLatestImageJob(activeVideoId);
-        setJob(latestJob && ["queued", "running", "paused"].includes(latestJob.status) ? latestJob : null);
+        setJob(latestJob && ["queued", "running", "paused", "stopped"].includes(latestJob.status) ? latestJob : null);
         const latest = loaded.groups[0]?.promptVersions[0];
         setActivePromptVersionId(latest?.id ?? null);
         setSystemPrompt(loaded.settings.find((s) => s.key === "system_prompt")?.value ?? latest?.systemPrompt ?? "");
         setUserPrompt(latest?.userPrompt ?? "");
         const latestRender = loaded.groups[0]?.imageRenders[0];
         setSelectedRenderId(latestRender?.id ?? null);
-        setCompareRenderId(latestRender?.parentRenderId ?? loaded.groups[0]?.imageRenders[1]?.id ?? null);
         const savedPrep = loaded.settings.find((setting) => setting.key === `prompt_prep.${activeVideoId}`)?.value;
         if (savedPrep) {
           try {
@@ -895,7 +1095,7 @@ function ImagesView() {
     if (!activeVideoId || !job || !["queued", "running"].includes(job.status)) return;
     const timer = window.setInterval(async () => {
       const latest = await projectsClient.getLatestImageJob(activeVideoId);
-      setJob(latest && ["queued", "running", "paused"].includes(latest.status) ? latest : null);
+      setJob(latest && ["queued", "running", "paused", "stopped"].includes(latest.status) ? latest : null);
       const refreshed = await projectsClient.getImageWorkspace(activeVideoId);
       setWorkspace(refreshed);
       const selected = refreshed.groups.find((item) => item.group.id === selectedGroupId);
@@ -909,7 +1109,7 @@ function ImagesView() {
     if (!activeVideoId) return;
     try {
       const loaded = await projectsClient.getImageWorkspace(activeVideoId);
-      imageWorkspaceCache.set(activeVideoId, loaded);
+      setCached(activeVideoId, loaded);
       setWorkspace(loaded);
       const selected = loaded.groups.find((group) => group.group.id === selectedGroupId);
       const newest = selected?.imageRenders[0];
@@ -949,7 +1149,7 @@ function ImagesView() {
 
   async function generateRender() {
     if (!activeVideoId || !selectedGroupId) return;
-    setLoading(true);
+    setGeneratingGroupId(selectedGroupId);
     setError(null);
     try {
       const versionId = (
@@ -979,7 +1179,7 @@ function ImagesView() {
     } catch (caught) {
       setError(String(caught));
     } finally {
-      setLoading(false);
+      setGeneratingGroupId(null);
     }
   }
 
@@ -987,6 +1187,16 @@ function ImagesView() {
     if (!job) return;
     try {
       setJob(await projectsClient.controlImageJob(job.id, action));
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  async function resumeStoppedJob() {
+    if (!activeVideoId) return;
+    try {
+      const newJob = await projectsClient.createImageJob(activeVideoId);
+      setJob(newJob);
     } catch (caught) {
       setError(String(caught));
     }
@@ -1002,6 +1212,8 @@ function ImagesView() {
   function selectGroup(groupId: string) {
     setError(null);
     setSelectedGroupId(groupId);
+    setShowAllVersions(false);
+    setShowAllRenders(false);
     if (activeVideoId) lastSelectedStill.set(activeVideoId, groupId);
     const latest = workspace?.groups.find((item) => item.group.id === groupId)?.promptVersions[0];
     setActivePromptVersionId(latest?.id ?? null);
@@ -1011,27 +1223,9 @@ function ImagesView() {
     setImageSettings(parseImageSettings(latest?.settingsJson));
     const latestRender = workspace?.groups.find((item) => item.group.id === groupId)?.imageRenders[0];
     setSelectedRenderId(latestRender?.id ?? null);
-    setCompareRenderId(latestRender?.parentRenderId ?? null);
   }
 
-  async function saveSettings() {
-    if (!activeVideoId || !selectedGroupId) return;
-    setLoading(true);
-    setError(null);
-    try {
-      await projectsClient.saveAppSetting("image_settings", settingsJson);
-      await projectsClient.saveAppSetting("gemini_model", geminiModel.trim());
-      if (userPrompt.trim()) {
-        const version = await projectsClient.createPromptVersion(activeVideoId, selectedGroupId, settingsJson, systemPrompt || "Preserve a coherent visual style.", userPrompt);
-        setActivePromptVersionId(version.id);
-      }
-      await refreshWorkspace();
-    } catch (caught) {
-      setError(String(caught));
-    } finally {
-      setLoading(false);
-    }
-  }
+
 
   async function runPromptPreparation() {
     if (!activeVideoId || !promptPrepTask.current) return;
@@ -1061,7 +1255,7 @@ function ImagesView() {
           }
         }
         const live = await projectsClient.getImageWorkspace(activeVideoId);
-        imageWorkspaceCache.set(activeVideoId, live);
+        setCached(activeVideoId, live);
         setWorkspace(live);
         if (item.group.id === selectedGroupId) {
           const livePrompt = live.groups.find((group) => group.group.id === item.group.id)?.promptVersions[0];
@@ -1136,7 +1330,7 @@ function ImagesView() {
 
   async function suggestPrompt() {
     if (!activeVideoId || !selectedGroupId) return;
-    setLoading(true);
+    setAiLoading(true);
     setError(null);
     try {
       const planned = await projectsClient.suggestStillPrompt(activeVideoId, selectedGroupId, systemPrompt, settingsJson);
@@ -1144,12 +1338,12 @@ function ImagesView() {
       setImageSettings((current) => mergeExtractedSettings(current, planned.imageSettings));
       await refreshWorkspace();
     } catch (caught) { setError(String(caught)); }
-    finally { setLoading(false); }
+    finally { setAiLoading(false); }
   }
 
   async function extractImageSettingsFromDirective() {
     if (!systemPrompt.trim()) return;
-    setLoading(true);
+    setAiLoading(true);
     setError(null);
     try {
       const result = await projectsClient.extractImageSettingsFromDirective(systemPrompt);
@@ -1157,9 +1351,10 @@ function ImagesView() {
       setImageSettings((current) => mergeExtractedSettings(current, result.imageSettings));
       setTab("settings");
     } catch (caught) { setError(String(caught)); }
-    finally { setLoading(false); }
+    finally { setAiLoading(false); }
   }
 
+  // Keep progress events alive while component is mounted
   useEffect(() => {
     const unlisten = listen<{ planned: number; total: number }>("bulk_plan_progress", (event) => {
       setBulkProgress((prev) => prev ? { ...prev, current: event.payload.planned, total: event.payload.total } : null);
@@ -1167,16 +1362,34 @@ function ImagesView() {
     return () => { void unlisten.then((fn) => fn()); };
   }, []);
 
+  // Reattach to an in-flight plan if the user navigated away and came back
+  useEffect(() => {
+    if (_planningPromise && _planningVideoId === activeVideoId) {
+      setBulkPlanLoading(true);
+      setBulkProgress({ current: 0, total: 0, label: "Planning stills with AI…" });
+      void _planningPromise
+        .then((plan) => { setBulkPlan(plan); setBulkOverviewOpen(true); })
+        .catch((err: unknown) => { setError(String(err)); setBulkOpen(true); })
+        .finally(() => { setBulkPlanLoading(false); setBulkProgress(null); });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeVideoId]);
+
   async function runBulkPlan() {
-    if (!activeVideoId || !workspace) return;
+    if (!activeVideoId || !workspace || _planningPromise) return;
     const total = workspace.groups.length;
     setBulkOpen(false);
     setBulkPlanLoading(true);
     setBulkProgress({ current: 0, total: 0, label: `Planning ${total} stills with AI…` });
     setError(null);
-    try {
+    _planningVideoId = activeVideoId;
+    const innerPromise = (async () => {
       await projectsClient.saveAppSetting("system_prompt", systemPrompt);
-      const plan = await projectsClient.planBulkVisuals(activeVideoId, systemPrompt, settingsJson, bulkInstruction);
+      return projectsClient.planBulkVisuals(activeVideoId, systemPrompt, settingsJson, bulkInstruction);
+    })();
+    _planningPromise = innerPromise;
+    try {
+      const plan = await innerPromise;
       setBulkPlan(plan);
       setBulkOverviewOpen(true);
     } catch (caught) {
@@ -1185,6 +1398,8 @@ function ImagesView() {
     } finally {
       setBulkPlanLoading(false);
       setBulkProgress(null);
+      _planningPromise = null;
+      _planningVideoId = null;
     }
   }
 
@@ -1196,7 +1411,7 @@ function ImagesView() {
       setBulkOverviewOpen(false);
       await projectsClient.approveBulkPlan(activeVideoId, systemPrompt, bulkPlan.stills);
       const live = await projectsClient.getImageWorkspace(activeVideoId);
-      imageWorkspaceCache.set(activeVideoId, live);
+      setCached(activeVideoId, live);
       setWorkspace(live);
       if (selectedGroupId) {
         const group = live.groups.find((g) => g.group.id === selectedGroupId);
@@ -1217,6 +1432,30 @@ function ImagesView() {
 
   function updateImageSetting<K extends keyof ImageSettings>(key: K, value: ImageSettings[K]) {
     setImageSettings((current) => ({ ...current, [key]: value }));
+  }
+
+  // Auto-save image settings whenever they change (replaces the removed "Apply settings" button)
+  useEffect(() => {
+    if (!activeVideoId) return;
+    const timer = window.setTimeout(() => {
+      void projectsClient.saveAppSetting("image_settings", settingsJson);
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [settingsJson, activeVideoId]);
+
+  async function downloadStill(renderId: string) {
+    try {
+      let folder = await projectsClient.getAppSetting("download_folder");
+      if (!folder) {
+        folder = await projectsClient.pickDownloadFolder();
+        if (!folder) return;
+        await projectsClient.saveAppSetting("download_folder", folder);
+      }
+      const fileName = await projectsClient.copyRenderToFolder(renderId, folder);
+      addToast(`Saved: ${fileName}`, "success");
+    } catch (caught) {
+      setError(String(caught));
+    }
   }
 
   async function importReference() {
@@ -1242,7 +1481,7 @@ function ImagesView() {
   }
 
   async function extractStyle(assetId: string) {
-    setLoading(true);
+    setAiLoading(true);
     setError(null);
     try {
       const extracted = await projectsClient.extractReferenceStyle(assetId);
@@ -1250,7 +1489,7 @@ function ImagesView() {
       setImageSettings((current) => mergeExtractedSettings(current, extracted.imageSettings));
       setTab("settings");
     } catch (caught) { setError(String(caught)); }
-    finally { setLoading(false); }
+    finally { setAiLoading(false); }
   }
 
   const previewLabel = selectedGroup?.group.label ?? "Still preview";
@@ -1259,12 +1498,12 @@ function ImagesView() {
   const imageRenders = selectedGroup?.imageRenders ?? [];
 
   useEffect(() => {
-    const ids = [selectedRenderId, compareRenderId].filter(Boolean) as string[];
+    const ids = [selectedRenderId].filter(Boolean) as string[];
     void Promise.all(ids.filter((id) => !renderUrls[id]).map(async (id) => {
       const url = await projectsClient.getRenderDataUrl(id);
       setRenderUrls((current) => ({ ...current, [id]: url }));
     }));
-  }, [selectedRenderId, compareRenderId, renderUrls]);
+  }, [selectedRenderId, renderUrls]);
 
   useEffect(() => {
     const ids = workspace?.groups.map((group) => group.imageRenders[0]?.id).filter(Boolean) as string[] | undefined;
@@ -1284,7 +1523,6 @@ function ImagesView() {
       const canvas = maskCanvasRef.current;
       const maskDataUrl = canvas && canvas.dataset.painted === "true" ? canvas.toDataURL("image/png") : undefined;
       const edited = await projectsClient.editImageRender(selectedRenderId, editInstruction.trim(), maskDataUrl, editStrength);
-      setCompareRenderId(selectedRenderId);
       setSelectedRenderId(edited.id);
       setEditInstruction("");
       await refreshWorkspace();
@@ -1296,7 +1534,6 @@ function ImagesView() {
   }
 
   function selectRender(render: ImageRenderRecord) {
-    setCompareRenderId(render.parentRenderId ?? selectedRenderId);
     setSelectedRenderId(render.id);
   }
 
@@ -1329,7 +1566,7 @@ function ImagesView() {
     } catch (caught) { setError(String(caught)); }
   }
 
-  async function deletePromptVersion(version: PromptVersionRecord) {
+  async function deleteVersionConfirmed(version: PromptVersionRecord) {
     try {
       await projectsClient.deletePromptVersion(version.id);
       if (activePromptVersionId === version.id) setActivePromptVersionId(null);
@@ -1337,7 +1574,7 @@ function ImagesView() {
     } catch (caught) { setError(String(caught)); }
   }
 
-  async function deleteRender(render: ImageRenderRecord) {
+  async function deleteRenderConfirmed(render: ImageRenderRecord) {
     try {
       await projectsClient.deleteImageRender(render.id);
       setRenderUrls((current) => {
@@ -1350,8 +1587,8 @@ function ImagesView() {
     } catch (caught) { setError(String(caught)); }
   }
 
-  async function resetImages() {
-    if (!activeVideoId || !window.confirm("Clear all image prompts, image versions, planner results, and still statuses for this video? This cannot be undone.")) return;
+  async function doResetImages() {
+    if (!activeVideoId) return;
     setLoading(true);
     setError(null);
     try {
@@ -1372,7 +1609,7 @@ function ImagesView() {
       setSystemPrompt("");
       setImageSettings(defaultImageSettings);
       const loaded = await projectsClient.getImageWorkspace(activeVideoId);
-      imageWorkspaceCache.set(activeVideoId, loaded);
+      setCached(activeVideoId, loaded);
       setWorkspace(loaded);
       setSelectedGroupId(loaded.groups[0]?.group.id ?? null);
     } catch (caught) {
@@ -1403,7 +1640,7 @@ function ImagesView() {
     if (!activeVideoId) return;
     try {
       const result = await projectsClient.exportLatestStills(activeVideoId);
-      if (result) setError(`Exported ${result.fileCount} stills to ${result.path}`);
+      if (result) addToast(`Exported ${result.fileCount} stills to ${result.path}`, "success");
     } catch (caught) { setError(String(caught)); }
   }
 
@@ -1411,20 +1648,23 @@ function ImagesView() {
     if (!activeVideoId) return;
     try {
       const result = await projectsClient.exportProjectBundle(activeVideoId);
-      if (result) setError(`Project bundle saved to ${result.path}`);
+      if (result) addToast(`Project bundle saved to ${result.path}`, "success");
     } catch (caught) { setError(String(caught)); }
   }
 
   return (
     <section className="view images-view">
       {loading && <LoadingOverlay label="Working on your images" />}
+      {confirmReset && <ConfirmDialog title="Reset all images?" message="This clears all prompts, image versions, planner results, and still statuses for this video. This cannot be undone." confirmLabel="Reset everything" onConfirm={() => { setConfirmReset(false); void doResetImages(); }} onCancel={() => setConfirmReset(false)} />}
+      {confirmDeleteRender && <ConfirmDialog title="Delete image version?" message="This permanently removes this render. It cannot be recovered." confirmLabel="Delete" onConfirm={() => { const r = confirmDeleteRender; setConfirmDeleteRender(null); void deleteRenderConfirmed(r); }} onCancel={() => setConfirmDeleteRender(null)} />}
+      {confirmDeleteVersion && <ConfirmDialog title="Delete prompt version?" message="This permanently removes this prompt version." confirmLabel="Delete" onConfirm={() => { const v = confirmDeleteVersion; setConfirmDeleteVersion(null); void deleteVersionConfirmed(v); }} onCancel={() => setConfirmDeleteVersion(null)} />}
       <div className="page-heading">
         <div>
           <p className="eyebrow">Stage 3 of 3</p>
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <div className="heading-actions"><button className="secondary danger-action" onClick={() => void resetImages()} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Final output folder</button><button className="secondary" onClick={() => void exportBundle()}><Download size={16} />Project bundle</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} />Bulk Generate</button></div>
+        <div className="heading-actions"><button className="secondary danger-action" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Final output folder</button><button className="secondary" onClick={() => void exportBundle()}><Download size={16} />Project bundle</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} />Bulk Generate</button></div>
       </div>
       {error && <div className="error-toast" role="alert"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
       {job && !bulkProgress && (
@@ -1435,6 +1675,7 @@ function ImagesView() {
             {["queued", "running"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("pause")}>Pause</button>}
             {job.status === "paused" && <button className="secondary" onClick={() => void controlJob("resume")}>Resume</button>}
             {["queued", "running", "paused"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("stop")}>Stop</button>}
+            {job.status === "stopped" && <button className="secondary" onClick={() => void resumeStoppedJob()}>Resume</button>}
           </div>
         </div>
       )}
@@ -1443,7 +1684,7 @@ function ImagesView() {
         <aside className="stills">
           <strong>Stills <span>{stillCount}</span></strong>
           {workspace?.groups.map((group) => (
-            <button key={group.group.id} className={`still-select${group.group.id === selectedGroupId ? " active" : ""}`} onClick={() => selectGroup(group.group.id)}>
+            <button key={group.group.id} className={`still-select${group.group.id === selectedGroupId ? " active" : ""}${generatingGroupId === group.group.id ? " generating" : ""}`} onClick={() => selectGroup(group.group.id)}>
               <div><strong>Still {group.group.ordinal}</strong>{group.imageRenders.length > 0 && <Check size={14} />}</div>
               <small>{(() => { const rows = group.group.sentenceIds.map((id) => workspace.sentences.find((s) => s.id === id)).filter(Boolean) as PlanSentenceRecord[]; return rows.length ? `${formatTime(rows[0].startSeconds)} – ${formatTime(rows.at(-1)!.endSeconds)}` : ""; })()}</small>
               <p>{group.group.sentenceIds.map((id) => workspace.sentences.find((s) => s.id === id)?.text).filter(Boolean).join(" ").slice(0, 72)}</p>
@@ -1462,15 +1703,20 @@ function ImagesView() {
             ) : <div className={`image-frame empty-frame ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}`}><div className="image-empty"><Image size={34} /><strong>No image generated yet</strong><span>{imageSettings.aspectRatio === "9:16" ? "YouTube Short · 9:16" : "YouTube Video · 16:9"}</span></div></div>}
           </div>
           <footer>
-            <div className="version-nav"><button disabled={imageRenders.findIndex((r) => r.id === selectedRenderId) >= imageRenders.length - 1} onClick={() => moveVersion(1)}><ChevronLeft size={16} />Previous</button><strong>{selectedRenderId ? `Version ${imageRenders.find((r) => r.id === selectedRenderId)?.version} / ${imageRenders.length}` : "No versions"}</strong><button disabled={imageRenders.findIndex((r) => r.id === selectedRenderId) <= 0} onClick={() => moveVersion(-1)}>Next<ChevronRight size={16} /></button></div>
-            {imageRenders.find((render) => render.id === selectedRenderId) && <div className="version-actions"><button className="secondary" onClick={() => void toggleFinal(imageRenders.find((render) => render.id === selectedRenderId)!)}>{imageRenders.find((render) => render.id === selectedRenderId)?.isFinal ? "Unmark Final" : "Mark as Final"}</button><button className="secondary" onClick={() => { const render = imageRenders.find((item) => item.id === selectedRenderId); const version = promptVersions.find((item) => item.id === render?.promptVersionId); if (version) selectVersion(version); }}>Roll Back To This Version</button></div>}
+            <div className="version-nav"><button disabled={imageRenders.findIndex((r) => r.id === selectedRenderId) >= imageRenders.length - 1} onClick={() => moveVersion(1)}><ChevronLeft size={16} />Older</button><strong>{selectedRenderId ? `Version ${imageRenders.find((r) => r.id === selectedRenderId)?.version} / ${imageRenders.length}` : "No versions"}</strong><button disabled={imageRenders.findIndex((r) => r.id === selectedRenderId) <= 0} onClick={() => moveVersion(-1)}>Newer<ChevronRight size={16} /></button></div>
+            {imageRenders.find((render) => render.id === selectedRenderId) && <div className="version-actions"><button className="secondary" onClick={() => void toggleFinal(imageRenders.find((render) => render.id === selectedRenderId)!)}>{imageRenders.find((render) => render.id === selectedRenderId)?.isFinal ? "Unmark Final" : "Mark as Final"}</button><button className="secondary" title="Loads this version's prompts back into the edit fields. Click Generate Image to re-render." onClick={() => { const render = imageRenders.find((item) => item.id === selectedRenderId); const version = promptVersions.find((item) => item.id === render?.promptVersionId); if (version) selectVersion(version); }}>Restore Prompts</button><button className="secondary" title="Download this image" onClick={() => { if (selectedRenderId) void downloadStill(selectedRenderId); }}><Download size={14} />Download</button></div>}
           </footer>
         </div>
         <aside className="prompt-panel">
-          <div className="tabs">
-            <button className={tab === "prompt" ? "active" : ""} onClick={() => setTab("prompt")}>Prompt</button>
-            <button className={tab === "settings" ? "active" : ""} onClick={() => setTab("settings")}>Settings</button>
-            <button className={tab === "edit" ? "active" : ""} onClick={() => setTab("edit")}>Edit / Inpaint</button>
+          <div className="tabs" role="tablist" onKeyDown={(e) => {
+            const tabs: Array<"prompt" | "settings" | "edit"> = ["prompt", "settings", "edit"];
+            const idx = tabs.indexOf(tab);
+            if (e.key === "ArrowRight") { e.preventDefault(); setTab(tabs[(idx + 1) % tabs.length]); }
+            if (e.key === "ArrowLeft") { e.preventDefault(); setTab(tabs[(idx - 1 + tabs.length) % tabs.length]); }
+          }}>
+            <button role="tab" aria-selected={tab === "prompt"} className={tab === "prompt" ? "active" : ""} onClick={() => setTab("prompt")}>Prompt</button>
+            <button role="tab" aria-selected={tab === "settings"} className={tab === "settings" ? "active" : ""} onClick={() => setTab("settings")}>Settings</button>
+            <button role="tab" aria-selected={tab === "edit"} className={tab === "edit" ? "active" : ""} onClick={() => setTab("edit")}>Edit / Inpaint</button>
           </div>
           {tab === "prompt" ? (
             <>
@@ -1484,28 +1730,29 @@ function ImagesView() {
                 <span className="field-heading">User Prompt</span>
                 <textarea className="production-copy" value={userPrompt} onChange={(event) => setUserPrompt(event.target.value)} onBlur={() => void createVersion()} placeholder="Describe the scene that directly supports this narration." />
               </label>
-              <button className="secondary full" onClick={() => void suggestPrompt()} disabled={!selectedGroupId || loading || !keyStatus.gemini}><Sparkles size={15} />Suggest Prompt</button>
+              <button className="secondary full" onClick={() => void suggestPrompt()} disabled={!selectedGroupId || aiLoading}>{aiLoading ? <><LoaderCircle className="spin" size={14} />Suggesting…</> : <><Sparkles size={15} />Suggest Prompt</>}</button>
               <label>
                 <span className="field-heading">Style Directive <small>Optional</small></span>
                 <textarea className="production-copy" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="Art style, rendering, color language, recurring subjects, visual consistency rules..." />
               </label>
-              <button className="primary full" onClick={() => void generateRender()} disabled={!selectedGroupId || !userPrompt.trim() || loading}>Generate Image</button>
+              <button className="primary full" onClick={() => void generateRender()} disabled={!selectedGroupId || !userPrompt.trim() || !!generatingGroupId}>{generatingGroupId === selectedGroupId ? <><LoaderCircle className="spin" size={14} />Generating…</> : "Generate Image"}</button>
               {promptVersions.length > 0 && (
                 <div className="version-history"><strong>Prompt versions</strong>
-                  {promptVersions.slice(0, 5).map((version) => (
-                    <div className="version-row" key={version.id}><button className={version.id === activePromptVersionId ? "active" : ""} onClick={() => selectVersion(version)}><span>v{version.version}</span><small>{new Date(version.createdAt).toLocaleString()}</small></button><button className="delete-version" onClick={() => void deletePromptVersion(version)} title="Delete prompt version"><Trash2 size={14} /></button></div>
+                  {(showAllVersions ? promptVersions : promptVersions.slice(0, 5)).map((version) => (
+                    <div className="version-row" key={version.id}><button className={version.id === activePromptVersionId ? "active" : ""} onClick={() => selectVersion(version)}><span>v{version.version}</span><small>{new Date(version.createdAt).toLocaleString()}</small></button><button className="delete-version" onClick={() => setConfirmDeleteVersion(version)} title="Delete prompt version"><Trash2 size={14} /></button></div>
                   ))}
+                  {promptVersions.length > 5 && !showAllVersions && <button className="show-all-btn" onClick={() => setShowAllVersions(true)}>Show all {promptVersions.length}</button>}
                 </div>
               )}
-              {imageRenders.length > 0 && <div className="version-history"><strong>Image versions</strong>{imageRenders.slice(0, 5).map((render) => (
+              {imageRenders.length > 0 && <div className="version-history"><strong>Image versions</strong>{(showAllRenders ? imageRenders : imageRenders.slice(0, 5)).map((render) => (
                 <div className="version-row" key={render.id}>
                   <button type="button" className={render.id === selectedRenderId ? "active" : ""} onClick={() => selectRender(render)}>
                     <span>Version {render.version} · {render.kind}{render.isFinal ? " · Final" : ""}</span>
                     <small>{render.editInstruction ?? new Date(render.createdAt).toLocaleString()}</small>
                   </button>
-                  <button className="delete-version" onClick={() => void deleteRender(render)} title="Delete image version"><Trash2 size={14} /></button>
+                  <button className="delete-version" onClick={() => setConfirmDeleteRender(render)} title="Delete image version"><Trash2 size={14} /></button>
                 </div>
-              ))}</div>}
+              ))}{imageRenders.length > 5 && !showAllRenders && <button className="show-all-btn" onClick={() => setShowAllRenders(true)}>Show all {imageRenders.length}</button>}</div>}
             </>
           ) : tab === "settings" ? (
             <>
@@ -1537,16 +1784,11 @@ function ImagesView() {
                   ["surfaceEffects","Surface Effects",["Undefined","None","Reflections","Glare Lens Flare","Water Droplets Condensation","Glass Glare","Custom..."]],
                 ] as [keyof ImageSettings,string,string[]][]).map(([key,label,options]) => <SettingSelect key={key} label={label} value={imageSettings[key]} options={options} onChange={(value) => updateImageSetting(key, value)} />)}
               </div></details>
-              <label className="model-setting"><span>Image model</span><select value={geminiModel} onChange={(event) => setGeminiModel(event.target.value)}><option value="gemini-3.1-flash-image">Gemini Nano Banana 2</option></select></label>
-              <div className={keyStatus.gemini ? "provider-status ready" : "provider-status"}>
-                <strong>Generation service</strong><span>{keyStatus.gemini ? "Configured securely in Windows Credential Manager" : "Not configured. Add the Gemini credential on the backend."}</span>
-              </div>
               <div className="reference-manager">
                 <div><strong>Visual references</strong><span>Style or subject guidance — Extract Style updates the Style Directive.</span></div>
                 {!references.length && <button className="secondary" onClick={() => void importReference()}><Plus size={14} />Add image</button>}
-                {references.map((reference) => <div className="reference-item" key={reference.id}>{referenceUrl ? <img src={referenceUrl} alt="Visual reference" /> : <span>IMG</span>}<button title="Extract Style" onClick={() => void extractStyle(reference.id)}><Sparkles size={13} />Extract Style</button><button onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button></div>)}
+                {references.map((reference) => <div className="reference-item" key={reference.id}>{referenceUrl ? <img src={referenceUrl} alt="Visual reference" /> : <span>IMG</span>}<button title="Extract Style" onClick={() => void extractStyle(reference.id)} disabled={aiLoading}><Sparkles size={13} />Extract Style</button><button onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button></div>)}
               </div>
-              <button className="primary full" style={{marginTop:"8px"}} onClick={() => void saveSettings()} disabled={loading}>Apply settings</button>
             </>
           ) : (
             <div className="edit-panel">
@@ -1559,7 +1801,7 @@ function ImagesView() {
       </div>
       {zoomOpen && selectedRenderId && renderUrls[selectedRenderId] && <div className="modal-backdrop image-lightbox" onClick={() => setZoomOpen(false)}>
         <div className="lightbox-shell" onClick={(event) => event.stopPropagation()}>
-          <div className="lightbox-toolbar"><strong>Image inspection</strong><button onClick={() => setZoom((value) => Math.max(.25, value - .25))}><ZoomOut size={17} /></button><button onClick={() => setZoom(1)}>Reset</button><button onClick={() => setZoom((value) => Math.min(5, value + .25))}><ZoomIn size={17} /></button><button onClick={() => { setZoom(1); }}>Fit</button><button onClick={() => setZoomOpen(false)}><X size={17} /></button></div>
+          <div className="lightbox-toolbar"><strong>Image inspection</strong><button onClick={() => setZoom((value) => Math.max(.25, value - .25))}><ZoomOut size={17} /></button><button onClick={() => setZoom(1)}>Reset</button><button onClick={() => setZoom((value) => Math.min(5, value + .25))}><ZoomIn size={17} /></button><button onClick={() => { setZoom(1); }}>Reset to 100%</button><button onClick={() => setZoomOpen(false)}><X size={17} /></button></div>
           <div className="lightbox-canvas"><img src={renderUrls[selectedRenderId]} alt="Zoomed selected version" style={{ transform: `scale(${zoom})` }} /></div>
         </div>
       </div>}
@@ -1570,7 +1812,7 @@ function ImagesView() {
             <div className={editPanMode ? "mask-stage panning" : "mask-stage"} onPointerDown={(event) => { if (editPanMode) panStartRef.current = { x: event.clientX, y: event.clientY, originX: editPan.x, originY: editPan.y }; }} onPointerMove={(event) => { const start = panStartRef.current; if (editPanMode && start) setEditPan({ x: start.originX + event.clientX - start.x, y: start.originY + event.clientY - start.y }); }} onPointerUp={() => { panStartRef.current = null; }}>
               <div className={`mask-transform ${imageSettings.aspectRatio === "9:16" ? "portrait" : ""}`} style={{ transform: `translate(${editPan.x}px, ${editPan.y}px) scale(${editZoom})` }}>
                 <img src={renderUrls[selectedRenderId]} alt="Source image for editing" />
-                <canvas ref={maskCanvasRef} width={imageSettings.aspectRatio === "9:16" ? 720 : 1280} height={imageSettings.aspectRatio === "9:16" ? 1280 : 720} onPointerDown={(event) => { if (editPanMode) return; paintingRef.current = true; event.currentTarget.setPointerCapture(event.pointerId); paintMask(event); }} onPointerMove={(event) => { if (!editPanMode) paintMask(event); }} onPointerUp={() => { paintingRef.current = false; }} />
+                <canvas ref={maskCanvasRef} aria-label="Mask painting canvas — paint over areas to edit" width={imageSettings.aspectRatio === "9:16" ? 720 : 1280} height={imageSettings.aspectRatio === "9:16" ? 1280 : 720} onPointerDown={(event) => { if (editPanMode) return; paintingRef.current = true; event.currentTarget.setPointerCapture(event.pointerId); paintMask(event); }} onPointerMove={(event) => { if (!editPanMode) paintMask(event); }} onPointerUp={() => { paintingRef.current = false; }} />
               </div>
             </div>
             <aside>
@@ -1585,20 +1827,20 @@ function ImagesView() {
           </div>
         </div>
       </div>}
-      {bulkOpen && <div className="modal-backdrop">
-        <div className="modal bulk-modal">
+      {bulkOpen && <div className="modal-backdrop" role="presentation" onMouseDown={() => setBulkOpen(false)}>
+        <div className="modal bulk-modal" onMouseDown={(e) => e.stopPropagation()}>
           <h2>Bulk Generate</h2>
           <div className="panel-section-heading" style={{marginTop:"4px"}}><h3>Style Directive</h3><small>Global visual style</small></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Describe overall cinematography and visual language. Avoid scene-specific details — the AI will handle those per still.</p>
           <textarea className="bulk-directive" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="e.g. Cinematic documentary style, shallow depth of field, warm color grade, soft natural lighting…" rows={4} />
-          <button className="secondary full" style={{marginTop:"6px"}} onClick={() => void extractImageSettingsFromDirective()} disabled={loading || !systemPrompt.trim() || !keyStatus.gemini}><Sparkles size={14} />Readjust to global settings only</button>
+          <button className="secondary full" style={{marginTop:"6px"}} onClick={() => void extractImageSettingsFromDirective()} disabled={aiLoading || !systemPrompt.trim()}>{aiLoading ? <><LoaderCircle className="spin" size={13} />Analyzing…</> : <><Sparkles size={14} />Readjust to global settings only</>}</button>
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Reference Image</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Upload a reference to extract visual style and populate the directive automatically.</p>
           <div className="reference-list bulk-ref-list">
             {references.map((reference) => (
               <div className="reference-item" key={reference.id}>
                 {referenceUrl ? <img src={referenceUrl} alt="Visual reference" /> : <span>IMG</span>}
-                <button onClick={() => void extractStyle(reference.id)} disabled={loading || !keyStatus.gemini}><Sparkles size={13} />Extract Style</button>
+                <button onClick={() => void extractStyle(reference.id)} disabled={aiLoading}><Sparkles size={13} />Extract Style</button>
                 <button onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button>
               </div>
             ))}
@@ -1607,14 +1849,14 @@ function ImagesView() {
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Any extra guidance the AI should follow when writing scene descriptions — e.g. "always include the orange cat", "show diversity in characters", "avoid close-ups on faces".</p>
           <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => setBulkInstruction(e.target.value)} placeholder="e.g. Use the same cartoon cat character across all stills. Show a diverse cast of people. Avoid showing text or labels in any scene." rows={3} />
-          <button className="primary full" style={{marginTop:"16px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length || !keyStatus.gemini}>
+          <button className="primary full" style={{marginTop:"16px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length}>
             {bulkPlanLoading ? "Planning…" : <><WandSparkles size={16} />Plan Video</>}
           </button>
           <button className="secondary full" style={{marginTop:"8px"}} onClick={() => setBulkOpen(false)}>Cancel</button>
         </div>
       </div>}
-      {bulkOverviewOpen && bulkPlan && <div className="modal-backdrop">
-        <div className="modal bulk-overview-modal">
+      {bulkOverviewOpen && bulkPlan && <div className="modal-backdrop" role="presentation" onMouseDown={() => { setBulkOverviewOpen(false); setBulkPlan(null); }}>
+        <div className="modal bulk-overview-modal" onMouseDown={(e) => e.stopPropagation()}>
           <h2>Visual Plan — {bulkPlan.summary.totalStills} Stills</h2>
           <p className="overview-summary">{bulkPlan.summary.shortOverview}</p>
           <div className="visual-type-counts">
@@ -1630,7 +1872,7 @@ function ImagesView() {
               <div key={still.visualPlanRowId} className="overview-table-row">
                 <span>{still.ordinal}</span>
                 <span>{formatTime(still.timestampStart)}–{formatTime(still.timestampEnd)}</span>
-                <span title={still.narrationPreview}>{still.narrationPreview.slice(0, 60)}{still.narrationPreview.length > 60 ? "…" : ""}</span>
+                <span title={still.narrationPreview} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }}>{still.narrationPreview}</span>
                 <span>{still.visualType}</span>
                 <span title={still.userPrompt}>{still.userPrompt.slice(0, 70)}{still.userPrompt.length > 70 ? "…" : ""}</span>
               </div>
@@ -1684,7 +1926,7 @@ function TimelineView() {
 
   const timelineReleased = false;
   if (!timelineReleased) {
-    return <section className="view"><div className="coming-soon"><PanelsTopLeft size={34} /><p className="eyebrow">In production</p><h1>Timeline is coming soon</h1><p>Timeline editing is being refined and is not available in this build.</p></div></section>;
+    return <section className="view"><div className="coming-soon"><p className="eyebrow">In production</p><h1>Timeline is coming soon</h1><p>Timeline editing is being refined and is not available in this build.</p></div></section>;
   }
 
   return (
@@ -1723,8 +1965,45 @@ export function App() {
   } = useAppStore();
   const [startupNotice, setStartupNotice] = useState<string | null>(null);
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
-  useEffect(() => log("info", "application_started", { release: "1.2.0" }), []);
+  // Proportional UI scaling: keep the exact same layout/proportions on every screen,
+  // simply scaled down on smaller displays. Uses the NATIVE webview zoom (true
+  // browser zoom) rather than CSS `zoom` — CSS zoom on <body> desyncs click
+  // hit-testing in WebView2 (page renders but clicks miss their targets). The
+  // scale is derived from the physical window width / DPI, which is independent
+  // of the webview zoom, so it never feeds back on itself.
+  useEffect(() => {
+    const REFERENCE_WIDTH = 1768; // 220px sidebar + 1480px content + padding = native full size
+    const win = getCurrentWindow();
+    const webview = getCurrentWebview();
+    let disposed = false;
+    const applyScale = async () => {
+      try {
+        const size = await win.innerSize();      // physical pixels (zoom-independent)
+        const dpr = await win.scaleFactor();     // Windows DPI factor (e.g. 1.5)
+        const cssWidth = size.width / dpr;       // CSS px at zoom 1.0
+        const scale = Math.min(1, cssWidth / REFERENCE_WIDTH);
+        if (!disposed) await webview.setZoom(scale);
+      } catch {
+        /* setZoom unavailable (e.g. non-Tauri) — leave at native size */
+      }
+    };
+    void applyScale();
+    const unlisten = win.onResized(() => void applyScale());
+    return () => {
+      disposed = true;
+      void unlisten.then((off) => off());
+    };
+  }, []);
+  useEffect(() => log("info", "application_started", { release: "1.2.3" }), []);
   useEffect(() => { void projectsClient.startupDiagnostic().then(setStartupNotice); }, []);
+  useEffect(() => {
+    void projectsClient.getAppSetting("theme").then((saved) => {
+      if (saved === "dark" || saved === "light") {
+        const { theme: current, toggleTheme } = useAppStore.getState();
+        if (saved !== current) toggleTheme();
+      }
+    });
+  }, []);
   useEffect(() => log("debug", "stage_opened", { stage }), [stage]);
   useEffect(() => {
     if (!activeChannelId || !activeVideoId) return;
@@ -1745,6 +2024,7 @@ export function App() {
       <TitleBar />
       <Sidebar />
       <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
+      <ToastDisplay />
     </div>
   );
 }

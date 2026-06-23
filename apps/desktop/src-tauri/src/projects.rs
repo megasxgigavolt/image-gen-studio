@@ -2069,7 +2069,25 @@ Return JSON only — no markdown, no explanation:
             let director_note = if creative_instruction.trim().is_empty() {
                 String::new()
             } else {
-                format!("\nDirector's creative instruction (apply to all stills): {}\n", creative_instruction.trim())
+                format!(
+                    "\n\n════════════════════════════════════════\n\
+                     MANDATORY CREATIVE RULES — NON-NEGOTIABLE\n\
+                     ════════════════════════════════════════\n\
+                     The following rules were set by the user and override any other planning preference.\n\
+                     They MUST be applied to EVERY still in this batch without exception:\n\n\
+                     {}\n\n\
+                     HOW TO EMBED THESE RULES IN userPrompt (mandatory — not optional):\n\
+                     1. POSITIVE rules (include X / always show Y / use Z / feature W):\n\
+                        → Weave the required subject, character, or element directly into the scene description as a concrete physical presence.\n\
+                        → Example rule \"always include the orange cat\" → userPrompt must contain the orange cat as an active participant in every scene.\n\
+                     2. NEGATIVE rules (avoid X / no Y / never Z / do not show W / exclude V):\n\
+                        → Parse every avoidance directive and collect them.\n\
+                        → Append them at the END of the userPrompt in this exact format: [Avoid: item1, item2, item3]\n\
+                        → Also reflect the avoidance in your choice of visualType and imageSettings where applicable.\n\
+                     3. Both positive and negative rules must be clearly visible in the output userPrompt — a reviewer must be able to confirm compliance by reading the userPrompt alone.\n\
+                     ════════════════════════════════════════\n",
+                    creative_instruction.trim()
+                )
             };
             let prompt = format!(
                 r#"You are an Educational Visual Director planning an entire video, not isolated stills.
@@ -2128,6 +2146,7 @@ The image is assembled from three SEPARATE layers: Style Directive (global look)
 - Ask yourself: "What is physically in this image?" — write exactly that, nothing more
 - ✓ CORRECT: "A wolf pack crossing a frozen river at dusk, pine forest on both banks, snow-covered rocks in the foreground"
 - ✗ WRONG: "A cinematic wide shot of a wolf pack with warm golden color grading and shallow depth of field crossing a river"
+- If MANDATORY CREATIVE RULES are present above: positive inclusions are woven into the scene description; negative exclusions appear as [Avoid: ...] at the end of the prompt.
 
 TEXTLESS VISUAL RULE (Textless Infographic, Timeline, Geographic Map, Scientific Diagram, Process Illustration):
 - Use arrows, icons, silhouettes, spatial layout, visual contrast, before/after, symbolic shapes.
@@ -2136,7 +2155,7 @@ TEXTLESS VISUAL RULE (Textless Infographic, Timeline, Geographic Map, Scientific
 Allowed visualType values: Character Scene; Behavioral Demonstration; Close Detail; Environmental Scene; Object Focus; Comparison; Process Illustration; Timeline; Textless Infographic; Scientific Diagram; Geographic Map; Concept Visualization; POV Scene; Symbolic Representation; Documentary Frame.
 
 You MUST return exactly one plan for every row in the current batch. Return JSON only — no explanation, no markdown:
-{{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content only — no style or camera words"}}]}}"#,
+{{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content — mandatory creative rules embedded; negatives as [Avoid: ...]"}}]}}"#,
                 chunk_index + 1,
                 serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
                 serde_json::to_string_pretty(chunk).unwrap_or_default(),

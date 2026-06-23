@@ -1850,8 +1850,8 @@ function ImagesView() {
             <button className="secondary" onClick={() => void importReference()}><Plus size={14} />{references.length ? "Replace image" : "Upload reference image"}</button>
           </div>
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
-          <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Any extra guidance the AI should follow when writing scene descriptions — e.g. "always include the orange cat", "show diversity in characters", "avoid close-ups on faces".</p>
-          <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => setBulkInstruction(e.target.value)} placeholder="e.g. Use the same cartoon cat character across all stills. Show a diverse cast of people. Avoid showing text or labels in any scene." rows={3} />
+          <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still. Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
+          <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => setBulkInstruction(e.target.value)} placeholder="e.g. Always include the orange cartoon cat as the main character. Show a diverse cast of people. Avoid showing text, labels, or close-ups on faces." rows={4} />
           <button className="primary full" style={{marginTop:"16px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length}>
             {bulkPlanLoading ? "Planning…" : <><WandSparkles size={16} />Plan Video</>}
           </button>

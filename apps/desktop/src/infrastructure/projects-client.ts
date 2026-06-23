@@ -571,6 +571,10 @@ export const projectsClient = {
     if (isTauri()) return invoke("approve_bulk_plan", { videoId, styleDirective, stills });
     throw new Error("Bulk plan approval requires the native application.");
   },
+  async applyStyleDirectiveToAll(videoId: string, styleDirective: string): Promise<number> {
+    if (isTauri()) return invoke("apply_style_directive_to_all", { videoId, styleDirective });
+    throw new Error("Style directive update requires the native application.");
+  },
   async importBrowserAsset(videoId: string, kind: "audio" | "reference", file: File) {
     if (isTauri()) throw new Error("Browser-file import is only available in the web preview.");
     const data = readBrowserData();

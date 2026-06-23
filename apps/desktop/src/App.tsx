@@ -1655,6 +1655,17 @@ function ImagesView() {
     } catch (caught) { setError(String(caught)); }
   }
 
+  const [applyingStyle, setApplyingStyle] = useState(false);
+  async function applyStyleToAll() {
+    if (!activeVideoId || !systemPrompt.trim()) return;
+    setApplyingStyle(true);
+    try {
+      const count = await projectsClient.applyStyleDirectiveToAll(activeVideoId, systemPrompt);
+      addToast(`Style directive applied to ${count} prompt version${count !== 1 ? "s" : ""}.`, "success");
+    } catch (caught) { setError(String(caught)); }
+    finally { setApplyingStyle(false); }
+  }
+
   return (
     <section className="view images-view">
       {loading && <LoadingOverlay label="Working on your images" />}
@@ -1667,7 +1678,7 @@ function ImagesView() {
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <div className="heading-actions"><button className="secondary danger-action" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Final output folder</button><button className="secondary" onClick={() => void exportBundle()}><Download size={16} />Project bundle</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} />Bulk Generate</button></div>
+        <div className="heading-actions"><button className="secondary danger-action" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Final output folder</button><button className="secondary" onClick={() => void exportBundle()}><Download size={16} />Project bundle</button><button className="secondary" title="Update the style directive on all existing prompt versions without re-planning" onClick={() => void applyStyleToAll()} disabled={applyingStyle || !systemPrompt.trim() || !workspace?.groups.length || loading}>{applyingStyle ? "Applying…" : "Apply Style to All"}</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} />Bulk Generate</button></div>
       </div>
       {error && <div className="error-toast" role="alert"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
       {job && !bulkProgress && (
@@ -1852,8 +1863,12 @@ function ImagesView() {
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still. Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
           <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => setBulkInstruction(e.target.value)} placeholder="e.g. Always include the orange cartoon cat as the main character. Show a diverse cast of people. Avoid showing text, labels, or close-ups on faces." rows={4} />
-          <button className="primary full" style={{marginTop:"16px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length}>
+          <button className="primary full" style={{marginTop:"16px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length || bulkProgress !== null}>
             {bulkPlanLoading ? "Planning…" : <><WandSparkles size={16} />Plan Video</>}
+          </button>
+          {bulkProgress !== null && <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Stop bulk generation to re-plan.</p>}
+          <button className="secondary full" style={{marginTop:"8px"}} onClick={() => void applyStyleToAll()} disabled={applyingStyle || !systemPrompt.trim() || !workspace?.groups.length}>
+            {applyingStyle ? "Applying…" : "Apply Style Directive to All Stills"}
           </button>
           <button className="secondary full" style={{marginTop:"8px"}} onClick={() => setBulkOpen(false)}>Cancel</button>
         </div>

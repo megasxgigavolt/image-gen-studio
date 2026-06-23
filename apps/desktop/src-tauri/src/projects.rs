@@ -2110,6 +2110,13 @@ ANTI-REPETITION (enforce strictly):
 - Vary subject framing, environment structure, and subject count across stills.
 - For animal/nature/documentary videos: mix types — character scene, close detail, object focus, environment only, comparison, diagram — do not show only character portraits.
 
+SETTINGS DIVERSITY — the AI defaults to warm/golden/indoor; actively counter this bias:
+- No single value for `lighting`, `colorTemperature`, or `weatherAtmosphere` may appear in more than 30% of stills across the video.
+- Time-of-day implied by lighting must span the full daily cycle across the video: include daytime, late-afternoon, dusk/blue-hour, night, overcast, and dawn — do not cluster everything in golden-hour daytime.
+- `colorTemperature` must spread across Warm, Neutral, AND Cool stills — all three bands must appear.
+- Consecutive stills must NOT share both the same `lighting` AND the same `colorTemperature` — vary at least one of these every still.
+- Location default: if the narration does not explicitly place the subject indoors, choose an EXTERIOR or NATURE setting. Resist defaulting to "home", "office", "classroom", or "bedroom" unless the narration forces it.
+
 IMAGE SETTINGS RULES — provide ALL of the following keys; never leave any as "Undefined":
 BASIC: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere
 ADVANCED: lensType, lightDirection, lightQuality, shadowType, contrast, focusType, exposure, motion, composition, saturation, vignette, grainIntensity, colorCastTint, surfaceEffects
@@ -2138,15 +2145,27 @@ Field value guidance:
 
 Rule: at least 6 of the 20 non-aspect settings must differ between consecutive stills.
 
-USER PROMPT RULES — critical, zero overlap with the other two components:
-The image is assembled from three SEPARATE layers: Style Directive (global look) + Image Settings (camera/light data) + User Prompt (scene content).
-- userPrompt MUST contain ONLY: subjects, objects, actions, environment, spatial relationships — the WHAT of this specific scene
-- userPrompt must NOT contain: cinematography style, color grade, film look, rendering style, visual treatment → those live in the Style Directive
-- userPrompt must NOT contain: camera angle, lighting type, depth of field, lens, exposure, saturation, or any image-settings term → those live in imageSettings
-- Ask yourself: "What is physically in this image?" — write exactly that, nothing more
-- ✓ CORRECT: "A wolf pack crossing a frozen river at dusk, pine forest on both banks, snow-covered rocks in the foreground"
-- ✗ WRONG: "A cinematic wide shot of a wolf pack with warm golden color grading and shallow depth of field crossing a river"
-- If MANDATORY CREATIVE RULES are present above: positive inclusions are woven into the scene description; negative exclusions appear as [Avoid: ...] at the end of the prompt.
+USER PROMPT — ABSOLUTE RULES (the most common AI planning mistake is bleeding image-settings language into userPrompt; read carefully):
+The final image is built from THREE completely independent layers — each owns exclusive territory and must NOT overlap:
+  Layer A → Style Directive  : global rendering style, art style, color grade, film look, visual treatment
+  Layer B → imageSettings    : ALL technical camera/lighting data (the 20 fields above)
+  Layer C → userPrompt       : ONLY the physical scene — WHO, WHAT, WHERE, doing WHAT
+
+userPrompt MUST contain: subjects, characters, animals, objects, actions, environment, props, spatial relationships.
+userPrompt MUST NOT contain ANY of the following — these words are BANNED inside userPrompt:
+  • Camera/framing words  : shot, angle, frame, lens, perspective, view, close-up, wide, macro, POV, zoom, cinematic
+  • Lighting descriptors  : lit, light, lighting, illuminated, glow, bright, dark, shadow, sunlit, backlit, "warm light", "golden light", "soft light", "harsh light", dim, luminous, shimmering, gleaming
+  • Color grade / style   : color grade, tones, palette, hue, saturated, vivid, muted, desaturated, warm, cool, teal, orange, sepia, cross-processed
+  • Atmosphere as quality : moody, dreamy (only use fog/mist when physically present as weather, not as aesthetic)
+  • Depth/focus words     : depth of field, bokeh, sharp, blurred background, in focus, out of focus, dreamy
+  • Render/film language  : photorealistic, 4K, HDR, film grain, cinematic, documentary style, rendered, hyper-detailed
+
+SELF-CHECK before writing userPrompt: scan your draft for every banned word above. If any appear → rewrite without them.
+✓ CORRECT: "A wolf pack crossing a frozen river at dusk, pine forest on both banks, snow-covered rocks in the foreground"
+✗ WRONG:   "A wolf pack bathed in warm golden light crossing a glimmering river, cinematic wide shot with soft bokeh"
+✓ CORRECT: "A wooden desk near a window, a cup of tea, open notebook, potted plant on the sill, morning cityscape outside"
+✗ WRONG:   "Softly lit bedroom interior, warm morning light streaming through curtains onto a wooden desk"
+If MANDATORY CREATIVE RULES are present above: positive inclusions are woven into the scene description; negative exclusions appear as [Avoid: ...] at the end of the prompt.
 
 TEXTLESS VISUAL RULE (Textless Infographic, Timeline, Geographic Map, Scientific Diagram, Process Illustration):
 - Use arrows, icons, silhouettes, spatial layout, visual contrast, before/after, symbolic shapes.
@@ -2358,6 +2377,19 @@ Return JSON only — one plan object:
             saved += 1;
         }
         Ok(saved)
+    }
+
+    pub fn apply_style_directive_to_all(&self, video_id: &str, style_directive: &str) -> Result<usize, String> {
+        if style_directive.trim().is_empty() {
+            return Err("Style directive cannot be empty.".into());
+        }
+        // Update system_prompt on every prompt_version for this video.
+        // This does NOT change user_prompt or image_settings — only the style layer.
+        let count = self.connection.execute(
+            "UPDATE prompt_versions SET system_prompt = ?1 WHERE video_id = ?2",
+            params![style_directive.trim(), video_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(count)
     }
 
     pub fn extract_reference_style(&self, asset_id: &str) -> Result<StyleExtraction, String> {

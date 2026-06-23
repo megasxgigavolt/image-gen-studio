@@ -464,6 +464,19 @@ async fn approve_bulk_plan(
 }
 
 #[tauri::command]
+async fn apply_style_directive_to_all(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    style_directive: String,
+) -> Result<usize, String> {
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.apply_style_directive_to_all(&video_id, &style_directive)
+    }).await.map_err(|e| format!("Style directive update failed: {e}"))?
+}
+
+#[tauri::command]
 fn get_render_data_url(
     state: State<'_, RepositoryState>,
     render_id: String,
@@ -1064,6 +1077,7 @@ pub fn run() {
             suggest_still_prompt,
             plan_bulk_visuals,
             approve_bulk_plan,
+            apply_style_directive_to_all,
             get_render_data_url,
             get_asset_data_url,
             pick_download_folder,

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
+use base64::Engine;
 use serde_json::json;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
@@ -842,6 +843,87 @@ fn reset_visual_plan(
     with_repository(state, |repository| repository.reset_visual_plan(&video_id))
 }
 
+#[tauri::command]
+fn pick_thumbnail_image(app: tauri::AppHandle) -> Option<serde_json::Value> {
+    let path = app
+        .dialog()
+        .file()
+        .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+        .blocking_pick_file()
+        .and_then(|value| value.as_path().map(ToOwned::to_owned))?;
+    let bytes = fs::read(&path).ok()?;
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "image.png".into());
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    let data_url = format!(
+        "data:{};base64,{}",
+        mime,
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    );
+    Some(json!({ "dataUrl": data_url, "fileName": file_name }))
+}
+
+#[tauri::command]
+async fn edit_thumbnail_image(
+    state: State<'_, RepositoryState>,
+    source_data_url: String,
+    instruction: String,
+    mask_data_url: Option<String>,
+    edit_strength: String,
+    aspect_ratio: String,
+) -> Result<String, String> {
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = projects::ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.edit_thumbnail(
+            &source_data_url,
+            &instruction,
+            mask_data_url.as_deref(),
+            &edit_strength,
+            &aspect_ratio,
+        )
+    })
+    .await
+    .map_err(|error| format!("Thumbnail editing stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
+fn save_thumbnail_image(
+    app: tauri::AppHandle,
+    data_url: String,
+    default_name: String,
+) -> Result<Option<String>, String> {
+    let Some(path) = app
+        .dialog()
+        .file()
+        .add_filter("PNG Image", &["png"])
+        .set_file_name(&default_name)
+        .blocking_save_file()
+        .and_then(|value| value.as_path().map(ToOwned::to_owned))
+    else {
+        return Ok(None);
+    };
+    let comma_pos = data_url
+        .find(',')
+        .ok_or("Invalid image data URL.")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&data_url[comma_pos + 1..])
+        .map_err(|error| format!("Could not decode image: {error}"))?;
+    fs::write(&path, bytes).map_err(|error| format!("Could not save image: {error}"))?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -996,7 +1078,10 @@ pub fn run() {
             rename_channel,
             rename_video,
             permanent_delete_video,
-            permanent_delete_channel
+            permanent_delete_channel,
+            pick_thumbnail_image,
+            edit_thumbnail_image,
+            save_thumbnail_image
         ])
         .run(tauri::generate_context!())
         .expect("error while running Auto Gen Studio");

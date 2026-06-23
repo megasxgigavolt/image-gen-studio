@@ -2558,6 +2558,44 @@ Return JSON only — one plan object:
         Ok(render)
     }
 
+    pub fn edit_thumbnail(
+        &self,
+        source_data_url: &str,
+        instruction: &str,
+        mask_data_url: Option<&str>,
+        edit_strength: &str,
+        aspect_ratio: &str,
+    ) -> Result<String, String> {
+        if instruction.trim().is_empty() {
+            return Err("Describe the requested change.".into());
+        }
+        let (mime_type, source_bytes) = decode_data_url(source_data_url)?;
+        let mask = mask_data_url.map(decode_data_url).transpose()?;
+        let edit_prompt = format!(
+            "Edit the provided image according to the user request.\n\nUser request:\n{}\n\nEdit strength: {}\n\nRules:\n1. Only change the white painted area shown in the mask image when a mask is provided.\n2. Preserve the rest of the image as much as possible.\n3. Preserve camera angle, lighting, colors, composition, character identity, subject identity, and visual style.\n4. Do not restyle or recreate the full image.\n5. Keep all unrelated objects unchanged.\n6. Return a natural looking edited image.",
+            instruction.trim(), edit_strength
+        );
+        let auth = self.gemini_auth()?;
+        let model = self
+            .get_app_setting("gemini_model")?
+            .unwrap_or_else(|| "gemini-3.1-flash-image".into());
+        let (image_bytes, extension) = request_gemini_image_with_source(
+            &auth,
+            &model,
+            &edit_prompt,
+            &source_bytes,
+            &mime_type,
+            mask.as_ref().map(|(_, bytes)| bytes.as_slice()),
+            aspect_ratio,
+        )?;
+        let data_url = format!(
+            "data:{};base64,{}",
+            extension_to_media_type(extension),
+            base64::engine::general_purpose::STANDARD.encode(image_bytes)
+        );
+        Ok(data_url)
+    }
+
     pub fn read_render_file(&self, render_id: &str) -> Result<(String, String), String> {
         let (video_id, relative_path): (String, String) = self
             .connection

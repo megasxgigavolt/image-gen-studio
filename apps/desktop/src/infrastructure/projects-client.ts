@@ -599,6 +599,18 @@ export const projectsClient = {
     if (isTauri()) return invoke<string | null>("pick_script_text");
     return null;
   },
+  async pickThumbnailImage(): Promise<{ dataUrl: string; fileName: string } | null> {
+    if (isTauri()) return invoke("pick_thumbnail_image");
+    return null;
+  },
+  async editThumbnailImage(sourceDataUrl: string, instruction: string, maskDataUrl: string | null, editStrength: string, aspectRatio: string): Promise<string> {
+    if (isTauri()) return invoke("edit_thumbnail_image", { sourceDataUrl, instruction, maskDataUrl: maskDataUrl || null, editStrength, aspectRatio });
+    throw new Error("Thumbnail editing requires the native application.");
+  },
+  async saveThumbnailImage(dataUrl: string, defaultName: string): Promise<string | null> {
+    if (isTauri()) return invoke("save_thumbnail_image", { dataUrl, defaultName });
+    return null;
+  },
   async readBrowserScript(file: File) {
     if (file.size > 1_000_000) throw new Error("Script exceeds the 1 MB limit.");
     return file.text();

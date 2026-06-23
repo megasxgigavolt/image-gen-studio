@@ -23,6 +23,7 @@ import {
   Maximize2,
   ZoomIn,
   ZoomOut,
+  Wrench,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -53,10 +54,11 @@ import {
   type TimelineRecord,
 } from "./infrastructure/projects-client";
 
-const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
+const navItems: { stage: AppStage; label: string; icon: typeof Home; alwaysEnabled?: boolean }[] = [
   { stage: "home", label: "Home", icon: Home },
   { stage: "inputs", label: "Production", icon: Upload },
   { stage: "images", label: "Images", icon: Image },
+  { stage: "tools", label: "Tools", icon: Wrench, alwaysEnabled: true },
 ];
 const MAX_CACHE_SIZE = 20;
 const imageWorkspaceCache = new Map<string, ImageWorkspaceRecord>();
@@ -172,11 +174,11 @@ function Sidebar() {
         <span>Auto Gen <strong>Studio</strong></span>
       </button>
       <nav>
-        {navItems.map(({ stage: itemStage, label, icon: Icon }) => {
+        {navItems.map(({ stage: itemStage, label, icon: Icon, alwaysEnabled }) => {
           const isActive = itemStage === "inputs"
             ? ["inputs", "visual-plan"].includes(stage)
             : stage === itemStage;
-          const isDisabled = itemStage !== "home" && !activeVideoId;
+          const isDisabled = !alwaysEnabled && itemStage !== "home" && !activeVideoId;
           return (
             <button
               className={isActive ? "nav-item active" : "nav-item"}
@@ -1889,6 +1891,227 @@ function ImagesView() {
   );
 }
 
+function ThumbnailEditorPane() {
+  const { addToast } = useAppStore();
+  const [sourceDataUrl, setSourceDataUrl] = useState<string | null>(null);
+  const [fileName, setFileName] = useState("thumbnail");
+  const [resultDataUrl, setResultDataUrl] = useState<string | null>(null);
+  const [instruction, setInstruction] = useState("");
+  const [editStrength, setEditStrength] = useState("Low");
+  const [aspectRatio, setAspectRatio] = useState("16:9");
+  const [brushSize, setBrushSize] = useState(36);
+  const [eraseMask, setEraseMask] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const maskCanvasRef = useRef<HTMLCanvasElement>(null);
+  const paintingRef = useRef(false);
+
+  async function loadImage() {
+    const picked = await projectsClient.pickThumbnailImage();
+    if (!picked) return;
+    setSourceDataUrl(picked.dataUrl);
+    setResultDataUrl(null);
+    setFileName(picked.fileName.replace(/\.[^.]+$/, "") + "-edited");
+    clearMask();
+  }
+
+  function clearMask() {
+    const canvas = maskCanvasRef.current;
+    if (canvas) {
+      canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+      canvas.dataset.painted = "false";
+    }
+  }
+
+  function paintMask(event: ReactPointerEvent<HTMLCanvasElement>) {
+    if (!paintingRef.current) return;
+    const canvas = event.currentTarget;
+    const rect = canvas.getBoundingClientRect();
+    const x = (event.clientX - rect.left) * canvas.width / rect.width;
+    const y = (event.clientY - rect.top) * canvas.height / rect.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.globalCompositeOperation = eraseMask ? "destination-out" : "source-over";
+    ctx.fillStyle = "#fff";
+    ctx.beginPath();
+    ctx.arc(x, y, brushSize / 2, 0, Math.PI * 2);
+    ctx.fill();
+    canvas.dataset.painted = "true";
+  }
+
+  async function applyEdit() {
+    if (!sourceDataUrl || !instruction.trim()) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const canvas = maskCanvasRef.current;
+      const maskDataUrl = canvas?.dataset.painted === "true" ? canvas.toDataURL("image/png") : null;
+      const edited = await projectsClient.editThumbnailImage(
+        sourceDataUrl,
+        instruction.trim(),
+        maskDataUrl,
+        editStrength,
+        aspectRatio,
+      );
+      setResultDataUrl(edited);
+      addToast("Edit applied successfully.", "success");
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveResult() {
+    if (!resultDataUrl) return;
+    try {
+      const saved = await projectsClient.saveThumbnailImage(resultDataUrl, `${fileName}.png`);
+      if (saved) addToast(`Saved: ${saved}`, "success");
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  function useResultAsSource() {
+    if (!resultDataUrl) return;
+    setSourceDataUrl(resultDataUrl);
+    setResultDataUrl(null);
+    clearMask();
+  }
+
+  const canvasWidth = aspectRatio === "9:16" ? 720 : 1280;
+  const canvasHeight = aspectRatio === "9:16" ? 1280 : 720;
+
+  return (
+    <div className="thumbnail-editor">
+      <div className="thumbnail-canvas-area">
+        {sourceDataUrl ? (
+          <div className={`thumb-frame ${aspectRatio === "9:16" ? "portrait" : ""}`}>
+            <img src={sourceDataUrl} alt="Source thumbnail" />
+            <canvas
+              ref={maskCanvasRef}
+              width={canvasWidth}
+              height={canvasHeight}
+              className="thumb-mask-canvas"
+              onPointerDown={(e) => { paintingRef.current = true; e.currentTarget.setPointerCapture(e.pointerId); paintMask(e); }}
+              onPointerMove={paintMask}
+              onPointerUp={() => { paintingRef.current = false; }}
+            />
+          </div>
+        ) : (
+          <div className="thumb-empty" onClick={() => void loadImage()}>
+            <Image size={36} />
+            <strong>Load an image to edit</strong>
+            <span>Click to pick a PNG, JPG, or WEBP file</span>
+          </div>
+        )}
+        {resultDataUrl && (
+          <div className={`thumb-frame result-frame ${aspectRatio === "9:16" ? "portrait" : ""}`}>
+            <span className="result-label">Result</span>
+            <img src={resultDataUrl} alt="Edited thumbnail" />
+          </div>
+        )}
+      </div>
+      <aside className="thumbnail-controls">
+        <div className="thumb-section">
+          <strong>Source Image</strong>
+          <button className="secondary full" onClick={() => void loadImage()}><Upload size={15} />{sourceDataUrl ? "Replace image" : "Load image"}</button>
+          {sourceDataUrl && <button className="secondary full" style={{ marginTop: "6px" }} onClick={clearMask}>Clear painted mask</button>}
+        </div>
+        {sourceDataUrl && (
+          <>
+            <div className="thumb-section">
+              <strong>Aspect Ratio</strong>
+              <div className="thumb-ratio-toggle">
+                <button className={aspectRatio === "16:9" ? "active" : ""} onClick={() => setAspectRatio("16:9")}>16:9</button>
+                <button className={aspectRatio === "9:16" ? "active" : ""} onClick={() => setAspectRatio("9:16")}>9:16</button>
+              </div>
+            </div>
+            <div className="thumb-section">
+              <strong>Brush</strong>
+              <label style={{ fontSize: "11px", fontWeight: 600 }}>
+                Size — {brushSize}px
+                <input type="range" min="8" max="140" value={brushSize} onChange={(e) => setBrushSize(Number(e.target.value))} style={{ margin: "6px 0 0" }} />
+              </label>
+              <button className={`secondary full${eraseMask ? " active-mode" : ""}`} style={{ marginTop: "8px" }} onClick={() => setEraseMask((v) => !v)}>
+                {eraseMask ? "Mode: Erase" : "Mode: Paint"}
+              </button>
+            </div>
+            <div className="thumb-section">
+              <strong>Edit Instruction</strong>
+              <textarea
+                className="thumb-instruction"
+                value={instruction}
+                onChange={(e) => setInstruction(e.target.value)}
+                placeholder="Describe exactly what to change in the painted area…"
+                rows={4}
+              />
+              <label style={{ fontSize: "11px", fontWeight: 600, display: "grid", gap: "5px", marginTop: "8px" }}>
+                Edit Strength
+                <select value={editStrength} onChange={(e) => setEditStrength(e.target.value)} style={{ height: "38px", padding: "0 10px", border: "1px solid var(--line)", borderRadius: "6px", background: "var(--surface)", color: "var(--text)" }}>
+                  <option>Low</option>
+                  <option>Medium</option>
+                  <option>High</option>
+                </select>
+              </label>
+            </div>
+            <div className="thumb-section">
+              {error && <div className="inline-error" style={{ marginBottom: "10px" }}>{error}<button type="button" style={{ float: "right", border: 0, background: "transparent", cursor: "pointer" }} onClick={() => setError(null)}>×</button></div>}
+              <button className="primary full" onClick={() => void applyEdit()} disabled={!instruction.trim() || loading}>
+                {loading ? <><LoaderCircle className="spin" size={15} />Applying edit…</> : <><Sparkles size={15} />Apply Edit</>}
+              </button>
+              {resultDataUrl && (
+                <>
+                  <button className="secondary full" style={{ marginTop: "8px" }} onClick={() => void saveResult()}><Download size={15} />Save result</button>
+                  <button className="secondary full" style={{ marginTop: "6px" }} onClick={useResultAsSource}>Use result as source</button>
+                </>
+              )}
+            </div>
+          </>
+        )}
+      </aside>
+    </div>
+  );
+}
+
+function ToolsView() {
+  const [activePane, setActivePane] = useState<"thumbnail-editor">("thumbnail-editor");
+  return (
+    <section className="view tools-view">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">Utilities</p>
+          <h1>Tools</h1>
+          <p>Standalone editing and enhancement utilities powered by AI.</p>
+        </div>
+      </div>
+      <div className="tools-layout">
+        <aside className="tools-pane-list">
+          <strong>Panes</strong>
+          <button
+            className={activePane === "thumbnail-editor" ? "tools-pane-btn active" : "tools-pane-btn"}
+            onClick={() => setActivePane("thumbnail-editor")}
+          >
+            <Image size={16} />
+            <span>Thumbnail Editor</span>
+          </button>
+        </aside>
+        <div className="tools-content">
+          {activePane === "thumbnail-editor" && (
+            <>
+              <div className="tool-heading">
+                <strong>Thumbnail Editor</strong>
+                <p>Load any image, paint a mask over the area to change, write an instruction, and let Gemini inpaint it — all on-screen, no windows.</p>
+              </div>
+              <ThumbnailEditorPane />
+            </>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function TimelineView() {
   const { activeVideoId } = useAppStore();
   const [timeline, setTimeline] = useState<TimelineRecord | null>(null);
@@ -2023,7 +2246,7 @@ export function App() {
     <div className="app-shell">
       <TitleBar />
       <Sidebar />
-      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
+      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}{stage === "tools" && <ToolsView />}</main>
       <ToastDisplay />
     </div>
   );

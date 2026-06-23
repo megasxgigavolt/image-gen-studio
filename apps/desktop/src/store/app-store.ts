@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { originalDemoPlan } from "../data/demo";
 import type { VisualPlanGroup } from "../domain/visual-plan";
 
-export type AppStage = "home" | "inputs" | "visual-plan" | "images" | "timeline";
+export type AppStage = "home" | "inputs" | "visual-plan" | "images" | "timeline" | "tools";
 export type Theme = "light" | "dark";
 
 type Toast = { id: number; message: string; kind: "success" | "error" | "info" };

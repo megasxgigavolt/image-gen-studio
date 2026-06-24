@@ -1555,6 +1555,10 @@ impl ProjectRepository {
             if let Ok(path) = self.render_absolute_path(&render) {
                 let _ = fs::remove_file(path);
             }
+            // Null FK references before deletion to avoid constraint failures.
+            self.connection.execute("UPDATE image_renders SET parent_render_id=NULL WHERE parent_render_id=?1", [&render.id]).map_err(|e| e.to_string())?;
+            self.connection.execute("UPDATE image_job_items SET render_id=NULL WHERE render_id=?1", [&render.id]).map_err(|e| e.to_string())?;
+            self.connection.execute("UPDATE timeline_clips SET render_id=NULL WHERE render_id=?1", [&render.id]).map_err(|e| e.to_string())?;
             self.connection.execute("DELETE FROM image_renders WHERE id=?1", [&render.id])
                 .map_err(|e| e.to_string())?;
         }

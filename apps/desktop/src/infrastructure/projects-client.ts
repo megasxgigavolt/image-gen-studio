@@ -575,6 +575,10 @@ export const projectsClient = {
     if (isTauri()) return invoke("apply_style_directive_to_all", { videoId, styleDirective });
     throw new Error("Style directive update requires the native application.");
   },
+  async applyCreativeInstructionsToAll(videoId: string, creativeInstruction: string): Promise<number> {
+    if (isTauri()) return invoke("apply_creative_instructions_to_all", { videoId, creativeInstruction });
+    throw new Error("Creative instruction apply requires the native application.");
+  },
   async importBrowserAsset(videoId: string, kind: "audio" | "reference", file: File) {
     if (isTauri()) throw new Error("Browser-file import is only available in the web preview.");
     const data = readBrowserData();

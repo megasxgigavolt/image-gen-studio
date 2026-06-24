@@ -464,6 +464,22 @@ async fn approve_bulk_plan(
 }
 
 #[tauri::command]
+async fn apply_creative_instructions_to_all(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    creative_instruction: String,
+) -> Result<usize, String> {
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.apply_creative_instructions_to_all(&video_id, &creative_instruction, |done, total| {
+            let _ = app.emit("creative_apply_progress", serde_json::json!({ "done": done, "total": total }));
+        })
+    }).await.map_err(|e| format!("Creative instruction apply failed: {e}"))?
+}
+
+#[tauri::command]
 async fn apply_style_directive_to_all(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -1077,6 +1093,7 @@ pub fn run() {
             suggest_still_prompt,
             plan_bulk_visuals,
             approve_bulk_plan,
+            apply_creative_instructions_to_all,
             apply_style_directive_to_all,
             get_render_data_url,
             get_asset_data_url,

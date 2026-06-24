@@ -2386,6 +2386,138 @@ Return JSON only — one plan object:
         Ok(saved)
     }
 
+    pub fn apply_creative_instructions_to_all(
+        &self,
+        video_id: &str,
+        creative_instruction: &str,
+        on_progress: impl Fn(usize, usize),
+    ) -> Result<usize, String> {
+        if creative_instruction.trim().is_empty() {
+            return Err("Creative instructions cannot be empty.".into());
+        }
+
+        // Collect latest prompt version for each still that has one
+        struct StillEntry {
+            group_id: String,
+            user_prompt: String,
+            settings_json: String,
+            system_prompt: String,
+        }
+
+        let plan = self.get_visual_plan(video_id)?;
+        let mut entries: Vec<StillEntry> = Vec::new();
+        for group in &plan.groups {
+            if let Some(pv) = self.list_prompt_versions(video_id, &group.id)?.into_iter().next() {
+                entries.push(StillEntry {
+                    group_id: group.id.clone(),
+                    user_prompt: strip_avoid_block(&pv.user_prompt),
+                    settings_json: pv.settings_json.clone(),
+                    system_prompt: pv.system_prompt.clone(),
+                });
+            }
+        }
+
+        if entries.is_empty() {
+            return Err("No stills with saved prompts found. Run Bulk Gen Config first.".into());
+        }
+
+        let total = entries.len();
+        let openai_key = self.get_provider_key("openai")?;
+        let gemini_auth = if openai_key.is_none() { Some(self.gemini_auth()?) } else { None };
+        let chunk_size: usize = if openai_key.is_some() { 6 } else { 3 };
+        let now = Utc::now().to_rfc3339();
+        let mut applied = 0usize;
+
+        for chunk in entries.chunks(chunk_size) {
+            let batch: Vec<_> = chunk.iter().map(|s| json!({
+                "groupId": s.group_id,
+                "currentUserPrompt": s.user_prompt,
+            })).collect();
+
+            let prompt = format!(
+                r#"Modify existing image scene descriptions to embed these creative rules. Do NOT re-plan — preserve all scene content and only add what the rules require.
+
+CREATIVE RULES (apply to every still below):
+{}
+
+EMBEDDING RULES:
+1. POSITIVE rules (include X / always show Y / feature Z / use W):
+   → Weave the required subject or element into the scene as a concrete physical presence.
+   → Do NOT just append the rule text — merge it naturally into the scene description.
+2. NEGATIVE rules (avoid X / no Y / never Z / do not show W / exclude V):
+   → Collect ALL avoidance items and append at the END of userPrompt in this EXACT format: [Avoid: item1, item2, item3]
+   → Put ALL avoidance items in ONE [Avoid: ...] block at the end — never scatter them through the description.
+3. Keep ALL original scene content — the modified prompt must still describe the same scene.
+4. BANNED words inside userPrompt: shot, angle, cinematic, lit, lighting, warm light, golden light, color grade, bokeh, depth of field, photorealistic, 4K, HDR.
+
+STILLS TO MODIFY:
+{}
+
+Return JSON only — no markdown, no explanation:
+{{"modifications":[{{"groupId":"exact groupId value","userPrompt":"modified prompt with rules embedded"}}]}}"#,
+                creative_instruction.trim(),
+                serde_json::to_string_pretty(&batch).unwrap_or_default(),
+            );
+
+            let response_text = match &openai_key {
+                Some(key) => {
+                    let resp = reqwest::blocking::Client::new()
+                        .post("https://api.openai.com/v1/responses")
+                        .bearer_auth(key)
+                        .json(&json!({
+                            "model": "gpt-4.1-mini",
+                            "input": prompt,
+                            "max_output_tokens": 8000
+                        }))
+                        .send()
+                        .map_err(|e| format!("OpenAI request failed: {e}"))?;
+                    if !resp.status().is_success() {
+                        let body: serde_json::Value = resp.json().unwrap_or_default();
+                        return Err(format!("OpenAI error: {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown")));
+                    }
+                    let body: serde_json::Value = resp.json().map_err(|e| format!("OpenAI JSON: {e}"))?;
+                    body.pointer("/output/0/content/0/text").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                }
+                None => request_gemini_text(gemini_auth.as_ref().unwrap(), &prompt)?,
+            };
+
+            let cleaned = extract_json_from_text(&response_text);
+            let parsed: serde_json::Value = serde_json::from_str(cleaned)
+                .map_err(|_| "AI returned invalid JSON while applying creative instructions.".to_string())?;
+
+            let modifications = parsed["modifications"].as_array()
+                .ok_or("AI response missing 'modifications' array.")?;
+
+            for modification in modifications {
+                let group_id = modification["groupId"].as_str().unwrap_or_default();
+                let new_prompt = modification["userPrompt"].as_str().unwrap_or("").trim();
+                if group_id.is_empty() || new_prompt.is_empty() { continue; }
+
+                let entry = match chunk.iter().find(|e| e.group_id == group_id) {
+                    Some(e) => e,
+                    None => continue,
+                };
+
+                let next_version: i64 = self.connection.query_row(
+                    "SELECT COALESCE(MAX(version),0)+1 FROM prompt_versions WHERE video_id=?1 AND group_id=?2",
+                    params![video_id, group_id],
+                    |row| row.get(0),
+                ).map_err(|e| e.to_string())?;
+
+                let pv_id = Uuid::new_v4().to_string();
+                self.connection.execute(
+                    "INSERT INTO prompt_versions(id,video_id,group_id,version,settings_json,system_prompt,user_prompt,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![pv_id, video_id, group_id, next_version, entry.settings_json, entry.system_prompt, new_prompt, now],
+                ).map_err(|e| e.to_string())?;
+
+                applied += 1;
+                on_progress(applied, total);
+            }
+        }
+
+        Ok(applied)
+    }
+
     pub fn apply_style_directive_to_all(&self, video_id: &str, style_directive: &str) -> Result<usize, String> {
         if style_directive.trim().is_empty() {
             return Err("Style directive cannot be empty.".into());
@@ -3834,6 +3966,17 @@ fn extension_to_media_type(extension: &str) -> &'static str {
         "webp" => "image/webp",
         _ => "application/octet-stream",
     }
+}
+
+fn strip_avoid_block(prompt: &str) -> String {
+    let trimmed = prompt.trim();
+    if let Some(idx) = trimmed.rfind("[Avoid:") {
+        let after = &trimmed[idx..];
+        if after.contains(']') {
+            return trimmed[..idx].trim().to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 fn assemble_image_prompt(

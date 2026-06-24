@@ -1362,6 +1362,13 @@ function ImagesView() {
     return () => { void unlisten.then((fn) => fn()); };
   }, []);
 
+  useEffect(() => {
+    const unlisten = listen<{ done: number; total: number }>("creative_apply_progress", (event) => {
+      setApplyInstrProgress({ done: event.payload.done, total: event.payload.total });
+    });
+    return () => { void unlisten.then((fn) => fn()); };
+  }, []);
+
   // Reattach to an in-flight plan if the user navigated away and came back
   useEffect(() => {
     if (_planningPromise && _planningVideoId === activeVideoId) {
@@ -1664,6 +1671,26 @@ function ImagesView() {
     finally { setApplyingStyle(false); }
   }
 
+  const [applyingInstructions, setApplyingInstructions] = useState(false);
+  const [applyInstrProgress, setApplyInstrProgress] = useState<{ done: number; total: number } | null>(null);
+  async function applyCreativeInstructionsToAll() {
+    if (!activeVideoId || !bulkInstruction.trim()) return;
+    setApplyingInstructions(true);
+    setApplyInstrProgress(null);
+    try {
+      const count = await projectsClient.applyCreativeInstructionsToAll(activeVideoId, bulkInstruction);
+      const live = await projectsClient.getImageWorkspace(activeVideoId);
+      setCached(activeVideoId, live);
+      setWorkspace(live);
+      if (selectedGroupId) {
+        const pv = live.groups.find((g) => g.group.id === selectedGroupId)?.promptVersions[0];
+        if (pv) setUserPrompt(pv.userPrompt);
+      }
+      addToast(`Creative rules applied to ${count} still${count !== 1 ? "s" : ""}.`, "success");
+    } catch (caught) { setError(String(caught)); }
+    finally { setApplyingInstructions(false); setApplyInstrProgress(null); }
+  }
+
   return (
     <section className="view images-view">
       {loading && <LoadingOverlay label="Working on your images" />}
@@ -1861,7 +1888,12 @@ function ImagesView() {
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still. Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
           <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => setBulkInstruction(e.target.value)} placeholder="e.g. Always include the orange cartoon cat as the main character. Show a diverse cast of people. Avoid showing text, labels, or close-ups on faces." rows={4} />
-          <button className="primary full" style={{marginTop:"16px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length || bulkProgress !== null}>
+          <button className="secondary full" style={{marginTop:"10px"}} onClick={() => void applyCreativeInstructionsToAll()} disabled={applyingInstructions || !bulkInstruction.trim() || !workspace?.groups.length}>
+            {applyingInstructions
+              ? (applyInstrProgress ? `Applying… ${applyInstrProgress.done}/${applyInstrProgress.total}` : "Applying…")
+              : "Apply Creative Instructions to All Stills"}
+          </button>
+          <button className="primary full" style={{marginTop:"10px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length || bulkProgress !== null}>
             {bulkPlanLoading ? "Planning…" : <><WandSparkles size={16} />Plan Video</>}
           </button>
           {bulkProgress !== null && <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Stop bulk generation to re-plan.</p>}

@@ -1004,7 +1004,7 @@ function ImagesView() {
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkPlan, setBulkPlan] = useState<import("./infrastructure/projects-client").BulkPlanResultRecord | null>(null);
   const [bulkPlanLoading, setBulkPlanLoading] = useState(false);
-  const [bulkInstruction, setBulkInstruction] = useState("");
+  const [bulkInstruction, setBulkInstruction] = useState(() => localStorage.getItem("bulk_creative_instruction") ?? "");
   const [bulkOverviewOpen, setBulkOverviewOpen] = useState(false);
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null);
   const [preparingGroupIds, setPreparingGroupIds] = useState<Set<string>>(new Set());
@@ -1696,7 +1696,7 @@ function ImagesView() {
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <div className="heading-actions"><button className="secondary danger-action" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Download All</button><button className="secondary" onClick={() => void generateAll()} disabled={loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={16} />Generate All</button><button className="secondary" title="Update the style directive on all existing prompt versions without re-planning" onClick={() => void applyStyleToAll()} disabled={applyingStyle || !systemPrompt.trim() || !workspace?.groups.length || loading}>{applyingStyle ? "Applying…" : "Apply Style to All"}</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} />Bulk Gen Config</button></div>
+        <div className="heading-actions"><button className="secondary danger-action" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Download All</button><button className="secondary" onClick={() => void generateAll()} disabled={loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={16} />Generate All</button><button className="secondary" title="Update the style directive on all existing prompt versions without re-planning" onClick={() => void applyStyleToAll()} disabled={applyingStyle || !systemPrompt.trim() || !workspace?.groups.length || loading}>{applyingStyle ? "Applying…" : "Apply Style to All"}</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading}><WandSparkles size={17} />Bulk Gen Config</button></div>
       </div>
       {error && <div className="error-toast" role="alert"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
       {job && !bulkProgress && (
@@ -1879,16 +1879,16 @@ function ImagesView() {
           </div>
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still. Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
-          <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => setBulkInstruction(e.target.value)} placeholder="e.g. Always include the orange cartoon cat as the main character. Show a diverse cast of people. Avoid showing text, labels, or close-ups on faces." rows={4} />
+          <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cartoon cat as the main character. Show a diverse cast of people. Avoid showing text, labels, or close-ups on faces." rows={4} />
           <button className="secondary full" style={{marginTop:"10px"}} onClick={() => void applyCreativeInstructionsToAll()} disabled={applyingInstructions || !bulkInstruction.trim() || !workspace?.groups.length}>
             {applyingInstructions
               ? (applyInstrProgress ? `Applying… ${applyInstrProgress.done}/${applyInstrProgress.total}` : "Applying…")
               : "Apply Creative Instructions to All Stills"}
           </button>
-          <button className="primary full" style={{marginTop:"10px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length || bulkProgress !== null}>
+          <button className="primary full" style={{marginTop:"10px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length || bulkProgress !== null || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>
             {bulkPlanLoading ? "Planning…" : <><WandSparkles size={16} />Plan Video</>}
           </button>
-          {bulkProgress !== null && <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Stop bulk generation to re-plan.</p>}
+          {Boolean(job && ["queued", "running", "paused"].includes(job.status)) && <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Stop the active job to re-plan.</p>}
           <button className="secondary full" style={{marginTop:"8px"}} onClick={() => void applyStyleToAll()} disabled={applyingStyle || !systemPrompt.trim() || !workspace?.groups.length}>
             {applyingStyle ? "Applying…" : "Apply Style Directive to All Stills"}
           </button>

@@ -2428,46 +2428,53 @@ Return JSON only — one plan object:
         let now = Utc::now().to_rfc3339();
         let mut applied = 0usize;
 
+        let http = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(180))
+            .build().map_err(|e| format!("HTTP client error: {e}"))?;
+
         for chunk in entries.chunks(chunk_size) {
-            let batch: Vec<_> = chunk.iter().map(|s| json!({
-                "groupId": s.group_id,
+            // Use a numeric index (n) for matching — LLMs can corrupt long UUID strings.
+            let batch: Vec<_> = chunk.iter().enumerate().map(|(i, s)| json!({
+                "n": i + 1,
                 "currentUserPrompt": s.user_prompt,
             })).collect();
 
             let prompt = format!(
-                r#"Modify existing image scene descriptions to embed these creative rules. Do NOT re-plan — preserve all scene content and only add what the rules require.
+                r#"Your task: add creative rules to existing image scene descriptions.
+IMPORTANT: DO NOT rewrite, shorten, or remove any existing content. ONLY add what the rules require.
 
-CREATIVE RULES (apply to every still below):
+CREATIVE RULES TO EMBED IN EVERY STILL:
 {}
 
-EMBEDDING RULES:
-1. POSITIVE rules (include X / always show Y / feature Z / use W):
-   → Weave the required subject or element into the scene as a concrete physical presence.
-   → Do NOT just append the rule text — merge it naturally into the scene description.
-2. NEGATIVE rules (avoid X / no Y / never Z / do not show W / exclude V):
-   → Collect ALL avoidance items and append at the END of userPrompt in this EXACT format: [Avoid: item1, item2, item3]
-   → Put ALL avoidance items in ONE [Avoid: ...] block at the end — never scatter them through the description.
-3. Keep ALL original scene content — the modified prompt must still describe the same scene.
-4. BANNED words inside userPrompt: shot, angle, cinematic, lit, lighting, warm light, golden light, color grade, bokeh, depth of field, photorealistic, 4K, HDR.
+HOW TO EMBED:
+1. POSITIVE rules (include X / always show Y / always use Z / feature W):
+   → Naturally extend the scene description to include the required element as a physical presence.
+   → The original scene must remain fully intact — you are adding to it, not replacing it.
+2. NEGATIVE rules (avoid X / no Y / never Z / do not include W / exclude V):
+   → Collect every avoidance item and append ONE [Avoid: item1, item2, item3] block at the very end.
+   → Never embed avoidance language inside the scene description itself.
+3. Output the FULL modified userPrompt — not a summary, not a truncation.
 
 STILLS TO MODIFY:
 {}
 
-Return JSON only — no markdown, no explanation:
-{{"modifications":[{{"groupId":"exact groupId value","userPrompt":"modified prompt with rules embedded"}}]}}"#,
+Return JSON only:
+{{"results":[{{"n":1,"userPrompt":"full modified prompt"}},{{"n":2,"userPrompt":"full modified prompt"}}]}}"#,
                 creative_instruction.trim(),
                 serde_json::to_string_pretty(&batch).unwrap_or_default(),
             );
 
             let response_text = match &openai_key {
                 Some(key) => {
-                    let resp = reqwest::blocking::Client::new()
-                        .post("https://api.openai.com/v1/responses")
+                    // Use Chat Completions with json_object mode — the Responses API
+                    // can emit unescaped quotes in freeform output.
+                    let resp = http.post("https://api.openai.com/v1/chat/completions")
                         .bearer_auth(key)
                         .json(&json!({
                             "model": "gpt-4.1-mini",
-                            "input": prompt,
-                            "max_output_tokens": 8000
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 8000,
+                            "response_format": {"type": "json_object"}
                         }))
                         .send()
                         .map_err(|e| format!("OpenAI request failed: {e}"))?;
@@ -2475,8 +2482,8 @@ Return JSON only — no markdown, no explanation:
                         let body: serde_json::Value = resp.json().unwrap_or_default();
                         return Err(format!("OpenAI error: {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown")));
                     }
-                    let body: serde_json::Value = resp.json().map_err(|e| format!("OpenAI JSON: {e}"))?;
-                    body.pointer("/output/0/content/0/text").and_then(|v| v.as_str()).unwrap_or_default().to_string()
+                    let body: serde_json::Value = resp.json().map_err(|e| format!("OpenAI JSON parse: {e}"))?;
+                    body.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or_default().to_string()
                 }
                 None => request_gemini_text(gemini_auth.as_ref().unwrap(), &prompt)?,
             };
@@ -2485,29 +2492,28 @@ Return JSON only — no markdown, no explanation:
             let parsed: serde_json::Value = serde_json::from_str(cleaned)
                 .map_err(|_| "AI returned invalid JSON while applying creative instructions.".to_string())?;
 
-            let modifications = parsed["modifications"].as_array()
-                .ok_or("AI response missing 'modifications' array.")?;
+            let results = parsed["results"].as_array()
+                .ok_or("AI response missing 'results' array.")?;
 
-            for modification in modifications {
-                let group_id = modification["groupId"].as_str().unwrap_or_default();
-                let new_prompt = modification["userPrompt"].as_str().unwrap_or("").trim();
-                if group_id.is_empty() || new_prompt.is_empty() { continue; }
+            for result in results {
+                // Match by numeric index — immune to LLM ID corruption.
+                let n = result["n"].as_u64().unwrap_or(0) as usize;
+                if n < 1 || n > chunk.len() { continue; }
+                let entry = &chunk[n - 1];
 
-                let entry = match chunk.iter().find(|e| e.group_id == group_id) {
-                    Some(e) => e,
-                    None => continue,
-                };
+                let new_prompt = result["userPrompt"].as_str().unwrap_or("").trim();
+                if new_prompt.is_empty() { continue; }
 
                 let next_version: i64 = self.connection.query_row(
                     "SELECT COALESCE(MAX(version),0)+1 FROM prompt_versions WHERE video_id=?1 AND group_id=?2",
-                    params![video_id, group_id],
+                    params![video_id, &entry.group_id],
                     |row| row.get(0),
                 ).map_err(|e| e.to_string())?;
 
                 let pv_id = Uuid::new_v4().to_string();
                 self.connection.execute(
                     "INSERT INTO prompt_versions(id,video_id,group_id,version,settings_json,system_prompt,user_prompt,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                    params![pv_id, video_id, group_id, next_version, entry.settings_json, entry.system_prompt, new_prompt, now],
+                    params![pv_id, video_id, &entry.group_id, next_version, entry.settings_json, entry.system_prompt, new_prompt, now],
                 ).map_err(|e| e.to_string())?;
 
                 applied += 1;

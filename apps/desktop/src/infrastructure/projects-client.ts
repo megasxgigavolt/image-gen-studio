@@ -476,7 +476,7 @@ export const projectsClient = {
     if (isTauri()) return invoke("get_latest_image_job", { videoId });
     return null;
   },
-  async controlImageJob(jobId: string, action: "pause" | "resume" | "stop"): Promise<ImageJobRecord> {
+  async controlImageJob(jobId: string, action: "pause" | "resume" | "stop" | "cancel"): Promise<ImageJobRecord> {
     if (isTauri()) return invoke("control_image_job", { jobId, action });
     throw new Error("Bulk jobs require the native application.");
   },

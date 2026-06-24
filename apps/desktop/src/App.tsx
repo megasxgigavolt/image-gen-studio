@@ -1183,20 +1183,12 @@ function ImagesView() {
     }
   }
 
-  async function controlJob(action: "pause" | "resume" | "stop") {
+  const [confirmingStop, setConfirmingStop] = useState(false);
+
+  async function controlJob(action: "pause" | "resume" | "stop" | "cancel") {
     if (!job) return;
     try {
       setJob(await projectsClient.controlImageJob(job.id, action));
-    } catch (caught) {
-      setError(String(caught));
-    }
-  }
-
-  async function resumeStoppedJob() {
-    if (!activeVideoId) return;
-    try {
-      const newJob = await projectsClient.createImageJob(activeVideoId);
-      setJob(newJob);
     } catch (caught) {
       setError(String(caught));
     }
@@ -1695,6 +1687,7 @@ function ImagesView() {
     <section className="view images-view">
       {loading && <LoadingOverlay label="Working on your images" />}
       {confirmReset && <ConfirmDialog title="Reset all images?" message="This clears all prompts, image versions, planner results, and still statuses for this video. This cannot be undone." confirmLabel="Reset everything" onConfirm={() => { setConfirmReset(false); void doResetImages(); }} onCancel={() => setConfirmReset(false)} />}
+      {confirmingStop && <ConfirmDialog title="Stop bulk generation?" message="This will permanently stop the current job. Any stills already generated are kept, but remaining stills will not be generated and the job cannot be resumed." confirmLabel="Stop generation" onConfirm={() => { setConfirmingStop(false); void controlJob("cancel"); }} onCancel={() => setConfirmingStop(false)} />}
       {confirmDeleteRender && <ConfirmDialog title="Delete image version?" message="This permanently removes this render. It cannot be recovered." confirmLabel="Delete" onConfirm={() => { const r = confirmDeleteRender; setConfirmDeleteRender(null); void deleteRenderConfirmed(r); }} onCancel={() => setConfirmDeleteRender(null)} />}
       {confirmDeleteVersion && <ConfirmDialog title="Delete prompt version?" message="This permanently removes this prompt version." confirmLabel="Delete" onConfirm={() => { const v = confirmDeleteVersion; setConfirmDeleteVersion(null); void deleteVersionConfirmed(v); }} onCancel={() => setConfirmDeleteVersion(null)} />}
       <div className="page-heading">
@@ -1713,8 +1706,7 @@ function ImagesView() {
           <div>
             {["queued", "running"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("pause")}>Pause</button>}
             {job.status === "paused" && <button className="secondary" onClick={() => void controlJob("resume")}>Resume</button>}
-            {["queued", "running", "paused"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("stop")}>Stop</button>}
-            {job.status === "stopped" && <button className="secondary" onClick={() => void resumeStoppedJob()}>Resume</button>}
+            {["queued", "running", "paused"].includes(job.status) && <button className="secondary" onClick={() => setConfirmingStop(true)}>Stop</button>}
           </div>
         </div>
       )}

@@ -3295,14 +3295,14 @@ Return JSON only — no markdown, no explanation:
     }
 
     pub fn set_image_job_status(&self, job_id: &str, status: &str) -> Result<ImageJob, String> {
-        if !["queued", "running", "paused", "stopped"].contains(&status) {
+        if !["queued", "running", "paused", "stopped", "failed"].contains(&status) {
             return Err("Unsupported image job transition.".into());
         }
         self.connection.execute(
             "UPDATE image_jobs SET status=?1,updated_at=?2 WHERE id=?3 AND status NOT IN ('completed','failed')",
             params![status, Utc::now().to_rfc3339(), job_id],
         ).map_err(|e| e.to_string())?;
-        if status == "stopped" {
+        if matches!(status, "stopped" | "failed") {
             self.connection.execute(
                 "UPDATE image_job_items SET status='stopped',updated_at=?1 WHERE job_id=?2 AND status IN ('queued','running')",
                 params![Utc::now().to_rfc3339(), job_id],

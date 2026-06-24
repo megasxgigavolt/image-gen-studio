@@ -651,7 +651,7 @@ fn spawn_job_workers(
                 let mut last_error = String::new();
                 let mut render_id = None;
                 for attempt in 0..5 {
-                    if repository.image_job_status(&job_id).ok().as_deref() == Some("stopped") {
+                    if matches!(repository.image_job_status(&job_id).ok().as_deref(), Some("stopped") | Some("failed")) {
                         break;
                     }
                     match repository.generate_image_render(
@@ -674,7 +674,7 @@ fn spawn_job_workers(
                                 let delay = if rate_limited { 30 * 2_u64.pow(attempt) } else { 3 * 2_u64.pow(attempt) };
                                 let mut remaining = delay.min(240);
                                 while remaining > 0 {
-                                    if repository.image_job_status(&job_id).ok().as_deref() == Some("stopped") {
+                                    if matches!(repository.image_job_status(&job_id).ok().as_deref(), Some("stopped") | Some("failed")) {
                                         break;
                                     }
                                     thread::sleep(Duration::from_secs(1));
@@ -684,13 +684,13 @@ fn spawn_job_workers(
                         }
                     }
                 }
-                if repository.image_job_status(&job_id).ok().as_deref() == Some("stopped") {
+                if matches!(repository.image_job_status(&job_id).ok().as_deref(), Some("stopped") | Some("failed")) {
                     break;
                 }
                 let result = render_id.ok_or(last_error);
                 let _ = repository.finish_job_item(&job_id, &item_id, result);
                 for _ in 0..8 {
-                    if repository.image_job_status(&job_id).ok().as_deref() == Some("stopped") {
+                    if matches!(repository.image_job_status(&job_id).ok().as_deref(), Some("stopped") | Some("failed")) {
                         break;
                     }
                     thread::sleep(Duration::from_secs(1));
@@ -732,6 +732,7 @@ fn control_image_job(
             "pause" => "paused",
             "resume" => "queued",
             "stop" => "stopped",
+            "cancel" => "failed",
             _ => return Err("Unknown job action.".into()),
         };
         let job = repository.set_image_job_status(&job_id, status)?;

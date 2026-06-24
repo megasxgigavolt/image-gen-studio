@@ -23,7 +23,6 @@ import {
   Maximize2,
   ZoomIn,
   ZoomOut,
-  Wrench,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -53,13 +52,11 @@ import {
   type PromptVersionRecord,
   type TimelineRecord,
 } from "./infrastructure/projects-client";
-import { ThumbnailEditorPane } from "./ThumbnailEditor";
 
 const navItems: { stage: AppStage; label: string; icon: typeof Home; alwaysEnabled?: boolean }[] = [
   { stage: "home", label: "Home", icon: Home },
   { stage: "inputs", label: "Production", icon: Upload },
   { stage: "images", label: "Images", icon: Image },
-  { stage: "tools", label: "Tools", icon: Wrench, alwaysEnabled: true },
 ];
 const MAX_CACHE_SIZE = 20;
 const imageWorkspaceCache = new Map<string, ImageWorkspaceRecord>();
@@ -1426,9 +1423,18 @@ function ImagesView() {
           setSystemPrompt(globalDirective ?? pv.systemPrompt ?? systemPrompt);
         }
       }
-      const job = await projectsClient.createImageJob(activeVideoId);
-      setJob(job);
       setBulkPlan(null);
+    } catch (caught) { setError(String(caught)); }
+    finally { setLoading(false); }
+  }
+
+  async function generateAll() {
+    if (!activeVideoId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const newJob = await projectsClient.createImageJob(activeVideoId);
+      setJob(newJob);
     } catch (caught) { setError(String(caught)); }
     finally { setLoading(false); }
   }
@@ -1647,14 +1653,6 @@ function ImagesView() {
     } catch (caught) { setError(String(caught)); }
   }
 
-  async function exportBundle() {
-    if (!activeVideoId) return;
-    try {
-      const result = await projectsClient.exportProjectBundle(activeVideoId);
-      if (result) addToast(`Project bundle saved to ${result.path}`, "success");
-    } catch (caught) { setError(String(caught)); }
-  }
-
   const [applyingStyle, setApplyingStyle] = useState(false);
   async function applyStyleToAll() {
     if (!activeVideoId || !systemPrompt.trim()) return;
@@ -1678,7 +1676,7 @@ function ImagesView() {
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <div className="heading-actions"><button className="secondary danger-action" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Final output folder</button><button className="secondary" onClick={() => void exportBundle()}><Download size={16} />Project bundle</button><button className="secondary" title="Update the style directive on all existing prompt versions without re-planning" onClick={() => void applyStyleToAll()} disabled={applyingStyle || !systemPrompt.trim() || !workspace?.groups.length || loading}>{applyingStyle ? "Applying…" : "Apply Style to All"}</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} />Bulk Generate</button></div>
+        <div className="heading-actions"><button className="secondary danger-action" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Download All</button><button className="secondary" onClick={() => void generateAll()} disabled={loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={16} />Generate All</button><button className="secondary" title="Update the style directive on all existing prompt versions without re-planning" onClick={() => void applyStyleToAll()} disabled={applyingStyle || !systemPrompt.trim() || !workspace?.groups.length || loading}>{applyingStyle ? "Applying…" : "Apply Style to All"}</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={17} />Bulk Gen Config</button></div>
       </div>
       {error && <div className="error-toast" role="alert"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
       {job && !bulkProgress && (
@@ -1843,7 +1841,7 @@ function ImagesView() {
       </div>}
       {bulkOpen && <div className="modal-backdrop" role="presentation" onMouseDown={() => setBulkOpen(false)}>
         <div className="modal bulk-modal" onMouseDown={(e) => e.stopPropagation()}>
-          <h2>Bulk Generate</h2>
+          <h2>Bulk Gen Config</h2>
           <div className="panel-section-heading" style={{marginTop:"4px"}}><h3>Style Directive</h3><small>Global visual style</small></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Describe overall cinematography and visual language. Avoid scene-specific details — the AI will handle those per still.</p>
           <textarea className="bulk-directive" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="e.g. Cinematic documentary style, shallow depth of field, warm color grade, soft natural lighting…" rows={4} />
@@ -1908,43 +1906,6 @@ function ImagesView() {
 }
 
 
-function ToolsView() {
-  const [activePane, setActivePane] = useState<"thumbnail-editor">("thumbnail-editor");
-  return (
-    <section className="view tools-view">
-      <div className="page-heading">
-        <div>
-          <p className="eyebrow">Utilities</p>
-          <h1>Tools</h1>
-          <p>Standalone editing and enhancement utilities powered by AI.</p>
-        </div>
-      </div>
-      <div className="tools-layout">
-        <aside className="tools-pane-list">
-          <strong>Panes</strong>
-          <button
-            className={activePane === "thumbnail-editor" ? "tools-pane-btn active" : "tools-pane-btn"}
-            onClick={() => setActivePane("thumbnail-editor")}
-          >
-            <Image size={16} />
-            <span>Thumbnail Editor</span>
-          </button>
-        </aside>
-        <div className="tools-content">
-          {activePane === "thumbnail-editor" && (
-            <>
-              <div className="tool-heading">
-                <strong>Thumbnail Editor</strong>
-                <p>Canva-style design editor — add backgrounds, text, preset elements, and AI-generated graphics. Drag, resize, and rotate elements freely. Export as PNG.</p>
-              </div>
-              <ThumbnailEditorPane />
-            </>
-          )}
-        </div>
-      </div>
-    </section>
-  );
-}
 
 function TimelineView() {
   const { activeVideoId } = useAppStore();
@@ -2080,7 +2041,7 @@ export function App() {
     <div className="app-shell">
       <TitleBar />
       <Sidebar />
-      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}{stage === "tools" && <ToolsView />}</main>
+      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
       <ToastDisplay />
     </div>
   );

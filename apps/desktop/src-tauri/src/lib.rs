@@ -1,16 +1,17 @@
 mod projects;
 
+use base64::Engine;
 use projects::{
-    Channel, ExportResult, ImageJob, ImageRender, ImageWorkspace, InputAsset, ProjectRepository,
-    PromptVersion, ResumeState, Timeline, Video, VideoInputs, VisualPlan,
+    CaptionSet, Channel, ExportResult, ImageJob, ImageRender, ImageWorkspace, InputAsset,
+    ProjectRepository, PromptVersion, ResumeState, Timeline, Video, VideoInputs, VideoProgress,
+    VisualPlan,
 };
+use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
-use base64::Engine;
-use serde_json::json;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
@@ -79,6 +80,14 @@ fn list_videos(
 }
 
 #[tauri::command]
+fn get_video_progress(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<VideoProgress, String> {
+    with_repository(state, |repository| repository.get_video_progress(&video_id))
+}
+
+#[tauri::command]
 fn create_video(
     state: State<'_, RepositoryState>,
     channel_id: String,
@@ -127,12 +136,20 @@ fn restore_video(state: State<'_, RepositoryState>, id: String) -> Result<(), St
 }
 
 #[tauri::command]
-fn rename_channel(state: State<'_, RepositoryState>, id: String, name: String) -> Result<(), String> {
+fn rename_channel(
+    state: State<'_, RepositoryState>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
     with_repository(state, |repository| repository.rename_channel(&id, &name))
 }
 
 #[tauri::command]
-fn rename_video(state: State<'_, RepositoryState>, id: String, title: String) -> Result<(), String> {
+fn rename_video(
+    state: State<'_, RepositoryState>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
     with_repository(state, |repository| repository.rename_video(&id, &title))
 }
 
@@ -245,7 +262,9 @@ fn delete_prompt_version(
     state: State<'_, RepositoryState>,
     prompt_version_id: String,
 ) -> Result<(), String> {
-    with_repository(state, |repository| repository.delete_prompt_version(&prompt_version_id))
+    with_repository(state, |repository| {
+        repository.delete_prompt_version(&prompt_version_id)
+    })
 }
 
 #[tauri::command]
@@ -269,27 +288,42 @@ async fn generate_image_render(
     user_prompt: String,
     settings_json: String,
 ) -> Result<ImageRender, String> {
-    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
         let mut last_error = String::new();
         for attempt in 0..4 {
             match repository.generate_image_render(
-                &video_id, &group_id, &prompt_version_id, &system_prompt, &user_prompt, &settings_json,
+                &video_id,
+                &group_id,
+                &prompt_version_id,
+                &system_prompt,
+                &user_prompt,
+                &settings_json,
             ) {
                 Ok(render) => return Ok(render),
                 Err(error) => {
                     last_error = error;
                     if attempt < 3 {
-                        let rate_limited = last_error.contains("429") || last_error.to_ascii_lowercase().contains("resource exhausted");
-                        let delay = if rate_limited { 20 * 2_u64.pow(attempt) } else { 2 * 2_u64.pow(attempt) };
+                        let rate_limited = last_error.contains("429")
+                            || last_error
+                                .to_ascii_lowercase()
+                                .contains("resource exhausted");
+                        let delay = if rate_limited {
+                            20 * 2_u64.pow(attempt)
+                        } else {
+                            2 * 2_u64.pow(attempt)
+                        };
                         thread::sleep(Duration::from_secs(delay.min(120)));
                     }
                 }
             }
         }
         Err(last_error)
-    }).await.map_err(|error| format!("Image generation worker stopped unexpectedly: {error}"))?
+    })
+    .await
+    .map_err(|error| format!("Image generation worker stopped unexpectedly: {error}"))?
 }
 
 #[tauri::command]
@@ -310,11 +344,19 @@ async fn edit_image_render(
     mask_data_url: Option<String>,
     edit_strength: String,
 ) -> Result<ImageRender, String> {
-    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
-        repository.edit_image_render(&source_render_id, &instruction, mask_data_url.as_deref(), &edit_strength)
-    }).await.map_err(|error| format!("Image editing worker stopped unexpectedly: {error}"))?
+        repository.edit_image_render(
+            &source_render_id,
+            &instruction,
+            mask_data_url.as_deref(),
+            &edit_strength,
+        )
+    })
+    .await
+    .map_err(|error| format!("Image editing worker stopped unexpectedly: {error}"))?
 }
 
 #[tauri::command]
@@ -323,23 +365,23 @@ fn set_final_render(
     render_id: String,
     is_final: bool,
 ) -> Result<ImageRender, String> {
-    with_repository(state, |repository| repository.set_final_render(&render_id, is_final))
+    with_repository(state, |repository| {
+        repository.set_final_render(&render_id, is_final)
+    })
 }
 
 #[tauri::command]
-fn delete_image_render(
-    state: State<'_, RepositoryState>,
-    render_id: String,
-) -> Result<(), String> {
-    with_repository(state, |repository| repository.delete_image_render(&render_id))
+fn delete_image_render(state: State<'_, RepositoryState>, render_id: String) -> Result<(), String> {
+    with_repository(state, |repository| {
+        repository.delete_image_render(&render_id)
+    })
 }
 
 #[tauri::command]
-fn reset_image_workflow(
-    state: State<'_, RepositoryState>,
-    video_id: String,
-) -> Result<(), String> {
-    with_repository(state, |repository| repository.reset_image_workflow(&video_id))
+fn reset_image_workflow(state: State<'_, RepositoryState>, video_id: String) -> Result<(), String> {
+    with_repository(state, |repository| {
+        repository.reset_image_workflow(&video_id)
+    })
 }
 
 #[tauri::command]
@@ -350,7 +392,8 @@ async fn suggest_image_prompt(
     settings_json: String,
     style_directive: String,
 ) -> Result<String, String> {
-    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
         repository.suggest_image_prompt(&video_id, &group_id, &settings_json, &style_directive)
@@ -367,11 +410,14 @@ async fn plan_educational_visual(
     settings_json: String,
     style_directive: String,
 ) -> Result<projects::EducationalVisualPlan, String> {
-    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
         repository.plan_educational_visual(&video_id, &group_id, &settings_json, &style_directive)
-    }).await.map_err(|error| format!("Educational planner stopped unexpectedly: {error}"))?
+    })
+    .await
+    .map_err(|error| format!("Educational planner stopped unexpectedly: {error}"))?
 }
 
 #[tauri::command]
@@ -382,11 +428,19 @@ async fn plan_whole_video_educational_visuals(
     style_directive: String,
     strategy_mode: String,
 ) -> Result<projects::WholeVideoEducationalPlan, String> {
-    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
-        repository.plan_whole_video_educational_visuals(&video_id, &settings_json, &style_directive, &strategy_mode)
-    }).await.map_err(|error| format!("Whole-video planner stopped unexpectedly: {error}"))?
+        repository.plan_whole_video_educational_visuals(
+            &video_id,
+            &settings_json,
+            &style_directive,
+            &strategy_mode,
+        )
+    })
+    .await
+    .map_err(|error| format!("Whole-video planner stopped unexpectedly: {error}"))?
 }
 
 #[tauri::command]
@@ -394,7 +448,9 @@ fn extract_reference_style(
     state: State<'_, RepositoryState>,
     asset_id: String,
 ) -> Result<projects::StyleExtraction, String> {
-    with_repository(state, |repository| repository.extract_reference_style(&asset_id))
+    with_repository(state, |repository| {
+        repository.extract_reference_style(&asset_id)
+    })
 }
 
 #[tauri::command]
@@ -405,7 +461,9 @@ fn set_still_lock(
     settings_locked: bool,
     prompt_locked: bool,
 ) -> Result<(), String> {
-    with_repository(state, |repository| repository.set_still_lock(&video_id, &group_id, settings_locked, prompt_locked))
+    with_repository(state, |repository| {
+        repository.set_still_lock(&video_id, &group_id, settings_locked, prompt_locked)
+    })
 }
 
 #[tauri::command]
@@ -413,7 +471,9 @@ fn extract_image_settings_from_directive(
     state: State<'_, RepositoryState>,
     directive: String,
 ) -> Result<projects::StyleExtraction, String> {
-    with_repository(state, |repository| repository.extract_image_settings_from_directive(&directive))
+    with_repository(state, |repository| {
+        repository.extract_image_settings_from_directive(&directive)
+    })
 }
 
 #[tauri::command]
@@ -424,11 +484,14 @@ async fn suggest_still_prompt(
     style_directive: String,
     base_settings_json: String,
 ) -> Result<projects::BulkPlannedStill, String> {
-    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
         repository.suggest_still_prompt(&video_id, &group_id, &style_directive, &base_settings_json)
-    }).await.map_err(|e| format!("Prompt suggestion stopped unexpectedly: {e}"))?
+    })
+    .await
+    .map_err(|e| format!("Prompt suggestion stopped unexpectedly: {e}"))?
 }
 
 #[tauri::command]
@@ -440,13 +503,25 @@ async fn plan_bulk_visuals(
     base_settings_json: String,
     creative_instruction: String,
 ) -> Result<projects::BulkPlanResult, String> {
-    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
-        repository.plan_bulk_visuals(&video_id, &style_directive, &base_settings_json, &creative_instruction, |planned, total| {
-            let _ = app.emit("bulk_plan_progress", serde_json::json!({ "planned": planned, "total": total }));
-        })
-    }).await.map_err(|e| format!("Bulk planner stopped unexpectedly: {e}"))?
+        repository.plan_bulk_visuals(
+            &video_id,
+            &style_directive,
+            &base_settings_json,
+            &creative_instruction,
+            |planned, total| {
+                let _ = app.emit(
+                    "bulk_plan_progress",
+                    serde_json::json!({ "planned": planned, "total": total }),
+                );
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("Bulk planner stopped unexpectedly: {e}"))?
 }
 
 #[tauri::command]
@@ -456,11 +531,14 @@ async fn approve_bulk_plan(
     style_directive: String,
     stills: Vec<projects::BulkPlannedStill>,
 ) -> Result<usize, String> {
-    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
         repository.approve_bulk_plan(&video_id, &style_directive, &stills)
-    }).await.map_err(|e| format!("Bulk plan approval stopped unexpectedly: {e}"))?
+    })
+    .await
+    .map_err(|e| format!("Bulk plan approval stopped unexpectedly: {e}"))?
 }
 
 #[tauri::command]
@@ -470,13 +548,23 @@ async fn apply_creative_instructions_to_all(
     video_id: String,
     creative_instruction: String,
 ) -> Result<usize, String> {
-    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
-        repository.apply_creative_instructions_to_all(&video_id, &creative_instruction, |done, total| {
-            let _ = app.emit("creative_apply_progress", serde_json::json!({ "done": done, "total": total }));
-        })
-    }).await.map_err(|e| format!("Creative instruction apply failed: {e}"))?
+        repository.apply_creative_instructions_to_all(
+            &video_id,
+            &creative_instruction,
+            |done, total| {
+                let _ = app.emit(
+                    "creative_apply_progress",
+                    serde_json::json!({ "done": done, "total": total }),
+                );
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("Creative instruction apply failed: {e}"))?
 }
 
 #[tauri::command]
@@ -485,11 +573,14 @@ async fn apply_style_directive_to_all(
     video_id: String,
     style_directive: String,
 ) -> Result<usize, String> {
-    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
         repository.apply_style_directive_to_all(&video_id, &style_directive)
-    }).await.map_err(|e| format!("Style directive update failed: {e}"))?
+    })
+    .await
+    .map_err(|e| format!("Style directive update failed: {e}"))?
 }
 
 #[tauri::command]
@@ -651,7 +742,10 @@ fn spawn_job_workers(
                 let mut last_error = String::new();
                 let mut render_id = None;
                 for attempt in 0..5 {
-                    if matches!(repository.image_job_status(&job_id).ok().as_deref(), Some("stopped") | Some("failed")) {
+                    if matches!(
+                        repository.image_job_status(&job_id).ok().as_deref(),
+                        Some("stopped") | Some("failed")
+                    ) {
                         break;
                     }
                     match repository.generate_image_render(
@@ -670,11 +764,20 @@ fn spawn_job_workers(
                             last_error = error;
                             if attempt < 4 {
                                 let rate_limited = last_error.contains("429")
-                                    || last_error.to_ascii_lowercase().contains("resource exhausted");
-                                let delay = if rate_limited { 30 * 2_u64.pow(attempt) } else { 3 * 2_u64.pow(attempt) };
+                                    || last_error
+                                        .to_ascii_lowercase()
+                                        .contains("resource exhausted");
+                                let delay = if rate_limited {
+                                    30 * 2_u64.pow(attempt)
+                                } else {
+                                    3 * 2_u64.pow(attempt)
+                                };
                                 let mut remaining = delay.min(240);
                                 while remaining > 0 {
-                                    if matches!(repository.image_job_status(&job_id).ok().as_deref(), Some("stopped") | Some("failed")) {
+                                    if matches!(
+                                        repository.image_job_status(&job_id).ok().as_deref(),
+                                        Some("stopped") | Some("failed")
+                                    ) {
                                         break;
                                     }
                                     thread::sleep(Duration::from_secs(1));
@@ -684,13 +787,19 @@ fn spawn_job_workers(
                         }
                     }
                 }
-                if matches!(repository.image_job_status(&job_id).ok().as_deref(), Some("stopped") | Some("failed")) {
+                if matches!(
+                    repository.image_job_status(&job_id).ok().as_deref(),
+                    Some("stopped") | Some("failed")
+                ) {
                     break;
                 }
                 let result = render_id.ok_or(last_error);
                 let _ = repository.finish_job_item(&job_id, &item_id, result);
                 for _ in 0..8 {
-                    if matches!(repository.image_job_status(&job_id).ok().as_deref(), Some("stopped") | Some("failed")) {
+                    if matches!(
+                        repository.image_job_status(&job_id).ok().as_deref(),
+                        Some("stopped") | Some("failed")
+                    ) {
                         break;
                     }
                     thread::sleep(Duration::from_secs(1));
@@ -817,17 +926,21 @@ async fn generate_visual_plan(
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
         let event_video_id = video_id.clone();
-        repository.generate_visual_plan_with_progress(&video_id, &engine_dir, |percent, stage, detail| {
-            let _ = app.emit(
-                "visual-plan-progress",
-                serde_json::json!({
-                    "videoId": &event_video_id,
-                    "percent": percent,
-                    "stage": stage,
-                    "detail": detail,
-                }),
-            );
-        })
+        repository.generate_visual_plan_with_progress(
+            &video_id,
+            &engine_dir,
+            |percent, stage, detail| {
+                let _ = app.emit(
+                    "visual-plan-progress",
+                    serde_json::json!({
+                        "videoId": &event_video_id,
+                        "percent": percent,
+                        "stage": stage,
+                        "detail": detail,
+                    }),
+                );
+            },
+        )
     })
     .await
     .map_err(|error| format!("Visual-plan worker failed: {error}"))?
@@ -839,6 +952,76 @@ fn get_visual_plan(
     video_id: String,
 ) -> Result<VisualPlan, String> {
     with_repository(state, |repository| repository.get_visual_plan(&video_id))
+}
+
+#[tauri::command]
+async fn generate_captions(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    interval_seconds: f64,
+) -> Result<CaptionSet, String> {
+    let (database_path, projects_dir) = {
+        let repository = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        repository.paths()
+    };
+    let engine_dir = if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../services/python-engine")
+    } else {
+        app.path()
+            .resource_dir()
+            .map_err(|e| format!("Could not locate app resource directory: {e}"))?
+            .join("python-engine")
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        let event_video_id = video_id.clone();
+        repository.generate_captions_with_progress(
+            &video_id,
+            &engine_dir,
+            interval_seconds,
+            |percent, stage, detail| {
+                let _ = app.emit(
+                    "caption-progress",
+                    serde_json::json!({
+                        "videoId": &event_video_id,
+                        "percent": percent,
+                        "stage": stage,
+                        "detail": detail,
+                    }),
+                );
+            },
+        )
+    })
+    .await
+    .map_err(|error| format!("Caption worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn get_captions(state: State<'_, RepositoryState>, video_id: String) -> Result<CaptionSet, String> {
+    with_repository(state, |repository| repository.get_captions(&video_id))
+}
+
+#[tauri::command]
+fn save_captions_file(
+    app: tauri::AppHandle,
+    srt_text: String,
+    default_name: String,
+) -> Result<Option<String>, String> {
+    let Some(path) = app
+        .dialog()
+        .file()
+        .add_filter("SubRip Subtitle", &["srt"])
+        .set_file_name(&default_name)
+        .blocking_save_file()
+        .and_then(|value| value.as_path().map(ToOwned::to_owned))
+    else {
+        return Ok(None);
+    };
+    fs::write(&path, srt_text).map_err(|error| format!("Could not save captions: {error}"))?;
+    Ok(Some(path.to_string_lossy().into_owned()))
 }
 
 #[tauri::command]
@@ -913,7 +1096,8 @@ async fn edit_thumbnail_image(
     edit_strength: String,
     aspect_ratio: String,
 ) -> Result<String, String> {
-    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
     tauri::async_runtime::spawn_blocking(move || {
         let repository = projects::ProjectRepository::open(&database_path, &projects_dir)?;
         repository.edit_thumbnail(
@@ -944,9 +1128,7 @@ fn save_thumbnail_image(
     else {
         return Ok(None);
     };
-    let comma_pos = data_url
-        .find(',')
-        .ok_or("Invalid image data URL.")?;
+    let comma_pos = data_url.find(',').ok_or("Invalid image data URL.")?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&data_url[comma_pos + 1..])
         .map_err(|error| format!("Could not decode image: {error}"))?;
@@ -965,8 +1147,8 @@ pub fn run() {
             {
                 let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("../../../services/python-engine");
-                let workspace_env = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../../../.env");
+                let workspace_env =
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../.env");
                 for local_env in [workspace_env, engine_dir.join(".env")] {
                     if let Ok(contents) = fs::read_to_string(local_env) {
                         for line in contents.lines() {
@@ -1025,10 +1207,14 @@ pub fn run() {
             repository
                 .recover_image_jobs()
                 .map_err(std::io::Error::other)?;
-            if repository.get_app_setting("gemini_model").map_err(std::io::Error::other)?
-                .as_deref() != Some("gemini-3.1-flash-image")
+            if repository
+                .get_app_setting("gemini_model")
+                .map_err(std::io::Error::other)?
+                .as_deref()
+                != Some("gemini-3.1-flash-image")
             {
-                repository.save_app_setting("gemini_model", "gemini-3.1-flash-image")
+                repository
+                    .save_app_setting("gemini_model", "gemini-3.1-flash-image")
                     .map_err(std::io::Error::other)?;
             }
             for (provider, variable) in [("gemini", "GEMINI_API_KEY"), ("openai", "OPENAI_API_KEY")]
@@ -1051,6 +1237,7 @@ pub fn run() {
             list_channels,
             create_channel,
             list_videos,
+            get_video_progress,
             create_video,
             get_resume_state,
             set_resume_state,
@@ -1067,6 +1254,9 @@ pub fn run() {
             pick_script_text,
             generate_visual_plan,
             get_visual_plan,
+            generate_captions,
+            get_captions,
+            save_captions_file,
             move_plan_sentence,
             create_plan_group,
             reset_visual_plan,

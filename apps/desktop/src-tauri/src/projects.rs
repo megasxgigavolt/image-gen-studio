@@ -282,6 +282,17 @@ ALTER TABLE visual_plan_groups ADD COLUMN settings_locked INTEGER NOT NULL DEFAU
 ALTER TABLE visual_plan_groups ADD COLUMN prompt_locked INTEGER NOT NULL DEFAULT 0;
 "#;
 
+const MIGRATION_013: &str = r#"
+CREATE TABLE IF NOT EXISTS captions (
+    video_id TEXT PRIMARY KEY REFERENCES videos(id),
+    interval_seconds REAL NOT NULL DEFAULT 1.0,
+    srt_text TEXT NOT NULL,
+    chunks_json TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -303,6 +314,15 @@ pub struct Video {
     pub progress: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoProgress {
+    pub video_id: String,
+    pub total_stills: i64,
+    pub generated_stills: i64,
+    pub preview_render_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -338,6 +358,26 @@ pub struct VideoInputs {
     pub pacing_max_seconds: i64,
     pub audio: Option<InputAsset>,
     pub references: Vec<InputAsset>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionChunk {
+    pub index: i64,
+    pub text: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptionSet {
+    pub video_id: String,
+    pub interval_seconds: f64,
+    pub srt_text: String,
+    pub chunks: Vec<CaptionChunk>,
+    pub generated_at: String,
     pub updated_at: String,
 }
 
@@ -783,6 +823,11 @@ impl ProjectRepository {
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(12, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
+        self.connection.execute_batch(MIGRATION_013).map_err(|error| error.to_string())?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(13, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -865,6 +910,44 @@ impl ProjectRepository {
             .map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
+    }
+
+    pub fn get_video_progress(&self, video_id: &str) -> Result<VideoProgress, String> {
+        let total_stills: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM visual_plan_groups WHERE video_id=?1 AND is_original=0",
+                [video_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let generated_stills: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(DISTINCT group_id) FROM image_renders WHERE video_id=?1",
+                [video_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let preview_render_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT ir.id FROM image_renders ir
+                 JOIN visual_plan_groups g ON g.id = ir.group_id AND g.video_id = ir.video_id
+                 WHERE ir.video_id = ?1 AND g.is_original = 0
+                 ORDER BY g.ordinal ASC, ir.version DESC
+                 LIMIT 1",
+                [video_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(VideoProgress {
+            video_id: video_id.into(),
+            total_stills,
+            generated_stills,
+            preview_render_id,
+        })
     }
 
     pub fn create_video(&self, channel_id: &str, title: &str) -> Result<Video, String> {
@@ -1043,6 +1126,7 @@ impl ProjectRepository {
             "DELETE FROM visual_plan_sentences WHERE video_id = ?1",
             "DELETE FROM visual_plan_groups WHERE video_id = ?1",
             "DELETE FROM visual_plan_meta WHERE video_id = ?1",
+            "DELETE FROM captions WHERE video_id = ?1",
             "DELETE FROM input_assets WHERE video_id = ?1",
             "DELETE FROM video_inputs WHERE video_id = ?1",
             "DELETE FROM video_snapshots WHERE video_id = ?1",
@@ -1068,6 +1152,7 @@ impl ProjectRepository {
             "DELETE FROM visual_plan_sentences WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
             "DELETE FROM visual_plan_groups WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
             "DELETE FROM visual_plan_meta WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
+            "DELETE FROM captions WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
             "DELETE FROM input_assets WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
             "DELETE FROM video_inputs WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
             "DELETE FROM video_snapshots WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
@@ -2073,9 +2158,14 @@ Return JSON only — no markdown, no explanation:
             api_calls += 1;
             let chunk_end = (next_to_plan + chunk_size).min(total);
             let chunk = &row_data[next_to_plan..chunk_end];
-            let prior_context: Vec<_> = planned.iter().rev().take(3).map(|s| json!({
+            let prior_context_start = planned.len().saturating_sub(12);
+            let prior_context: Vec<_> = planned[prior_context_start..].iter().map(|s| json!({
                 "visualPlanRowId": s.visual_plan_row_id,
                 "visualType": s.visual_type,
+                "mood": s.image_settings.get("mood").and_then(|v| v.as_str()),
+                "cameraAngle": s.image_settings.get("cameraAngle").and_then(|v| v.as_str()),
+                "lighting": s.image_settings.get("lighting").and_then(|v| v.as_str()),
+                "sceneAndEmotionPreview": s.user_prompt.chars().take(320).collect::<String>(),
             })).collect();
             let director_note = if creative_instruction.trim().is_empty() {
                 String::new()
@@ -2090,6 +2180,7 @@ Return JSON only — no markdown, no explanation:
                      HOW TO EMBED THESE RULES IN userPrompt (mandatory — not optional):\n\
                      1. POSITIVE rules (include X / always show Y / use Z / feature W):\n\
                         → Weave the required subject, character, or element directly into the scene description as a concrete physical presence.\n\
+                        → If the rule contains style words such as realistic, animated, cartoon, 3D, anime, cinematic, or illustration, treat those as Style Directive content and do NOT copy those words into userPrompt.\n\
                         → Example rule \"always include the orange cat\" → userPrompt must contain the orange cat as an active participant in every scene.\n\
                      2. NEGATIVE rules (avoid X / no Y / never Z / do not show W / exclude V):\n\
                         → Parse every avoidance directive and collect them.\n\
@@ -2106,12 +2197,20 @@ Return JSON only — no markdown, no explanation:
 Style directive: {style_directive}
 Base image settings: {base_settings_json}{director_note}
 Total stills in video: {total}. This is planning batch {} of {total_batches}.
-Previously planned (last 3, newest first): {}
+Previously planned context (chronological; includes earlier batches and must guide continuity, emotional variety, and non-repetition): {}
 
 Current batch rows to plan:
 {}
 
 CORE GOAL: Ask "What image best helps the viewer understand this concept?" — never "What literally matches the sentence?"
+
+EXPRESSIVE STORYTELLING LAYER (required, not a style):
+- Every still needs a clear emotional beat or physical tension that helps the viewer feel the idea, not just identify the subject.
+- For people, animals, or character-like subjects: make the subject visibly expressive through action, posture, gesture, facial reaction, eye direction, body tension, interaction, or relationship to another subject/object.
+- For object, environment, diagram, map, or infographic stills: express emotion through physical consequences, contrast, stakes, motion, arrangement, scale, proximity, damage, comfort, isolation, pressure, relief, or discovery.
+- Vary emotional energy across adjacent stills: curiosity, surprise, worry, relief, tenderness, urgency, triumph, hesitation, focus, confusion, wonder. Do not repeat neutral standing/sitting/watching beats.
+- userPrompt should name physical emotion signals only when they are visible scene content, e.g. "a child gripping a blanket and peering from behind a doorway", "a tired worker rubbing their forehead beside scattered notes", "a fish darting away from a sudden ripple".
+- Keep expression choices faithful to narration and previous planned context. Use the previous context above to continue the story and avoid repeating the same pose, emotion, environment, or subject arrangement across batches.
 
 INTERNAL TARGET DISTRIBUTION (soft targets; do not force inappropriate visuals):
 Character Scene 25-35%; Behavioral Demonstration 10-15%; Close Detail 10-15%; Environmental Scene 5-10%; Object Focus 5-10%; Comparison 10-15%; Process Illustration 5-10%; Timeline 2-5%; Textless Infographic 5-10%; Scientific Diagram 2-8%; Geographic Map 0-5%; Concept Visualization 2-8%; POV Scene 0-5%; Symbolic Representation 2-8%; Documentary Frame 5-15%.
@@ -2162,18 +2261,21 @@ The final image is built from THREE completely independent layers — each owns 
   Layer B → imageSettings    : ALL technical camera/lighting data (the 20 fields above)
   Layer C → userPrompt       : ONLY the physical scene — WHO, WHAT, WHERE, doing WHAT
 
-userPrompt MUST contain: subjects, characters, animals, objects, actions, environment, props, spatial relationships.
+userPrompt MUST contain: subjects, characters, animals, objects, actions, environment, props, spatial relationships, and visible emotional/expressive cues when a subject is present.
+userPrompt MUST NOT copy, paraphrase, or restate the Style Directive. If the style directive says animated, realistic, 3D, watercolor, cinematic, etc., those words belong ONLY to Layer A and must be absent from userPrompt.
 userPrompt MUST NOT contain ANY of the following — these words are BANNED inside userPrompt:
   • Camera/framing words  : shot, angle, frame, lens, perspective, view, close-up, wide, macro, POV, zoom, cinematic
   • Lighting descriptors  : lit, light, lighting, illuminated, glow, bright, dark, shadow, sunlit, backlit, "warm light", "golden light", "soft light", "harsh light", dim, luminous, shimmering, gleaming
   • Color grade / style   : color grade, tones, palette, hue, saturated, vivid, muted, desaturated, warm, cool, teal, orange, sepia, cross-processed
   • Atmosphere as quality : moody, dreamy (only use fog/mist when physically present as weather, not as aesthetic)
   • Depth/focus words     : depth of field, bokeh, sharp, blurred background, in focus, out of focus, dreamy
-  • Render/film language  : photorealistic, 4K, HDR, film grain, cinematic, documentary style, rendered, hyper-detailed
+  • Render/medium/style language: realistic, realism, photorealistic, 4K, HDR, film grain, cinematic, documentary style, animated, animation, cartoon, Pixar, Disney, anime, 3D, CGI, render, rendered, illustration, painting, watercolor, claymation, stop motion, hyper-detailed, highly detailed
 
 SELF-CHECK before writing userPrompt: scan your draft for every banned word above. If any appear → rewrite without them.
 ✓ CORRECT: "A wolf pack crossing a frozen river at dusk, pine forest on both banks, snow-covered rocks in the foreground"
 ✗ WRONG:   "A wolf pack bathed in warm golden light crossing a glimmering river, cinematic wide shot with soft bokeh"
+✓ CORRECT: "A worried teenager clutching a cracked phone beside an empty bus stop, shoulders raised, eyes fixed on the road"
+✗ WRONG:   "A realistic animated teenager in a cinematic frame clutching a phone"
 ✓ CORRECT: "A wooden desk near a window, a cup of tea, open notebook, potted plant on the sill, morning cityscape outside"
 ✗ WRONG:   "Softly lit bedroom interior, warm morning light streaming through curtains onto a wooden desk"
 If MANDATORY CREATIVE RULES are present above: positive inclusions are woven into the scene description; negative exclusions appear as [Avoid: ...] at the end of the prompt.
@@ -2233,11 +2335,7 @@ You MUST return exactly one plan for every row in the current batch. Return JSON
         if next_to_plan < total {
             return Err(format!("Planning incomplete after {api_calls} API calls: only {next_to_plan} of {total} stills planned."));
         }
-        for window in planned.windows(4) {
-            if window.iter().all(|p| p.visual_type == window[0].visual_type) {
-                return Err(format!("Planner produced more than 3 consecutive '{}' stills. Please retry.", window[0].visual_type));
-            }
-        }
+        repair_excessive_consecutive_visual_types(&mut planned, &row_data);
         let mut visual_type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for p in &planned { *visual_type_counts.entry(p.visual_type.clone()).or_insert(0) += 1; }
         let short_overview = {
@@ -2310,6 +2408,9 @@ USER PROMPT RULES:
 - Describe ONLY the WHAT: subjects, objects, actions, environment for THIS specific narration
 - NO cinematography style, color grade, rendering style (those go in Style Directive)
 - NO camera angle, lighting type, depth of field, or image-settings terms (those go in imageSettings)
+- NO style/medium words in userPrompt, including realistic, realism, photorealistic, animated, animation, cartoon, Pixar, Disney, anime, 3D, CGI, rendered, illustration, painting, watercolor, cinematic, 4K, HDR, or hyper-detailed
+- Make the subject expressive when a subject is present: visible action, posture, facial reaction, gesture, body tension, interaction, or relationship to an object/environment
+- If there is no character-like subject, express stakes through physical arrangement, contrast, motion, scale, damage, comfort, isolation, pressure, relief, or discovery
 - Ask: "What is physically in this image?" — write exactly that
 
 Allowed visualType values: Character Scene; Behavioral Demonstration; Close Detail; Environmental Scene; Object Focus; Comparison; Process Illustration; Timeline; Textless Infographic; Scientific Diagram; Geographic Map; Concept Visualization; POV Scene; Symbolic Representation; Documentary Frame.
@@ -2320,7 +2421,7 @@ Return JSON only — one plan object:
             group.id,
         );
         let text = request_gemini_text(&auth, &prompt)?;
-        let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+        let cleaned = extract_json_from_text(&text);
         let parsed: serde_json::Value = serde_json::from_str(cleaned)
             .map_err(|e| format!("Prompt suggestion was not valid JSON: {e}"))?;
         let plan = parsed.pointer("/plans/0")
@@ -3722,6 +3823,240 @@ Return JSON only:
         })
     }
 
+    pub fn generate_captions(
+        &self,
+        video_id: &str,
+        engine_dir: &Path,
+        interval_seconds: f64,
+    ) -> Result<CaptionSet, String> {
+        self.generate_captions_with_progress(video_id, engine_dir, interval_seconds, |_, _, _| {})
+    }
+
+    pub fn generate_captions_with_progress<F>(
+        &self,
+        video_id: &str,
+        engine_dir: &Path,
+        interval_seconds: f64,
+        mut progress: F,
+    ) -> Result<CaptionSet, String>
+    where
+        F: FnMut(i64, &str, &str),
+    {
+        if !(0.2..=5.0).contains(&interval_seconds) {
+            return Err("Caption window must be between 0.2 and 5 seconds.".into());
+        }
+        let inputs = self.get_video_inputs(video_id)?;
+        if inputs.script_text.trim().is_empty() || inputs.audio.is_none() {
+            return Err("Script and narration audio are required.".into());
+        }
+        #[cfg(test)]
+        {
+            let _ = engine_dir;
+            let (clean_script, _) = remove_tts_pause_markers(&inputs.script_text);
+            let words: Vec<&str> = clean_script.split_whitespace().collect();
+            let mut chunks = Vec::new();
+            for (index, group) in words.chunks(3).enumerate() {
+                chunks.push(CaptionChunk {
+                    index: index as i64 + 1,
+                    text: group.join(" "),
+                    start_seconds: index as f64,
+                    end_seconds: index as f64 + 1.0,
+                });
+            }
+            self.save_caption_set(video_id, interval_seconds, "1\n00:00:00,000 --> 00:00:01,000\ntest\n", &chunks)?;
+            return self.get_captions(video_id);
+        }
+        #[cfg(not(test))]
+        {
+            let audio = inputs.audio.as_ref().unwrap();
+            let channel_id: String = self
+                .connection
+                .query_row(
+                    "SELECT channel_id FROM videos WHERE id=?1",
+                    [video_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            let video_dir = self.projects_dir.join(channel_id).join(video_id);
+            let audio_path = video_dir.join(&audio.relative_path);
+            let work_dir = video_dir.join("captions");
+            fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
+            let script_path = work_dir.join("authoritative-script.txt");
+            let output_srt = work_dir.join("captions.srt");
+            let output_json = output_srt.with_extension("json");
+            let (clean_script, _) = remove_tts_pause_markers(&inputs.script_text);
+            fs::write(&script_path, clean_script).map_err(|e| e.to_string())?;
+            let caption_engine = engine_dir.join("auto_gen_engine/caption_engine.py");
+            if !caption_engine.exists() {
+                return Err(format!(
+                    "Internal caption engine was not found at {}.",
+                    caption_engine.display()
+                ));
+            }
+            let mut command = Command::new(find_python());
+            command
+                .arg(&caption_engine)
+                .arg(&audio_path)
+                .arg(&script_path)
+                .arg("--interval")
+                .arg(interval_seconds.to_string())
+                .arg("--output")
+                .arg(&output_srt)
+                .current_dir(&engine_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            command.creation_flags(0x08000000);
+            let mut child = command
+                .spawn()
+                .map_err(|e| format!("Could not start the Python caption engine: {e}"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or("Could not capture caption engine output.")?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or("Could not capture caption engine errors.")?;
+            let stderr_thread = std::thread::spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                let mut bytes = Vec::new();
+                let mut output = Vec::new();
+                loop {
+                    bytes.clear();
+                    match reader.read_until(b'\n', &mut bytes) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => output.push(String::from_utf8_lossy(&bytes).trim().to_string()),
+                    }
+                }
+                output.join("\n")
+            });
+            let mut output_lines = Vec::new();
+            let mut stdout_reader = BufReader::new(stdout);
+            let mut line_bytes = Vec::new();
+            loop {
+                line_bytes.clear();
+                let count = stdout_reader
+                    .read_until(b'\n', &mut line_bytes)
+                    .map_err(|e| format!("Could not read engine progress: {e}"))?;
+                if count == 0 {
+                    break;
+                }
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                if let Some(payload) = line.strip_prefix("AUTOGEN_PROGRESS ") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                        progress(
+                            value["percent"].as_i64().unwrap_or(0),
+                            value["stage"].as_str().unwrap_or("Building captions"),
+                            value["detail"].as_str().unwrap_or_default(),
+                        );
+                    }
+                } else {
+                    output_lines.push(line);
+                }
+            }
+            let status = child
+                .wait()
+                .map_err(|e| format!("Could not wait for caption engine: {e}"))?;
+            let raw_stderr = stderr_thread.join().unwrap_or_default();
+            if !status.success() {
+                let clean_stdout: Vec<&str> = output_lines
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|l| {
+                        !l.is_empty()
+                            && !l.chars().all(|c| "#|-% \t".contains(c))
+                            && !l.contains("iB/s")
+                            && !l.contains("eta 0:")
+                    })
+                    .collect();
+                let clean_stderr: Vec<&str> = raw_stderr
+                    .lines()
+                    .filter(|l| {
+                        !l.is_empty()
+                            && !l.contains("UserWarning")
+                            && !l.contains("warnings.warn")
+                            && !l.contains("FP16")
+                    })
+                    .collect();
+                let mut parts = clean_stdout.join("\n");
+                if !clean_stderr.is_empty() {
+                    if !parts.is_empty() {
+                        parts.push('\n');
+                    }
+                    parts.push_str(&clean_stderr.join("\n"));
+                }
+                return Err(format!("Caption engine failed. {parts}"));
+            }
+            let srt_text =
+                fs::read_to_string(&output_srt).map_err(|e| format!("Could not read captions: {e}"))?;
+            let audit: serde_json::Value = serde_json::from_slice(
+                &fs::read(&output_json)
+                    .map_err(|e| format!("Could not read caption audit: {e}"))?,
+            )
+            .map_err(|e| format!("Caption audit was invalid: {e}"))?;
+            let chunks = audit
+                .as_array()
+                .ok_or("Caption audit contained no chunks.")?
+                .iter()
+                .map(|item| CaptionChunk {
+                    index: item["index"].as_i64().unwrap_or(0),
+                    text: item["text"].as_str().unwrap_or_default().to_string(),
+                    start_seconds: item["start"].as_f64().unwrap_or(0.0),
+                    end_seconds: item["end"].as_f64().unwrap_or(0.0),
+                })
+                .collect::<Vec<_>>();
+            self.save_caption_set(video_id, interval_seconds, &srt_text, &chunks)?;
+            self.get_captions(video_id)
+        }
+    }
+
+    fn save_caption_set(
+        &self,
+        video_id: &str,
+        interval_seconds: f64,
+        srt_text: &str,
+        chunks: &[CaptionChunk],
+    ) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let chunks_json = serde_json::to_string(chunks).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "INSERT INTO captions(video_id, interval_seconds, srt_text, chunks_json, generated_at, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?5) ON CONFLICT(video_id) DO UPDATE SET
+             interval_seconds=excluded.interval_seconds, srt_text=excluded.srt_text,
+             chunks_json=excluded.chunks_json, generated_at=excluded.generated_at, updated_at=excluded.updated_at",
+            params![video_id, interval_seconds, srt_text, chunks_json, now],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_captions(&self, video_id: &str) -> Result<CaptionSet, String> {
+        let (interval_seconds, srt_text, chunks_json, generated_at, updated_at): (
+            f64,
+            String,
+            String,
+            String,
+            String,
+        ) = self
+            .connection
+            .query_row(
+                "SELECT interval_seconds, srt_text, chunks_json, generated_at, updated_at FROM captions WHERE video_id = ?1",
+                [video_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .map_err(|_| "Captions have not been generated.".to_string())?;
+        let chunks: Vec<CaptionChunk> =
+            serde_json::from_str(&chunks_json).map_err(|e| e.to_string())?;
+        Ok(CaptionSet {
+            video_id: video_id.into(),
+            interval_seconds,
+            srt_text,
+            chunks,
+            generated_at,
+            updated_at,
+        })
+    }
+
     pub fn move_plan_sentence(
         &self,
         video_id: &str,
@@ -4061,6 +4396,56 @@ struct V2PlanChunkResponse {
     plans: Vec<V2PlanStillResponse>,
 }
 
+fn repair_excessive_consecutive_visual_types(planned: &mut [V2PlanStillResponse], row_data: &[serde_json::Value]) {
+    let alternatives = [
+        "Behavioral Demonstration",
+        "Close Detail",
+        "Environmental Scene",
+        "Object Focus",
+        "Comparison",
+        "Process Illustration",
+        "Textless Infographic",
+        "Concept Visualization",
+        "Documentary Frame",
+    ];
+    let mut run_type = String::new();
+    let mut run_len = 0usize;
+
+    for index in 0..planned.len() {
+        if planned[index].visual_type == run_type {
+            run_len += 1;
+        } else {
+            run_type = planned[index].visual_type.clone();
+            run_len = 1;
+        }
+        if run_len <= 3 {
+            continue;
+        }
+
+        let is_locked = row_data.get(index).is_some_and(|row| {
+            row["settingsLocked"].as_bool().unwrap_or(false) || row["promptLocked"].as_bool().unwrap_or(false)
+        });
+        if is_locked {
+            continue;
+        }
+
+        let previous = index.checked_sub(1).and_then(|prior| planned.get(prior)).map(|plan| plan.visual_type.as_str());
+        let next = planned.get(index + 1).map(|plan| plan.visual_type.as_str());
+        if let Some(replacement) = alternatives.iter().copied().find(|candidate| {
+            *candidate != run_type && Some(*candidate) != previous && Some(*candidate) != next
+        }) {
+            planned[index].visual_type = replacement.to_string();
+            planned[index].reason = if planned[index].reason.trim().is_empty() {
+                "Adjusted visual type to prevent repetitive consecutive stills.".into()
+            } else {
+                format!("{} Adjusted visual type to prevent repetitive consecutive stills.", planned[index].reason.trim())
+            };
+            run_type = planned[index].visual_type.clone();
+            run_len = 1;
+        }
+    }
+}
+
 fn request_openai_v2_plan(api_key: &str, prompt: &str) -> Result<V2PlanChunkResponse, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
@@ -4085,8 +4470,11 @@ fn request_openai_v2_plan(api_key: &str, prompt: &str) -> Result<V2PlanChunkResp
             Err(e) => return Err(format!("Could not reach OpenAI: {e}")),
         };
         let status = response.status();
-        let body: serde_json::Value = response.json()
-            .map_err(|e| format!("OpenAI returned unreadable response: {e}"))?;
+        let body: serde_json::Value = match response.json() {
+            Ok(value) => value,
+            Err(_) if attempt < 3 => continue,
+            Err(e) => return Err(format!("OpenAI returned unreadable response: {e}")),
+        };
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
             if attempt < 3 { continue; }
             return Err(format!("OpenAI bulk planning failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("server error")));
@@ -4289,7 +4677,8 @@ fn extract_json_from_text(raw: &str) -> &str {
     let s = s.strip_prefix("```").unwrap_or(s);
     let s = s.strip_suffix("```").unwrap_or(s);
     let s = s.trim();
-    // Find the outermost JSON object or array bounds
+    // Find the first complete JSON object or array, ignoring any prose or
+    // repeated JSON-looking blocks after it.
     let obj_start = s.find('{');
     let arr_start = s.find('[');
     let start = match (obj_start, arr_start) {
@@ -4299,8 +4688,37 @@ fn extract_json_from_text(raw: &str) -> &str {
         (None, None) => return s,
     };
     let start = start.unwrap();
-    let end = s.rfind('}').or_else(|| s.rfind(']')).unwrap_or(s.len().saturating_sub(1));
-    if end >= start { &s[start..=end] } else { s }
+    let opening = s.as_bytes()[start];
+    let closing = if opening == b'{' { b'}' } else { b']' };
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, byte) in s[start..].bytes().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if byte == b'"' {
+            in_string = true;
+        } else if byte == opening {
+            depth += 1;
+        } else if byte == closing {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return &s[start..=start + offset];
+            }
+        }
+    }
+
+    s
 }
 
 fn request_gemini_text(auth: &GeminiAuth, prompt: &str) -> Result<String, String> {
@@ -4402,7 +4820,11 @@ fn request_gemini_v2_plan(auth: &GeminiAuth, prompt: &str) -> Result<V2PlanChunk
             }
             return Err("Gemini rate limit hit. Wait a minute and try again.".to_string());
         }
-        let body: serde_json::Value = response.json().map_err(|e| format!("Gemini returned unreadable response: {e}"))?;
+        let body: serde_json::Value = match response.json() {
+            Ok(value) => value,
+            Err(_) if attempt < 3 => continue,
+            Err(e) => return Err(format!("Gemini returned unreadable response: {e}")),
+        };
         if !status.is_success() {
             return Err(format!("Gemini bulk planning failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
         }
@@ -4859,7 +5281,7 @@ mod tests {
         )
         .unwrap();
         repo.import_asset(&video.id, &audio, "audio").unwrap();
-        let original = repo.generate_visual_plan(&video.id).unwrap();
+        let original = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
         assert!(!original.groups.is_empty());
         if original.groups.len() > 1 {
             let sentence = original.groups[0].sentence_ids.last().unwrap().clone();
@@ -4882,6 +5304,8 @@ mod tests {
                 label: "First".into(),
                 kind: "still".into(),
                 sentence_ids: vec!["s1".into(), "s3".into()],
+                settings_locked: false,
+                prompt_locked: false,
             },
             PlanGroup {
                 id: "g2".into(),
@@ -4889,6 +5313,8 @@ mod tests {
                 label: "Second".into(),
                 kind: "still".into(),
                 sentence_ids: vec!["s2".into()],
+                settings_locked: false,
+                prompt_locked: false,
             },
         ];
         assert!(validate_group_chronology(&groups).is_err());
@@ -4905,7 +5331,7 @@ mod tests {
             repo.save_video_inputs(&video.id, "One. Two. Three.", 6)
                 .unwrap();
             repo.import_asset(&video.id, &audio, "audio").unwrap();
-            let plan = repo.generate_visual_plan(&video.id).unwrap();
+            let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
             assert_eq!(plan.sentences[0].id, "s1");
             assert_eq!(plan.groups[0].id, "g1");
         }
@@ -4921,7 +5347,7 @@ mod tests {
         repo.save_video_inputs(&video.id, "A complete scene.", 8)
             .unwrap();
         repo.import_asset(&video.id, &audio, "audio").unwrap();
-        let plan = repo.generate_visual_plan(&video.id).unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
         repo.save_app_setting("gemini_model", "gemini-2.5-flash-image")
             .unwrap();
         let first = repo
@@ -4967,6 +5393,50 @@ mod tests {
     }
 
     #[test]
+    fn repairs_repetitive_bulk_planner_visual_types() {
+        let mut planned: Vec<V2PlanStillResponse> = (1..=5)
+            .map(|index| V2PlanStillResponse {
+                visual_plan_row_id: format!("g{index}"),
+                visual_type: "Character Scene".into(),
+                image_settings: json!({}),
+                user_prompt: format!("Scene {index}"),
+                reason: String::new(),
+            })
+            .collect();
+        let row_data: Vec<serde_json::Value> = (1..=5)
+            .map(|index| {
+                json!({
+                    "visualPlanRowId": format!("g{index}"),
+                    "settingsLocked": false,
+                    "promptLocked": false
+                })
+            })
+            .collect();
+
+        repair_excessive_consecutive_visual_types(&mut planned, &row_data);
+
+        assert!(planned
+            .windows(4)
+            .all(|window| !window.iter().all(|plan| plan.visual_type == window[0].visual_type)));
+        assert_eq!(planned[0].visual_type, "Character Scene");
+        assert_ne!(planned[3].visual_type, "Character Scene");
+    }
+
+    #[test]
+    fn extracts_json_when_prompt_suggestion_has_trailing_text() {
+        let raw = "{\"plans\":[{\"visualPlanRowId\":\"g1\"}]}\nDone.";
+
+        assert_eq!(extract_json_from_text(raw), "{\"plans\":[{\"visualPlanRowId\":\"g1\"}]}");
+    }
+
+    #[test]
+    fn extracts_first_json_when_prompt_suggestion_repeats_json() {
+        let raw = "{\"plans\":[{\"visualPlanRowId\":\"g1\"}]}\n{\"extra\":true}";
+
+        assert_eq!(extract_json_from_text(raw), "{\"plans\":[{\"visualPlanRowId\":\"g1\"}]}");
+    }
+
+    #[test]
     fn creates_and_controls_persistent_bulk_jobs() {
         let (temp, repo) = repository();
         let channel = repo.create_channel("Channel", None).unwrap();
@@ -4976,7 +5446,7 @@ mod tests {
         repo.save_video_inputs(&video.id, "First scene. Second scene.", 4)
             .unwrap();
         repo.import_asset(&video.id, &audio, "audio").unwrap();
-        let plan = repo.generate_visual_plan(&video.id).unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
         for group in plan.groups {
             repo.create_prompt_version(&video.id, &group.id, "{}", "system", "scene")
                 .unwrap();
@@ -5119,7 +5589,7 @@ mod tests {
         repo.save_video_inputs(&video.id, "First scene. Second scene. Third scene.", 4)
             .unwrap();
         repo.import_asset(&video.id, &audio, "audio").unwrap();
-        repo.generate_visual_plan(&video.id).unwrap();
+        repo.generate_visual_plan(&video.id, temp.path()).unwrap();
         let timeline = repo.build_timeline(&video.id).unwrap();
         assert!(!timeline.clips.is_empty());
         assert!(timeline

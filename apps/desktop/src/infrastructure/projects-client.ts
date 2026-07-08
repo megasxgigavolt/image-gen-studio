@@ -20,6 +20,13 @@ export type VideoRecord = {
   updatedAt: string;
 };
 
+export type VideoProgressRecord = {
+  videoId: string;
+  totalStills: number;
+  generatedStills: number;
+  previewRenderId: string | null;
+};
+
 export type ResumeRecord = {
   channelId: string | null;
   videoId: string | null;
@@ -53,6 +60,16 @@ export type VideoInputsRecord = {
 export type PlanSentenceRecord = { id: string; ordinal: number; text: string; startSeconds: number; endSeconds: number };
 export type PlanGroupRecord = { id: string; ordinal: number; label: string; kind: string; sentenceIds: string[]; settingsLocked: boolean; promptLocked: boolean };
 export type VisualPlanRecord = { videoId: string; timingSource: string; sentences: PlanSentenceRecord[]; groups: PlanGroupRecord[]; updatedAt: string };
+
+export type CaptionChunkRecord = { index: number; text: string; startSeconds: number; endSeconds: number };
+export type CaptionSetRecord = {
+  videoId: string;
+  intervalSeconds: number;
+  srtText: string;
+  chunks: CaptionChunkRecord[];
+  generatedAt: string;
+  updatedAt: string;
+};
 
 export type PromptVersionRecord = {
   id: string;
@@ -193,6 +210,16 @@ function writeBrowserData(data: BrowserData) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
 }
 
+function formatSrtTimestamp(seconds: number): string {
+  const ms = Math.round((seconds % 1) * 1000);
+  const whole = Math.floor(seconds);
+  const s = whole % 60;
+  const m = Math.floor(whole / 60) % 60;
+  const h = Math.floor(whole / 3600);
+  const pad = (value: number, width = 2) => String(value).padStart(width, "0");
+  return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms, 3)}`;
+}
+
 export const projectsClient = {
   async startupDiagnostic(): Promise<string | null> {
     if (isTauri()) return invoke("startup_diagnostic");
@@ -219,6 +246,10 @@ export const projectsClient = {
     const data = readBrowserData();
     const source = includeTrashed ? data.trashedVideos ?? [] : data.videos;
     return source.filter((video) => video.channelId === channelId);
+  },
+  async getVideoProgress(videoId: string): Promise<VideoProgressRecord> {
+    if (isTauri()) return invoke("get_video_progress", { videoId });
+    return { videoId, totalStills: 0, generatedStills: 0, previewRenderId: null };
   },
   async createVideo(channelId: string, title: string): Promise<VideoRecord> {
     if (isTauri()) return invoke("create_video", { channelId, title });
@@ -682,5 +713,43 @@ export const projectsClient = {
     if (!original) throw new Error("Original visual plan was not found.");
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, original);
     return JSON.parse(original) as VisualPlanRecord;
+  },
+  async generateCaptions(videoId: string, intervalSeconds: number): Promise<CaptionSetRecord> {
+    if (isTauri()) return invoke("generate_captions", { videoId, intervalSeconds });
+    const inputs = await this.getVideoInputs(videoId);
+    const cleanedScript = inputs.scriptText
+      .replace(/<#\s*\d+(?:\.\d+)?\s*#>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const words = cleanedScript.split(" ").filter(Boolean);
+    const chunks: CaptionChunkRecord[] = [];
+    for (let i = 0; i < words.length; i += 3) {
+      const group = words.slice(i, i + 3);
+      const index = chunks.length + 1;
+      chunks.push({ index, text: group.join(" "), startSeconds: chunks.length, endSeconds: chunks.length + 1 });
+    }
+    const srtText = chunks
+      .map((c) => `${c.index}\n${formatSrtTimestamp(c.startSeconds)} --> ${formatSrtTimestamp(c.endSeconds)}\n${c.text}\n`)
+      .join("\n");
+    const set: CaptionSetRecord = { videoId, intervalSeconds, srtText, chunks, generatedAt: now(), updatedAt: now() };
+    localStorage.setItem(`${STORAGE_KEY}.captions.${videoId}`, JSON.stringify(set));
+    return set;
+  },
+  async getCaptions(videoId: string): Promise<CaptionSetRecord> {
+    if (isTauri()) return invoke("get_captions", { videoId });
+    const stored = localStorage.getItem(`${STORAGE_KEY}.captions.${videoId}`);
+    if (!stored) throw new Error("Captions have not been generated.");
+    return JSON.parse(stored) as CaptionSetRecord;
+  },
+  async saveCaptionsFile(srtText: string, defaultName: string): Promise<string | null> {
+    if (isTauri()) return invoke("save_captions_file", { srtText, defaultName });
+    const blob = new Blob([srtText], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = defaultName;
+    link.click();
+    URL.revokeObjectURL(url);
+    return null;
   },
 };

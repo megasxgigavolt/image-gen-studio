@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { originalDemoPlan } from "../data/demo";
 import type { VisualPlanGroup } from "../domain/visual-plan";
 
-export type AppStage = "home" | "inputs" | "visual-plan" | "images" | "timeline" | "tools";
+export type AppStage = "home" | "inputs" | "visual-plan" | "captions" | "images" | "timeline" | "tools";
 export type Theme = "light" | "dark";
 
 type Toast = { id: number; message: string; kind: "success" | "error" | "info" };
@@ -15,7 +15,7 @@ type AppState = {
   activeChannelName: string | null;
   activeVideoId: string | null;
   activeVideoTitle: string | null;
-  lastProductionStage: "inputs" | "visual-plan";
+  lastProductionStage: "inputs" | "visual-plan" | "captions";
   toast: Toast | null;
   setStage: (stage: AppStage) => void;
   toggleTheme: () => void;
@@ -53,7 +53,9 @@ export const useAppStore = create<AppState>((set) => ({
     set((state) => ({
       stage,
       lastProductionStage:
-        stage === "inputs" || stage === "visual-plan" ? stage : state.lastProductionStage,
+        stage === "inputs" || stage === "visual-plan" || stage === "captions"
+          ? stage
+          : state.lastProductionStage,
     })),
   toggleTheme: () =>
     set((state) => ({ theme: state.theme === "light" ? "dark" : "light" })),

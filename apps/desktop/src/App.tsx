@@ -40,6 +40,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { type ChangeEvent, type FormEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type AppStage, useAppStore } from "./store/app-store";
 import { log } from "./infrastructure/logger";
+import { formatTime } from "./domain/timecode";
 import {
   projectsClient,
   type ChannelRecord,
@@ -59,6 +60,7 @@ const navItems: { stage: AppStage; label: string; icon: typeof Home; alwaysEnabl
   { stage: "images", label: "Images", icon: Image },
 ];
 const MAX_CACHE_SIZE = 20;
+const STILLS_PER_BATCH = 6;
 const imageWorkspaceCache = new Map<string, ImageWorkspaceRecord>();
 const lastSelectedStill = new Map<string, string>(); // videoId → groupId
 
@@ -143,12 +145,6 @@ function ToastDisplay() {
   );
 }
 
-function formatTime(seconds: number) {
-  const minutes = Math.floor(seconds / 60);
-  const remainder = (seconds % 60).toFixed(1).padStart(4, "0");
-  return `${String(minutes).padStart(2, "0")}:${remainder}`;
-}
-
 function TitleBar() {
   const win = getCurrentWindow();
   return (
@@ -174,7 +170,7 @@ function Sidebar() {
       <nav>
         {navItems.map(({ stage: itemStage, label, icon: Icon, alwaysEnabled }) => {
           const isActive = itemStage === "inputs"
-            ? ["inputs", "visual-plan"].includes(stage)
+            ? ["inputs", "visual-plan", "captions"].includes(stage)
             : stage === itemStage;
           const isDisabled = !alwaysEnabled && itemStage !== "home" && !activeVideoId;
           return (
@@ -242,6 +238,8 @@ function HomeView() {
   const [renamingChannelId, setRenamingChannelId] = useState<string | null>(null);
   const [renamingVideoId, setRenamingVideoId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [videoProgress, setVideoProgress] = useState<Record<string, import("./infrastructure/projects-client").VideoProgressRecord>>({});
+  const [videoPreviewUrls, setVideoPreviewUrls] = useState<Record<string, string>>({});
 
   const loadWorkspace = useCallback(async () => {
     setLoading(true);
@@ -269,6 +267,24 @@ function HomeView() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadWorkspace();
   }, [loadWorkspace]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all(videos.map(async (video) => {
+      try {
+        const progress = await projectsClient.getVideoProgress(video.id);
+        if (cancelled) return;
+        setVideoProgress((current) => ({ ...current, [video.id]: progress }));
+        if (progress.previewRenderId) {
+          const url = await projectsClient.getRenderDataUrl(progress.previewRenderId);
+          if (!cancelled) setVideoPreviewUrls((current) => ({ ...current, [video.id]: url }));
+        }
+      } catch {
+        // A video without a visual plan yet has no progress to show.
+      }
+    }));
+    return () => { cancelled = true; };
+  }, [videos]);
 
   async function selectChannel(channelId: string) {
     setSelectedChannelId(channelId);
@@ -477,12 +493,22 @@ function HomeView() {
                     style={{ flex: 1 }}
                   />
                 </div>
-              ) : (
-                <button className="video-open" onClick={() => void openVideo(video)}>
-                  <div className={`video-art art-${(index % 3) + 1}`}><span>{video.progress}%</span></div>
-                  <div><small>{video.stage.replace("-", " ").toUpperCase()}</small><h3>{video.title}</h3><p>Saved locally · {new Date(video.updatedAt).toLocaleDateString()}</p><i style={{ width: `${video.progress}%` }} /></div>
-                </button>
-              )}
+              ) : (() => {
+                const progress = videoProgress[video.id];
+                const percent = progress && progress.totalStills > 0
+                  ? Math.round((progress.generatedStills / progress.totalStills) * 100)
+                  : 0;
+                const previewUrl = videoPreviewUrls[video.id];
+                return (
+                  <button className="video-open" onClick={() => void openVideo(video)}>
+                    <div className={previewUrl ? "video-art has-preview" : `video-art art-${(index % 3) + 1}`}>
+                      {previewUrl && <img src={previewUrl} alt="" />}
+                      <span>{percent}%</span>
+                    </div>
+                    <div><small>{video.stage.replace("-", " ").toUpperCase()}</small><h3>{video.title}</h3><p>Saved locally · {new Date(video.updatedAt).toLocaleDateString()}</p><i style={{ width: `${percent}%` }} /></div>
+                  </button>
+                );
+              })()}
               <button className="card-rename" aria-label={`Rename ${video.title}`} title="Rename" onClick={() => void startRenameVideo(video)}><Check size={13} /></button>
               <button className="card-trash" aria-label={`Move ${video.title} to trash`} onClick={() => void deleteVideo(video.id)}><Trash2 size={15} /></button>
             </article>
@@ -684,7 +710,7 @@ function InputsView() {
       <input ref={scriptFileRef} className="visually-hidden" type="file" accept=".txt,text/plain" onChange={(event) => void importBrowserScript(event)} />
       <input ref={audioFileRef} className="visually-hidden" type="file" accept=".wav,.mp3,.m4a,.aac,.flac,audio/*" onChange={(event) => void importBrowserAudio(event)} />
       {generating && <GenerationProgress progress={generationProgress} />}
-      <div className="workflow-tabs" role="tablist"><button role="tab" aria-selected={true} className="active">1 · Source & pacing</button><button role="tab" aria-selected={false} disabled={!hasPlan} onClick={() => setStage("visual-plan")}>2 · Visual plan</button></div>
+      <div className="workflow-tabs" role="tablist"><button role="tab" aria-selected={true} className="active">1 · Source & pacing</button><button role="tab" aria-selected={false} disabled={!hasPlan} onClick={() => setStage("visual-plan")}>2 · Visual plan</button><button role="tab" aria-selected={false} disabled={!ready} onClick={() => setStage("captions")}>3 · Captions</button></div>
       <div className="page-heading"><div><p className="eyebrow">Stage 1 of 3</p><h1>Source material</h1><p>Add narration and references that will guide the visual plan.</p></div><span className="save-state">{status}</span></div>
       {!activeVideoId && <div className="inline-error">Open or create a video before adding source material.</div>}
       {error && <div className="inline-error">{error}</div>}
@@ -750,7 +776,7 @@ function VisualPlanView() {
 
   return (
     <section className="view">
-      <div className="workflow-tabs" role="tablist"><button role="tab" aria-selected={false} onClick={() => setStage("inputs")}>1 · Source & pacing</button><button role="tab" aria-selected={true} className="active">2 · Visual plan</button></div>
+      <div className="workflow-tabs" role="tablist"><button role="tab" aria-selected={false} onClick={() => setStage("inputs")}>1 · Source & pacing</button><button role="tab" aria-selected={true} className="active">2 · Visual plan</button><button role="tab" aria-selected={false} onClick={() => setStage("captions")}>3 · Captions</button></div>
       <div className="page-heading">
         <div><p className="eyebrow">Stage 2 of 3</p><h1>Visual plan</h1><p>Drag a sentence into an adjacent still to regroup it. Chronological order remains enforced.</p></div>
         <div className="heading-actions"><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
@@ -839,7 +865,147 @@ function GenerationProgress({ progress }: { progress: { percent: number; stage: 
 
 function ProductionView() {
   const { stage } = useAppStore();
-  return stage === "visual-plan" ? <VisualPlanView /> : <InputsView />;
+  if (stage === "visual-plan") return <VisualPlanView />;
+  if (stage === "captions") return <CaptionsView />;
+  return <InputsView />;
+}
+
+function CaptionsView() {
+  const { activeVideoId, activeVideoTitle, setStage, addToast } = useAppStore();
+  const [ready, setReady] = useState(false);
+  const [audioDataUrl, setAudioDataUrl] = useState<string | null>(null);
+  const [captions, setCaptions] = useState<import("./infrastructure/projects-client").CaptionSetRecord | null>(null);
+  const [intervalSeconds, setIntervalSeconds] = useState(1);
+  const [generating, setGenerating] = useState(false);
+  const [progress, setProgress] = useState({ percent: 0, stage: "Preparing captions", detail: "" });
+  const [error, setError] = useState<string | null>(null);
+  const [currentTime, setCurrentTime] = useState(0);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!activeVideoId) return;
+    setCaptions(null);
+    setAudioDataUrl(null);
+    void projectsClient.getVideoInputs(activeVideoId).then((inputs) => {
+      setReady(Boolean(inputs.scriptText.trim() && inputs.audio));
+      if (inputs.audio) {
+        void projectsClient.getAssetDataUrl(inputs.audio.id).then(setAudioDataUrl).catch(() => {});
+      }
+    }).catch((caught) => setError(String(caught)));
+    void projectsClient.getCaptions(activeVideoId).then((set) => { setCaptions(set); setIntervalSeconds(set.intervalSeconds); }).catch(() => setCaptions(null));
+  }, [activeVideoId]);
+
+  const activeChunk = captions?.chunks.find((chunk) => currentTime >= chunk.startSeconds && currentTime < chunk.endSeconds) ?? null;
+
+  useEffect(() => {
+    if (activeChunk == null) return;
+    const row = listRef.current?.querySelector<HTMLElement>(`[data-index="${activeChunk.index}"]`);
+    row?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [activeChunk?.index]);
+
+  async function generate() {
+    if (!activeVideoId) return;
+    setGenerating(true);
+    setError(null);
+    setProgress({ percent: 0, stage: "Preparing captions", detail: "" });
+    let unlisten: (() => void) | undefined;
+    try {
+      try {
+        unlisten = await listen<{
+          videoId: string;
+          percent: number;
+          stage: string;
+          detail: string;
+        }>("caption-progress", ({ payload }) => {
+          if (payload.videoId === activeVideoId) {
+            setProgress({ percent: payload.percent, stage: payload.stage, detail: payload.detail });
+          }
+        });
+      } catch {
+        // Browser preview has no native event bridge.
+      }
+      const result = await projectsClient.generateCaptions(activeVideoId, intervalSeconds);
+      setCaptions(result);
+      addToast("Captions generated.", "success");
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      unlisten?.();
+      setGenerating(false);
+    }
+  }
+
+  async function saveAs() {
+    if (!captions) return;
+    const safeTitle = (activeVideoTitle || "Video").replace(/[\\/:*?"<>|]/g, "").trim() || "Video";
+    try {
+      const path = await projectsClient.saveCaptionsFile(captions.srtText, `${safeTitle} Captions.srt`);
+      if (path) addToast(`Captions saved to ${path}`, "success");
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  return (
+    <section className="view">
+      {generating && <GenerationProgress progress={progress} />}
+      <div className="workflow-tabs" role="tablist">
+        <button role="tab" aria-selected={false} onClick={() => setStage("inputs")}>1 · Source & pacing</button>
+        <button role="tab" aria-selected={false} onClick={() => setStage("visual-plan")}>2 · Visual plan</button>
+        <button role="tab" aria-selected={true} className="active">3 · Captions</button>
+      </div>
+      <div className="page-heading">
+        <div><p className="eyebrow">Captions</p><h1>Captions</h1><p>Generate an SRT caption file from the narration audio and script already added in Source material.</p></div>
+        <div className="heading-actions">
+          <label className="caption-interval" title="Maximum seconds of narration per caption">
+            <span>Window</span>
+            <input type="number" min="0.2" max="5" step="0.1" value={intervalSeconds} disabled={generating} onChange={(event) => setIntervalSeconds(Number(event.target.value))} />
+            <span>sec</span>
+          </label>
+          <button className="primary" disabled={!ready || !activeVideoId || generating} onClick={() => void generate()}>
+            {generating ? <><LoaderCircle className="spin" size={16} />Generating…</> : captions ? <>Regenerate captions</> : <>Generate captions</>}
+          </button>
+        </div>
+      </div>
+      {!ready && <div className="inline-error">Add a script and narration audio in Source material before generating captions.</div>}
+      {error && <div className="inline-error">{error}</div>}
+      {!captions && ready && !generating && <div className="empty-state">No captions generated yet.<span>Choose a caption window and generate to build an SRT file.</span></div>}
+      {captions && (
+        <div className="caption-workspace">
+          {audioDataUrl && (
+            <audio
+              ref={audioRef}
+              controls
+              src={audioDataUrl}
+              className="caption-audio"
+              onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+            />
+          )}
+          <div className="caption-preview-stage">
+            <span className="caption-preview-text">{activeChunk?.text ?? captions.chunks[0]?.text ?? ""}</span>
+          </div>
+          <div className="caption-list" ref={listRef}>
+            {captions.chunks.map((chunk) => (
+              <div
+                key={chunk.index}
+                data-index={chunk.index}
+                className={activeChunk?.index === chunk.index ? "caption-row active" : "caption-row"}
+                onClick={() => { if (audioRef.current) { audioRef.current.currentTime = chunk.startSeconds; audioRef.current.play(); } }}
+              >
+                <span className="caption-time">{formatTime(chunk.startSeconds)} – {formatTime(chunk.endSeconds)}</span>
+                <span>{chunk.text}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="footer-actions">
+        <button className="secondary" onClick={() => setStage("visual-plan")}>Back</button>
+        <button className="primary" disabled={!captions} onClick={() => void saveAs()}><Download size={16} />Save captions as…</button>
+      </div>
+    </section>
+  );
 }
 
 type ImageSettings = {
@@ -971,7 +1137,6 @@ function ImagesView() {
   const { activeVideoId, addToast } = useAppStore();
   const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
-  const [activePromptVersionId, setActivePromptVersionId] = useState<string | null>(null);
   const [systemPrompt, setSystemPrompt] = useState("");
   const [userPrompt, setUserPrompt] = useState("");
   const [imageSettings, setImageSettings] = useState<ImageSettings>(defaultImageSettings);
@@ -985,8 +1150,6 @@ function ImagesView() {
   const [selectedRenderId, setSelectedRenderId] = useState<string | null>(null);
   const [renderUrls, setRenderUrls] = useState<Record<string, string>>({});
   const [confirmReset, setConfirmReset] = useState(false);
-  const [confirmDeleteRender, setConfirmDeleteRender] = useState<ImageRenderRecord | null>(null);
-  const [confirmDeleteVersion, setConfirmDeleteVersion] = useState<PromptVersionRecord | null>(null);
   const [editInstruction, setEditInstruction] = useState("");
   const [editStrength, setEditStrength] = useState("Low");
   const [editOpen, setEditOpen] = useState(false);
@@ -1013,8 +1176,7 @@ function ImagesView() {
   const promptPrepTask = useRef<{ items: ImageWorkspaceRecord["groups"]; index: number } | null>(null);
   const [referenceUrl, setReferenceUrl] = useState("");
   const promptPrepSettingKey = activeVideoId ? `prompt_prep.${activeVideoId}` : "";
-  const [showAllVersions, setShowAllVersions] = useState(false);
-  const [showAllRenders, setShowAllRenders] = useState(false);
+  const [expandedBatch, setExpandedBatch] = useState<number | null>(0);
 
   const selectedGroup = useMemo(
     () => workspace?.groups.find((group) => group.group.id === selectedGroupId) ?? null,
@@ -1030,7 +1192,46 @@ function ImagesView() {
     start: selectedSentences[0].startSeconds,
     end: selectedSentences.at(-1)!.endSeconds,
   } : null;
-  const educationalPlan = selectedGroup?.educationalPlan ?? null;
+  const stillBatches = useMemo(() => {
+    const groups = workspace?.groups ?? [];
+    const batches: typeof groups[] = [];
+    for (let index = 0; index < groups.length; index += STILLS_PER_BATCH) {
+      batches.push(groups.slice(index, index + STILLS_PER_BATCH));
+    }
+    return batches;
+  }, [workspace]);
+
+  useEffect(() => {
+    if (!selectedGroupId || !workspace) return;
+    const index = workspace.groups.findIndex((group) => group.group.id === selectedGroupId);
+    if (index < 0) return;
+    setExpandedBatch(Math.floor(index / STILLS_PER_BATCH));
+  }, [selectedGroupId, workspace]);
+
+  function toggleBatch(index: number) {
+    setExpandedBatch((current) => (current === index ? null : index));
+  }
+
+  useEffect(() => {
+    function handleArrowNavigation(event: KeyboardEvent) {
+      if (zoomOpen || editOpen) return;
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable) return;
+      const groups = workspace?.groups;
+      if (!groups?.length) return;
+      const index = groups.findIndex((group) => group.group.id === selectedGroupId);
+      if (index < 0) return;
+      const next = groups[index + (event.key === "ArrowRight" ? 1 : -1)];
+      if (next) {
+        event.preventDefault();
+        selectGroup(next.group.id);
+      }
+    }
+    window.addEventListener("keydown", handleArrowNavigation);
+    return () => window.removeEventListener("keydown", handleArrowNavigation);
+  }, [workspace, selectedGroupId, zoomOpen, editOpen]);
 
   useEffect(() => {
     async function loadWorkspace() {
@@ -1062,7 +1263,6 @@ function ImagesView() {
         const latestJob = await projectsClient.getLatestImageJob(activeVideoId);
         setJob(latestJob && ["queued", "running", "paused", "stopped"].includes(latestJob.status) ? latestJob : null);
         const latest = loaded.groups[0]?.promptVersions[0];
-        setActivePromptVersionId(latest?.id ?? null);
         setSystemPrompt(loaded.settings.find((s) => s.key === "system_prompt")?.value ?? latest?.systemPrompt ?? "");
         setUserPrompt(latest?.userPrompt ?? "");
         const latestRender = loaded.groups[0]?.imageRenders[0];
@@ -1114,12 +1314,6 @@ function ImagesView() {
       const selected = loaded.groups.find((group) => group.group.id === selectedGroupId);
       const newest = selected?.imageRenders[0];
       if (newest) setSelectedRenderId(newest.id);
-      setActivePromptVersionId((current) => {
-        if (current && loaded.groups.some((group) => group.promptVersions.some((version) => version.id === current))) {
-          return current;
-        }
-        return loaded.groups[0]?.promptVersions[0]?.id ?? null;
-      });
     } catch (caught) {
       setError(String(caught));
     }
@@ -1133,14 +1327,13 @@ function ImagesView() {
     const sameSettings = latest ? normalizeSettings(latest.settingsJson) === normalizeSettings(settingsJson) : false;
     if (!userPrompt.trim() || (latest?.userPrompt === userPrompt && latest?.systemPrompt === style && sameSettings)) return;
     try {
-      const version = await projectsClient.createPromptVersion(
+      await projectsClient.createPromptVersion(
         activeVideoId,
         selectedGroupId,
         settingsJson,
         style,
         userPrompt,
       );
-      setActivePromptVersionId(version.id);
       await refreshWorkspace();
     } catch (caught) {
       setError(String(caught));
@@ -1195,7 +1388,6 @@ function ImagesView() {
   }
 
   function selectVersion(version: PromptVersionRecord) {
-    setActivePromptVersionId(version.id);
     setSystemPrompt(version.systemPrompt);
     setUserPrompt(version.userPrompt);
     setImageSettings(parseImageSettings(version.settingsJson));
@@ -1204,11 +1396,8 @@ function ImagesView() {
   function selectGroup(groupId: string) {
     setError(null);
     setSelectedGroupId(groupId);
-    setShowAllVersions(false);
-    setShowAllRenders(false);
     if (activeVideoId) lastSelectedStill.set(activeVideoId, groupId);
     const latest = workspace?.groups.find((item) => item.group.id === groupId)?.promptVersions[0];
-    setActivePromptVersionId(latest?.id ?? null);
     const globalDirective = workspace?.settings.find((s) => s.key === "system_prompt")?.value;
     setSystemPrompt(globalDirective ?? latest?.systemPrompt ?? "");
     setUserPrompt(latest?.userPrompt ?? "");
@@ -1239,11 +1428,10 @@ function ImagesView() {
         const latest = item.promptVersions[0];
         const latestMeta = (() => { try { return JSON.parse(latest?.settingsJson ?? "{}") as { _educationalPlanSignature?: string }; } catch { return {}; } })();
         if (latestMeta._educationalPlanSignature !== planned.planSignature) {
-          const savedVersion = await projectsClient.createPromptVersion(activeVideoId, item.group.id, perStillJson, systemPrompt || "Preserve a coherent visual style.", planned.userPrompt);
+          await projectsClient.createPromptVersion(activeVideoId, item.group.id, perStillJson, systemPrompt || "Preserve a coherent visual style.", planned.userPrompt);
           if (item.group.id === selectedGroupId) {
             setImageSettings(perStill);
             setUserPrompt(planned.userPrompt);
-            setActivePromptVersionId(savedVersion.id);
           }
         }
         const live = await projectsClient.getImageWorkspace(activeVideoId);
@@ -1567,30 +1755,11 @@ function ImagesView() {
     if (canvas) canvas.dataset.painted = "false";
   }
 
-  async function toggleFinal(render: ImageRenderRecord) {
+  async function restorePromptsAndMarkFinal(render: ImageRenderRecord) {
+    const version = promptVersions.find((item) => item.id === render.promptVersionId);
+    if (version) selectVersion(version);
     try {
-      await projectsClient.setFinalRender(render.id, !render.isFinal);
-      await refreshWorkspace();
-    } catch (caught) { setError(String(caught)); }
-  }
-
-  async function deleteVersionConfirmed(version: PromptVersionRecord) {
-    try {
-      await projectsClient.deletePromptVersion(version.id);
-      if (activePromptVersionId === version.id) setActivePromptVersionId(null);
-      await refreshWorkspace();
-    } catch (caught) { setError(String(caught)); }
-  }
-
-  async function deleteRenderConfirmed(render: ImageRenderRecord) {
-    try {
-      await projectsClient.deleteImageRender(render.id);
-      setRenderUrls((current) => {
-        const next = { ...current };
-        delete next[render.id];
-        return next;
-      });
-      if (selectedRenderId === render.id) setSelectedRenderId(null);
+      await projectsClient.setFinalRender(render.id, true);
       await refreshWorkspace();
     } catch (caught) { setError(String(caught)); }
   }
@@ -1612,7 +1781,6 @@ function ImagesView() {
       setPreparingGroupIds(new Set());
       setRenderUrls({});
       setSelectedRenderId(null);
-      setActivePromptVersionId(null);
       setUserPrompt("");
       setSystemPrompt("");
       setImageSettings(defaultImageSettings);
@@ -1688,54 +1856,102 @@ function ImagesView() {
       {loading && <LoadingOverlay label="Working on your images" />}
       {confirmReset && <ConfirmDialog title="Reset all images?" message="This clears all prompts, image versions, planner results, and still statuses for this video. This cannot be undone." confirmLabel="Reset everything" onConfirm={() => { setConfirmReset(false); void doResetImages(); }} onCancel={() => setConfirmReset(false)} />}
       {confirmingStop && <ConfirmDialog title="Stop bulk generation?" message="This will permanently stop the current job. Any stills already generated are kept, but remaining stills will not be generated and the job cannot be resumed." confirmLabel="Stop generation" onConfirm={() => { setConfirmingStop(false); void controlJob("cancel"); }} onCancel={() => setConfirmingStop(false)} />}
-      {confirmDeleteRender && <ConfirmDialog title="Delete image version?" message="This permanently removes this render. It cannot be recovered." confirmLabel="Delete" onConfirm={() => { const r = confirmDeleteRender; setConfirmDeleteRender(null); void deleteRenderConfirmed(r); }} onCancel={() => setConfirmDeleteRender(null)} />}
-      {confirmDeleteVersion && <ConfirmDialog title="Delete prompt version?" message="This permanently removes this prompt version." confirmLabel="Delete" onConfirm={() => { const v = confirmDeleteVersion; setConfirmDeleteVersion(null); void deleteVersionConfirmed(v); }} onCancel={() => setConfirmDeleteVersion(null)} />}
       <div className="page-heading">
         <div>
           <p className="eyebrow">Stage 3 of 3</p>
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <div className="heading-actions"><button className="secondary danger-action" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Download All</button><button className="secondary" onClick={() => void generateAll()} disabled={loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={16} />Generate All</button><button className="secondary" title="Update the style directive on all existing prompt versions without re-planning" onClick={() => void applyStyleToAll()} disabled={applyingStyle || !systemPrompt.trim() || !workspace?.groups.length || loading}>{applyingStyle ? "Applying…" : "Apply Style to All"}</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading}><WandSparkles size={17} />Bulk Gen Config</button></div>
+        <div className="heading-actions"><button className="secondary danger-action" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Download All</button><button className="secondary" onClick={() => void generateAll()} disabled={loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={16} />Generate All</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading}><WandSparkles size={17} />Bulk Gen Config</button></div>
       </div>
       {error && <div className="error-toast" role="alert"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
-      {job && !bulkProgress && (
-        <div className="job-status">
-          <div><strong>Bulk job: {job.status}</strong><span>{job.completedItems}/{job.totalItems} completed · {job.failedItems} failed</span></div>
-          <progress value={job.completedItems + job.failedItems} max={job.totalItems} />
-          <div>
-            {["queued", "running"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("pause")}>Pause</button>}
-            {job.status === "paused" && <button className="secondary" onClick={() => void controlJob("resume")}>Resume</button>}
-            {["queued", "running", "paused"].includes(job.status) && <button className="secondary" onClick={() => setConfirmingStop(true)}>Stop</button>}
-          </div>
-        </div>
-      )}
-      {bulkProgress && <div className="bulk-live-progress"><div><strong>{bulkProgress.label}</strong>{bulkProgress.total > 0 && <span>{bulkProgress.current} / {bulkProgress.total}</span>}</div>{bulkProgress.total > 0 ? <progress value={bulkProgress.current} max={bulkProgress.total} /> : <progress />}{bulkProgress.total > 0 && <div className="prompt-progress-actions">{promptPrepStatus === "running" && <button className="secondary" onClick={() => controlPromptPreparation("pause")}>Pause</button>}{promptPrepStatus === "paused" && <button className="secondary" onClick={() => controlPromptPreparation("resume")}>Resume</button>}<button className="secondary" onClick={() => controlPromptPreparation("stop")}>Stop</button></div>}</div>}
       <div className="image-workspace">
         <aside className="stills">
-          <strong>Stills <span>{stillCount}</span></strong>
-          {workspace?.groups.map((group) => (
-            <button key={group.group.id} className={`still-select${group.group.id === selectedGroupId ? " active" : ""}${generatingGroupId === group.group.id ? " generating" : ""}`} onClick={() => selectGroup(group.group.id)}>
-              <div><strong>Still {group.group.ordinal}</strong>{group.imageRenders.length > 0 && <Check size={14} />}</div>
-              <small>{(() => { const rows = group.group.sentenceIds.map((id) => workspace.sentences.find((s) => s.id === id)).filter(Boolean) as PlanSentenceRecord[]; return rows.length ? `${formatTime(rows[0].startSeconds)} – ${formatTime(rows.at(-1)!.endSeconds)}` : ""; })()}</small>
-              <p>{group.group.sentenceIds.map((id) => workspace.sentences.find((s) => s.id === id)?.text).filter(Boolean).join(" ").slice(0, 72)}</p>
-              {(() => { const item = job?.items.find((candidate) => candidate.groupId === group.group.id); const newestPrompt = group.promptVersions[0]; const newestRender = group.imageRenders[0]; const status = preparingGroupIds.has(group.group.id) ? "Preparing prompt" : item?.status === "running" ? "Generating" : item?.status === "failed" ? "Failed" : newestRender && newestPrompt && newestRender.promptVersionId !== newestPrompt.id ? "Outdated" : newestRender ? "Generated" : newestPrompt ? "Prompt ready" : "No prompt"; return <span className={`still-status ${status.toLowerCase().replace(" ","-")}`}>{status}</span>; })()}
-            </button>
-          ))}
+          <div className="stills-heading">
+            <span className="stills-heading-label">Stills</span>
+            <span className="stills-heading-count">{stillCount}</span>
+          </div>
+          {stillBatches.map((batch, batchIndex) => {
+            const start = batchIndex * STILLS_PER_BATCH;
+            const expanded = expandedBatch === batchIndex;
+            const generatedCount = batch.filter((group) => group.imageRenders.length > 0).length;
+            return (
+              <div className="still-batch" key={batchIndex}>
+                <button type="button" className="still-batch-header" aria-expanded={expanded} onClick={() => toggleBatch(batchIndex)}>
+                  <span className="still-batch-title">Stills {start + 1}–{start + batch.length}</span>
+                  <span className="still-batch-meta"><span className={`still-batch-count${generatedCount === batch.length ? " all-done" : ""}`}>{generatedCount}/{batch.length}</span><ChevronRight size={14} className={expanded ? "chevron expanded" : "chevron"} /></span>
+                </button>
+                {expanded && (
+                  <div className="still-batch-body">
+                    {batch.map((group) => {
+                      const newestPrompt = group.promptVersions[0];
+                      const newestRender = group.imageRenders[0];
+                      const thumbUrl = newestRender ? renderUrls[newestRender.id] : undefined;
+                      const item = job?.items.find((candidate) => candidate.groupId === group.group.id);
+                      const isPreparing = preparingGroupIds.has(group.group.id);
+                      const isGenerating = item?.status === "running" || generatingGroupId === group.group.id;
+                      const statusKey = isPreparing || isGenerating ? "generating" : item?.status === "failed" ? "failed" : newestRender && newestPrompt && newestRender.promptVersionId !== newestPrompt.id ? "outdated" : newestRender ? "generated" : newestPrompt ? "ready" : "empty";
+                      const statusLabel = isPreparing ? "Preparing prompt" : isGenerating ? "Generating" : statusKey === "failed" ? "Failed" : statusKey === "outdated" ? "Outdated — regenerate" : statusKey === "generated" ? "Generated" : statusKey === "ready" ? "Prompt ready" : "No prompt yet";
+                      return (
+                        <button
+                          key={group.group.id}
+                          className={`still-select${group.group.id === selectedGroupId ? " active" : ""}`}
+                          title={statusLabel}
+                          onClick={() => selectGroup(group.group.id)}
+                        >
+                          <div className={`still-thumb ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}${thumbUrl ? "" : " empty"}`}>
+                            {thumbUrl ? <img src={thumbUrl} alt={`Still ${group.group.ordinal} preview`} /> : <div className="still-thumb-empty"><Image size={18} /><span>No image generated yet</span></div>}
+                            <span className="still-number">{group.group.ordinal}</span>
+                            {statusKey !== "empty" && (
+                              <span className={`still-status-badge ${statusKey}`} aria-label={statusLabel}>
+                                {statusKey === "generated" && <Check size={11} />}
+                                {statusKey === "ready" && <Sparkles size={11} />}
+                                {statusKey === "generating" && <LoaderCircle size={11} className="spin" />}
+                                {statusKey === "failed" && <X size={11} />}
+                                {statusKey === "outdated" && <Undo2 size={11} />}
+                              </span>
+                            )}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
           {!workspace && <div className="empty-state">Loading stills…</div>}
         </aside>
         <div className="preview">
+          {job && !bulkProgress && (
+            <div className="job-status">
+              <div><strong>Bulk job: {job.status}</strong><span>{job.completedItems}/{job.totalItems} completed · {job.failedItems} failed</span></div>
+              <progress value={job.completedItems + job.failedItems} max={job.totalItems} />
+              <div>
+                {["queued", "running"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("pause")}>Pause</button>}
+                {job.status === "paused" && <button className="secondary" onClick={() => void controlJob("resume")}>Resume</button>}
+                {["queued", "running", "paused"].includes(job.status) && <button className="secondary" onClick={() => setConfirmingStop(true)}>Stop</button>}
+              </div>
+            </div>
+          )}
+          {bulkProgress && <div className="bulk-live-progress"><div><strong>{bulkProgress.label}</strong>{bulkProgress.total > 0 && <span>{bulkProgress.current} / {bulkProgress.total}</span>}</div>{bulkProgress.total > 0 ? <progress value={bulkProgress.current} max={bulkProgress.total} /> : <progress />}{bulkProgress.total > 0 && <div className="prompt-progress-actions">{promptPrepStatus === "running" && <button className="secondary" onClick={() => controlPromptPreparation("pause")}>Pause</button>}{promptPrepStatus === "paused" && <button className="secondary" onClick={() => controlPromptPreparation("resume")}>Resume</button>}<button className="secondary" onClick={() => controlPromptPreparation("stop")}>Stop</button></div>}</div>}
           <header>
-            <div><span className="timestamp-heading">{selectedTiming ? `${formatTime(selectedTiming.start)} – ${formatTime(selectedTiming.end)}` : previewLabel}</span><strong className="production-copy">{selectedSentences.map((sentence) => sentence.text).join(" ")}</strong></div>
+            <div><span className="timestamp-heading">{selectedTiming ? `${formatTime(selectedTiming.start)} – ${formatTime(selectedTiming.end)}` : previewLabel}</span><strong className="production-copy narration-preview">{selectedSentences.map((sentence) => sentence.text).join(" ")}</strong></div>
           </header>
           <div className="preview-art">
             {selectedRenderId && renderUrls[selectedRenderId] ? (
-              <figure className={`image-frame ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}`}><img src={renderUrls[selectedRenderId]} alt="Selected image version" /><button className="inspect-button" onClick={() => { setZoom(1); setZoomOpen(true); }}><Maximize2 size={16} /><span>Inspect</span></button></figure>
+              <figure className={`image-frame ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}`}>
+                <img src={renderUrls[selectedRenderId]} alt="Selected image version" />
+                <div className="image-actions">
+                  <button className="image-action-btn" title="Inspect" onClick={() => { setZoom(1); setZoomOpen(true); }}><Maximize2 size={16} /><span>Inspect</span></button>
+                  <button className="image-action-btn" title="Download this image" onClick={() => { if (selectedRenderId) void downloadStill(selectedRenderId); }}><Download size={16} /><span>Download</span></button>
+                  <button className="image-action-btn" title="Restore this version's prompts for editing and mark it as the final still" onClick={() => { const render = imageRenders.find((item) => item.id === selectedRenderId); if (render) void restorePromptsAndMarkFinal(render); }}><Undo2 size={16} /><span>Restore prompt</span></button>
+                </div>
+              </figure>
             ) : <div className={`image-frame empty-frame ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}`}><div className="image-empty"><Image size={34} /><strong>No image generated yet</strong><span>{imageSettings.aspectRatio === "9:16" ? "YouTube Short · 9:16" : "YouTube Video · 16:9"}</span></div></div>}
           </div>
           <footer>
             <div className="version-nav"><button disabled={imageRenders.findIndex((r) => r.id === selectedRenderId) >= imageRenders.length - 1} onClick={() => moveVersion(1)}><ChevronLeft size={16} />Older</button><strong>{selectedRenderId ? `Version ${imageRenders.find((r) => r.id === selectedRenderId)?.version} / ${imageRenders.length}` : "No versions"}</strong><button disabled={imageRenders.findIndex((r) => r.id === selectedRenderId) <= 0} onClick={() => moveVersion(-1)}>Newer<ChevronRight size={16} /></button></div>
-            {imageRenders.find((render) => render.id === selectedRenderId) && <div className="version-actions"><button className="secondary" onClick={() => void toggleFinal(imageRenders.find((render) => render.id === selectedRenderId)!)}>{imageRenders.find((render) => render.id === selectedRenderId)?.isFinal ? "Unmark Final" : "Mark as Final"}</button><button className="secondary" title="Loads this version's prompts back into the edit fields. Click Generate Image to re-render." onClick={() => { const render = imageRenders.find((item) => item.id === selectedRenderId); const version = promptVersions.find((item) => item.id === render?.promptVersionId); if (version) selectVersion(version); }}>Restore Prompts</button><button className="secondary" title="Download this image" onClick={() => { if (selectedRenderId) void downloadStill(selectedRenderId); }}><Download size={14} />Download</button></div>}
           </footer>
         </div>
         <aside className="prompt-panel">
@@ -1750,13 +1966,7 @@ function ImagesView() {
             <button role="tab" aria-selected={tab === "edit"} className={tab === "edit" ? "active" : ""} onClick={() => setTab("edit")}>Edit / Inpaint</button>
           </div>
           {tab === "prompt" ? (
-            <>
-              <div className="panel-section-heading"><h3>Scene prompt</h3><small>Still {selectedGroup?.group.ordinal ?? "—"}</small></div>
-              {educationalPlan && <div className="educational-plan-card">
-                <div><span>Educational objective</span><strong>{educationalPlan.educationalObjective}</strong></div>
-                <div><span>Visual intent</span><strong>{educationalPlan.visualIntent}</strong></div>
-                <div><span>Subject strategy</span><strong>{educationalPlan.subjectStrategy}</strong></div>
-              </div>}
+            <div className="prompt-fields">
               <label>
                 <span className="field-heading">User Prompt</span>
                 <textarea className="production-copy" value={userPrompt} onChange={(event) => setUserPrompt(event.target.value)} onBlur={() => void createVersion()} placeholder="Describe the scene that directly supports this narration." />
@@ -1766,25 +1976,17 @@ function ImagesView() {
                 <span className="field-heading">Style Directive <small>Optional</small></span>
                 <textarea className="production-copy" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="Art style, rendering, color language, recurring subjects, visual consistency rules..." />
               </label>
-              <button className="primary full" onClick={() => void generateRender()} disabled={!selectedGroupId || !userPrompt.trim() || !!generatingGroupId}>{generatingGroupId === selectedGroupId ? <><LoaderCircle className="spin" size={14} />Generating…</> : "Generate Image"}</button>
-              {promptVersions.length > 0 && (
-                <div className="version-history"><strong>Prompt versions</strong>
-                  {(showAllVersions ? promptVersions : promptVersions.slice(0, 5)).map((version) => (
-                    <div className="version-row" key={version.id}><button className={version.id === activePromptVersionId ? "active" : ""} onClick={() => selectVersion(version)}><span>v{version.version}</span><small>{new Date(version.createdAt).toLocaleString()}</small></button><button className="delete-version" onClick={() => setConfirmDeleteVersion(version)} title="Delete prompt version"><Trash2 size={14} /></button></div>
-                  ))}
-                  {promptVersions.length > 5 && !showAllVersions && <button className="show-all-btn" onClick={() => setShowAllVersions(true)}>Show all {promptVersions.length}</button>}
-                </div>
-              )}
-              {imageRenders.length > 0 && <div className="version-history"><strong>Image versions</strong>{(showAllRenders ? imageRenders : imageRenders.slice(0, 5)).map((render) => (
-                <div className="version-row" key={render.id}>
-                  <button type="button" className={render.id === selectedRenderId ? "active" : ""} onClick={() => selectRender(render)}>
-                    <span>Version {render.version} · {render.kind}{render.isFinal ? " · Final" : ""}</span>
-                    <small>{render.editInstruction ?? new Date(render.createdAt).toLocaleString()}</small>
-                  </button>
-                  <button className="delete-version" onClick={() => setConfirmDeleteRender(render)} title="Delete image version"><Trash2 size={14} /></button>
-                </div>
-              ))}{imageRenders.length > 5 && !showAllRenders && <button className="show-all-btn" onClick={() => setShowAllRenders(true)}>Show all {imageRenders.length}</button>}</div>}
-            </>
+              <button
+                type="button"
+                className="text-button style-apply-all"
+                onClick={() => void applyStyleToAll()}
+                disabled={applyingStyle || !systemPrompt.trim() || !workspace?.groups.length}
+                title="Updates this style directive on every still's existing prompt version, without re-planning"
+              >
+                {applyingStyle ? <><LoaderCircle className="spin" size={13} />Applying to all stills…</> : <><WandSparkles size={13} />Apply this style to all stills</>}
+              </button>
+              <button className="primary full generate-image-btn" onClick={() => void generateRender()} disabled={!selectedGroupId || !userPrompt.trim() || !!generatingGroupId}>{generatingGroupId === selectedGroupId ? <><LoaderCircle className="spin" size={14} />Generating…</> : "Generate Image"}</button>
+            </div>
           ) : tab === "settings" ? (
             <>
               <div className="panel-section-heading"><h3>Image settings</h3><small>Per still</small></div>
@@ -1832,7 +2034,7 @@ function ImagesView() {
       </div>
       {zoomOpen && selectedRenderId && renderUrls[selectedRenderId] && <div className="modal-backdrop image-lightbox" onClick={() => setZoomOpen(false)}>
         <div className="lightbox-shell" onClick={(event) => event.stopPropagation()}>
-          <div className="lightbox-toolbar"><strong>Image inspection</strong><button onClick={() => setZoom((value) => Math.max(.25, value - .25))}><ZoomOut size={17} /></button><button onClick={() => setZoom(1)}>Reset</button><button onClick={() => setZoom((value) => Math.min(5, value + .25))}><ZoomIn size={17} /></button><button onClick={() => { setZoom(1); }}>Reset to 100%</button><button onClick={() => setZoomOpen(false)}><X size={17} /></button></div>
+          <div className="lightbox-toolbar"><strong>Image inspection</strong><button onClick={() => setZoom((value) => Math.max(.25, value - .25))}><ZoomOut size={17} /></button><button onClick={() => setZoom(1)}>Reset</button><button onClick={() => setZoom((value) => Math.min(5, value + .25))}><ZoomIn size={17} /></button><button onClick={() => setZoomOpen(false)}><X size={17} /></button></div>
           <div className="lightbox-canvas"><img src={renderUrls[selectedRenderId]} alt="Zoomed selected version" style={{ transform: `scale(${zoom})` }} /></div>
         </div>
       </div>}
@@ -1879,7 +2081,7 @@ function ImagesView() {
           </div>
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still. Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
-          <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cartoon cat as the main character. Show a diverse cast of people. Avoid showing text, labels, or close-ups on faces." rows={4} />
+          <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cat as the main character. Show visible emotions and varied body language. Avoid showing text, labels, or close-ups on faces." rows={4} />
           <button className="secondary full" style={{marginTop:"10px"}} onClick={() => void applyCreativeInstructionsToAll()} disabled={applyingInstructions || !bulkInstruction.trim() || !workspace?.groups.length}>
             {applyingInstructions
               ? (applyInstrProgress ? `Applying… ${applyInstrProgress.done}/${applyInstrProgress.total}` : "Applying…")
@@ -1889,9 +2091,6 @@ function ImagesView() {
             {bulkPlanLoading ? "Planning…" : <><WandSparkles size={16} />Plan Video</>}
           </button>
           {Boolean(job && ["queued", "running", "paused"].includes(job.status)) && <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Stop the active job to re-plan.</p>}
-          <button className="secondary full" style={{marginTop:"8px"}} onClick={() => void applyStyleToAll()} disabled={applyingStyle || !systemPrompt.trim() || !workspace?.groups.length}>
-            {applyingStyle ? "Applying…" : "Apply Style Directive to All Stills"}
-          </button>
           <button className="secondary full" style={{marginTop:"8px"}} onClick={() => setBulkOpen(false)}>Cancel</button>
         </div>
       </div>}
@@ -2036,7 +2235,7 @@ export function App() {
       void unlisten.then((off) => off());
     };
   }, []);
-  useEffect(() => log("info", "application_started", { release: "1.2.3" }), []);
+  useEffect(() => log("info", "application_started", { release: "1.2.10" }), []);
   useEffect(() => { void projectsClient.startupDiagnostic().then(setStartupNotice); }, []);
   useEffect(() => {
     void projectsClient.getAppSetting("theme").then((saved) => {
@@ -2065,7 +2264,7 @@ export function App() {
     <div className="app-shell">
       <TitleBar />
       <Sidebar />
-      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
+      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan", "captions"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
       <ToastDisplay />
     </div>
   );

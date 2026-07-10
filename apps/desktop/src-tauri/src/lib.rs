@@ -7,6 +7,7 @@ use projects::{
     VisualPlan,
 };
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -21,6 +22,7 @@ fn application_version() -> &'static str {
 }
 
 type RepositoryState = Mutex<ProjectRepository>;
+type ExportJobsState = Mutex<HashMap<String, u32>>;
 struct StartupState {
     recovery_backup: Option<PathBuf>,
 }
@@ -606,7 +608,45 @@ fn get_asset_data_url(
 }
 
 #[tauri::command]
+fn get_render_file_path(
+    state: State<'_, RepositoryState>,
+    render_id: String,
+) -> Result<String, String> {
+    with_repository(state, |repository| {
+        repository.render_file_path(&render_id).map(|path| path.to_string_lossy().into_owned())
+    })
+}
+
+#[tauri::command]
+fn get_asset_file_path(
+    state: State<'_, RepositoryState>,
+    asset_id: String,
+) -> Result<String, String> {
+    with_repository(state, |repository| {
+        repository.asset_file_path(&asset_id).map(|path| path.to_string_lossy().into_owned())
+    })
+}
+
+#[tauri::command]
 fn pick_download_folder(app: tauri::AppHandle) -> Option<String> {
+    app.dialog()
+        .file()
+        .blocking_pick_folder()
+        .and_then(|value| value.as_path().map(|p| p.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+fn pick_export_destination(app: tauri::AppHandle, default_name: String) -> Option<String> {
+    app.dialog()
+        .file()
+        .add_filter("MP4 video", &["mp4"])
+        .set_file_name(&default_name)
+        .blocking_save_file()
+        .and_then(|value| value.as_path().map(|p| p.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+fn pick_export_project_destination(app: tauri::AppHandle) -> Option<String> {
     app.dialog()
         .file()
         .blocking_pick_folder()
@@ -715,6 +755,221 @@ fn update_timeline_clip(
 ) -> Result<Timeline, String> {
     with_repository(state, |repository| {
         repository.update_timeline_clip(&video_id, &clip_id, start, end)
+    })
+}
+
+#[tauri::command]
+fn populate_timeline_from_sources(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.populate_timeline_from_sources(&video_id)
+    })
+}
+
+#[tauri::command]
+fn add_stills_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_id: String,
+    start_seconds: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.add_stills_clip(&video_id, &group_id, start_seconds)
+    })
+}
+
+#[tauri::command]
+fn add_caption_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    chunk_index: i64,
+    start_seconds: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.add_caption_clip(&video_id, chunk_index, start_seconds)
+    })
+}
+
+#[tauri::command]
+fn update_timeline_caption_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    start: f64,
+    end: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.update_timeline_caption_clip(&video_id, &clip_id, start, end)
+    })
+}
+
+#[tauri::command]
+fn set_timeline_clip_render(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    render_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_timeline_clip_render(&video_id, &clip_id, &render_id)
+    })
+}
+
+#[tauri::command]
+fn set_timeline_clip_motion(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    motion_preset: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_timeline_clip_motion(&video_id, &clip_id, &motion_preset)
+    })
+}
+
+#[tauri::command]
+fn set_timeline_clip_transition(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    transition_in: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_timeline_clip_transition(&video_id, &clip_id, &transition_in)
+    })
+}
+
+#[tauri::command]
+fn set_timeline_clip_transition_out(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    transition_out: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_timeline_clip_transition_out(&video_id, &clip_id, &transition_out)
+    })
+}
+
+#[tauri::command]
+fn set_timeline_clip_motion_intensity(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    intensity: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_timeline_clip_motion_intensity(&video_id, &clip_id, intensity)
+    })
+}
+
+#[tauri::command]
+fn apply_motion_to_all_clips(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    motion_preset: String,
+    intensity: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.apply_motion_to_all_clips(&video_id, &motion_preset, intensity)
+    })
+}
+
+#[tauri::command]
+fn apply_transition_in_to_all_clips(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    transition_in: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.apply_transition_in_to_all_clips(&video_id, &transition_in)
+    })
+}
+
+#[tauri::command]
+fn apply_transition_out_to_all_clips(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    transition_out: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.apply_transition_out_to_all_clips(&video_id, &transition_out)
+    })
+}
+
+#[tauri::command]
+fn apply_motion_intensity_to_all_clips(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    intensity: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.apply_motion_intensity_to_all_clips(&video_id, intensity)
+    })
+}
+
+#[tauri::command]
+fn alternate_zoom_for_all_clips(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    intensity: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.alternate_zoom_for_all_clips(&video_id, intensity)
+    })
+}
+
+#[tauri::command]
+fn extrapolate_stills_to_fill_gaps(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    total_duration_seconds: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.extrapolate_stills_to_fill_gaps(&video_id, total_duration_seconds)
+    })
+}
+
+#[tauri::command]
+fn reset_stills_timing_to_natural(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| repository.reset_stills_timing_to_natural(&video_id))
+}
+
+#[tauri::command]
+fn delete_timeline_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.delete_timeline_clip(&video_id, &clip_id)
+    })
+}
+
+#[tauri::command]
+fn delete_timeline_caption_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.delete_timeline_caption_clip(&video_id, &clip_id)
+    })
+}
+
+#[tauri::command]
+fn clear_timeline_track(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    track: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.clear_timeline_track(&video_id, &track)
     })
 }
 
@@ -1005,6 +1260,21 @@ fn get_captions(state: State<'_, RepositoryState>, video_id: String) -> Result<C
 }
 
 #[tauri::command]
+async fn optimize_captions(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<CaptionSet, String> {
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.optimize_captions(&video_id)
+    })
+    .await
+    .map_err(|error| format!("Caption optimization worker stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
 fn save_captions_file(
     app: tauri::AppHandle,
     srt_text: String,
@@ -1022,6 +1292,168 @@ fn save_captions_file(
     };
     fs::write(&path, srt_text).map_err(|error| format!("Could not save captions: {error}"))?;
     Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+async fn export_timeline_video(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    narration_duration_seconds: f64,
+    destination_path: String,
+) -> Result<Option<String>, String> {
+    let (database_path, projects_dir) = {
+        let repository = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        repository.paths()
+    };
+    let engine_dir = if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../services/python-engine")
+    } else {
+        app.path()
+            .resource_dir()
+            .map_err(|e| format!("Could not locate app resource directory: {e}"))?
+            .join("python-engine")
+    };
+    let output_path = {
+        let progress_app = app.clone();
+        let pid_app = app.clone();
+        let cleanup_app = app.clone();
+        let event_video_id = video_id.clone();
+        let pid_video_id = video_id.clone();
+        let cleanup_video_id = video_id.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+            let result = repository.export_timeline_video_with_progress(
+                &video_id,
+                &engine_dir,
+                narration_duration_seconds,
+                move |pid| {
+                    let jobs = pid_app.state::<ExportJobsState>();
+                    jobs.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(pid_video_id.clone(), pid);
+                },
+                move |percent, stage, detail| {
+                    let _ = progress_app.emit(
+                        "export-progress",
+                        serde_json::json!({
+                            "videoId": &event_video_id,
+                            "percent": percent,
+                            "stage": stage,
+                            "detail": detail,
+                        }),
+                    );
+                },
+            );
+            let jobs = cleanup_app.state::<ExportJobsState>();
+            jobs.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&cleanup_video_id);
+            result
+        })
+        .await
+        .map_err(|error| format!("Export worker failed: {error}"))??
+    };
+    let dest = PathBuf::from(&destination_path);
+    fs::copy(&output_path, &dest).map_err(|e| format!("Could not save exported video: {e}"))?;
+    Ok(Some(dest.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+async fn export_timeline_project(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    narration_duration_seconds: f64,
+    destination_path: String,
+) -> Result<String, String> {
+    let (database_path, projects_dir) = {
+        let repository = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        repository.paths()
+    };
+    let engine_dir = if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../services/python-engine")
+    } else {
+        app.path()
+            .resource_dir()
+            .map_err(|e| format!("Could not locate app resource directory: {e}"))?
+            .join("python-engine")
+    };
+    let destination_dir = PathBuf::from(destination_path);
+    let progress_app = app.clone();
+    let pid_app = app.clone();
+    let cleanup_app = app.clone();
+    let event_video_id = video_id.clone();
+    let pid_video_id = video_id.clone();
+    let cleanup_video_id = video_id.clone();
+    let output_dir = tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        let result = repository.export_timeline_project_with_progress(
+            &video_id,
+            &engine_dir,
+            narration_duration_seconds,
+            &destination_dir,
+            move |pid| {
+                let jobs = pid_app.state::<ExportJobsState>();
+                jobs.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(pid_video_id.clone(), pid);
+            },
+            move |percent, stage, detail| {
+                let _ = progress_app.emit(
+                    "export-progress",
+                    serde_json::json!({
+                        "videoId": &event_video_id,
+                        "percent": percent,
+                        "stage": stage,
+                        "detail": detail,
+                    }),
+                );
+            },
+        );
+        let jobs = cleanup_app.state::<ExportJobsState>();
+        jobs.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&cleanup_video_id);
+        result
+    })
+    .await
+    .map_err(|error| format!("Export worker failed: {error}"))??;
+    Ok(output_dir.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn cancel_timeline_export(app: tauri::AppHandle, video_id: String) -> Result<bool, String> {
+    let jobs = app.state::<ExportJobsState>();
+    let pid = jobs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&video_id);
+    let Some(_pid) = pid else {
+        return Ok(false);
+    };
+    #[cfg(windows)]
+    {
+        let mut command = std::process::Command::new("taskkill");
+        command.args(["/PID", &_pid.to_string(), "/T", "/F"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let status = command
+            .status()
+            .map_err(|e| format!("Could not stop the export: {e}"))?;
+        Ok(status.success())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
 }
 
 #[tauri::command]
@@ -1229,6 +1661,7 @@ pub fn run() {
             }
             app.manage(Mutex::new(repository));
             app.manage(StartupState { recovery_backup });
+            app.manage(Mutex::new(HashMap::<String, u32>::new()) as ExportJobsState);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1256,6 +1689,7 @@ pub fn run() {
             get_visual_plan,
             generate_captions,
             get_captions,
+            optimize_captions,
             save_captions_file,
             move_plan_sentence,
             create_plan_group,
@@ -1288,7 +1722,10 @@ pub fn run() {
             apply_style_directive_to_all,
             get_render_data_url,
             get_asset_data_url,
+            get_render_file_path,
+            get_asset_file_path,
             pick_download_folder,
+            pick_export_destination,
             copy_render_to_folder,
             export_latest_stills,
             export_project_bundle,
@@ -1297,6 +1734,29 @@ pub fn run() {
             get_timeline,
             update_timeline_view,
             update_timeline_clip,
+            populate_timeline_from_sources,
+            add_stills_clip,
+            add_caption_clip,
+            update_timeline_caption_clip,
+            set_timeline_clip_render,
+            set_timeline_clip_motion,
+            set_timeline_clip_transition,
+            set_timeline_clip_transition_out,
+            set_timeline_clip_motion_intensity,
+            apply_motion_to_all_clips,
+            apply_transition_in_to_all_clips,
+            apply_transition_out_to_all_clips,
+            apply_motion_intensity_to_all_clips,
+            alternate_zoom_for_all_clips,
+            extrapolate_stills_to_fill_gaps,
+            reset_stills_timing_to_natural,
+            delete_timeline_clip,
+            delete_timeline_caption_clip,
+            clear_timeline_track,
+            export_timeline_video,
+            pick_export_project_destination,
+            export_timeline_project,
+            cancel_timeline_export,
             rename_channel,
             rename_video,
             permanent_delete_video,

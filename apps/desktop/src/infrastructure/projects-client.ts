@@ -181,9 +181,17 @@ export type ImageJobRecord = {
   items: { id: string; groupId: string; promptVersionId: string; status: string; attempts: number; lastError: string | null; renderId: string | null }[];
 };
 export type ExportResultRecord = { path: string; fileCount: number };
+export type MotionPreset = "none" | "zoom-in" | "zoom-out" | "pan-left" | "pan-right";
+export type TransitionPreset = "cut" | "fade";
+export type TimelineClipRecord = {
+  id: string; groupId: string; renderId: string | null; ordinal: number; startSeconds: number; endSeconds: number; label: string;
+  motionPreset: MotionPreset; transitionIn: TransitionPreset; transitionOut: TransitionPreset; motionIntensity: number;
+};
+export type TimelineCaptionClipRecord = { id: string; sourceChunkIndex: number | null; text: string; ordinal: number; startSeconds: number; endSeconds: number };
 export type TimelineRecord = {
   videoId: string; durationSeconds: number; playheadSeconds: number; zoom: number; updatedAt: string;
-  clips: { id: string; groupId: string; renderId: string | null; ordinal: number; startSeconds: number; endSeconds: number; label: string }[];
+  clips: TimelineClipRecord[];
+  captionClips: TimelineCaptionClipRecord[];
 };
 
 type BrowserData = {
@@ -463,8 +471,16 @@ export const projectsClient = {
     if (isTauri()) return invoke("get_render_data_url", { renderId });
     return "";
   },
+  async getRenderFilePath(renderId: string): Promise<string> {
+    if (isTauri()) return invoke("get_render_file_path", { renderId });
+    return "";
+  },
   async pickDownloadFolder(): Promise<string | null> {
     if (isTauri()) return invoke("pick_download_folder");
+    return null;
+  },
+  async pickExportDestination(defaultName: string): Promise<string | null> {
+    if (isTauri()) return invoke("pick_export_destination", { defaultName });
     return null;
   },
   async copyRenderToFolder(renderId: string, folderPath: string): Promise<string> {
@@ -498,6 +514,98 @@ export const projectsClient = {
   async updateTimelineClip(videoId: string, clipId: string, start: number, end: number): Promise<TimelineRecord> {
     if (isTauri()) return invoke("update_timeline_clip", { videoId, clipId, start, end });
     throw new Error("Timeline requires the native application.");
+  },
+  async populateTimelineFromSources(videoId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("populate_timeline_from_sources", { videoId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async addStillsClip(videoId: string, groupId: string, startSeconds: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("add_stills_clip", { videoId, groupId, startSeconds });
+    throw new Error("Timeline requires the native application.");
+  },
+  async addCaptionClip(videoId: string, chunkIndex: number, startSeconds: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("add_caption_clip", { videoId, chunkIndex, startSeconds });
+    throw new Error("Timeline requires the native application.");
+  },
+  async updateTimelineCaptionClip(videoId: string, clipId: string, start: number, end: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("update_timeline_caption_clip", { videoId, clipId, start, end });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setTimelineClipRender(videoId: string, clipId: string, renderId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_timeline_clip_render", { videoId, clipId, renderId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setTimelineClipMotion(videoId: string, clipId: string, motionPreset: MotionPreset): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_timeline_clip_motion", { videoId, clipId, motionPreset });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setTimelineClipTransition(videoId: string, clipId: string, transitionIn: TransitionPreset): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_timeline_clip_transition", { videoId, clipId, transitionIn });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setTimelineClipTransitionOut(videoId: string, clipId: string, transitionOut: TransitionPreset): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_timeline_clip_transition_out", { videoId, clipId, transitionOut });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setTimelineClipMotionIntensity(videoId: string, clipId: string, intensity: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_timeline_clip_motion_intensity", { videoId, clipId, intensity });
+    throw new Error("Timeline requires the native application.");
+  },
+  async applyMotionToAllClips(videoId: string, motionPreset: MotionPreset, intensity: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("apply_motion_to_all_clips", { videoId, motionPreset, intensity });
+    throw new Error("Timeline requires the native application.");
+  },
+  async applyTransitionInToAllClips(videoId: string, transitionIn: TransitionPreset): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("apply_transition_in_to_all_clips", { videoId, transitionIn });
+    throw new Error("Timeline requires the native application.");
+  },
+  async applyTransitionOutToAllClips(videoId: string, transitionOut: TransitionPreset): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("apply_transition_out_to_all_clips", { videoId, transitionOut });
+    throw new Error("Timeline requires the native application.");
+  },
+  async applyMotionIntensityToAllClips(videoId: string, intensity: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("apply_motion_intensity_to_all_clips", { videoId, intensity });
+    throw new Error("Timeline requires the native application.");
+  },
+  async alternateZoomForAllClips(videoId: string, intensity: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("alternate_zoom_for_all_clips", { videoId, intensity });
+    throw new Error("Timeline requires the native application.");
+  },
+  async extrapolateStillsToFillGaps(videoId: string, totalDurationSeconds: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("extrapolate_stills_to_fill_gaps", { videoId, totalDurationSeconds });
+    throw new Error("Timeline requires the native application.");
+  },
+  async resetStillsTimingToNatural(videoId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("reset_stills_timing_to_natural", { videoId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async deleteTimelineClip(videoId: string, clipId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("delete_timeline_clip", { videoId, clipId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async deleteTimelineCaptionClip(videoId: string, clipId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("delete_timeline_caption_clip", { videoId, clipId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async clearTimelineTrack(videoId: string, track: "stills" | "captions"): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("clear_timeline_track", { videoId, track });
+    throw new Error("Timeline requires the native application.");
+  },
+  async exportTimelineVideo(videoId: string, narrationDurationSeconds: number, destinationPath: string): Promise<string | null> {
+    if (isTauri()) return invoke("export_timeline_video", { videoId, narrationDurationSeconds, destinationPath });
+    throw new Error("Video export requires the native application.");
+  },
+  async pickExportProjectDestination(): Promise<string | null> {
+    if (isTauri()) return invoke("pick_export_project_destination");
+    return null;
+  },
+  async exportTimelineProject(videoId: string, narrationDurationSeconds: number, destinationPath: string): Promise<string> {
+    if (isTauri()) return invoke("export_timeline_project", { videoId, narrationDurationSeconds, destinationPath });
+    throw new Error("Project export requires the native application.");
+  },
+  async cancelTimelineExport(videoId: string): Promise<boolean> {
+    if (isTauri()) return invoke("cancel_timeline_export", { videoId });
+    return false;
   },
   async createImageJob(videoId: string): Promise<ImageJobRecord> {
     if (isTauri()) return invoke("create_image_job", { videoId });
@@ -540,6 +648,10 @@ export const projectsClient = {
   },
   async getAssetDataUrl(assetId: string): Promise<string> {
     if (isTauri()) return invoke("get_asset_data_url", { assetId });
+    return "";
+  },
+  async getAssetFilePath(assetId: string): Promise<string> {
+    if (isTauri()) return invoke("get_asset_file_path", { assetId });
     return "";
   },
   async setFinalRender(renderId: string, isFinal: boolean): Promise<ImageRenderRecord> {
@@ -740,6 +852,10 @@ export const projectsClient = {
     const stored = localStorage.getItem(`${STORAGE_KEY}.captions.${videoId}`);
     if (!stored) throw new Error("Captions have not been generated.");
     return JSON.parse(stored) as CaptionSetRecord;
+  },
+  async optimizeCaptions(videoId: string): Promise<CaptionSetRecord> {
+    if (isTauri()) return invoke("optimize_captions", { videoId });
+    throw new Error("AI caption optimization requires the native application.");
   },
   async saveCaptionsFile(srtText: string, defaultName: string): Promise<string | null> {
     if (isTauri()) return invoke("save_captions_file", { srtText, defaultName });

@@ -1,4 +1,5 @@
 import {
+  Film,
   FolderOpen,
   Home,
   Image,
@@ -40,6 +41,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { type ChangeEvent, type FormEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type AppStage, useAppStore } from "./store/app-store";
 import { log } from "./infrastructure/logger";
+import { resolveAssetUrl, resolveRenderUrl } from "./infrastructure/media-cache";
 import { formatTime } from "./domain/timecode";
 import {
   projectsClient,
@@ -51,13 +53,14 @@ import {
   type ImageJobRecord,
   type ImageRenderRecord,
   type PromptVersionRecord,
-  type TimelineRecord,
 } from "./infrastructure/projects-client";
+import { TimelineView } from "./TimelineView";
 
 const navItems: { stage: AppStage; label: string; icon: typeof Home; alwaysEnabled?: boolean }[] = [
   { stage: "home", label: "Home", icon: Home },
   { stage: "inputs", label: "Production", icon: Upload },
   { stage: "images", label: "Images", icon: Image },
+  { stage: "timeline", label: "Timeline", icon: Film },
 ];
 const MAX_CACHE_SIZE = 20;
 const STILLS_PER_BATCH = 6;
@@ -79,7 +82,7 @@ function getGreeting() {
   return "Good evening";
 }
 
-function ConfirmDialog({
+export function ConfirmDialog({
   title,
   message,
   confirmLabel = "Confirm",
@@ -276,7 +279,7 @@ function HomeView() {
         if (cancelled) return;
         setVideoProgress((current) => ({ ...current, [video.id]: progress }));
         if (progress.previewRenderId) {
-          const url = await projectsClient.getRenderDataUrl(progress.previewRenderId);
+          const url = await resolveRenderUrl(progress.previewRenderId);
           if (!cancelled) setVideoPreviewUrls((current) => ({ ...current, [video.id]: url }));
         }
       } catch {
@@ -847,7 +850,7 @@ function LoadingOverlay({ label }: { label: string }) {
   return <div className="loading-overlay" role="status"><div className="loading-card"><LoaderCircle size={28} /><strong>{label}</strong><span>This may take a moment.</span><div className="loading-bar"><i /></div></div></div>;
 }
 
-function GenerationProgress({ progress }: { progress: { percent: number; stage: string; detail: string } }) {
+export function GenerationProgress({ progress }: { progress: { percent: number; stage: string; detail: string } }) {
   const percent = Math.max(0, Math.min(100, progress.percent));
   return <div className="loading-overlay" role="status" aria-live="polite">
     <div className="loading-card generation-progress">
@@ -877,6 +880,7 @@ function CaptionsView() {
   const [captions, setCaptions] = useState<import("./infrastructure/projects-client").CaptionSetRecord | null>(null);
   const [intervalSeconds, setIntervalSeconds] = useState(1);
   const [generating, setGenerating] = useState(false);
+  const [optimizing, setOptimizing] = useState(false);
   const [progress, setProgress] = useState({ percent: 0, stage: "Preparing captions", detail: "" });
   const [error, setError] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
@@ -890,7 +894,7 @@ function CaptionsView() {
     void projectsClient.getVideoInputs(activeVideoId).then((inputs) => {
       setReady(Boolean(inputs.scriptText.trim() && inputs.audio));
       if (inputs.audio) {
-        void projectsClient.getAssetDataUrl(inputs.audio.id).then(setAudioDataUrl).catch(() => {});
+        void resolveAssetUrl(inputs.audio.id).then(setAudioDataUrl).catch(() => {});
       }
     }).catch((caught) => setError(String(caught)));
     void projectsClient.getCaptions(activeVideoId).then((set) => { setCaptions(set); setIntervalSeconds(set.intervalSeconds); }).catch(() => setCaptions(null));
@@ -936,6 +940,21 @@ function CaptionsView() {
     }
   }
 
+  async function optimizeWithAi() {
+    if (!activeVideoId) return;
+    setOptimizing(true);
+    setError(null);
+    try {
+      const result = await projectsClient.optimizeCaptions(activeVideoId);
+      setCaptions(result);
+      addToast("Captions optimized with AI.", "success");
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setOptimizing(false);
+    }
+  }
+
   async function saveAs() {
     if (!captions) return;
     const safeTitle = (activeVideoTitle || "Video").replace(/[\\/:*?"<>|]/g, "").trim() || "Video";
@@ -965,6 +984,14 @@ function CaptionsView() {
           </label>
           <button className="primary" disabled={!ready || !activeVideoId || generating} onClick={() => void generate()}>
             {generating ? <><LoaderCircle className="spin" size={16} />Generating…</> : captions ? <>Regenerate captions</> : <>Generate captions</>}
+          </button>
+          <button
+            className="secondary"
+            disabled={!captions || generating || optimizing}
+            title="Uses AI to fix capitalization of proper nouns, your channel name, and other names to industry-standard caption style"
+            onClick={() => void optimizeWithAi()}
+          >
+            {optimizing ? <><LoaderCircle className="spin" size={16} />Optimizing…</> : <><WandSparkles size={16} />Optimize with AI</>}
           </button>
         </div>
       </div>
@@ -1134,7 +1161,7 @@ void listen<{ planned: number; total: number }>("bulk_plan_progress", (event) =>
 });
 
 function ImagesView() {
-  const { activeVideoId, addToast } = useAppStore();
+  const { activeVideoId, addToast, setStage } = useAppStore();
   const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [systemPrompt, setSystemPrompt] = useState("");
@@ -1660,14 +1687,14 @@ function ImagesView() {
     const asset = await projectsClient.pickAndImportAsset(activeVideoId, "reference");
     if (asset) {
       setReferences([asset]);
-      setReferenceUrl(await projectsClient.getAssetDataUrl(asset.id));
+      setReferenceUrl(await resolveAssetUrl(asset.id));
     }
   }
 
   useEffect(() => {
     const reference = references[0];
     if (!reference) return;
-    void projectsClient.getAssetDataUrl(reference.id).then(setReferenceUrl).catch(() => setReferenceUrl(""));
+    void resolveAssetUrl(reference.id).then(setReferenceUrl).catch(() => setReferenceUrl(""));
   }, [references]);
 
   async function removeReference(assetId: string) {
@@ -1696,7 +1723,7 @@ function ImagesView() {
   useEffect(() => {
     const ids = [selectedRenderId].filter(Boolean) as string[];
     void Promise.all(ids.filter((id) => !renderUrls[id]).map(async (id) => {
-      const url = await projectsClient.getRenderDataUrl(id);
+      const url = await resolveRenderUrl(id);
       setRenderUrls((current) => ({ ...current, [id]: url }));
     }));
   }, [selectedRenderId, renderUrls]);
@@ -1705,7 +1732,7 @@ function ImagesView() {
     const ids = workspace?.groups.map((group) => group.imageRenders[0]?.id).filter(Boolean) as string[] | undefined;
     if (!ids?.length) return;
     void Promise.all(ids.filter((id) => !renderUrls[id]).map(async (id) => {
-      const url = await projectsClient.getRenderDataUrl(id);
+      const url = await resolveRenderUrl(id);
       setRenderUrls((current) => ({ ...current, [id]: url }));
     }));
   }, [workspace, renderUrls]);
@@ -1862,7 +1889,7 @@ function ImagesView() {
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <div className="heading-actions"><button className="secondary danger-action" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Download All</button><button className="secondary" onClick={() => void generateAll()} disabled={loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={16} />Generate All</button><button className="primary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading}><WandSparkles size={17} />Bulk Gen Config</button></div>
+        <div className="heading-actions"><button className="secondary danger-action" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Download All</button><button className="secondary" onClick={() => void generateAll()} disabled={loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={16} />Generate All</button><button className="secondary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading}><WandSparkles size={17} />Bulk Gen Config</button><button className="primary" onClick={() => setStage("timeline")} disabled={!workspace?.groups.length}><Film size={17} />Continue to timeline →</button></div>
       </div>
       {error && <div className="error-toast" role="alert"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
       <div className="image-workspace">
@@ -2129,73 +2156,6 @@ function ImagesView() {
 }
 
 
-
-function TimelineView() {
-  const { activeVideoId } = useAppStore();
-  const [timeline, setTimeline] = useState<TimelineRecord | null>(null);
-  const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!activeVideoId) return;
-    projectsClient.getTimeline(activeVideoId).catch(() => projectsClient.buildTimeline(activeVideoId))
-      .then(setTimeline).catch((caught) => setError(String(caught)));
-  }, [activeVideoId]);
-
-  async function rebuild() {
-    if (!activeVideoId) return;
-    try { setTimeline(await projectsClient.buildTimeline(activeVideoId)); } catch (caught) { setError(String(caught)); }
-  }
-
-  async function updateView(playhead: number, zoom: number) {
-    if (!activeVideoId) return;
-    setTimeline(await projectsClient.updateTimelineView(activeVideoId, playhead, zoom));
-  }
-
-  async function nudgeBoundary(edge: "start" | "end", delta: number) {
-    if (!activeVideoId || !timeline || !selectedClipId) return;
-    const clip = timeline.clips.find((item) => item.id === selectedClipId);
-    if (!clip) return;
-    try {
-      setTimeline(await projectsClient.updateTimelineClip(
-        activeVideoId, clip.id,
-        edge === "start" ? clip.startSeconds + delta : clip.startSeconds,
-        edge === "end" ? clip.endSeconds + delta : clip.endSeconds,
-      ));
-    } catch (caught) { setError(String(caught)); }
-  }
-
-  const timelineReleased = false;
-  if (!timelineReleased) {
-    return <section className="view"><div className="coming-soon"><p className="eyebrow">In production</p><h1>Timeline is coming soon</h1><p>Timeline editing is being refined and is not available in this build.</p></div></section>;
-  }
-
-  return (
-    <section className="view">
-      <div className="page-heading"><div><p className="eyebrow">Editor foundation</p><h1>Timeline</h1><p>Arrange approved stills against narration timing.</p></div><button className="secondary" onClick={() => void rebuild()}><Undo2 size={16} />Reset from visual plan</button></div>
-      {error && <div className="inline-error">{error}</div>}
-      {!timeline ? <div className="empty-state">Building timeline…</div> : (
-        <div className="timeline-editor">
-          <div className="timeline-toolbar">
-            <label>Playhead <input type="range" min="0" max={timeline.durationSeconds} step=".1" value={timeline.playheadSeconds} onChange={(event) => void updateView(Number(event.target.value), timeline.zoom)} /></label>
-            <label>Zoom <input type="range" min=".5" max="4" step=".25" value={timeline.zoom} onChange={(event) => void updateView(timeline.playheadSeconds, Number(event.target.value))} /></label>
-            <span>{formatTime(timeline.playheadSeconds)} / {formatTime(timeline.durationSeconds)}</span>
-          </div>
-          <div className="timeline-track" style={{ width: `${Math.max(100, timeline.zoom * 100)}%` }}>
-            <i className="playhead" style={{ left: `${timeline.durationSeconds ? timeline.playheadSeconds / timeline.durationSeconds * 100 : 0}%` }} />
-            {timeline.clips.map((clip) => (
-              <button key={clip.id} className={clip.id === selectedClipId ? "timeline-clip active" : "timeline-clip"} style={{ width: `${(clip.endSeconds - clip.startSeconds) / timeline.durationSeconds * 100}%` }} onClick={() => setSelectedClipId(clip.id)}>
-                <strong>{clip.label}</strong><small>{formatTime(clip.startSeconds)}–{formatTime(clip.endSeconds)}</small><span>{clip.renderId ? "Still ready" : "Missing render"}</span>
-              </button>
-            ))}
-          </div>
-          {selectedClipId && <div className="clip-controls"><strong>Adjust selected clip</strong><button onClick={() => void nudgeBoundary("start", -.1)}>Start −0.1s</button><button onClick={() => void nudgeBoundary("start", .1)}>Start +0.1s</button><button onClick={() => void nudgeBoundary("end", -.1)}>End −0.1s</button><button onClick={() => void nudgeBoundary("end", .1)}>End +0.1s</button></div>}
-          <div className="future-tools">{["Captions","Animation","Transitions","Audio mixing"].map((tool) => <button key={tool} disabled><strong>{tool}</strong><span>Planned after 1.0</span></button>)}</div>
-        </div>
-      )}
-    </section>
-  );
-}
 
 export function App() {
   const {

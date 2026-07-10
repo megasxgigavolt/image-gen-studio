@@ -231,3 +231,100 @@ textarea{text-align:justify!important}
 .still-batch .still-batch-header .still-batch-title{font-size:12px!important;font-weight:600!important;color:var(--muted)!important;text-transform:uppercase;letter-spacing:.04em}
 .still-batch .still-batch-header .still-batch-count{background:var(--surface)!important;color:var(--muted)!important;font-weight:800!important;font-size:11px!important;padding:2px 9px!important;border-radius:99px!important;border:1px solid var(--line)}
 .still-batch .still-batch-header .still-batch-count.all-done{background:var(--brand-soft)!important;color:var(--brand)!important;border-color:transparent}
+.timeline-view{display:flex;flex-direction:column;height:100%;min-height:0}
+.tl-workspace{flex:1;min-height:0;display:flex;gap:14px;margin-top:4px}
+.tl-preview-pane{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:center;border:1px solid var(--line);border-radius:8px;background:var(--surface-2);padding:18px}
+.tl-preview-frame{flex:1;min-height:0;width:100%;max-height:440px;display:flex;align-items:center;justify-content:center;background:#0b0d0c;border-radius:8px;overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,.2)}
+.tl-preview-frame canvas{max-width:100%;max-height:100%;display:block}
+.tl-preview-empty{color:var(--muted);font-size:13px}
+.tl-play-btn{flex-shrink:0;width:38px;height:38px;border-radius:50%;display:grid;place-items:center;border:1px solid var(--line);background:var(--brand);color:#fff;cursor:pointer;transition:transform .1s ease,opacity .15s ease}
+.tl-play-btn:hover:not(:disabled){transform:scale(1.06)}
+.tl-play-btn:disabled{opacity:.4;cursor:not-allowed;background:var(--surface-2);color:var(--muted)}
+.tl-preview-time{font-size:12px;color:var(--text);font-variant-numeric:tabular-nums;white-space:nowrap;font-weight:600}
+.tl-preview-time i{color:var(--muted);font-style:normal;margin:0 2px}
+.tl-media-pane{width:280px;flex-shrink:0;display:flex;flex-direction:column;max-height:100%;overflow-y:auto;border:1px solid var(--line);border-radius:8px;background:var(--surface);padding:14px}
+.tl-inspector-pane{width:330px;flex-shrink:0;display:flex;flex-direction:column;max-height:100%;overflow-y:auto;border:1px solid var(--line);border-radius:8px;background:var(--surface);padding:14px}
+.tl-inspector-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--muted);text-align:center;padding:26px 20px;border:1px dashed var(--line);border-radius:8px;background:color-mix(in srgb,var(--surface-2) 55%,var(--surface))}
+.tl-inspector-empty svg{opacity:.5}
+.tl-inspector-empty p{font-size:12px;line-height:1.55}
+.tl-source-tabs{display:flex;gap:4px;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:4px;margin-bottom:12px}
+.tl-source-tab{flex:1;border:none;background:transparent;color:var(--muted);font-size:13px;font-weight:700;padding:8px 0;border-radius:6px;cursor:pointer}
+.tl-source-tab.active{background:var(--surface);color:var(--text);box-shadow:var(--shadow)}
+.tl-broll-panel strong{display:flex;align-items:center;gap:6px;font-size:14px}
+.tl-soon-badge{margin-left:auto;background:var(--surface-2);color:var(--muted);border:1px solid var(--line);border-radius:99px;padding:2px 9px;font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.03em}
+.tl-broll-panel button{display:flex;align-items:center;gap:6px;justify-content:center;margin-top:4px}
+.tl-source-section{display:flex;flex-direction:column;gap:10px}
+.tl-source-section>strong{display:flex;justify-content:space-between;align-items:center;font-size:14px}
+.tl-source-section>strong span{background:var(--brand-soft);color:var(--brand);border-radius:99px;padding:2px 9px;font-size:12px;font-weight:800}
+.tl-source-grid{display:flex;flex-direction:column;gap:8px;max-height:600px;overflow-y:auto}
+.tl-source-thumb-btn{position:relative;flex-shrink:0;width:100%;aspect-ratio:16/9;border-radius:6px;border:1px solid var(--line);background:var(--surface-2);color:var(--muted);display:grid;place-items:center;overflow:hidden;cursor:pointer;padding:0;transition:border-color .12s ease}
+.tl-source-thumb-btn:hover{border-color:var(--brand)}
+.tl-source-thumb-btn img{width:100%;height:100%;object-fit:cover;pointer-events:none}
+.tl-source-badge{position:absolute;left:5px;top:5px;z-index:1;background:#17211ecc;color:#fff;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700;pointer-events:none}
+.tl-source-empty{font-size:12px;color:var(--muted);padding:8px 0}
+.tl-source-hint{font-size:12px;color:var(--muted);line-height:1.55;margin-top:auto;padding-top:10px}
+.tl-timeline-pane{flex-shrink:0;display:flex;flex-direction:column;gap:8px;margin-top:14px}
+.tl-toolbar{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:14px;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:8px 12px;flex-shrink:0}
+.tl-toolbar .tl-preview-time{justify-self:start}
+.tl-zoom-control{display:flex;align-items:center;gap:8px}
+.tl-zoom-control .tl-slider{width:110px}
+.tl-zoom-label{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;width:38px}
+/* Plain native range input, styled only via accent-color — every custom
+   pseudo-element attempt at redrawing the track/thumb (multiple rounds)
+   either misaligned the thumb or broke dragging outright. accent-color is
+   guaranteed correct on both counts because it's the browser's own render. */
+.tl-slider{accent-color:var(--brand);cursor:pointer;height:16px;margin:0}
+.tl-icon-btn{width:24px;height:24px;display:grid;place-items:center;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--text);cursor:pointer;flex-shrink:0}
+.tl-icon-btn:hover{background:var(--surface-2)}
+.tl-toolbar .tl-zoom-control{justify-self:end}
+.tl-canvas{flex:0 0 auto;height:204px;display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--surface)}
+.tl-lane-gutter{flex-shrink:0;width:96px;background:var(--surface-2);border-right:1px solid var(--line);display:flex;flex-direction:column}
+.tl-gutter-cell{display:flex;align-items:center;padding:0 10px;font-size:11px;font-weight:700;color:var(--muted);border-bottom:1px solid var(--line)}
+.tl-canvas-scroll{flex:1;min-width:0;overflow-x:auto;overflow-y:hidden}
+.tl-canvas-inner{position:relative;min-width:100%;height:100%;cursor:text}
+.tl-playhead{position:absolute;top:0;bottom:0;width:2px;background:#d2604c;z-index:6;pointer-events:none}
+.tl-playhead-handle{position:absolute;top:0;bottom:0;left:-6px;right:-6px;cursor:ew-resize;pointer-events:auto}
+.tl-playhead-tag{position:absolute;top:2px;left:4px;background:#d2604c;color:#fff;font-size:10px;font-weight:700;font-variant-numeric:tabular-nums;padding:1px 5px;border-radius:4px;white-space:nowrap;pointer-events:auto;cursor:ew-resize}
+.tl-lane-track{position:relative;border-bottom:1px solid var(--line);background:var(--surface)}
+.tl-narration-track{display:flex;align-items:center;background:var(--surface-2)}
+.tl-narration-empty{padding:0 12px;font-size:12px;color:var(--muted);white-space:nowrap}
+.tl-waveform-canvas{height:100%;display:block}
+.tl-captions-track{background:var(--surface-2)}
+.tl-clip{position:absolute;top:4px;bottom:4px;border-radius:7px;overflow:hidden;cursor:pointer;display:flex;align-items:center;user-select:none;box-shadow:0 1px 2px rgba(0,0,0,.18);transition:box-shadow .12s ease}
+.tl-clip:hover{box-shadow:0 2px 6px rgba(0,0,0,.28)}
+.tl-clip-stills{background:#101412;border:1px solid rgba(148,163,157,.55)}
+.tl-clip-stills img{width:100%;height:100%;object-fit:cover;pointer-events:none}
+.tl-clip-fallback{color:#fff;font-size:11px;padding:0 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tl-clip-captions{background:var(--brand-soft);border:1px solid color-mix(in srgb,var(--brand) 40%,var(--line));padding:0 8px;cursor:default}
+.tl-clip-captions.readonly{cursor:default;pointer-events:none}
+.tl-clip-captions.narrow{padding:0;border-left-width:2px;border-right-width:2px}
+.tl-clip-text{font-size:11px;color:var(--brand);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tl-clip.active{box-shadow:0 0 0 2px var(--brand)}
+.tl-clip-badge{position:absolute;top:3px;display:grid;place-items:center;width:16px;height:16px;border-radius:50%;background:rgba(0,0,0,.6);color:#fff;z-index:3;pointer-events:none}
+.tl-clip-badge-fade{left:3px}
+.tl-clip-badge-motion{right:3px}
+.tl-inspector{display:flex;flex-direction:column;gap:12px;height:100%}
+.tl-inspector-header{display:flex;flex-direction:column;gap:3px}
+.tl-inspector-header strong{font-size:14px}
+.tl-inspector-header span{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+.tl-version-chips{display:flex;flex-wrap:wrap;gap:6px}
+.tl-version-chip{border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--text);font-size:11px;font-weight:700;padding:5px 10px;cursor:pointer}
+.tl-version-chip:hover{background:var(--surface-2)}
+.tl-version-chip.active{border-color:var(--brand);background:var(--brand-soft);color:var(--brand)}
+.tl-inspector-group{display:flex;flex-direction:column;gap:7px;border-top:1px solid var(--line);padding-top:10px}
+.tl-inspector-label-row{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.tl-inspector-label{display:flex;align-items:center;gap:5px;font-size:11px;font-weight:700;color:var(--text)}
+.tl-apply-all-btn{border:0;background:transparent;color:var(--brand);font-size:11px;font-weight:700;cursor:pointer;padding:2px 0;flex-shrink:0}
+.tl-apply-all-btn:hover{text-decoration:underline}
+.tl-preset-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.tl-preset-grid.two{grid-template-columns:1fr 1fr}
+.tl-preset-btn{display:flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--text);font-size:11px;padding:7px 8px;cursor:pointer}
+.tl-preset-btn:hover{background:var(--surface-2)}
+.tl-preset-btn.active{border-color:var(--brand);background:var(--brand-soft);color:var(--brand);font-weight:700}
+.tl-preset-btn.full{width:100%}
+.tl-intensity-control{display:flex;align-items:center;gap:8px;margin-top:2px}
+.tl-intensity-control span{font-size:11px;color:var(--muted);white-space:nowrap}
+.tl-intensity-control .tl-slider{flex:1}
+.tl-intensity-value{font-size:11px;font-variant-numeric:tabular-nums;width:32px;text-align:right}
+.tl-inspector-actions{display:flex;margin-top:auto;padding-top:10px}
+.tl-inspector-actions button{width:100%;justify-content:center}

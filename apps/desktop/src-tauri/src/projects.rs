@@ -293,6 +293,29 @@ CREATE TABLE IF NOT EXISTS captions (
 );
 "#;
 
+const MIGRATION_014: &str = r#"
+CREATE TABLE IF NOT EXISTS timeline_caption_clips (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    source_chunk_index INTEGER,
+    text TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    start_seconds REAL NOT NULL,
+    end_seconds REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_timeline_caption_clips_video ON timeline_caption_clips(video_id, start_seconds);
+"#;
+
+const MIGRATION_015: &str = r#"
+ALTER TABLE timeline_clips ADD COLUMN motion_preset TEXT NOT NULL DEFAULT 'none';
+ALTER TABLE timeline_clips ADD COLUMN transition_in TEXT NOT NULL DEFAULT 'cut';
+"#;
+
+const MIGRATION_016: &str = r#"
+ALTER TABLE timeline_clips ADD COLUMN transition_out TEXT NOT NULL DEFAULT 'cut';
+ALTER TABLE timeline_clips ADD COLUMN motion_intensity REAL NOT NULL DEFAULT 0.22;
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -536,6 +559,21 @@ pub struct TimelineClip {
     pub start_seconds: f64,
     pub end_seconds: f64,
     pub label: String,
+    pub motion_preset: String,
+    pub transition_in: String,
+    pub transition_out: String,
+    pub motion_intensity: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineCaptionClip {
+    pub id: String,
+    pub source_chunk_index: Option<i64>,
+    pub text: String,
+    pub ordinal: i64,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -547,6 +585,7 @@ pub struct Timeline {
     pub zoom: f64,
     pub updated_at: String,
     pub clips: Vec<TimelineClip>,
+    pub caption_clips: Vec<TimelineCaptionClip>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -826,6 +865,41 @@ impl ProjectRepository {
         self.connection.execute_batch(MIGRATION_013).map_err(|error| error.to_string())?;
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(13, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        self.connection.execute_batch(MIGRATION_014).map_err(|error| error.to_string())?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(14, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_motion_preset: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timeline_clips') WHERE name='motion_preset')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_motion_preset {
+            self.connection.execute_batch(MIGRATION_015).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(15, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_transition_out: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timeline_clips') WHERE name='transition_out')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_transition_out {
+            self.connection.execute_batch(MIGRATION_016).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(16, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -2941,6 +3015,24 @@ Return JSON only:
         Ok((asset.media_type, base64::engine::general_purpose::STANDARD.encode(bytes)))
     }
 
+    /// Absolute path to a render's image file, for loading via Tauri's asset
+    /// protocol (convertFileSrc) instead of a base64 round-trip — much faster
+    /// for the dozens of thumbnails ImagesView/TimelineView load per visit.
+    pub fn render_file_path(&self, render_id: &str) -> Result<PathBuf, String> {
+        let render = self.get_render_by_id(render_id)?;
+        self.render_absolute_path(&render)
+    }
+
+    /// Absolute path to an uploaded asset (narration audio, reference image),
+    /// for the same asset-protocol fast path as `render_file_path`.
+    pub fn asset_file_path(&self, asset_id: &str) -> Result<PathBuf, String> {
+        let asset = self.asset_by_id(asset_id)?.ok_or("Asset was not found.")?;
+        let channel_id: String = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1", [&asset.video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        Ok(self.projects_dir.join(channel_id).join(&asset.video_id).join(&asset.relative_path))
+    }
+
     pub fn export_latest_stills(
         &self,
         video_id: &str,
@@ -3157,7 +3249,7 @@ Return JSON only:
             [video_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
         ).map_err(|_| "Timeline has not been built.".to_string())?;
         let mut statement = self.connection.prepare(
-            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
+            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
         ).map_err(|e| e.to_string())?;
         let clips = statement
             .query_map([video_id], |row| {
@@ -3169,6 +3261,27 @@ Return JSON only:
                     start_seconds: row.get(4)?,
                     end_seconds: row.get(5)?,
                     label: row.get(6)?,
+                    motion_preset: row.get(7)?,
+                    transition_in: row.get(8)?,
+                    transition_out: row.get(9)?,
+                    motion_intensity: row.get(10)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut caption_statement = self.connection.prepare(
+            "SELECT id,source_chunk_index,text,ordinal,start_seconds,end_seconds FROM timeline_caption_clips WHERE video_id=?1 ORDER BY start_seconds"
+        ).map_err(|e| e.to_string())?;
+        let caption_clips = caption_statement
+            .query_map([video_id], |row| {
+                Ok(TimelineCaptionClip {
+                    id: row.get(0)?,
+                    source_chunk_index: row.get(1)?,
+                    text: row.get(2)?,
+                    ordinal: row.get(3)?,
+                    start_seconds: row.get(4)?,
+                    end_seconds: row.get(5)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -3181,6 +3294,7 @@ Return JSON only:
             zoom,
             updated_at,
             clips,
+            caption_clips,
         })
     }
 
@@ -3226,20 +3340,401 @@ Return JSON only:
             "UPDATE timeline_clips SET start_seconds=?1,end_seconds=?2 WHERE id=?3 AND video_id=?4",
             params![start, end, clip_id, video_id],
         ).map_err(|e| e.to_string())?;
-        let duration: f64 = self
-            .connection
-            .query_row(
-                "SELECT COALESCE(MAX(end_seconds),0) FROM timeline_clips WHERE video_id=?1",
-                [video_id],
-                |row| row.get(0),
-            )
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    fn recompute_timeline_duration(&self, video_id: &str) -> Result<(), String> {
+        let stills_max: f64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(end_seconds),0) FROM timeline_clips WHERE video_id=?1",
+            [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let captions_max: f64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(end_seconds),0) FROM timeline_caption_clips WHERE video_id=?1",
+            [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "UPDATE timelines SET duration_seconds=?1,updated_at=?2 WHERE video_id=?3",
+            params![stills_max.max(captions_max), Utc::now().to_rfc3339(), video_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn ensure_timeline_row(&self, video_id: &str) -> Result<(), String> {
+        self.connection.execute(
+            "INSERT INTO timelines(video_id,duration_seconds,playhead_seconds,zoom,updated_at) VALUES(?1,0,0,1,?2) ON CONFLICT(video_id) DO NOTHING",
+            params![video_id, Utc::now().to_rfc3339()],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Adds a timeline clip for every visual-plan still and caption chunk that
+    /// isn't on the timeline yet. Additive — re-running after generating more
+    /// stills or captions fills gaps without disturbing existing arrangement.
+    pub fn populate_timeline_from_sources(&self, video_id: &str) -> Result<Timeline, String> {
+        self.ensure_timeline_row(video_id)?;
+
+        let plan = self.get_visual_plan(video_id)?;
+        let sentence_map: std::collections::HashMap<_, _> =
+            plan.sentences.iter().map(|s| (s.id.as_str(), s)).collect();
+        let mut cursor = 0.0;
+        for group in &plan.groups {
+            let sentences: Vec<_> = group
+                .sentence_ids
+                .iter()
+                .filter_map(|id| sentence_map.get(id.as_str()))
+                .collect();
+            let start = sentences.first().map(|s| s.start_seconds).unwrap_or(cursor);
+            let end = sentences.last().map(|s| s.end_seconds).unwrap_or(start + 3.0);
+            cursor = cursor.max(end);
+            let exists: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM timeline_clips WHERE video_id=?1 AND group_id=?2)",
+                params![video_id, group.id], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if exists {
+                continue;
+            }
+            let render_id = self
+                .list_image_renders(video_id, &group.id)?
+                .into_iter()
+                .find(|render| render.is_final)
+                .map(|render| render.id);
+            self.connection.execute(
+                "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![Uuid::new_v4().to_string(), video_id, group.id, render_id, group.ordinal, start, end, group.label],
+            ).map_err(|e| e.to_string())?;
+        }
+
+        if let Ok(captions) = self.get_captions(video_id) {
+            for chunk in &captions.chunks {
+                let exists: bool = self.connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM timeline_caption_clips WHERE video_id=?1 AND source_chunk_index=?2)",
+                    params![video_id, chunk.index], |row| row.get(0),
+                ).map_err(|e| e.to_string())?;
+                if exists {
+                    continue;
+                }
+                self.connection.execute(
+                    "INSERT INTO timeline_caption_clips(id,video_id,source_chunk_index,text,ordinal,start_seconds,end_seconds) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![Uuid::new_v4().to_string(), video_id, chunk.index, chunk.text, chunk.index, chunk.start_seconds, chunk.end_seconds],
+                ).map_err(|e| e.to_string())?;
+            }
+        }
+
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn add_stills_clip(&self, video_id: &str, group_id: &str, start_seconds: f64) -> Result<Timeline, String> {
+        if start_seconds < 0.0 {
+            return Err("Clip position is invalid.".into());
+        }
+        self.ensure_timeline_row(video_id)?;
+        let plan = self.get_visual_plan(video_id)?;
+        let group = plan.groups.iter().find(|g| g.id == group_id)
+            .ok_or("Still was not found in the visual plan.")?;
+        let sentence_map: std::collections::HashMap<_, _> =
+            plan.sentences.iter().map(|s| (s.id.as_str(), s)).collect();
+        let sentences: Vec<_> = group.sentence_ids.iter()
+            .filter_map(|id| sentence_map.get(id.as_str())).collect();
+        let natural_duration = match (sentences.first(), sentences.last()) {
+            (Some(first), Some(last)) => (last.end_seconds - first.start_seconds).max(0.5),
+            _ => 3.0,
+        };
+        let end_seconds = start_seconds + natural_duration;
+        let overlap: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM timeline_clips WHERE video_id=?1 AND ?2 < end_seconds AND ?3 > start_seconds)",
+            params![video_id, start_seconds, end_seconds], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if overlap {
+            return Err("That position overlaps an existing clip on the stills track.".into());
+        }
+        let render_id = self
+            .list_image_renders(video_id, group_id)?
+            .into_iter()
+            .find(|render| render.is_final)
+            .map(|render| render.id);
+        self.connection.execute(
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![Uuid::new_v4().to_string(), video_id, group_id, render_id, group.ordinal, start_seconds, end_seconds, group.label],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn add_caption_clip(&self, video_id: &str, chunk_index: i64, start_seconds: f64) -> Result<Timeline, String> {
+        if start_seconds < 0.0 {
+            return Err("Clip position is invalid.".into());
+        }
+        self.ensure_timeline_row(video_id)?;
+        let captions = self.get_captions(video_id)?;
+        let chunk = captions.chunks.iter().find(|c| c.index == chunk_index)
+            .ok_or("Caption chunk was not found.")?;
+        let duration = (chunk.end_seconds - chunk.start_seconds).max(0.3);
+        let end_seconds = start_seconds + duration;
+        let overlap: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM timeline_caption_clips WHERE video_id=?1 AND ?2 < end_seconds AND ?3 > start_seconds)",
+            params![video_id, start_seconds, end_seconds], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if overlap {
+            return Err("That position overlaps an existing clip on the captions track.".into());
+        }
+        self.connection.execute(
+            "INSERT INTO timeline_caption_clips(id,video_id,source_chunk_index,text,ordinal,start_seconds,end_seconds) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![Uuid::new_v4().to_string(), video_id, chunk_index, chunk.text, chunk_index, start_seconds, end_seconds],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn update_timeline_caption_clip(&self, video_id: &str, clip_id: &str, start: f64, end: f64) -> Result<Timeline, String> {
+        if start < 0.0 || end <= start {
+            return Err("Clip boundaries are invalid.".into());
+        }
+        let overlap: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM timeline_caption_clips WHERE video_id=?1 AND id<>?2 AND ?3 < end_seconds AND ?4 > start_seconds)",
+            params![video_id, clip_id, start, end], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if overlap {
+            return Err("Timeline clips may not overlap on the same track.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_caption_clips SET start_seconds=?1,end_seconds=?2 WHERE id=?3 AND video_id=?4",
+            params![start, end, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn set_timeline_clip_render(&self, video_id: &str, clip_id: &str, render_id: &str) -> Result<Timeline, String> {
+        let clip_group_id: String = self.connection.query_row(
+            "SELECT group_id FROM timeline_clips WHERE id=?1 AND video_id=?2",
+            params![clip_id, video_id], |row| row.get(0),
+        ).map_err(|_| "Timeline clip was not found.".to_string())?;
+        let render_group_id: String = self.connection.query_row(
+            "SELECT group_id FROM image_renders WHERE id=?1 AND video_id=?2",
+            params![render_id, video_id], |row| row.get(0),
+        ).map_err(|_| "Image render was not found.".to_string())?;
+        if clip_group_id != render_group_id {
+            return Err("That version belongs to a different still.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_clips SET render_id=?1 WHERE id=?2 AND video_id=?3",
+            params![render_id, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn set_timeline_clip_motion(&self, video_id: &str, clip_id: &str, motion_preset: &str) -> Result<Timeline, String> {
+        const VALID: [&str; 5] = ["none", "zoom-in", "zoom-out", "pan-left", "pan-right"];
+        if !VALID.contains(&motion_preset) {
+            return Err("Unknown camera movement preset.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_clips SET motion_preset=?1 WHERE id=?2 AND video_id=?3",
+            params![motion_preset, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn set_timeline_clip_transition(&self, video_id: &str, clip_id: &str, transition_in: &str) -> Result<Timeline, String> {
+        const VALID: [&str; 2] = ["cut", "fade"];
+        if !VALID.contains(&transition_in) {
+            return Err("Unknown transition preset.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_clips SET transition_in=?1 WHERE id=?2 AND video_id=?3",
+            params![transition_in, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn set_timeline_clip_transition_out(&self, video_id: &str, clip_id: &str, transition_out: &str) -> Result<Timeline, String> {
+        const VALID: [&str; 2] = ["cut", "fade"];
+        if !VALID.contains(&transition_out) {
+            return Err("Unknown transition preset.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_clips SET transition_out=?1 WHERE id=?2 AND video_id=?3",
+            params![transition_out, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn set_timeline_clip_motion_intensity(&self, video_id: &str, clip_id: &str, intensity: f64) -> Result<Timeline, String> {
+        let clamped = intensity.clamp(0.02, 0.6);
+        self.connection.execute(
+            "UPDATE timeline_clips SET motion_intensity=?1 WHERE id=?2 AND video_id=?3",
+            params![clamped, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn apply_motion_to_all_clips(&self, video_id: &str, motion_preset: &str, intensity: f64) -> Result<Timeline, String> {
+        const VALID: [&str; 5] = ["none", "zoom-in", "zoom-out", "pan-left", "pan-right"];
+        if !VALID.contains(&motion_preset) {
+            return Err("Unknown camera movement preset.".into());
+        }
+        let clamped = intensity.clamp(0.02, 0.6);
+        self.connection.execute(
+            "UPDATE timeline_clips SET motion_preset=?1, motion_intensity=?2 WHERE video_id=?3",
+            params![motion_preset, clamped, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn apply_transition_in_to_all_clips(&self, video_id: &str, transition_in: &str) -> Result<Timeline, String> {
+        const VALID: [&str; 2] = ["cut", "fade"];
+        if !VALID.contains(&transition_in) {
+            return Err("Unknown transition preset.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_clips SET transition_in=?1 WHERE video_id=?2",
+            params![transition_in, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn apply_transition_out_to_all_clips(&self, video_id: &str, transition_out: &str) -> Result<Timeline, String> {
+        const VALID: [&str; 2] = ["cut", "fade"];
+        if !VALID.contains(&transition_out) {
+            return Err("Unknown transition preset.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_clips SET transition_out=?1 WHERE video_id=?2",
+            params![transition_out, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn apply_motion_intensity_to_all_clips(&self, video_id: &str, intensity: f64) -> Result<Timeline, String> {
+        let clamped = intensity.clamp(0.02, 0.6);
+        self.connection.execute(
+            "UPDATE timeline_clips SET motion_intensity=?1 WHERE video_id=?2",
+            params![clamped, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    /// Assigns alternating zoom-in/zoom-out to every still on the timeline,
+    /// in start-time order, all at the given intensity.
+    pub fn alternate_zoom_for_all_clips(&self, video_id: &str, intensity: f64) -> Result<Timeline, String> {
+        let clamped = intensity.clamp(0.02, 0.6);
+        let mut statement = self.connection.prepare(
+            "SELECT id FROM timeline_clips WHERE video_id=?1 ORDER BY start_seconds"
+        ).map_err(|e| e.to_string())?;
+        let clip_ids: Vec<String> = statement.query_map([video_id], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        self.connection
-            .execute(
-                "UPDATE timelines SET duration_seconds=?1,updated_at=?2 WHERE video_id=?3",
-                params![duration, Utc::now().to_rfc3339(), video_id],
-            )
+        drop(statement);
+        for (index, clip_id) in clip_ids.iter().enumerate() {
+            let preset = if index % 2 == 0 { "zoom-in" } else { "zoom-out" };
+            self.connection.execute(
+                "UPDATE timeline_clips SET motion_preset=?1, motion_intensity=?2 WHERE id=?3",
+                params![preset, clamped, clip_id],
+            ).map_err(|e| e.to_string())?;
+        }
+        self.get_timeline(video_id)
+    }
+
+    /// Stretches every still to close the gaps between them (and any leading
+    /// gap before the first one, and trailing gap after the last one), so
+    /// stills tile back-to-back with no silent black filler in between —
+    /// this is what makes fade transitions actually visible, since a fade
+    /// into/out of an existing black gap otherwise looks like nothing happened.
+    pub fn extrapolate_stills_to_fill_gaps(&self, video_id: &str, total_duration_seconds: f64) -> Result<Timeline, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, start_seconds, end_seconds FROM timeline_clips WHERE video_id=?1 ORDER BY start_seconds"
+        ).map_err(|e| e.to_string())?;
+        let mut clips: Vec<(String, f64, f64)> = statement
+            .query_map([video_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
+        drop(statement);
+
+        if clips.is_empty() {
+            return self.get_timeline(video_id);
+        }
+        clips[0].1 = 0.0;
+        let len = clips.len();
+        for i in 0..len.saturating_sub(1) {
+            let next_start = clips[i + 1].1;
+            clips[i].2 = next_start;
+        }
+        if let Some(last) = clips.last_mut() {
+            last.2 = last.2.max(total_duration_seconds);
+        }
+
+        for (id, start, end) in &clips {
+            self.connection.execute(
+                "UPDATE timeline_clips SET start_seconds=?1, end_seconds=?2 WHERE id=?3",
+                params![start, end, id],
+            ).map_err(|e| e.to_string())?;
+        }
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    /// Resets every stills clip's start/end back to its natural sentence-based
+    /// timing from the visual plan — undoes whatever `extrapolate_stills_to_fill_gaps`
+    /// stretched, without touching motion/transitions/version selection.
+    pub fn reset_stills_timing_to_natural(&self, video_id: &str) -> Result<Timeline, String> {
+        let plan = self.get_visual_plan(video_id)?;
+        let sentence_map: std::collections::HashMap<_, _> =
+            plan.sentences.iter().map(|s| (s.id.as_str(), s)).collect();
+        let group_timing: std::collections::HashMap<&str, (f64, f64)> = plan.groups.iter().map(|group| {
+            let sentences: Vec<_> = group.sentence_ids.iter().filter_map(|id| sentence_map.get(id.as_str())).collect();
+            let start = sentences.first().map(|s| s.start_seconds).unwrap_or(0.0);
+            let end = sentences.last().map(|s| s.end_seconds).unwrap_or(start + 1.0);
+            (group.id.as_str(), (start, end))
+        }).collect();
+
+        let timeline = self.get_timeline(video_id)?;
+        for clip in &timeline.clips {
+            if let Some(&(start, end)) = group_timing.get(clip.group_id.as_str()) {
+                self.connection.execute(
+                    "UPDATE timeline_clips SET start_seconds=?1, end_seconds=?2 WHERE id=?3",
+                    params![start, end, clip.id],
+                ).map_err(|e| e.to_string())?;
+            }
+        }
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn delete_timeline_clip(&self, video_id: &str, clip_id: &str) -> Result<Timeline, String> {
+        self.connection.execute(
+            "DELETE FROM timeline_clips WHERE id=?1 AND video_id=?2",
+            params![clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn delete_timeline_caption_clip(&self, video_id: &str, clip_id: &str) -> Result<Timeline, String> {
+        self.connection.execute(
+            "DELETE FROM timeline_caption_clips WHERE id=?1 AND video_id=?2",
+            params![clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn clear_timeline_track(&self, video_id: &str, track: &str) -> Result<Timeline, String> {
+        match track {
+            "stills" => {
+                self.connection.execute("DELETE FROM timeline_clips WHERE video_id=?1", [video_id])
+                    .map_err(|e| e.to_string())?;
+            }
+            "captions" => {
+                self.connection.execute("DELETE FROM timeline_caption_clips WHERE video_id=?1", [video_id])
+                    .map_err(|e| e.to_string())?;
+            }
+            _ => return Err("Unknown timeline track.".into()),
+        }
+        self.recompute_timeline_duration(video_id)?;
         self.get_timeline(video_id)
     }
 
@@ -4057,6 +4552,427 @@ Return JSON only:
         })
     }
 
+    /// Uses AI to fix ONLY capitalization (proper nouns, the channel name,
+    /// sentence starts) across every caption line — timing and wording are
+    /// left untouched, so a mismatched response length is rejected outright
+    /// rather than risking corrupted sync.
+    pub fn optimize_captions(&self, video_id: &str) -> Result<CaptionSet, String> {
+        let set = self.get_captions(video_id)?;
+        if set.chunks.is_empty() {
+            return Err("No captions to optimize yet. Generate captions first.".into());
+        }
+        let openai_key = self.get_provider_key("openai")?
+            .ok_or("Add an OpenAI API key in Settings to use AI caption optimization.")?;
+        let channel_name: String = self.connection.query_row(
+            "SELECT c.name FROM channels c JOIN videos v ON v.channel_id = c.id WHERE v.id = ?1",
+            [video_id],
+            |row| row.get(0),
+        ).unwrap_or_default();
+        let texts: Vec<String> = set.chunks.iter().map(|chunk| chunk.text.clone()).collect();
+        let fixed = request_openai_caption_fix(&openai_key, &channel_name, &texts)?;
+        if fixed.len() != texts.len() {
+            return Err("AI caption optimization returned a different number of lines than expected; no changes were made.".into());
+        }
+        let new_chunks: Vec<CaptionChunk> = set.chunks.iter().zip(fixed.into_iter())
+            .map(|(chunk, text)| CaptionChunk {
+                index: chunk.index,
+                text: text.trim().to_string(),
+                start_seconds: chunk.start_seconds,
+                end_seconds: chunk.end_seconds,
+            })
+            .collect();
+        let srt_text = build_srt_text(&new_chunks);
+        self.save_caption_set(video_id, set.interval_seconds, &srt_text, &new_chunks)?;
+        self.get_captions(video_id)
+    }
+
+    fn get_render_by_id(&self, render_id: &str) -> Result<ImageRender, String> {
+        self.connection.query_row(
+            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,is_final,edit_strength,mask_path,mask_used,created_at FROM image_renders WHERE id=?1",
+            [render_id],
+            |row| Ok(ImageRender {
+                id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?,
+                version: row.get(3)?, prompt_version_id: row.get(4)?, file_name: row.get(5)?,
+                relative_path: row.get(6)?, parent_render_id: row.get(7)?,
+                edit_instruction: row.get(8)?, kind: row.get(9)?,
+                is_final: row.get::<_, i64>(10)? != 0, edit_strength: row.get(11)?,
+                mask_path: row.get(12)?, mask_used: row.get::<_, i64>(13)? != 0,
+                created_at: row.get(14)?,
+            }),
+        ).map_err(|_| "Image render was not found.".to_string())
+    }
+
+    /// Builds the ffmpeg export manifest from the CURRENT timeline arrangement
+    /// (not the source visual-plan/captions tables) — export renders exactly
+    /// what's on the timeline. Returns (video_dir, manifest_path).
+    fn build_timeline_export_manifest(
+        &self,
+        video_id: &str,
+        narration_duration_seconds: f64,
+    ) -> Result<(PathBuf, PathBuf), String> {
+        let inputs = self.get_video_inputs(video_id)?;
+        let audio = inputs.audio.as_ref().ok_or("Narration audio is required to export a video.")?;
+        let channel_id: String = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let video_dir = self.projects_dir.join(&channel_id).join(video_id);
+        let narration_audio_path = video_dir.join(&audio.relative_path);
+
+        let timeline = self.get_timeline(video_id)?;
+        if timeline.clips.is_empty() {
+            return Err("Add at least one still to the timeline before exporting.".into());
+        }
+
+        let mut stills = Vec::new();
+        for clip in &timeline.clips {
+            let Some(render_id) = &clip.render_id else { continue };
+            let render = self.get_render_by_id(render_id)?;
+            let image_path = self.render_absolute_path(&render)?;
+            stills.push(json!({
+                "imagePath": image_path.to_string_lossy(),
+                "start": clip.start_seconds,
+                "end": clip.end_seconds,
+                "motion": clip.motion_preset,
+                "motionIntensity": clip.motion_intensity,
+                "transitionIn": clip.transition_in,
+                "transitionOut": clip.transition_out,
+            }));
+        }
+        if stills.is_empty() {
+            return Err("None of the stills on the timeline have a generated image yet.".into());
+        }
+        // Always open the exported video on the first still rather than a
+        // leading black segment — narration audio starting before any
+        // picture appears (from a small silence before the first sentence)
+        // reads as broken, not as an intentional pause.
+        if let Some(min_index) = stills.iter().enumerate()
+            .min_by(|(_, a), (_, b)| {
+                a["start"].as_f64().unwrap_or(0.0)
+                    .partial_cmp(&b["start"].as_f64().unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(index, _)| index)
+        {
+            if stills[min_index]["start"].as_f64().unwrap_or(0.0) > 0.0 {
+                stills[min_index]["start"] = json!(0.0);
+            }
+        }
+
+        // Captions are always burned in exactly as generated — never a user-editable
+        // copy — so export reads straight from the caption engine's own output.
+        let captions: Vec<serde_json::Value> = self
+            .get_captions(video_id)
+            .map(|set| set.chunks.iter().map(|chunk| json!({
+                "text": chunk.text,
+                "start": chunk.start_seconds,
+                "end": chunk.end_seconds,
+            })).collect())
+            .unwrap_or_default();
+
+        let settings_raw = self.get_app_setting("image_settings")?.unwrap_or_default();
+        let settings: serde_json::Value =
+            serde_json::from_str(&settings_raw).unwrap_or_else(|_| json!({}));
+        let (width, height) = match requested_aspect_ratio(&settings) {
+            "9:16" => (1080, 1920),
+            _ => (1920, 1080),
+        };
+
+        let last_still_end = timeline.clips.iter().map(|c| c.end_seconds).fold(0.0f64, f64::max);
+        let last_caption_end = captions.iter()
+            .filter_map(|c| c.get("end").and_then(|v| v.as_f64()))
+            .fold(0.0f64, f64::max);
+        let duration_seconds = [last_still_end, last_caption_end, narration_duration_seconds]
+            .into_iter()
+            .fold(0.0f64, f64::max);
+
+        let manifest = json!({
+            "width": width,
+            "height": height,
+            "fps": 30,
+            "narrationAudioPath": narration_audio_path.to_string_lossy(),
+            "stills": stills,
+            "captions": captions,
+            "durationSeconds": duration_seconds,
+        });
+
+        let work_dir = video_dir.join("export");
+        fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
+        let manifest_path = work_dir.join("manifest.json");
+        fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?,
+        ).map_err(|e| e.to_string())?;
+        Ok((video_dir, manifest_path))
+    }
+
+    pub fn export_timeline_video_with_progress<F, S>(
+        &self,
+        video_id: &str,
+        engine_dir: &Path,
+        narration_duration_seconds: f64,
+        mut on_spawn: S,
+        mut progress: F,
+    ) -> Result<PathBuf, String>
+    where
+        F: FnMut(i64, &str, &str),
+        S: FnMut(u32),
+    {
+        #[cfg(test)]
+        {
+            let _ = (engine_dir, narration_duration_seconds, &mut on_spawn);
+            progress(100, "Export ready", "test");
+            Ok(PathBuf::from("test-output.mp4"))
+        }
+        #[cfg(not(test))]
+        {
+            let (video_dir, manifest_path) =
+                self.build_timeline_export_manifest(video_id, narration_duration_seconds)?;
+            let output_path = video_dir.join("export").join("output.mp4");
+            let export_engine = engine_dir.join("auto_gen_engine/video_export_engine.py");
+            if !export_engine.exists() {
+                return Err(format!(
+                    "Internal video export engine was not found at {}.",
+                    export_engine.display()
+                ));
+            }
+            let mut command = Command::new(find_python());
+            command
+                .arg(&export_engine)
+                .arg(&manifest_path)
+                .arg("--output")
+                .arg(&output_path)
+                .current_dir(&engine_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            command.creation_flags(0x08000000);
+            let mut child = command
+                .spawn()
+                .map_err(|e| format!("Could not start the video export engine: {e}"))?;
+            on_spawn(child.id());
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or("Could not capture export engine output.")?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or("Could not capture export engine errors.")?;
+            let stderr_thread = std::thread::spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                let mut bytes = Vec::new();
+                let mut output = Vec::new();
+                loop {
+                    bytes.clear();
+                    match reader.read_until(b'\n', &mut bytes) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => output.push(String::from_utf8_lossy(&bytes).trim().to_string()),
+                    }
+                }
+                output.join("\n")
+            });
+            let mut output_lines = Vec::new();
+            let mut stdout_reader = BufReader::new(stdout);
+            let mut line_bytes = Vec::new();
+            loop {
+                line_bytes.clear();
+                let count = stdout_reader
+                    .read_until(b'\n', &mut line_bytes)
+                    .map_err(|e| format!("Could not read engine progress: {e}"))?;
+                if count == 0 {
+                    break;
+                }
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                if let Some(payload) = line.strip_prefix("AUTOGEN_PROGRESS ") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                        progress(
+                            value["percent"].as_i64().unwrap_or(0),
+                            value["stage"].as_str().unwrap_or("Exporting video"),
+                            value["detail"].as_str().unwrap_or_default(),
+                        );
+                    }
+                } else {
+                    output_lines.push(line);
+                }
+            }
+            let status = child
+                .wait()
+                .map_err(|e| format!("Could not wait for export engine: {e}"))?;
+            let raw_stderr = stderr_thread.join().unwrap_or_default();
+            if !status.success() {
+                let clean_stdout: Vec<&str> = output_lines
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|l| {
+                        !l.is_empty()
+                            && !l.chars().all(|c| "#|-% \t".contains(c))
+                            && !l.contains("iB/s")
+                            && !l.contains("eta 0:")
+                    })
+                    .collect();
+                let clean_stderr: Vec<&str> = raw_stderr
+                    .lines()
+                    .filter(|l| {
+                        !l.is_empty()
+                            && !l.contains("UserWarning")
+                            && !l.contains("warnings.warn")
+                            && !l.contains("FP16")
+                    })
+                    .collect();
+                let mut parts = clean_stdout.join("\n");
+                if !clean_stderr.is_empty() {
+                    if !parts.is_empty() {
+                        parts.push('\n');
+                    }
+                    parts.push_str(&clean_stderr.join("\n"));
+                }
+                return Err(format!("Video export failed. {parts}"));
+            }
+            if !output_path.exists() {
+                return Err("Video export finished but no output file was produced.".into());
+            }
+            Ok(output_path)
+        }
+    }
+
+    /// Exports the timeline as separate editor-ready assets (CapCut, Premiere,
+    /// etc.) instead of one baked video — each still becomes its own clip file,
+    /// stretched to close any silence gap and trimmed to its exact timeline
+    /// slot, so placing them back-to-back in order reproduces the whole
+    /// timeline without manual trimming. See `video_export_engine.py`'s
+    /// `run_bundle` for the actual asset generation.
+    pub fn export_timeline_project_with_progress<F, S>(
+        &self,
+        video_id: &str,
+        engine_dir: &Path,
+        narration_duration_seconds: f64,
+        destination_dir: &Path,
+        mut on_spawn: S,
+        mut progress: F,
+    ) -> Result<PathBuf, String>
+    where
+        F: FnMut(i64, &str, &str),
+        S: FnMut(u32),
+    {
+        #[cfg(test)]
+        {
+            let _ = (engine_dir, narration_duration_seconds, destination_dir, &mut on_spawn);
+            progress(100, "Export ready", "test");
+            Ok(PathBuf::from("test-bundle"))
+        }
+        #[cfg(not(test))]
+        {
+            let (_video_dir, manifest_path) =
+                self.build_timeline_export_manifest(video_id, narration_duration_seconds)?;
+            let export_engine = engine_dir.join("auto_gen_engine/video_export_engine.py");
+            if !export_engine.exists() {
+                return Err(format!(
+                    "Internal video export engine was not found at {}.",
+                    export_engine.display()
+                ));
+            }
+            let mut command = Command::new(find_python());
+            command
+                .arg(&export_engine)
+                .arg(&manifest_path)
+                .arg("--output")
+                .arg(destination_dir)
+                .arg("--mode")
+                .arg("bundle")
+                .current_dir(&engine_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            command.creation_flags(0x08000000);
+            let mut child = command
+                .spawn()
+                .map_err(|e| format!("Could not start the video export engine: {e}"))?;
+            on_spawn(child.id());
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or("Could not capture export engine output.")?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or("Could not capture export engine errors.")?;
+            let stderr_thread = std::thread::spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                let mut bytes = Vec::new();
+                let mut output = Vec::new();
+                loop {
+                    bytes.clear();
+                    match reader.read_until(b'\n', &mut bytes) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => output.push(String::from_utf8_lossy(&bytes).trim().to_string()),
+                    }
+                }
+                output.join("\n")
+            });
+            let mut output_lines = Vec::new();
+            let mut stdout_reader = BufReader::new(stdout);
+            let mut line_bytes = Vec::new();
+            loop {
+                line_bytes.clear();
+                let count = stdout_reader
+                    .read_until(b'\n', &mut line_bytes)
+                    .map_err(|e| format!("Could not read engine progress: {e}"))?;
+                if count == 0 {
+                    break;
+                }
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                if let Some(payload) = line.strip_prefix("AUTOGEN_PROGRESS ") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                        progress(
+                            value["percent"].as_i64().unwrap_or(0),
+                            value["stage"].as_str().unwrap_or("Exporting project"),
+                            value["detail"].as_str().unwrap_or_default(),
+                        );
+                    }
+                } else {
+                    output_lines.push(line);
+                }
+            }
+            let status = child
+                .wait()
+                .map_err(|e| format!("Could not wait for export engine: {e}"))?;
+            let raw_stderr = stderr_thread.join().unwrap_or_default();
+            if !status.success() {
+                let clean_stdout: Vec<&str> = output_lines
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|l| {
+                        !l.is_empty()
+                            && !l.chars().all(|c| "#|-% \t".contains(c))
+                            && !l.contains("iB/s")
+                            && !l.contains("eta 0:")
+                    })
+                    .collect();
+                let clean_stderr: Vec<&str> = raw_stderr
+                    .lines()
+                    .filter(|l| {
+                        !l.is_empty()
+                            && !l.contains("UserWarning")
+                            && !l.contains("warnings.warn")
+                            && !l.contains("FP16")
+                    })
+                    .collect();
+                let mut parts = clean_stdout.join("\n");
+                if !clean_stderr.is_empty() {
+                    if !parts.is_empty() {
+                        parts.push('\n');
+                    }
+                    parts.push_str(&clean_stderr.join("\n"));
+                }
+                return Err(format!("Project export failed. {parts}"));
+            }
+            if !destination_dir.exists() {
+                return Err("Project export finished but no output folder was produced.".into());
+            }
+            Ok(destination_dir.to_path_buf())
+        }
+    }
+
     pub fn move_plan_sentence(
         &self,
         video_id: &str,
@@ -4375,6 +5291,99 @@ fn request_openai_text(api_key: &str, prompt: &str) -> Result<String, String> {
     body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
         .map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
         .ok_or_else(|| "OpenAI returned no prompt text.".to_string())
+}
+
+fn to_srt_timestamp(seconds: f64) -> String {
+    let millis_total = (seconds.max(0.0) * 1000.0).round() as i64;
+    let ms = millis_total % 1000;
+    let total_seconds = millis_total / 1000;
+    let s = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let m = total_minutes % 60;
+    let h = total_minutes / 60;
+    format!("{h:02}:{m:02}:{s:02},{ms:03}")
+}
+
+fn build_srt_text(chunks: &[CaptionChunk]) -> String {
+    let mut out = String::new();
+    for chunk in chunks {
+        out.push_str(&chunk.index.to_string());
+        out.push('\n');
+        out.push_str(&to_srt_timestamp(chunk.start_seconds));
+        out.push_str(" --> ");
+        out.push_str(&to_srt_timestamp(chunk.end_seconds));
+        out.push('\n');
+        out.push_str(&chunk.text);
+        out.push_str("\n\n");
+    }
+    out
+}
+
+#[derive(Deserialize)]
+struct CaptionFixResponse {
+    lines: Vec<String>,
+}
+
+fn request_openai_caption_fix(api_key: &str, channel_name: &str, texts: &[String]) -> Result<Vec<String>, String> {
+    let input_json = serde_json::to_string(texts).map_err(|e| e.to_string())?;
+    let channel_hint = if channel_name.trim().is_empty() {
+        String::new()
+    } else {
+        format!("The channel name is \"{channel_name}\" — capitalize it correctly wherever it appears. ")
+    };
+    let count = texts.len();
+    let prompt = format!(
+        r#"You are a professional caption editor preparing burned-in video captions to industry standard.
+
+Fix ONLY capitalization in each caption line below: capitalize proper nouns (people, places, organizations, universities, brand names), capitalize "I", fix sentence-start capitalization, and correct obviously wrong casing (e.g. a proper noun written in all lowercase, or a whole line in ALL CAPS). {channel_hint}Do NOT reword anything, do NOT change punctuation beyond what capitalization requires, do NOT merge, split, add, or remove lines — return exactly the same number of lines in the same order.
+
+Input lines (JSON array, {count} items):
+{input_json}
+
+Respond with ONLY this JSON shape: {{"lines": ["<line 1>", "<line 2>", ...]}} — exactly {count} strings, same order as input."#
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build().map_err(|e| format!("Could not initialize OpenAI client: {e}"))?;
+    for attempt in 0u32..4 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(5 * 2_u64.pow(attempt - 1)));
+        }
+        let response = match client.post("https://api.openai.com/v1/chat/completions")
+            .bearer_auth(api_key)
+            .json(&json!({
+                "model": "gpt-4.1-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 8000,
+                "response_format": {"type": "json_object"}
+            }))
+            .send() {
+            Ok(r) => r,
+            Err(_) if attempt < 3 => continue,
+            Err(e) => return Err(format!("Could not reach OpenAI: {e}")),
+        };
+        let status = response.status();
+        let body: serde_json::Value = match response.json() {
+            Ok(value) => value,
+            Err(_) if attempt < 3 => continue,
+            Err(e) => return Err(format!("OpenAI returned an unreadable response: {e}")),
+        };
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            if attempt < 3 { continue; }
+            return Err(format!("OpenAI caption optimization failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("server error")));
+        }
+        if !status.is_success() {
+            return Err(format!("OpenAI caption optimization failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
+        }
+        let text = body.pointer("/choices/0/message/content").and_then(|v| v.as_str())
+            .ok_or("OpenAI returned no caption optimization result.")?;
+        let cleaned = extract_json_from_text(text);
+        let parsed: CaptionFixResponse = serde_json::from_str(cleaned)
+            .map_err(|_| "OpenAI caption optimization response was not valid JSON.".to_string())?;
+        return Ok(parsed.lines);
+    }
+    Err("OpenAI caption optimization failed after retries.".to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]

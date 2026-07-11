@@ -79,6 +79,24 @@ def build_segments(stills: list[dict], duration_seconds: float) -> list[dict]:
     return segments
 
 
+def assign_frame_counts(segments: list[dict], fps: int) -> None:
+    """Assigns each segment's exact output frame count in place, using a
+    running cumulative frame position rather than rounding each segment's own
+    duration independently. Rounding each segment in isolation loses up to
+    half a frame per segment; with dozens of stills those small errors
+    accumulate into a growing drift between the picture track and the
+    narration/captions that becomes clearly visible by the end of a long
+    video — even though each individual clip's own duration looks correct.
+    Computing each cut point from the ABSOLUTE, cumulative frame position
+    instead means the errors cancel out: the total frames across every
+    segment always exactly equals round(total_duration * fps)."""
+    cumulative_frame = 0
+    for segment in segments:
+        end_frame = round(segment["end"] * fps)
+        segment["frames"] = max(1, end_frame - cumulative_frame)
+        cumulative_frame += segment["frames"]
+
+
 def close_gaps(stills: list[dict], duration_seconds: float) -> list[dict]:
     """Stretches each still to cover through to the next one's start (and the
     first/last still out to the timeline's edges), so no silence gap is left
@@ -103,11 +121,15 @@ REFERENCE_DURATION = 5.0  # seconds — `intensity` is calibrated as the total
 
 def build_image_filter(
     motion: str, transition_in: str, transition_out: str, intensity: float,
-    width: int, height: int, fps: int, duration: float,
+    width: int, height: int, fps: int, duration: float, frames: int,
 ) -> str:
     """Ken Burns camera-movement presets via ffmpeg's zoompan filter, plus
-    optional fade-from/to-black "transitions" at the start and/or end."""
-    frames = max(1, round(duration * fps))
+    optional fade-from/to-black "transitions" at the start and/or end.
+    `frames` is the segment's cumulative-frame-accurate output length (see
+    `assign_frame_counts`) — using it here instead of re-deriving frame count
+    from `duration` keeps the zoompan animation's length exactly matching
+    what the output is actually trimmed to."""
+    frames = max(1, frames)
     amount = max(0.02, min(0.6, intensity))
     rate = amount / REFERENCE_DURATION
     max_scale = 1 + amount * 3
@@ -168,7 +190,15 @@ def run_ffmpeg(args: list[str]) -> None:
 def encode_segment(
     segment: dict, index: int, width: int, height: int, fps: int, work_dir: Path
 ) -> Path:
+    # `duration` (seconds) only bounds the input source (loop/color generator)
+    # with headroom to spare — the segment's actual output length is fixed by
+    # `-frames:v`, using the cumulative-frame-accurate count `assign_frame_counts`
+    # already computed, not by re-deriving it from a time value. Trimming
+    # output by `-t` instead would round each segment independently, which is
+    # exactly the per-clip rounding error that used to accumulate into a
+    # growing drift across many stills.
     duration = max(0.05, segment["end"] - segment["start"])
+    frames = segment["frames"]
     out_path = work_dir / f"seg_{index:04d}.ts"
     if segment["kind"] == "image":
         vf = build_image_filter(
@@ -176,23 +206,24 @@ def encode_segment(
             segment.get("transitionIn", "cut"),
             segment.get("transitionOut", "cut"),
             segment.get("motionIntensity", 0.22),
-            width, height, fps, duration,
+            width, height, fps, duration, frames,
         )
         run_ffmpeg([
-            "-y", "-loop", "1", "-t", f"{duration:.3f}", "-i", segment["path"],
+            "-y", "-loop", "1", "-t", f"{duration + 1:.3f}", "-i", segment["path"],
             # Intermediate segments are re-encoded again in the final concat
             # pass, so a low-quality intermediate compounds into a visibly
             # blurrier/blockier final export (double generation loss). A high
             # CRF here keeps this first pass close to lossless — the disk
             # cost is temporary, these files are deleted after the final pass.
             "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
-            "-r", str(fps), "-t", f"{duration:.3f}", str(out_path),
+            "-r", str(fps), "-frames:v", str(frames), str(out_path),
         ])
     else:
         run_ffmpeg([
-            "-y", "-f", "lavfi", "-t", f"{duration:.3f}",
+            "-y", "-f", "lavfi", "-t", f"{duration + 1:.3f}",
             "-i", f"color=c=black:s={width}x{height}:r={fps}",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", str(out_path),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+            "-frames:v", str(frames), str(out_path),
         ])
     return out_path
 
@@ -265,6 +296,7 @@ def run(manifest_path: Path, output_path: Path) -> None:
     segments = build_segments(stills, duration_seconds)
     if not segments:
         raise ValueError("Nothing to export — the timeline has no stills.")
+    assign_frame_counts(segments, fps)
 
     # A fade-in/out at the two hard edges of the whole export has nothing to
     # fade from/to — it just opens or closes on black — so ignore it there
@@ -379,6 +411,7 @@ def run_bundle(manifest_path: Path, destination_dir: Path) -> None:
         segments[0]["transitionIn"] = "cut"
     if segments[-1]["kind"] == "image":
         segments[-1]["transitionOut"] = "cut"
+    assign_frame_counts(segments, fps)
 
     destination_dir.mkdir(parents=True, exist_ok=True)
     clips_dir = destination_dir / "clips"

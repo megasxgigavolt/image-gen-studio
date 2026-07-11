@@ -113,6 +113,7 @@ export function TimelineView() {
   const [audioDataUrl, setAudioDataUrl] = useState<string | null>(null);
   const [renderUrls, setRenderUrls] = useState<Record<string, string>>({});
   const [narrationDuration, setNarrationDuration] = useState(0);
+  const [nativeAudioDuration, setNativeAudioDuration] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedClip, setSelectedClip] = useState<TimelineClipRecord | null>(null);
@@ -233,7 +234,13 @@ export function TimelineView() {
 
   const zoom = timeline?.zoom ?? 1;
   const pixelsPerSecond = BASE_PIXELS_PER_SECOND * zoom;
-  const totalDuration = Math.max(timeline?.durationSeconds ?? 0, narrationDuration, 1);
+  // Prefer the native <audio> element's duration (the same value export uses
+  // to determine true video length) over the Web Audio API's decoded-buffer
+  // duration used for the waveform — for compressed audio (MP3/AAC) these can
+  // differ by tens to a hundred-plus milliseconds due to encoder padding,
+  // which previously made "Extrapolate stills to fill gaps" stretch stills to
+  // a slightly-too-short duration, leaving a small trailing gap at export.
+  const totalDuration = Math.max(timeline?.durationSeconds ?? 0, nativeAudioDuration || narrationDuration, 1);
   const totalWidthPx = secondsToPixels(totalDuration, pixelsPerSecond);
   const stillsClips = [...(timeline?.clips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds);
   const captionClips = captionSet?.chunks ?? [];
@@ -631,7 +638,7 @@ export function TimelineView() {
     setExportProgress({ percent: 0, stage: "Preparing export", detail: "" });
     setError(null);
     try {
-      const duration = audioRef.current?.duration ?? narrationDuration;
+      const duration = nativeAudioDuration || narrationDuration;
       const savedPath = await projectsClient.exportTimelineVideo(activeVideoId, duration || 0, destinationPath);
       if (savedPath) addToast(`Video exported to ${savedPath}`, "success");
       setExportModal(null);
@@ -651,7 +658,7 @@ export function TimelineView() {
     setExportProgress({ percent: 0, stage: "Preparing export", detail: "" });
     setError(null);
     try {
-      const duration = audioRef.current?.duration ?? narrationDuration;
+      const duration = nativeAudioDuration || narrationDuration;
       const savedPath = await projectsClient.exportTimelineProject(activeVideoId, duration || 0, destinationPath);
       addToast(`Project assets exported to ${savedPath}`, "success");
       setExportModal(null);
@@ -977,7 +984,13 @@ export function TimelineView() {
           </div>
         </div>
       )}
-      <audio ref={audioRef} src={audioDataUrl ?? undefined} style={{ display: "none" }} onEnded={() => pausePreview()} />
+      <audio
+        ref={audioRef}
+        src={audioDataUrl ?? undefined}
+        style={{ display: "none" }}
+        onEnded={() => pausePreview()}
+        onLoadedMetadata={(event) => setNativeAudioDuration(event.currentTarget.duration || 0)}
+      />
     </section>
   );
 }

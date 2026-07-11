@@ -591,16 +591,20 @@ export const projectsClient = {
     if (isTauri()) return invoke("clear_timeline_track", { videoId, track });
     throw new Error("Timeline requires the native application.");
   },
-  async exportTimelineVideo(videoId: string, narrationDurationSeconds: number, destinationPath: string): Promise<string | null> {
-    if (isTauri()) return invoke("export_timeline_video", { videoId, narrationDurationSeconds, destinationPath });
+  async probeNarrationDuration(videoId: string): Promise<number> {
+    if (isTauri()) return invoke("probe_narration_duration", { videoId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async exportTimelineVideo(videoId: string, destinationPath: string): Promise<string | null> {
+    if (isTauri()) return invoke("export_timeline_video", { videoId, destinationPath });
     throw new Error("Video export requires the native application.");
   },
   async pickExportProjectDestination(): Promise<string | null> {
     if (isTauri()) return invoke("pick_export_project_destination");
     return null;
   },
-  async exportTimelineProject(videoId: string, narrationDurationSeconds: number, destinationPath: string): Promise<string> {
-    if (isTauri()) return invoke("export_timeline_project", { videoId, narrationDurationSeconds, destinationPath });
+  async exportTimelineProject(videoId: string, destinationPath: string): Promise<string> {
+    if (isTauri()) return invoke("export_timeline_project", { videoId, destinationPath });
     throw new Error("Project export requires the native application.");
   },
   async cancelTimelineExport(videoId: string): Promise<boolean> {

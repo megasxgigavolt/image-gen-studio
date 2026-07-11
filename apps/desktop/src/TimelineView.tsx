@@ -607,7 +607,17 @@ export function TimelineView() {
 
   async function extrapolateStills() {
     if (!activeVideoId) return;
-    await refresh(projectsClient.extrapolateStillsToFillGaps(activeVideoId, totalDuration));
+    // Use ffmpeg's own measured duration (the same value export computes
+    // video length from) rather than a browser-measured one, so extrapolated
+    // stills always reach exactly as far as the exported audio/captions do.
+    let duration = totalDuration;
+    try {
+      duration = await projectsClient.probeNarrationDuration(activeVideoId);
+    } catch {
+      // No narration audio yet, or the probe failed — fall back rather than
+      // blocking the action entirely.
+    }
+    await refresh(projectsClient.extrapolateStillsToFillGaps(activeVideoId, duration));
     addToast("Stills stretched to close every gap.", "success");
   }
 
@@ -638,8 +648,7 @@ export function TimelineView() {
     setExportProgress({ percent: 0, stage: "Preparing export", detail: "" });
     setError(null);
     try {
-      const duration = nativeAudioDuration || narrationDuration;
-      const savedPath = await projectsClient.exportTimelineVideo(activeVideoId, duration || 0, destinationPath);
+      const savedPath = await projectsClient.exportTimelineVideo(activeVideoId, destinationPath);
       if (savedPath) addToast(`Video exported to ${savedPath}`, "success");
       setExportModal(null);
     } catch (caught) {
@@ -658,8 +667,7 @@ export function TimelineView() {
     setExportProgress({ percent: 0, stage: "Preparing export", detail: "" });
     setError(null);
     try {
-      const duration = nativeAudioDuration || narrationDuration;
-      const savedPath = await projectsClient.exportTimelineProject(activeVideoId, duration || 0, destinationPath);
+      const savedPath = await projectsClient.exportTimelineProject(activeVideoId, destinationPath);
       addToast(`Project assets exported to ${savedPath}`, "success");
       setExportModal(null);
     } catch (caught) {

@@ -437,12 +437,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="video_export_engine",
         description="Composite a timeline arrangement of stills, captions, and narration audio into a final MP4, "
-                     "or export it as separate editor-ready assets (--mode bundle).",
+                     "or export it as separate editor-ready assets (--mode bundle), "
+                     "or just report an audio file's real duration (--mode probe).",
     )
-    parser.add_argument("manifest", help="Path to the timeline export manifest JSON")
-    parser.add_argument("--output", required=True, metavar="PATH", help="Output video path, or destination folder for --mode bundle")
-    parser.add_argument("--mode", choices=["video", "bundle"], default="video", help="'video' bakes one MP4 (default); 'bundle' exports separate clip/audio/caption assets")
+    parser.add_argument("manifest", help="Path to the timeline export manifest JSON, or an audio file path for --mode probe")
+    parser.add_argument("--output", metavar="PATH", help="Output video path, or destination folder for --mode bundle (unused for --mode probe)")
+    parser.add_argument("--mode", choices=["video", "bundle", "probe"], default="video", help="'video' bakes one MP4 (default); 'bundle' exports separate clip/audio/caption assets; 'probe' reports an audio file's real duration")
     return parser
+
+
+def run_probe(audio_path: Path) -> None:
+    """Prints the audio file's real ffmpeg-measured duration (seconds) to
+    stdout. Browser-side duration measurements (Web Audio API, <audio>
+    element) can each disagree with ffmpeg's own duration for compressed
+    audio by tens to a hundred-plus milliseconds — this is the single
+    authoritative value the app uses everywhere duration matters (export and
+    "Extrapolate stills to fill gaps"), so the two can never disagree."""
+    # `ffmpeg -i` with no output always exits non-zero (nothing to encode to) —
+    # that's expected here, we only need the "Duration: HH:MM:SS.ss" line it
+    # prints to stderr regardless of exit status.
+    result = subprocess.run(
+        ["ffmpeg", "-i", str(audio_path), "-hide_banner"],
+        capture_output=True, text=True, **_subprocess_kwargs(),
+    )
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+    if not match:
+        raise RuntimeError(f"Could not determine audio duration: {result.stderr[-500:]}")
+    hours, minutes, seconds = match.groups()
+    total_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    print(f"{total_seconds:.6f}", flush=True)
 
 
 if __name__ == "__main__":
@@ -451,8 +474,12 @@ if __name__ == "__main__":
         cli_parser.print_help()
         sys.exit(0)
     args = cli_parser.parse_args()
+    if args.mode != "probe" and not args.output:
+        cli_parser.error("--output is required for --mode video/bundle")
     try:
-        if args.mode == "bundle":
+        if args.mode == "probe":
+            run_probe(Path(args.manifest).expanduser().resolve())
+        elif args.mode == "bundle":
             run_bundle(Path(args.manifest).expanduser().resolve(), Path(args.output).expanduser().resolve())
         else:
             run(Path(args.manifest).expanduser().resolve(), Path(args.output).expanduser().resolve())

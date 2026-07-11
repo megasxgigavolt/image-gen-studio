@@ -4608,7 +4608,7 @@ Return JSON only:
     fn build_timeline_export_manifest(
         &self,
         video_id: &str,
-        narration_duration_seconds: f64,
+        engine_dir: &Path,
     ) -> Result<(PathBuf, PathBuf), String> {
         let inputs = self.get_video_inputs(video_id)?;
         let audio = inputs.audio.as_ref().ok_or("Narration audio is required to export a video.")?;
@@ -4617,6 +4617,13 @@ Return JSON only:
         ).map_err(|e| e.to_string())?;
         let video_dir = self.projects_dir.join(&channel_id).join(video_id);
         let narration_audio_path = video_dir.join(&audio.relative_path);
+        // Ask ffmpeg itself for the narration's real duration rather than
+        // trusting a browser-measured value — browser APIs (Web Audio,
+        // <audio> element) can each disagree with ffmpeg's own duration for
+        // compressed audio by tens to a hundred-plus milliseconds, which
+        // previously made exported/extrapolated stills fall slightly short
+        // of the actual audio length.
+        let narration_duration_seconds = Self::probe_audio_duration(engine_dir, &narration_audio_path)?;
 
         let timeline = self.get_timeline(video_id)?;
         if timeline.clips.is_empty() {
@@ -4705,11 +4712,64 @@ Return JSON only:
         Ok((video_dir, manifest_path))
     }
 
+    /// The ffmpeg-measured duration of this video's narration audio — the
+    /// same authoritative value export uses. Exposed so "Extrapolate stills
+    /// to fill gaps" targets exactly what export will, instead of a
+    /// browser-measured duration that can disagree with ffmpeg by tens to a
+    /// hundred-plus milliseconds for compressed audio.
+    pub fn probe_narration_duration_seconds(&self, video_id: &str, engine_dir: &Path) -> Result<f64, String> {
+        let inputs = self.get_video_inputs(video_id)?;
+        let audio = inputs.audio.as_ref().ok_or("Narration audio is required.")?;
+        let channel_id: String = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let audio_path = self.projects_dir.join(&channel_id).join(video_id).join(&audio.relative_path);
+        Self::probe_audio_duration(engine_dir, &audio_path)
+    }
+
+    fn probe_audio_duration(engine_dir: &Path, audio_path: &Path) -> Result<f64, String> {
+        #[cfg(test)]
+        {
+            let _ = (engine_dir, audio_path);
+            Ok(1.0)
+        }
+        #[cfg(not(test))]
+        {
+            let export_engine = engine_dir.join("auto_gen_engine/video_export_engine.py");
+            if !export_engine.exists() {
+                return Err(format!(
+                    "Internal video export engine was not found at {}.",
+                    export_engine.display()
+                ));
+            }
+            let mut command = Command::new(find_python());
+            command
+                .arg(&export_engine)
+                .arg(audio_path)
+                .arg("--mode")
+                .arg("probe")
+                .current_dir(engine_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            command.creation_flags(0x08000000);
+            let output = command
+                .output()
+                .map_err(|e| format!("Could not start the video export engine: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Could not determine narration duration: {}", stderr.trim()));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.trim().parse::<f64>()
+                .map_err(|_| format!("Could not parse narration duration from engine output: {}", stdout.trim()))
+        }
+    }
+
     pub fn export_timeline_video_with_progress<F, S>(
         &self,
         video_id: &str,
         engine_dir: &Path,
-        narration_duration_seconds: f64,
         mut on_spawn: S,
         mut progress: F,
     ) -> Result<PathBuf, String>
@@ -4719,14 +4779,14 @@ Return JSON only:
     {
         #[cfg(test)]
         {
-            let _ = (engine_dir, narration_duration_seconds, &mut on_spawn);
+            let _ = (engine_dir, &mut on_spawn);
             progress(100, "Export ready", "test");
             Ok(PathBuf::from("test-output.mp4"))
         }
         #[cfg(not(test))]
         {
             let (video_dir, manifest_path) =
-                self.build_timeline_export_manifest(video_id, narration_duration_seconds)?;
+                self.build_timeline_export_manifest(video_id, engine_dir)?;
             let output_path = video_dir.join("export").join("output.mp4");
             let export_engine = engine_dir.join("auto_gen_engine/video_export_engine.py");
             if !export_engine.exists() {
@@ -4845,7 +4905,6 @@ Return JSON only:
         &self,
         video_id: &str,
         engine_dir: &Path,
-        narration_duration_seconds: f64,
         destination_dir: &Path,
         mut on_spawn: S,
         mut progress: F,
@@ -4856,14 +4915,14 @@ Return JSON only:
     {
         #[cfg(test)]
         {
-            let _ = (engine_dir, narration_duration_seconds, destination_dir, &mut on_spawn);
+            let _ = (engine_dir, destination_dir, &mut on_spawn);
             progress(100, "Export ready", "test");
             Ok(PathBuf::from("test-bundle"))
         }
         #[cfg(not(test))]
         {
             let (_video_dir, manifest_path) =
-                self.build_timeline_export_manifest(video_id, narration_duration_seconds)?;
+                self.build_timeline_export_manifest(video_id, engine_dir)?;
             let export_engine = engine_dir.join("auto_gen_engine/video_export_engine.py");
             if !export_engine.exists() {
                 return Err(format!(

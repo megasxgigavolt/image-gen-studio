@@ -1295,11 +1295,34 @@ fn save_captions_file(
 }
 
 #[tauri::command]
+async fn probe_narration_duration(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<f64, String> {
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
+    let engine_dir = if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../services/python-engine")
+    } else {
+        app.path()
+            .resource_dir()
+            .map_err(|e| format!("Could not locate app resource directory: {e}"))?
+            .join("python-engine")
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.probe_narration_duration_seconds(&video_id, &engine_dir)
+    })
+    .await
+    .map_err(|error| format!("Duration probe worker stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
 async fn export_timeline_video(
     app: tauri::AppHandle,
     state: State<'_, RepositoryState>,
     video_id: String,
-    narration_duration_seconds: f64,
     destination_path: String,
 ) -> Result<Option<String>, String> {
     let (database_path, projects_dir) = {
@@ -1328,7 +1351,6 @@ async fn export_timeline_video(
             let result = repository.export_timeline_video_with_progress(
                 &video_id,
                 &engine_dir,
-                narration_duration_seconds,
                 move |pid| {
                     let jobs = pid_app.state::<ExportJobsState>();
                     jobs.lock()
@@ -1366,7 +1388,6 @@ async fn export_timeline_project(
     app: tauri::AppHandle,
     state: State<'_, RepositoryState>,
     video_id: String,
-    narration_duration_seconds: f64,
     destination_path: String,
 ) -> Result<String, String> {
     let (database_path, projects_dir) = {
@@ -1395,7 +1416,6 @@ async fn export_timeline_project(
         let result = repository.export_timeline_project_with_progress(
             &video_id,
             &engine_dir,
-            narration_duration_seconds,
             &destination_dir,
             move |pid| {
                 let jobs = pid_app.state::<ExportJobsState>();
@@ -1753,6 +1773,7 @@ pub fn run() {
             delete_timeline_clip,
             delete_timeline_caption_clip,
             clear_timeline_track,
+            probe_narration_duration,
             export_timeline_video,
             pick_export_project_destination,
             export_timeline_project,

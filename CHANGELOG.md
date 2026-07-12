@@ -230,3 +230,12 @@
 - Removed API-secret entry from the frontend; backend environment credentials are stored securely.
 - Hid unavailable downstream screens and marked Timeline as in production.
 - Corrected video-card spacing and tightened typography to match the product mockup.
+# 2.1.0
+
+- Added Veo 3 image-to-video animation generation from any timeline still, with 720p/1080p resolution selection.
+- Added automatic duration selection (Veo's fixed 4s/6s/8s clips) based on the still's timeline slot, with immediate trimming for slots under 4s.
+- Added an "Adjust animation to duration" control that stretches a generated clip to exactly fill its timeline slot.
+- Added an editable animation prompt with an AI "Suggest prompt" action grounded in the still's narration and existing image description.
+- Added Undo/Restore for generated animations — reverting to the still keeps the animation cached until a new one is generated.
+- Added live video playback of animation clips on the timeline preview canvas.
+- Fixed a Timeline UI misalignment where the Animations tab heading and the zoom/camera-intensity sliders picked up unrelated global CSS.

@@ -1,5 +1,6 @@
 import {
   Clapperboard,
+  Clock,
   Download,
   ImageOff,
   LoaderCircle,
@@ -8,12 +9,14 @@ import {
   Pause,
   Play,
   Plus,
+  Redo2,
   Scissors,
   Shuffle,
   SlidersHorizontal,
   Sparkles,
   Square,
   Trash2,
+  Undo2,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
@@ -21,15 +24,19 @@ import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { useAppStore } from "./store/app-store";
 import { formatTime, pixelsToSeconds, secondsToPixels } from "./domain/timecode";
-import { getCachedData, resolveAssetUrl, resolveRenderUrl, setCachedData } from "./infrastructure/media-cache";
+import { pickVeoDuration } from "./domain/animation";
+import { getCachedData, resolveAssetUrl, resolveRenderUrl, resolveVideoAssetUrl, setCachedData } from "./infrastructure/media-cache";
 import {
   projectsClient,
+  type AnimationJobRecord,
   type CaptionSetRecord,
   type ImageRenderRecord,
   type ImageWorkspaceRecord,
   type MotionPreset,
   type TimelineClipRecord,
   type TimelineRecord,
+  type VeoResolution,
+  type VideoAssetRecord,
 } from "./infrastructure/projects-client";
 
 const BASE_PIXELS_PER_SECOND = 40;
@@ -124,14 +131,24 @@ export function TimelineView() {
   const [canvasSize, setCanvasSize] = useState({ width: 960, height: 540 });
   const [previewTime, setPreviewTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [sourceTab, setSourceTab] = useState<"stills" | "broll">("stills");
+  const [sourceTab, setSourceTab] = useState<"stills" | "animations">("stills");
   const [inspectorTab, setInspectorTab] = useState<"clip" | "global">("clip");
   const [globalIntensity, setGlobalIntensity] = useState(0.22);
+  const [videoAssetUrls, setVideoAssetUrls] = useState<Record<string, string>>({});
+  const [animationResolution, setAnimationResolution] = useState<VeoResolution>("720p");
+  const [animationPrompt, setAnimationPrompt] = useState("");
+  const [suggestingPrompt, setSuggestingPrompt] = useState(false);
+  const [animationJob, setAnimationJob] = useState<AnimationJobRecord | null>(null);
+  const [selectedClipVideoAsset, setSelectedClipVideoAsset] = useState<VideoAssetRecord | null>(null);
+  const [retiming, setRetiming] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
   const imageElsRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const videoElsRef = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const activeVideoElRef = useRef<HTMLVideoElement | null>(null);
+  const activeAnimationAssetIdRef = useRef<string | null>(null);
   const previewTimeRef = useRef(0);
   const isPlayingRef = useRef(false);
   const playStartRef = useRef<{ wallStart: number; timeStart: number } | null>(null);
@@ -216,12 +233,42 @@ export function TimelineView() {
   }, [timeline, renderUrls]);
 
   useEffect(() => {
+    const videoAssetIds = (timeline?.clips ?? []).map((clip) => clip.videoAssetId).filter(Boolean) as string[];
+    void Promise.all(videoAssetIds.filter((id) => !videoAssetUrls[id]).map(async (id) => {
+      const url = await resolveVideoAssetUrl(id);
+      setVideoAssetUrls((current) => ({ ...current, [id]: url }));
+    }));
+  }, [timeline, videoAssetUrls]);
+
+  useEffect(() => {
     if (!selectedClip || !activeVideoId) {
       setSelectedClipRenders([]);
       return;
     }
     void projectsClient.listImageRenders(activeVideoId, selectedClip.groupId).then(setSelectedClipRenders).catch(() => setSelectedClipRenders([]));
   }, [selectedClip, activeVideoId]);
+
+  // Clear any typed/suggested animation prompt when the selection moves to a
+  // different clip — a prompt written for one still shouldn't silently apply
+  // to the next one the user picks.
+  useEffect(() => {
+    setAnimationPrompt("");
+  }, [selectedClip?.id]);
+
+  // Fetches the animation clip's real stored duration so the inspector can
+  // tell whether it still matches the slot it currently occupies (the slot
+  // may have been resized since the last generation/retime).
+  useEffect(() => {
+    if (!selectedClip || selectedClip.clipKind !== "animation" || !selectedClip.videoAssetId) {
+      setSelectedClipVideoAsset(null);
+      return;
+    }
+    let cancelled = false;
+    void projectsClient.getVideoAssetRecord(selectedClip.videoAssetId)
+      .then((asset) => { if (!cancelled) setSelectedClipVideoAsset(asset); })
+      .catch(() => { if (!cancelled) setSelectedClipVideoAsset(null); });
+    return () => { cancelled = true; };
+  }, [selectedClip]);
 
   // Keep the selected clip's snapshot in sync after any mutation (motion,
   // transition, version swap, resize) so the inspector reflects it live.
@@ -333,6 +380,20 @@ export function TimelineView() {
     });
   }
 
+  function getOrLoadVideo(url: string): HTMLVideoElement {
+    const cache = videoElsRef.current;
+    let video = cache.get(url);
+    if (!video) {
+      video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = "auto";
+      video.src = url;
+      cache.set(url, video);
+    }
+    return video;
+  }
+
   function drawFrame(time: number) {
     const canvas = previewCanvasRef.current;
     if (!canvas) return;
@@ -341,7 +402,47 @@ export function TimelineView() {
     ctx.fillStyle = "#000000";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     const clip = findClipAtTime(stillsClips, time);
-    if (clip?.renderId) {
+
+    // Live playback of a generated animation clip draws real video frames;
+    // while paused/scrubbing it falls through to the poster-frame path below
+    // (renderId still points at the source still for every animation clip).
+    let drewVideoFrame = false;
+    const isAnimationClip = clip?.clipKind === "animation" && !!clip.videoAssetId;
+    if (activeVideoElRef.current && (!isAnimationClip || activeAnimationAssetIdRef.current !== clip?.videoAssetId)) {
+      activeVideoElRef.current.pause();
+      activeVideoElRef.current = null;
+      activeAnimationAssetIdRef.current = null;
+    }
+    if (isAnimationClip && isPlayingRef.current) {
+      const videoUrl = videoAssetUrls[clip.videoAssetId as string];
+      if (videoUrl) {
+        const video = getOrLoadVideo(videoUrl);
+        activeVideoElRef.current = video;
+        activeAnimationAssetIdRef.current = clip.videoAssetId as string;
+        const elapsedSeconds = Math.max(0, time - clip.startSeconds);
+        if (Math.abs(video.currentTime - elapsedSeconds) > 0.15) {
+          video.currentTime = elapsedSeconds;
+        }
+        if (video.paused) void video.play().catch(() => {});
+        if (video.readyState >= 2 && video.videoWidth && video.videoHeight) {
+          const scale = Math.min(canvas.width / video.videoWidth, canvas.height / video.videoHeight);
+          const w = video.videoWidth * scale;
+          const h = video.videoHeight * scale;
+          ctx.drawImage(video, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
+          drewVideoFrame = true;
+          const clipDuration = clip.endSeconds - clip.startSeconds;
+          const overlayAlpha = fadeOverlayAlpha(clip.transitionIn, clip.transitionOut, elapsedSeconds, clipDuration);
+          if (overlayAlpha > 0) {
+            ctx.globalAlpha = overlayAlpha;
+            ctx.fillStyle = "#000000";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.globalAlpha = 1;
+          }
+        }
+      }
+    }
+
+    if (!drewVideoFrame && clip?.renderId) {
       const url = renderUrls[clip.renderId];
       const img = url ? getOrLoadImage(url) : null;
       if (img) {
@@ -385,7 +486,7 @@ export function TimelineView() {
 
   useEffect(() => {
     drawFrameRef.current(previewTimeRef.current);
-  }, [stillsClips, captionClips, renderUrls, canvasSize]);
+  }, [stillsClips, captionClips, renderUrls, videoAssetUrls, canvasSize]);
 
   useEffect(() => {
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
@@ -439,6 +540,7 @@ export function TimelineView() {
     isPlayingRef.current = false;
     setIsPlaying(false);
     audioRef.current?.pause();
+    activeVideoElRef.current?.pause();
     playStartRef.current = null;
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
   }
@@ -621,6 +723,93 @@ export function TimelineView() {
     addToast("Stills stretched to close every gap.", "success");
   }
 
+  async function generateAnimation() {
+    if (!activeVideoId || !selectedClip || selectedClip.clipKind !== "still") return;
+    try {
+      setError(null);
+      setAnimationJob(await projectsClient.createAnimationJob(activeVideoId, selectedClip.id, animationResolution, animationPrompt));
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  async function suggestAnimationPrompt() {
+    if (!activeVideoId || !selectedClip || selectedClip.clipKind !== "still") return;
+    setSuggestingPrompt(true);
+    setError(null);
+    try {
+      setAnimationPrompt(await projectsClient.suggestAnimationPrompt(activeVideoId, selectedClip.groupId));
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setSuggestingPrompt(false);
+    }
+  }
+
+  async function cancelAnimationGeneration() {
+    if (!animationJob) return;
+    await projectsClient.controlAnimationJob(animationJob.id, "stop");
+  }
+
+  useEffect(() => {
+    if (!animationJob || !activeVideoId || !["queued", "running"].includes(animationJob.status)) return;
+    let cancelled = false;
+    const interval = window.setInterval(async () => {
+      try {
+        const latest = await projectsClient.getLatestAnimationJob(activeVideoId);
+        if (cancelled || !latest) return;
+        setAnimationJob(latest);
+        if (latest.status === "completed") {
+          addToast("Animation generated.", "success");
+          await refresh(projectsClient.getTimeline(activeVideoId));
+        } else if (latest.status === "failed") {
+          const failedItem = latest.items.find((item) => item.status === "failed");
+          setError(failedItem?.lastError ?? "Animation generation failed.");
+        }
+      } catch {
+        // Transient — keep polling until it settles.
+      }
+    }, 1500);
+    return () => { cancelled = true; window.clearInterval(interval); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [animationJob?.id, animationJob?.status, activeVideoId]);
+
+  async function adjustAnimationToDuration() {
+    if (!activeVideoId || !selectedClip) return;
+    setRetiming(true);
+    setError(null);
+    try {
+      await refresh(projectsClient.retimeAnimationClip(activeVideoId, selectedClip.id));
+      addToast("Animation stretched to fill its timeline slot.", "success");
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setRetiming(false);
+    }
+  }
+
+  async function undoAnimation() {
+    if (!activeVideoId || !selectedClip) return;
+    setError(null);
+    try {
+      await refresh(projectsClient.revertAnimationClipToStill(activeVideoId, selectedClip.id));
+      addToast("Reverted to the still — the animation stays cached until you generate a new one.", "success");
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  async function restoreAnimation() {
+    if (!activeVideoId || !selectedClip) return;
+    setError(null);
+    try {
+      await refresh(projectsClient.restoreAnimationClip(activeVideoId, selectedClip.id));
+      addToast("Cached animation restored.", "success");
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
   useEffect(() => {
     if (!exporting || !activeVideoId) return;
     let unlisten: (() => void) | undefined;
@@ -714,7 +903,7 @@ export function TimelineView() {
           <aside className="tl-media-pane">
             <div className="tl-source-tabs">
               <button className={sourceTab === "stills" ? "tl-source-tab active" : "tl-source-tab"} onClick={() => setSourceTab("stills")}>Stills</button>
-              <button className={sourceTab === "broll" ? "tl-source-tab active" : "tl-source-tab"} onClick={() => setSourceTab("broll")}>B-roll</button>
+              <button className={sourceTab === "animations" ? "tl-source-tab active" : "tl-source-tab"} onClick={() => setSourceTab("animations")}>Animations</button>
             </div>
             {sourceTab === "stills" && (
               <div className="tl-source-section">
@@ -735,14 +924,61 @@ export function TimelineView() {
                 </div>
               </div>
             )}
-            {sourceTab === "broll" && (
+            {sourceTab === "animations" && (
               <div className="tl-source-section tl-broll-panel">
-                <strong><Clapperboard size={14} />B-roll<span className="tl-soon-badge">Coming soon</span></strong>
-                <p className="tl-source-hint">
-                  A dedicated lane for cutting away to supplementary footage between stills — without disturbing your
-                  arrangement — is on the way. This tab is reserved for it.
-                </p>
-                <button className="secondary" disabled><Clapperboard size={14} />Upload B-roll clip</button>
+                <strong><Clapperboard size={14} />Animations</strong>
+                {selectedClip && selectedClip.clipKind === "still" ? (
+                  <>
+                    <div className="tl-source-thumb-preview">
+                      {selectedClip.renderId && renderUrls[selectedClip.renderId]
+                        ? <img src={renderUrls[selectedClip.renderId]} alt="" />
+                        : <ImageOff size={16} />}
+                    </div>
+                    <div className="tl-inspector-group">
+                      <span className="tl-inspector-label">Resolution</span>
+                      <div className="tl-preset-grid two">
+                        {(["720p", "1080p"] as VeoResolution[]).map((option) => (
+                          <button
+                            key={option}
+                            className={animationResolution === option ? "tl-preset-btn active" : "tl-preset-btn"}
+                            onClick={() => setAnimationResolution(option)}
+                          >
+                            <span>{option}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="tl-inspector-group">
+                      <div className="tl-inspector-label-row">
+                        <span className="tl-inspector-label">Animation prompt</span>
+                        <button className="tl-apply-all-btn" disabled={suggestingPrompt} onClick={() => void suggestAnimationPrompt()}>
+                          {suggestingPrompt ? "Suggesting…" : "Suggest prompt"}
+                        </button>
+                      </div>
+                      <textarea
+                        className="tl-prompt-textarea"
+                        placeholder="Describe the motion to add (camera drift, wind, gestures…) — leave blank to let Veo decide, or click Suggest prompt for an AI variation based on this still's narration."
+                        value={animationPrompt}
+                        onChange={(event) => setAnimationPrompt(event.target.value)}
+                        rows={4}
+                      />
+                      <p className="tl-source-hint">
+                        This exact text is sent to Veo alongside the still. Edit it freely, or click "Suggest prompt"
+                        again for a different variation grounded in this still's narration.
+                      </p>
+                    </div>
+                    <p className="tl-source-hint">
+                      Veo only generates 4s, 6s, or 8s clips — this will generate as{" "}
+                      {pickVeoDuration(selectedClip.endSeconds - selectedClip.startSeconds)}s. Use "Adjust animation to
+                      duration" afterward to stretch it to exactly fill this {formatTime(selectedClip.endSeconds - selectedClip.startSeconds)} slot.
+                    </p>
+                    <button className="primary full" onClick={() => void generateAnimation()}>
+                      <Clapperboard size={14} />Generate Animation
+                    </button>
+                  </>
+                ) : (
+                  <p className="tl-source-hint">Select a still on the timeline to animate it.</p>
+                )}
               </div>
             )}
           </aside>
@@ -827,25 +1063,72 @@ export function TimelineView() {
                     </div>
                   </div>
                 )}
-                <div className="tl-inspector-group">
-                  <div className="tl-inspector-label-row">
-                    <span className="tl-inspector-label"><Move size={12} />Camera movement</span>
-                    <button className="tl-apply-all-btn" onClick={() => void applyMotionToAll()}>Apply to all</button>
+                {selectedClip.clipKind === "animation" && (
+                  <div className="tl-inspector-group">
+                    <span className="tl-inspector-label">Prompt sent to Veo</span>
+                    <p className="tl-source-hint tl-prompt-readout">
+                      {selectedClipVideoAsset?.prompt ? selectedClipVideoAsset.prompt : "(no prompt — Veo decided the motion on its own)"}
+                    </p>
                   </div>
-                  <div className="tl-preset-grid two">
-                    {MOTION_OPTIONS.map((option) => (
-                      <button
-                        key={option.value}
-                        className={selectedClip.motionPreset === option.value ? "tl-preset-btn active" : "tl-preset-btn"}
-                        onClick={() => void setMotion(option.value)}
-                        title={option.label}
-                      >
-                        <option.icon size={13} />
-                        <span>{option.label}</span>
-                      </button>
-                    ))}
+                )}
+                {selectedClip.clipKind === "animation" && (
+                  <div className="tl-inspector-group">
+                    <span className="tl-inspector-label"><Clock size={12} />Animation duration</span>
+                    {selectedClipVideoAsset && Math.abs(selectedClipVideoAsset.actualDurationSeconds - (selectedClip.endSeconds - selectedClip.startSeconds)) > 0.05 ? (
+                      <>
+                        <p className="tl-source-hint">
+                          Doesn't match its slot ({selectedClipVideoAsset.actualDurationSeconds.toFixed(1)}s vs{" "}
+                          {(selectedClip.endSeconds - selectedClip.startSeconds).toFixed(1)}s).
+                        </p>
+                        <button className="secondary" disabled={retiming} onClick={() => void adjustAnimationToDuration()}>
+                          <Clock size={14} />{retiming ? "Adjusting…" : "Adjust animation to duration"}
+                        </button>
+                      </>
+                    ) : (
+                      <p className="tl-source-hint">Matches its timeline slot.</p>
+                    )}
                   </div>
-                </div>
+                )}
+                {selectedClip.clipKind === "animation" && (
+                  <div className="tl-inspector-group">
+                    <button className="secondary" onClick={() => void undoAnimation()}>
+                      <Undo2 size={14} />Undo animation
+                    </button>
+                    <p className="tl-source-hint">
+                      Reverts to the still. The generated animation stays cached — restore it any time from the
+                      Animations tab, unless you generate a new one first.
+                    </p>
+                  </div>
+                )}
+                {selectedClip.clipKind === "still" && selectedClip.videoAssetId && (
+                  <div className="tl-inspector-group">
+                    <button className="secondary" onClick={() => void restoreAnimation()}>
+                      <Redo2 size={14} />Restore cached animation
+                    </button>
+                    <p className="tl-source-hint">A previously generated animation for this still is cached and ready to bring back.</p>
+                  </div>
+                )}
+                {selectedClip.clipKind !== "animation" && (
+                  <div className="tl-inspector-group">
+                    <div className="tl-inspector-label-row">
+                      <span className="tl-inspector-label"><Move size={12} />Camera movement</span>
+                      <button className="tl-apply-all-btn" onClick={() => void applyMotionToAll()}>Apply to all</button>
+                    </div>
+                    <div className="tl-preset-grid two">
+                      {MOTION_OPTIONS.map((option) => (
+                        <button
+                          key={option.value}
+                          className={selectedClip.motionPreset === option.value ? "tl-preset-btn active" : "tl-preset-btn"}
+                          onClick={() => void setMotion(option.value)}
+                          title={option.label}
+                        >
+                          <option.icon size={13} />
+                          <span>{option.label}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div className="tl-inspector-group">
                   <div className="tl-inspector-label-row">
                     <span className="tl-inspector-label"><Sparkles size={12} />Transition in</span>
@@ -936,6 +1219,7 @@ export function TimelineView() {
                       {clip.renderId && renderUrls[clip.renderId] ? <img src={renderUrls[clip.renderId]} alt="" draggable={false} /> : <span className="tl-clip-fallback">{clip.label}</span>}
                       {clip.transitionIn === "fade" && <span className="tl-clip-badge tl-clip-badge-fade" title="Fade in"><Sparkles size={10} /></span>}
                       {clip.motionPreset !== "none" && <span className="tl-clip-badge tl-clip-badge-motion" title={`Camera: ${motionLabel(clip.motionPreset)}`}><Move size={10} /></span>}
+                      {clip.clipKind === "animation" && <span className="tl-clip-badge tl-clip-badge-animation" title="Animated with Veo"><Clapperboard size={10} /></span>}
                     </div>
                   ))}
                 </div>
@@ -989,6 +1273,18 @@ export function TimelineView() {
             <span>{exportProgress.detail || "Starting the export engine…"}</span>
             <div className="loading-bar determinate"><i style={{ width: `${exportProgress.percent}%` }} /></div>
             <button className="secondary" style={{ marginTop: "14px" }} onClick={() => void cancelExport()}><Square size={13} />Stop</button>
+          </div>
+        </div>
+      )}
+      {animationJob && (animationJob.status === "queued" || animationJob.status === "running") && (
+        <div className="loading-overlay" role="status" aria-live="polite">
+          <div className="loading-card generation-progress">
+            <div className="progress-heading">
+              <LoaderCircle className="spin" size={26} />
+              <strong>Generating animation</strong>
+            </div>
+            <span>Veo is animating your still at {animationResolution} — this can take a few minutes.</span>
+            <button className="secondary" style={{ marginTop: "14px" }} onClick={() => void cancelAnimationGeneration()}><Square size={13} />Stop</button>
           </div>
         </div>
       )}

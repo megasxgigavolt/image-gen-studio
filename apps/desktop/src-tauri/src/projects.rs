@@ -316,6 +316,70 @@ ALTER TABLE timeline_clips ADD COLUMN transition_out TEXT NOT NULL DEFAULT 'cut'
 ALTER TABLE timeline_clips ADD COLUMN motion_intensity REAL NOT NULL DEFAULT 0.22;
 "#;
 
+const MIGRATION_017: &str = r#"
+ALTER TABLE timeline_clips ADD COLUMN clip_kind TEXT NOT NULL DEFAULT 'still';
+ALTER TABLE timeline_clips ADD COLUMN video_asset_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_timeline_clips_video_asset ON timeline_clips(video_asset_id);
+"#;
+
+const MIGRATION_018: &str = r#"
+CREATE TABLE IF NOT EXISTS video_assets (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    group_id TEXT NOT NULL,
+    source_render_id TEXT NOT NULL REFERENCES image_renders(id),
+    version INTEGER NOT NULL,
+    parent_video_asset_id TEXT REFERENCES video_assets(id),
+    kind TEXT NOT NULL DEFAULT 'generation',
+    file_name TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    resolution TEXT NOT NULL,
+    requested_duration_seconds REAL NOT NULL,
+    veo_duration_seconds INTEGER NOT NULL,
+    actual_duration_seconds REAL NOT NULL,
+    veo_model TEXT NOT NULL,
+    veo_operation_name TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_video_assets_video_group ON video_assets(video_id, group_id, version DESC);
+
+CREATE TABLE IF NOT EXISTS animation_jobs (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    status TEXT NOT NULL CHECK(status IN ('queued','running','paused','stopped','completed','failed')),
+    total_items INTEGER NOT NULL,
+    completed_items INTEGER NOT NULL DEFAULT 0,
+    failed_items INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS animation_job_items (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES animation_jobs(id),
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    group_id TEXT NOT NULL,
+    clip_id TEXT NOT NULL REFERENCES timeline_clips(id),
+    source_render_id TEXT NOT NULL REFERENCES image_renders(id),
+    resolution TEXT NOT NULL,
+    requested_duration_seconds REAL NOT NULL,
+    veo_duration_seconds INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','stopped')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    veo_operation_name TEXT,
+    video_asset_id TEXT REFERENCES video_assets(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_animation_jobs_video ON animation_jobs(video_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_animation_job_items_job ON animation_job_items(job_id, status, created_at);
+"#;
+
+const MIGRATION_019: &str = r#"
+ALTER TABLE video_assets ADD COLUMN prompt TEXT NOT NULL DEFAULT '';
+ALTER TABLE animation_job_items ADD COLUMN prompt TEXT NOT NULL DEFAULT '';
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -563,6 +627,62 @@ pub struct TimelineClip {
     pub transition_in: String,
     pub transition_out: String,
     pub motion_intensity: f64,
+    pub clip_kind: String,
+    pub video_asset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoAsset {
+    pub id: String,
+    pub video_id: String,
+    pub group_id: String,
+    pub source_render_id: String,
+    pub version: i64,
+    pub parent_video_asset_id: Option<String>,
+    pub kind: String,
+    pub file_name: String,
+    pub relative_path: String,
+    pub resolution: String,
+    pub requested_duration_seconds: f64,
+    pub veo_duration_seconds: i64,
+    pub actual_duration_seconds: f64,
+    pub veo_model: String,
+    pub veo_operation_name: Option<String>,
+    pub prompt: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationJobItem {
+    pub id: String,
+    pub video_id: String,
+    pub clip_id: String,
+    pub group_id: String,
+    pub source_render_id: String,
+    pub resolution: String,
+    pub requested_duration_seconds: f64,
+    pub veo_duration_seconds: i64,
+    pub prompt: String,
+    pub status: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub video_asset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationJob {
+    pub id: String,
+    pub video_id: String,
+    pub status: String,
+    pub total_items: i64,
+    pub completed_items: i64,
+    pub failed_items: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub items: Vec<AnimationJobItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -900,6 +1020,41 @@ impl ProjectRepository {
         }
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(16, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_clip_kind: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timeline_clips') WHERE name='clip_kind')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_clip_kind {
+            self.connection.execute_batch(MIGRATION_017).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(17, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        self.connection.execute_batch(MIGRATION_018).map_err(|error| error.to_string())?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(18, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_asset_prompt: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('video_assets') WHERE name='prompt')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_asset_prompt {
+            self.connection.execute_batch(MIGRATION_019).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(19, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -2517,6 +2672,55 @@ Return JSON only — one plan object:
         })
     }
 
+    /// Suggests a short Veo motion prompt for animating a still, grounded in
+    /// that still's narration (visual intent) and its existing image prompt
+    /// (what's actually depicted) — not just a generic "add motion" request.
+    /// Called fresh each time the user clicks "Suggest prompt", so repeated
+    /// clicks intentionally return different phrasings/variations rather than
+    /// a cached single suggestion.
+    pub fn suggest_animation_prompt(&self, video_id: &str, group_id: &str) -> Result<String, String> {
+        let auth = self.gemini_auth()?;
+        let visual_plan = self.get_visual_plan(video_id)?;
+        let group = visual_plan.groups.iter().find(|g| g.id == group_id)
+            .ok_or("Still not found in visual plan.")?;
+        let members: Vec<_> = group.sentence_ids.iter()
+            .filter_map(|id| visual_plan.sentences.iter().find(|s| &s.id == id)).collect();
+        let narration = members.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+        let existing_still_prompt = self.list_prompt_versions(video_id, group_id)?
+            .into_iter().next().map(|p| p.user_prompt);
+        // `request_gemini_text` always sets `responseMimeType: application/json`
+        // (every other caller needs structured output) — asking it for bare
+        // prose under that constraint reliably comes back empty, so this
+        // wraps the suggestion in a trivial JSON envelope like every other
+        // caller does, rather than fighting the shared helper's contract.
+        let prompt = format!(
+            r#"You are directing a brief Veo 3 image-to-video animation of a single still image in an explainer video.
+
+Narration spoken while this still is on screen (its visual intent):
+{narration}
+
+What the still image actually depicts:
+{}
+
+Write ONE short, concrete motion/camera prompt (1-2 sentences, under 40 words) describing ONLY subtle, natural movement to bring this exact still to life — e.g. gentle camera drift/push-in, wind, steam, blinking, small gestures, parallax — that supports (never contradicts) the narration's intent. Do not introduce new subjects, objects, or scene changes not already in the still. Do not mention "Veo," camera brand names, resolution, or duration.
+
+Return JSON only, in exactly this shape: {{"prompt": "the motion prompt text"}}"#,
+            existing_still_prompt.as_deref().unwrap_or("(no description available)"),
+        );
+        let text = request_gemini_text(&auth, &prompt)?;
+        let cleaned = extract_json_from_text(&text);
+        let parsed: serde_json::Value = serde_json::from_str(cleaned)
+            .map_err(|e| format!("Prompt suggestion was not valid JSON: {e}"))?;
+        let suggestion = parsed.get("prompt")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .ok_or("No prompt returned.")?;
+        if suggestion.is_empty() {
+            return Err("Gemini returned an empty prompt suggestion.".into());
+        }
+        Ok(suggestion.to_string())
+    }
+
     pub fn approve_bulk_plan(&self, video_id: &str, style_directive: &str, stills: &[BulkPlannedStill]) -> Result<usize, String> {
         let now = Utc::now().to_rfc3339();
         let mut saved = 0usize;
@@ -3033,6 +3237,42 @@ Return JSON only:
         Ok(self.projects_dir.join(channel_id).join(&asset.video_id).join(&asset.relative_path))
     }
 
+    fn get_video_asset(&self, id: &str) -> Result<VideoAsset, String> {
+        self.connection.query_row(
+            "SELECT id,video_id,group_id,source_render_id,version,parent_video_asset_id,kind,file_name,relative_path,resolution,requested_duration_seconds,veo_duration_seconds,actual_duration_seconds,veo_model,veo_operation_name,prompt,created_at FROM video_assets WHERE id=?1",
+            [id],
+            |row| Ok(VideoAsset {
+                id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?, source_render_id: row.get(3)?,
+                version: row.get(4)?, parent_video_asset_id: row.get(5)?, kind: row.get(6)?,
+                file_name: row.get(7)?, relative_path: row.get(8)?, resolution: row.get(9)?,
+                requested_duration_seconds: row.get(10)?, veo_duration_seconds: row.get(11)?,
+                actual_duration_seconds: row.get(12)?, veo_model: row.get(13)?, veo_operation_name: row.get(14)?,
+                prompt: row.get(15)?, created_at: row.get(16)?,
+            }),
+        ).map_err(|_| "Animation clip was not found.".to_string())
+    }
+
+    /// Public read accessor for a single generated/retimed animation clip
+    /// version, used by the timeline inspector to compare its real duration
+    /// against the slot it currently occupies.
+    pub fn get_video_asset_record(&self, id: &str) -> Result<VideoAsset, String> {
+        self.get_video_asset(id)
+    }
+
+    fn video_asset_absolute_path(&self, asset: &VideoAsset) -> Result<PathBuf, String> {
+        let channel_id: String = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1", [&asset.video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        Ok(self.projects_dir.join(channel_id).join(&asset.video_id).join(&asset.relative_path))
+    }
+
+    /// Absolute path to a generated animation clip's video file, for the same
+    /// asset-protocol fast path `render_file_path` uses for stills.
+    pub fn video_asset_file_path(&self, video_asset_id: &str) -> Result<PathBuf, String> {
+        let asset = self.get_video_asset(video_asset_id)?;
+        self.video_asset_absolute_path(&asset)
+    }
+
     pub fn export_latest_stills(
         &self,
         video_id: &str,
@@ -3249,7 +3489,7 @@ Return JSON only:
             [video_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
         ).map_err(|_| "Timeline has not been built.".to_string())?;
         let mut statement = self.connection.prepare(
-            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
+            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
         ).map_err(|e| e.to_string())?;
         let clips = statement
             .query_map([video_id], |row| {
@@ -3265,6 +3505,8 @@ Return JSON only:
                     transition_in: row.get(8)?,
                     transition_out: row.get(9)?,
                     motion_intensity: row.get(10)?,
+                    clip_kind: row.get(11)?,
+                    video_asset_id: row.get(12)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -3521,6 +3763,40 @@ Return JSON only:
         self.connection.execute(
             "UPDATE timeline_clips SET render_id=?1 WHERE id=?2 AND video_id=?3",
             params![render_id, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    /// Reverts an animation clip to showing its source still, WITHOUT
+    /// clearing `video_asset_id` — the generated clip stays cached (on disk
+    /// and in `video_assets`) so `restore_animation_clip` can bring it right
+    /// back with no re-generation, right up until a fresh "Generate
+    /// Animation" replaces `video_asset_id` with a new version.
+    pub fn revert_animation_clip_to_still(&self, video_id: &str, clip_id: &str) -> Result<Timeline, String> {
+        let updated = self.connection.execute(
+            "UPDATE timeline_clips SET clip_kind='still' WHERE id=?1 AND video_id=?2 AND clip_kind='animation'",
+            params![clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        if updated == 0 {
+            return Err("This clip is not currently animated.".into());
+        }
+        self.get_timeline(video_id)
+    }
+
+    /// Re-applies a clip's cached animation (from `video_asset_id`) without
+    /// calling Veo again — the counterpart to `revert_animation_clip_to_still`.
+    pub fn restore_animation_clip(&self, video_id: &str, clip_id: &str) -> Result<Timeline, String> {
+        let has_cached_asset: bool = self.connection.query_row(
+            "SELECT video_asset_id IS NOT NULL FROM timeline_clips WHERE id=?1 AND video_id=?2 AND clip_kind='still'",
+            params![clip_id, video_id],
+            |row| row.get(0),
+        ).map_err(|_| "This clip is not currently a still.".to_string())?;
+        if !has_cached_asset {
+            return Err("No cached animation to restore — generate one first.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_clips SET clip_kind='animation' WHERE id=?1 AND video_id=?2",
+            params![clip_id, video_id],
         ).map_err(|e| e.to_string())?;
         self.get_timeline(video_id)
     }
@@ -3997,6 +4273,372 @@ Return JSON only:
             self.connection.execute("UPDATE image_jobs SET status=?1,updated_at=?2 WHERE id=?3 AND status NOT IN ('paused','stopped')", params![if failed > 0 {"failed"} else {"completed"}, now, job_id]).map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+
+    pub fn create_animation_job(&self, video_id: &str, clip_id: &str, resolution: &str, prompt: &str) -> Result<AnimationJob, String> {
+        if !matches!(resolution, "720p" | "1080p") {
+            return Err("Resolution must be 720p or 1080p.".into());
+        }
+        let (group_id, render_id, start_seconds, end_seconds): (String, Option<String>, f64, f64) = self.connection.query_row(
+            "SELECT group_id,render_id,start_seconds,end_seconds FROM timeline_clips WHERE id=?1 AND video_id=?2",
+            params![clip_id, video_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).map_err(|_| "Timeline clip was not found.".to_string())?;
+        let source_render_id = render_id.ok_or("Select a still with a generated image before animating it.")?;
+        let requested_duration_seconds = (end_seconds - start_seconds).max(0.1);
+        let veo_duration_seconds = pick_veo_duration(requested_duration_seconds);
+
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO animation_jobs(id,video_id,status,total_items,created_at,updated_at) VALUES(?1,?2,'queued',1,?3,?3)",
+            params![id, video_id, now],
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "INSERT INTO animation_job_items(id,job_id,video_id,group_id,clip_id,source_render_id,resolution,requested_duration_seconds,veo_duration_seconds,prompt,status,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'queued',?11,?11)",
+            params![Uuid::new_v4().to_string(), id, video_id, group_id, clip_id, source_render_id, resolution, requested_duration_seconds, veo_duration_seconds, prompt.trim(), now],
+        ).map_err(|e| e.to_string())?;
+        self.get_animation_job(&id)
+    }
+
+    pub fn get_animation_job(&self, job_id: &str) -> Result<AnimationJob, String> {
+        let mut job: AnimationJob = self.connection.query_row(
+            "SELECT id,video_id,status,total_items,completed_items,failed_items,created_at,updated_at FROM animation_jobs WHERE id=?1",
+            [job_id],
+            |row| Ok(AnimationJob { id: row.get(0)?, video_id: row.get(1)?, status: row.get(2)?, total_items: row.get(3)?, completed_items: row.get(4)?, failed_items: row.get(5)?, created_at: row.get(6)?, updated_at: row.get(7)?, items: vec![] }),
+        ).map_err(|_| "Animation job was not found.".to_string())?;
+        let mut statement = self.connection.prepare(
+            "SELECT id,video_id,clip_id,group_id,source_render_id,resolution,requested_duration_seconds,veo_duration_seconds,prompt,status,attempts,last_error,video_asset_id FROM animation_job_items WHERE job_id=?1 ORDER BY created_at"
+        ).map_err(|e| e.to_string())?;
+        job.items = statement
+            .query_map([job_id], |row| {
+                Ok(AnimationJobItem {
+                    id: row.get(0)?, video_id: row.get(1)?, clip_id: row.get(2)?, group_id: row.get(3)?, source_render_id: row.get(4)?,
+                    resolution: row.get(5)?, requested_duration_seconds: row.get(6)?, veo_duration_seconds: row.get(7)?,
+                    prompt: row.get(8)?, status: row.get(9)?, attempts: row.get(10)?, last_error: row.get(11)?, video_asset_id: row.get(12)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(job)
+    }
+
+    pub fn animation_job_status(&self, job_id: &str) -> Result<String, String> {
+        self.connection.query_row(
+            "SELECT status FROM animation_jobs WHERE id=?1",
+            [job_id],
+            |row| row.get(0),
+        ).map_err(|_| "Animation job was not found.".to_string())
+    }
+
+    pub fn latest_animation_job(&self, video_id: &str) -> Result<Option<AnimationJob>, String> {
+        let id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM animation_jobs WHERE video_id=?1 ORDER BY created_at DESC LIMIT 1",
+                [video_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        id.map(|id| self.get_animation_job(&id)).transpose()
+    }
+
+    pub fn set_animation_job_status(&self, job_id: &str, status: &str) -> Result<AnimationJob, String> {
+        if !["queued", "running", "paused", "stopped", "failed"].contains(&status) {
+            return Err("Unsupported animation job transition.".into());
+        }
+        self.connection.execute(
+            "UPDATE animation_jobs SET status=?1,updated_at=?2 WHERE id=?3 AND status NOT IN ('completed','failed')",
+            params![status, Utc::now().to_rfc3339(), job_id],
+        ).map_err(|e| e.to_string())?;
+        if matches!(status, "stopped" | "failed") {
+            self.connection.execute(
+                "UPDATE animation_job_items SET status='stopped',updated_at=?1 WHERE job_id=?2 AND status IN ('queued','running')",
+                params![Utc::now().to_rfc3339(), job_id],
+            ).map_err(|e| e.to_string())?;
+        }
+        self.get_animation_job(job_id)
+    }
+
+    pub fn recover_animation_jobs(&self) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        self.connection
+            .execute(
+                "UPDATE animation_job_items SET status='queued',updated_at=?1 WHERE status='running'",
+                [&now],
+            )
+            .map_err(|e| e.to_string())?;
+        self.connection
+            .execute(
+                "UPDATE animation_jobs SET status='paused',updated_at=?1 WHERE status='running'",
+                [&now],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn claim_animation_job_item(&self, job_id: &str) -> Result<Option<AnimationJobItem>, String> {
+        let job_status: String = self
+            .connection
+            .query_row(
+                "SELECT status FROM animation_jobs WHERE id=?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !matches!(job_status.as_str(), "queued" | "running") {
+            return Ok(None);
+        }
+        let item_id: Option<String> = self.connection.query_row(
+            "SELECT id FROM animation_job_items WHERE job_id=?1 AND status='queued' ORDER BY created_at LIMIT 1",
+            [job_id], |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some(item_id) = item_id else {
+            return Ok(None);
+        };
+        let claimed = self.connection.execute(
+            "UPDATE animation_job_items SET status='running',attempts=attempts+1,updated_at=?1 WHERE id=?2 AND status='queued'",
+            params![Utc::now().to_rfc3339(), item_id],
+        ).map_err(|e| e.to_string())?;
+        if claimed == 0 {
+            return self.claim_animation_job_item(job_id);
+        }
+        self.connection.execute(
+            "UPDATE animation_jobs SET status='running',updated_at=?1 WHERE id=?2 AND status='queued'",
+            params![Utc::now().to_rfc3339(), job_id],
+        ).map_err(|e| e.to_string())?;
+        let mut statement = self.connection.prepare(
+            "SELECT id,video_id,clip_id,group_id,source_render_id,resolution,requested_duration_seconds,veo_duration_seconds,prompt,status,attempts,last_error,video_asset_id FROM animation_job_items WHERE id=?1"
+        ).map_err(|e| e.to_string())?;
+        let item = statement.query_row([&item_id], |row| {
+            Ok(AnimationJobItem {
+                id: row.get(0)?, video_id: row.get(1)?, clip_id: row.get(2)?, group_id: row.get(3)?, source_render_id: row.get(4)?,
+                resolution: row.get(5)?, requested_duration_seconds: row.get(6)?, veo_duration_seconds: row.get(7)?,
+                prompt: row.get(8)?, status: row.get(9)?, attempts: row.get(10)?, last_error: row.get(11)?, video_asset_id: row.get(12)?,
+            })
+        }).map_err(|e| e.to_string())?;
+        Ok(Some(item))
+    }
+
+    pub fn finish_animation_job_item(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        result: Result<String, String>,
+    ) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        match result {
+            Ok(video_asset_id) => self.connection.execute("UPDATE animation_job_items SET status='completed',video_asset_id=?1,last_error=NULL,updated_at=?2 WHERE id=?3 AND status='running'", params![video_asset_id, now, item_id]),
+            Err(error) => self.connection.execute("UPDATE animation_job_items SET status='failed',last_error=?1,updated_at=?2 WHERE id=?3 AND status='running'", params![error, now, item_id]),
+        }.map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "UPDATE animation_jobs SET completed_items=(SELECT COUNT(*) FROM animation_job_items WHERE job_id=?1 AND status='completed'),failed_items=(SELECT COUNT(*) FROM animation_job_items WHERE job_id=?1 AND status='failed'),updated_at=?2 WHERE id=?1",
+            params![job_id, now],
+        ).map_err(|e| e.to_string())?;
+        let (pending, failed): (i64, i64) = self.connection.query_row(
+            "SELECT SUM(CASE WHEN status IN ('queued','running') THEN 1 ELSE 0 END),SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) FROM animation_job_items WHERE job_id=?1",
+            [job_id], |row| Ok((row.get::<_, Option<i64>>(0)?.unwrap_or(0), row.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+        ).map_err(|e| e.to_string())?;
+        if pending == 0 {
+            self.connection.execute("UPDATE animation_jobs SET status=?1,updated_at=?2 WHERE id=?3 AND status NOT IN ('paused','stopped')", params![if failed > 0 {"failed"} else {"completed"}, now, job_id]).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Generates a Veo animation for a timeline clip's source still, then
+    /// flips the same clip row from `clip_kind='still'` to `'animation'` in
+    /// place (same id/start/end/ordinal) rather than inserting a new clip —
+    /// this avoids any ordinal/overlap bookkeeping and gives a natural
+    /// "revert to still" path later. The requested duration is always the
+    /// clip's current slot width; `pick_veo_duration` picks the largest of
+    /// Veo's fixed 4s/6s/8s durations that still fits, and if the slot itself
+    /// is under 4s the excess is trimmed immediately after download.
+    pub fn generate_animation_clip(
+        &self,
+        video_id: &str,
+        clip_id: &str,
+        resolution: &str,
+        prompt: &str,
+        engine_dir: &Path,
+    ) -> Result<VideoAsset, String> {
+        if !matches!(resolution, "720p" | "1080p") {
+            return Err("Resolution must be 720p or 1080p.".into());
+        }
+        let (group_id, render_id, start_seconds, end_seconds): (String, Option<String>, f64, f64) = self.connection.query_row(
+            "SELECT group_id,render_id,start_seconds,end_seconds FROM timeline_clips WHERE id=?1 AND video_id=?2",
+            params![clip_id, video_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).map_err(|_| "Timeline clip was not found.".to_string())?;
+        let source_render_id = render_id.ok_or("Select a still with a generated image before animating it.")?;
+        let render = self.get_render_by_id(&source_render_id)?;
+        let source_path = self.render_absolute_path(&render)?;
+        let source_bytes = fs::read(&source_path).map_err(|_| "Source still file is missing.".to_string())?;
+        let mime_type = extension_to_media_type(
+            source_path.extension().and_then(|value| value.to_str()).unwrap_or("png"),
+        );
+
+        let requested_duration_seconds = (end_seconds - start_seconds).max(0.1);
+        let veo_duration_seconds = pick_veo_duration(requested_duration_seconds);
+
+        let auth = self.gemini_auth()?;
+        // The "Lite" model only exists under that name on the Gemini Developer
+        // API (API-key auth); Vertex AI's equivalent low-cost tier is named
+        // "fast" instead. An explicit `veo_model` app setting always wins.
+        let model = self.get_app_setting("veo_model")?.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| {
+            match &auth {
+                GeminiAuth::ApiKey(_) => "veo-3.1-lite-generate-preview".to_string(),
+                GeminiAuth::Vertex { .. } => "veo-3.0-fast-generate-001".to_string(),
+            }
+        });
+
+        let operation_name = request_veo_generate(
+            &auth, &model, prompt, &source_bytes, mime_type, resolution, veo_duration_seconds,
+        )?;
+
+        let started = std::time::Instant::now();
+        let poll_timeout = std::time::Duration::from_secs(600);
+        let video_bytes = loop {
+            if started.elapsed() > poll_timeout {
+                return Err("Animation generation timed out.".into());
+            }
+            match poll_veo_operation(&auth, &model, &operation_name)? {
+                Some(bytes) => break bytes,
+                None => std::thread::sleep(std::time::Duration::from_secs(10)),
+            }
+        };
+
+        let channel_id: String = self
+            .connection
+            .query_row(
+                "SELECT channel_id FROM videos WHERE id = ?1 AND trashed_at IS NULL",
+                [video_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Video was not found.".to_string())?;
+        let animation_dir = self.projects_dir.join(&channel_id).join(video_id).join("animations").join(&group_id);
+        fs::create_dir_all(&animation_dir).map_err(|e| e.to_string())?;
+        let version: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM video_assets WHERE video_id = ?1 AND group_id = ?2",
+                params![video_id, group_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let file_name = format!("animation-v{}.mp4", version);
+        let relative_path = format!("animations/{}/{}", group_id, file_name);
+        let raw_path = animation_dir.join(format!("animation-v{}.raw.mp4", version));
+        fs::write(&raw_path, &video_bytes).map_err(|e| e.to_string())?;
+        let raw_duration = Self::probe_audio_duration(engine_dir, &raw_path)?;
+
+        let out_path = animation_dir.join(&file_name);
+        // The slot was under 4s, so we generated Veo's 4s minimum anyway —
+        // trim the excess now rather than leaving an oversized stored file.
+        let actual_duration_seconds = if requested_duration_seconds < raw_duration - 0.05 {
+            Self::run_retime(engine_dir, &raw_path, raw_duration, requested_duration_seconds, &out_path)?;
+            let _ = fs::remove_file(&raw_path);
+            requested_duration_seconds.min(raw_duration)
+        } else {
+            fs::rename(&raw_path, &out_path).map_err(|e| e.to_string())?;
+            raw_duration
+        };
+
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO video_assets(id,video_id,group_id,source_render_id,version,parent_video_asset_id,kind,file_name,relative_path,resolution,requested_duration_seconds,veo_duration_seconds,actual_duration_seconds,veo_model,veo_operation_name,prompt,created_at) VALUES(?1,?2,?3,?4,?5,NULL,'generation',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            params![id, video_id, group_id, source_render_id, version, file_name, relative_path, resolution, requested_duration_seconds, veo_duration_seconds, actual_duration_seconds, model, operation_name, prompt.trim(), now],
+        ).map_err(|e| e.to_string())?;
+
+        self.connection.execute(
+            "UPDATE timeline_clips SET clip_kind='animation', video_asset_id=?1 WHERE id=?2",
+            params![id, clip_id],
+        ).map_err(|e| e.to_string())?;
+
+        self.create_snapshot(
+            video_id,
+            &json!({
+                "reason": "animation-generated",
+                "groupId": group_id,
+                "clipId": clip_id,
+                "videoAssetId": id,
+                "version": version,
+            })
+            .to_string(),
+        )?;
+
+        self.get_video_asset(&id)
+    }
+
+    /// Slows a generated animation clip down (or trims it) to exactly fill
+    /// its current timeline slot. Always re-derives from the ORIGINAL Veo
+    /// output (`kind='generation'`), never from a previously-retimed version,
+    /// so repeated clicks don't compound re-encode quality loss.
+    pub fn retime_animation_clip(
+        &self,
+        video_id: &str,
+        clip_id: &str,
+        engine_dir: &Path,
+    ) -> Result<Timeline, String> {
+        let (clip_kind, video_asset_id, start_seconds, end_seconds): (String, Option<String>, f64, f64) = self.connection.query_row(
+            "SELECT clip_kind,video_asset_id,start_seconds,end_seconds FROM timeline_clips WHERE id=?1 AND video_id=?2",
+            params![clip_id, video_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).map_err(|_| "Timeline clip was not found.".to_string())?;
+        if clip_kind != "animation" {
+            return Err("Only animation clips can be adjusted to a duration.".into());
+        }
+        let asset_id = video_asset_id.ok_or("This clip has no generated animation yet.")?;
+        let mut root_asset = self.get_video_asset(&asset_id)?;
+        while root_asset.kind != "generation" {
+            let Some(parent_id) = root_asset.parent_video_asset_id.clone() else { break };
+            root_asset = self.get_video_asset(&parent_id)?;
+        }
+        let source_path = self.video_asset_absolute_path(&root_asset)?;
+        let target_duration = (end_seconds - start_seconds).max(0.1);
+
+        let channel_id: String = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let animation_dir = self.projects_dir.join(&channel_id).join(video_id).join("animations").join(&root_asset.group_id);
+        fs::create_dir_all(&animation_dir).map_err(|e| e.to_string())?;
+        let version: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM video_assets WHERE video_id=?1 AND group_id=?2",
+            params![video_id, root_asset.group_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let file_name = format!("animation-v{}.mp4", version);
+        let relative_path = format!("animations/{}/{}", root_asset.group_id, file_name);
+        let out_path = animation_dir.join(&file_name);
+
+        Self::run_retime(engine_dir, &source_path, root_asset.actual_duration_seconds, target_duration, &out_path)?;
+        let actual_duration_seconds = Self::probe_audio_duration(engine_dir, &out_path)?;
+
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO video_assets(id,video_id,group_id,source_render_id,version,parent_video_asset_id,kind,file_name,relative_path,resolution,requested_duration_seconds,veo_duration_seconds,actual_duration_seconds,veo_model,veo_operation_name,prompt,created_at) VALUES(?1,?2,?3,?4,?5,?6,'retimed',?7,?8,?9,?10,?11,?12,?13,NULL,?14,?15)",
+            params![id, video_id, root_asset.group_id, root_asset.source_render_id, version, root_asset.id, file_name, relative_path, root_asset.resolution, target_duration, root_asset.veo_duration_seconds, actual_duration_seconds, root_asset.veo_model, root_asset.prompt, now],
+        ).map_err(|e| e.to_string())?;
+
+        self.connection.execute(
+            "UPDATE timeline_clips SET video_asset_id=?1 WHERE id=?2",
+            params![id, clip_id],
+        ).map_err(|e| e.to_string())?;
+
+        self.create_snapshot(
+            video_id,
+            &json!({
+                "reason": "animation-retimed",
+                "clipId": clip_id,
+                "videoAssetId": id,
+                "version": version,
+            })
+            .to_string(),
+        )?;
+
+        self.get_timeline(video_id)
     }
 
     fn asset_by_id(&self, id: &str) -> Result<Option<InputAsset>, String> {
@@ -4632,10 +5274,26 @@ Return JSON only:
 
         let mut stills = Vec::new();
         for clip in &timeline.clips {
+            if clip.clip_kind == "animation" {
+                let Some(video_asset_id) = &clip.video_asset_id else { continue };
+                let asset = self.get_video_asset(video_asset_id)?;
+                let video_path = self.video_asset_absolute_path(&asset)?;
+                stills.push(json!({
+                    "kind": "video",
+                    "videoPath": video_path.to_string_lossy(),
+                    "start": clip.start_seconds,
+                    "end": clip.end_seconds,
+                    "sourceDurationSeconds": asset.actual_duration_seconds,
+                    "transitionIn": clip.transition_in,
+                    "transitionOut": clip.transition_out,
+                }));
+                continue;
+            }
             let Some(render_id) = &clip.render_id else { continue };
             let render = self.get_render_by_id(render_id)?;
             let image_path = self.render_absolute_path(&render)?;
             stills.push(json!({
+                "kind": "image",
                 "imagePath": image_path.to_string_lossy(),
                 "start": clip.start_seconds,
                 "end": clip.end_seconds,
@@ -4763,6 +5421,59 @@ Return JSON only:
             let stdout = String::from_utf8_lossy(&output.stdout);
             stdout.trim().parse::<f64>()
                 .map_err(|_| format!("Could not parse narration duration from engine output: {}", stdout.trim()))
+        }
+    }
+
+    /// Stretches (slows down) or trims a generated animation clip to exactly
+    /// fill its timeline slot, via the export engine's `--mode retime`. Never
+    /// speeds a clip up — only ever stretches or trims, per product decision.
+    fn run_retime(
+        engine_dir: &Path,
+        source_path: &Path,
+        source_duration: f64,
+        target_duration: f64,
+        output_path: &Path,
+    ) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            let _ = (engine_dir, source_duration, target_duration);
+            fs::copy(source_path, output_path).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            let export_engine = engine_dir.join("auto_gen_engine/video_export_engine.py");
+            if !export_engine.exists() {
+                return Err(format!(
+                    "Internal video export engine was not found at {}.",
+                    export_engine.display()
+                ));
+            }
+            let mut command = Command::new(find_python());
+            command
+                .arg(&export_engine)
+                .arg(source_path)
+                .arg("--output")
+                .arg(output_path)
+                .arg("--mode")
+                .arg("retime")
+                .arg("--source-duration")
+                .arg(format!("{source_duration}"))
+                .arg("--target-duration")
+                .arg(format!("{target_duration}"))
+                .current_dir(engine_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            command.creation_flags(0x08000000);
+            let output = command
+                .output()
+                .map_err(|e| format!("Could not start the video export engine: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Could not adjust the animation's duration: {}", stderr.trim()));
+            }
+            Ok(())
         }
     }
 
@@ -5326,6 +6037,21 @@ fn requested_aspect_ratio(settings: &serde_json::Value) -> &'static str {
         Some("9:16") => "9:16",
         _ => "16:9",
     }
+}
+
+/// Veo 3 only generates clips at these fixed lengths — never an arbitrary duration.
+const VEO_ALLOWED_DURATIONS: [i64; 3] = [4, 6, 8];
+
+/// Picks the largest Veo-supported duration that still fits inside the target gap,
+/// so "Adjust animation to duration" only ever needs to slow the clip down (stretch),
+/// never speed it up. Falls back to the shortest duration if the gap is under 4s —
+/// the caller is expected to trim the excess immediately after generation.
+fn pick_veo_duration(gap_seconds: f64) -> i64 {
+    VEO_ALLOWED_DURATIONS
+        .into_iter()
+        .filter(|duration| (*duration as f64) <= gap_seconds)
+        .max()
+        .unwrap_or(4)
 }
 
 fn request_openai_text(api_key: &str, prompt: &str) -> Result<String, String> {
@@ -5910,6 +6636,170 @@ fn request_gemini_v2_plan(auth: &GeminiAuth, prompt: &str) -> Result<V2PlanChunk
         }
     }
     Err("Gemini rate limit persists after retries.".to_string())
+}
+
+/// Submits an image-to-video generation request to Veo's long-running-operation
+/// endpoint and returns the operation's resource name to poll. Structurally
+/// mirrors `request_gemini_image`'s auth/URL branching. Request shape
+/// confirmed against Google's published Veo 3.1 REST reference: the source
+/// image goes under `instances[0].image.inlineData` (same envelope Gemini
+/// image generation uses for uploaded images), not a bare `bytesBase64Encoded`.
+/// There is no documented way to request audio-free generation — Veo always
+/// returns audio for image-to-video, so it's stripped in post via ffmpeg
+/// `-an` instead (see `generate_animation_clip` / `video_export_engine.py`).
+///
+/// Unlike Gemini text/image models, Veo is NOT available at Vertex AI's
+/// "global" location — it must be called against a region-prefixed host
+/// (`{location}-aiplatform.googleapis.com`) with a concrete location such as
+/// `us-central1` in both the URL path and the hostname.
+const VERTEX_VEO_LOCATION: &str = "us-central1";
+
+fn request_veo_generate(
+    auth: &GeminiAuth,
+    model: &str,
+    prompt: &str,
+    image_bytes: &[u8],
+    image_mime: &str,
+    resolution: &str,
+    duration_seconds: i64,
+) -> Result<String, String> {
+    let model = model.trim();
+    if model.is_empty()
+        || !model.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_')
+        })
+    {
+        return Err("Veo model name is invalid.".into());
+    }
+    let client = reqwest::blocking::Client::new();
+    let encoded_image = base64::engine::general_purpose::STANDARD.encode(image_bytes);
+    // The Gemini Developer API and Vertex AI genuinely diverge here despite
+    // both fronting "Veo": the API-key surface wants the image nested under
+    // `inlineData` (the same envelope Gemini image generation uses), while
+    // Vertex wants `bytesBase64Encoded`/`mimeType` directly on `image` — the
+    // same shape Vertex's Imagen API uses. Sending the wrong one to Vertex
+    // produces a 400 "image is empty" (the nested inlineData field is simply
+    // not recognized, so Vertex sees no image at all).
+    let image_field = match auth {
+        GeminiAuth::ApiKey(_) => json!({
+            "inlineData": { "mimeType": image_mime, "data": encoded_image }
+        }),
+        GeminiAuth::Vertex { .. } => json!({
+            "bytesBase64Encoded": encoded_image, "mimeType": image_mime
+        }),
+    };
+    let parameters = json!({
+        "aspectRatio": "16:9",
+        "resolution": resolution,
+        "durationSeconds": duration_seconds,
+    });
+    let request = match auth {
+        GeminiAuth::ApiKey(api_key) => client
+            .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:predictLongRunning"))
+            .header("x-goog-api-key", api_key),
+        GeminiAuth::Vertex { access_token, project_id } => client
+            .post(format!("https://{VERTEX_VEO_LOCATION}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{VERTEX_VEO_LOCATION}/publishers/google/models/{model}:predictLongRunning"))
+            .bearer_auth(access_token),
+    };
+    let response = request
+        .json(&json!({
+            "instances": [{"prompt": prompt.trim(), "image": image_field}],
+            "parameters": parameters,
+        }))
+        .send()
+        .map_err(|error| format!("Could not reach Veo: {error}"))?;
+    let status = response.status();
+    let raw_text = response.text().map_err(|error| format!("Could not read Veo's response ({status}): {error}"))?;
+    let body: serde_json::Value = serde_json::from_str(&raw_text).map_err(|_| {
+        let snippet: String = raw_text.chars().take(500).collect();
+        format!("Veo returned a non-JSON response ({status}): {snippet}")
+    })?;
+    if !status.is_success() {
+        let message = body
+            .pointer("/error/message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Animation generation failed to start.");
+        return Err(format!("Veo error ({status}): {message}"));
+    }
+    body.get("name")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "Veo did not return an operation to track.".to_string())
+}
+
+/// Checks a Veo long-running operation once (not a loop — the caller owns
+/// the poll interval/timeout). Returns `Ok(None)` while still running, or
+/// the decoded video bytes once done.
+///
+/// The Gemini Developer API exposes operations as plain REST resources
+/// (`GET /v1beta/{operation_name}`), but Vertex AI's publisher-model
+/// long-running operations are NOT directly gettable that way — they must be
+/// polled via `POST {model}:fetchPredictOperation` with `{"operationName": ...}`
+/// in the body, against the same region-prefixed host/model used to submit.
+fn poll_veo_operation(auth: &GeminiAuth, model: &str, operation_name: &str) -> Result<Option<Vec<u8>>, String> {
+    let client = reqwest::blocking::Client::new();
+    let response = match auth {
+        GeminiAuth::ApiKey(api_key) => client
+            .get(format!("https://generativelanguage.googleapis.com/v1beta/{operation_name}"))
+            .header("x-goog-api-key", api_key)
+            .send(),
+        GeminiAuth::Vertex { access_token, project_id } => client
+            .post(format!("https://{VERTEX_VEO_LOCATION}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{VERTEX_VEO_LOCATION}/publishers/google/models/{model}:fetchPredictOperation"))
+            .bearer_auth(access_token)
+            .json(&json!({"operationName": operation_name}))
+            .send(),
+    }
+    .map_err(|error| format!("Could not reach Veo: {error}"))?;
+    let status = response.status();
+    let raw_text = response.text().map_err(|error| format!("Could not read Veo's response ({status}): {error}"))?;
+    let body: serde_json::Value = serde_json::from_str(&raw_text).map_err(|_| {
+        let snippet: String = raw_text.chars().take(500).collect();
+        format!("Veo returned a non-JSON response ({status}): {snippet}")
+    })?;
+    if !status.is_success() {
+        let message = body
+            .pointer("/error/message")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Could not check animation status.");
+        return Err(format!("Veo error ({status}): {message}"));
+    }
+    if let Some(error) = body.get("error") {
+        let message = error.get("message").and_then(|value| value.as_str()).unwrap_or("Animation generation failed.");
+        return Err(format!("Veo generation failed: {message}"));
+    }
+    if !body.get("done").and_then(|value| value.as_bool()).unwrap_or(false) {
+        return Ok(None);
+    }
+    let sample = body
+        .pointer("/response/generateVideoResponse/generatedSamples/0/video")
+        .or_else(|| body.pointer("/response/videos/0"))
+        .ok_or("Veo finished but returned no video.")?;
+    if let Some(data) = sample.get("bytesBase64Encoded").and_then(|value| value.as_str()) {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|_| "Veo returned invalid video data.".to_string())?;
+        return Ok(Some(bytes));
+    }
+    let uri = sample
+        .get("uri")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            if sample.get("gcsUri").is_some() {
+                "Veo delivered the video to Cloud Storage (gcsUri), which this app does not yet download from — configure the request to return an inline/HTTPS URI instead.".to_string()
+            } else {
+                "Veo returned a video with no retrievable data.".to_string()
+            }
+        })?;
+    let download_request = match auth {
+        GeminiAuth::ApiKey(api_key) => client.get(uri).header("x-goog-api-key", api_key),
+        GeminiAuth::Vertex { access_token, .. } => client.get(uri).bearer_auth(access_token),
+    };
+    let bytes = download_request
+        .send()
+        .map_err(|error| format!("Could not download the generated animation: {error}"))?
+        .bytes()
+        .map_err(|error| format!("Could not read the generated animation: {error}"))?;
+    Ok(Some(bytes.to_vec()))
 }
 
 fn request_gemini_image(
@@ -6681,6 +7571,70 @@ mod tests {
     }
 
     #[test]
+    fn animation_clip_can_be_reverted_and_restored_from_cache() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let prompt = repo
+            .create_prompt_version(&video.id, "g1", "{}", "system", "scene")
+            .unwrap();
+        let render_dir = temp.path().join("Projects").join(&channel.id).join(&video.id).join("renders").join("g1");
+        fs::create_dir_all(&render_dir).unwrap();
+        fs::write(render_dir.join("render-v1.png"), b"source").unwrap();
+        let render = repo
+            .insert_image_render(
+                "render1", &video.id, "g1", 1, &prompt.id, "render-v1.png", "renders/g1/render-v1.png", None, None, "generation",
+            )
+            .unwrap();
+
+        repo.connection.execute(
+            "INSERT INTO timelines(video_id,duration_seconds,playhead_seconds,zoom,updated_at) VALUES(?1,10,0,1,'now')",
+            [&video.id],
+        ).unwrap();
+        repo.connection.execute(
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label) VALUES('clip1',?1,'g1',?2,1,0,5,'Scene 1')",
+            params![video.id, render.id],
+        ).unwrap();
+        repo.connection.execute(
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label) VALUES('clip2',?1,'g1',?2,2,5,10,'Scene 2')",
+            params![video.id, render.id],
+        ).unwrap();
+
+        let animation_dir = temp.path().join("Projects").join(&channel.id).join(&video.id).join("animations").join("g1");
+        fs::create_dir_all(&animation_dir).unwrap();
+        fs::write(animation_dir.join("animation-v1.mp4"), b"video").unwrap();
+        repo.connection.execute(
+            "INSERT INTO video_assets(id,video_id,group_id,source_render_id,version,parent_video_asset_id,kind,file_name,relative_path,resolution,requested_duration_seconds,veo_duration_seconds,actual_duration_seconds,veo_model,veo_operation_name,prompt,created_at) VALUES('asset1',?1,'g1',?2,1,NULL,'generation','animation-v1.mp4','animations/g1/animation-v1.mp4','720p',5,6,6,'test-model',NULL,'',   'now')",
+            params![video.id, render.id],
+        ).unwrap();
+        repo.connection.execute(
+            "UPDATE timeline_clips SET clip_kind='animation', video_asset_id='asset1' WHERE id='clip1'",
+            [],
+        ).unwrap();
+
+        // Reverting an animation clip keeps video_asset_id cached, not cleared.
+        let timeline = repo.revert_animation_clip_to_still(&video.id, "clip1").unwrap();
+        let clip = timeline.clips.iter().find(|c| c.id == "clip1").unwrap();
+        assert_eq!(clip.clip_kind, "still");
+        assert_eq!(clip.video_asset_id.as_deref(), Some("asset1"));
+
+        // Reverting again fails — it's not currently animated.
+        assert!(repo.revert_animation_clip_to_still(&video.id, "clip1").is_err());
+
+        // Restoring re-applies the cached animation with no Veo call.
+        let timeline = repo.restore_animation_clip(&video.id, "clip1").unwrap();
+        let clip = timeline.clips.iter().find(|c| c.id == "clip1").unwrap();
+        assert_eq!(clip.clip_kind, "animation");
+        assert_eq!(clip.video_asset_id.as_deref(), Some("asset1"));
+
+        // Restoring again fails — it's not currently a still.
+        assert!(repo.restore_animation_clip(&video.id, "clip1").is_err());
+
+        // A still with no cached animation at all can't be "restored".
+        assert!(repo.restore_animation_clip(&video.id, "clip2").is_err());
+    }
+
+    #[test]
     fn preserves_corrupt_database_before_recovery() {
         let temp = TempDir::new().unwrap();
         let database = temp.path().join("app.db");
@@ -6713,5 +7667,16 @@ mod tests {
             (10, 16)
         );
         assert!(repo.save_video_pacing(&video.id, "custom", 12, 4).is_err());
+    }
+
+    #[test]
+    fn picks_largest_veo_duration_that_fits_the_gap() {
+        assert_eq!(pick_veo_duration(8.0), 8);
+        assert_eq!(pick_veo_duration(7.9), 6);
+        assert_eq!(pick_veo_duration(6.0), 6);
+        assert_eq!(pick_veo_duration(5.9), 4);
+        assert_eq!(pick_veo_duration(4.0), 4);
+        assert_eq!(pick_veo_duration(3.0), 4);
+        assert_eq!(pick_veo_duration(0.0), 4);
     }
 }

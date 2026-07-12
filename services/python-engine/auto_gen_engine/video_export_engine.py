@@ -55,7 +55,10 @@ def to_srt_ts(seconds: float) -> str:
 
 def build_segments(stills: list[dict], duration_seconds: float) -> list[dict]:
     """Fills any uncovered time range between/around stills with black
-    segments so the whole [0, duration_seconds] range is covered."""
+    segments so the whole [0, duration_seconds] range is covered. A still
+    entry with `"kind": "video"` is a generated animation clip (Veo output)
+    rather than a static image — it carries a `videoPath` instead of an
+    `imagePath` and no motion/Ken-Burns settings."""
     ordered = sorted(stills, key=lambda item: item["start"])
     segments: list[dict] = []
     cursor = 0.0
@@ -66,13 +69,21 @@ def build_segments(stills: list[dict], duration_seconds: float) -> list[dict]:
             continue
         if start > cursor + 1e-6:
             segments.append({"kind": "black", "start": cursor, "end": start})
-        segments.append({
-            "kind": "image", "path": still["imagePath"], "start": start, "end": end,
-            "motion": still.get("motion", "none"),
-            "motionIntensity": still.get("motionIntensity", 0.22),
-            "transitionIn": still.get("transitionIn", "cut"),
-            "transitionOut": still.get("transitionOut", "cut"),
-        })
+        if still.get("kind") == "video":
+            segments.append({
+                "kind": "video", "path": still["videoPath"], "start": start, "end": end,
+                "sourceDurationSeconds": still.get("sourceDurationSeconds"),
+                "transitionIn": still.get("transitionIn", "cut"),
+                "transitionOut": still.get("transitionOut", "cut"),
+            })
+        else:
+            segments.append({
+                "kind": "image", "path": still["imagePath"], "start": start, "end": end,
+                "motion": still.get("motion", "none"),
+                "motionIntensity": still.get("motionIntensity", 0.22),
+                "transitionIn": still.get("transitionIn", "cut"),
+                "transitionOut": still.get("transitionOut", "cut"),
+            })
         cursor = max(cursor, end)
     if cursor < duration_seconds - 1e-6:
         segments.append({"kind": "black", "start": cursor, "end": duration_seconds})
@@ -179,6 +190,25 @@ def build_image_filter(
     )
 
 
+def build_video_filter(
+    transition_in: str, transition_out: str, width: int, height: int, fps: int, duration: float,
+) -> str:
+    """Scale/pad a generated animation clip onto the target canvas, same as a
+    still's `build_image_filter` but with no Ken-Burns zoompan — Veo output
+    already has real motion, it just needs to fit the export frame."""
+    fades = []
+    if transition_in == "fade":
+        fades.append(f"fade=t=in:st=0:d={min(0.5, duration / 2):.3f}:color=black")
+    if transition_out == "fade":
+        fade_out_duration = min(0.5, duration / 2)
+        fades.append(f"fade=t=out:st={max(0.0, duration - fade_out_duration):.3f}:d={fade_out_duration:.3f}:color=black")
+    fade = "".join(f",{f}" for f in fades)
+    return (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}{fade}"
+    )
+
+
 def run_ffmpeg(args: list[str]) -> None:
     result = subprocess.run(
         ["ffmpeg", *args], capture_output=True, text=True, **_subprocess_kwargs()
@@ -218,6 +248,26 @@ def encode_segment(
             "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
             "-r", str(fps), "-frames:v", str(frames), str(out_path),
         ])
+    elif segment["kind"] == "video":
+        vf = build_video_filter(
+            segment.get("transitionIn", "cut"),
+            segment.get("transitionOut", "cut"),
+            width, height, fps, duration,
+        )
+        # Safety net for a stale asset (the slot was resized after the last
+        # "Adjust animation to duration" click): if the stored clip is
+        # shorter than the slot now needs, clone its last frame to fill the
+        # remainder rather than let ffmpeg silently emit fewer frames than
+        # `-frames:v` asked for. If it's longer, `-frames:v` below simply
+        # truncates it — no special-casing needed for that direction.
+        source_duration = segment.get("sourceDurationSeconds")
+        if source_duration is not None and source_duration < duration - 0.05:
+            vf = f"tpad=stop_mode=clone:stop_duration={duration - source_duration:.3f},{vf}"
+        run_ffmpeg([
+            "-y", "-i", segment["path"],
+            "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+            "-r", str(fps), "-frames:v", str(frames), str(out_path),
+        ])
     else:
         run_ffmpeg([
             "-y", "-f", "lavfi", "-t", f"{duration + 1:.3f}",
@@ -226,6 +276,30 @@ def encode_segment(
             "-frames:v", str(frames), str(out_path),
         ])
     return out_path
+
+
+def retime_clip(source_path: Path, source_duration: float, target_duration: float, output_path: Path) -> None:
+    """Adjusts a generated animation clip to exactly fill its timeline slot.
+    Only ever stretches (slows down, via `setpts`) — never speeds up — per
+    product decision: a clip shorter than its slot is stretched to match; a
+    clip already at or beyond the target is simply trimmed. Audio is always
+    dropped (`-an`) since these are silent B-roll clips layered under
+    separate narration."""
+    if target_duration <= 0 or source_duration <= 0:
+        raise ValueError("Clip and target durations must both be positive.")
+    factor = target_duration / source_duration
+    if factor > 1.0:
+        run_ffmpeg([
+            "-y", "-i", str(source_path), "-vf", f"setpts={factor:.6f}*PTS", "-an",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "16", "-pix_fmt", "yuv420p",
+            str(output_path),
+        ])
+    else:
+        run_ffmpeg([
+            "-y", "-i", str(source_path), "-t", f"{target_duration:.3f}", "-an",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "16", "-pix_fmt", "yuv420p",
+            str(output_path),
+        ])
 
 
 def write_captions_srt(captions: list[dict], out_path: Path) -> None:
@@ -471,11 +545,14 @@ def build_parser() -> argparse.ArgumentParser:
         prog="video_export_engine",
         description="Composite a timeline arrangement of stills, captions, and narration audio into a final MP4, "
                      "or export it as separate editor-ready assets (--mode bundle), "
-                     "or just report an audio file's real duration (--mode probe).",
+                     "or just report a media file's real duration (--mode probe), "
+                     "or stretch/trim a generated animation clip to a target duration (--mode retime).",
     )
-    parser.add_argument("manifest", help="Path to the timeline export manifest JSON, or an audio file path for --mode probe")
+    parser.add_argument("manifest", help="Path to the timeline export manifest JSON, or a media file path for --mode probe/retime")
     parser.add_argument("--output", metavar="PATH", help="Output video path, or destination folder for --mode bundle (unused for --mode probe)")
-    parser.add_argument("--mode", choices=["video", "bundle", "probe"], default="video", help="'video' bakes one MP4 (default); 'bundle' exports separate clip/audio/caption assets; 'probe' reports an audio file's real duration")
+    parser.add_argument("--mode", choices=["video", "bundle", "probe", "retime"], default="video", help="'video' bakes one MP4 (default); 'bundle' exports separate clip/audio/caption assets; 'probe' reports a media file's real duration; 'retime' stretches/trims a clip to a target duration")
+    parser.add_argument("--source-duration", type=float, help="The input clip's real duration in seconds (required for --mode retime)")
+    parser.add_argument("--target-duration", type=float, help="The desired output duration in seconds (required for --mode retime)")
     return parser
 
 
@@ -512,6 +589,14 @@ if __name__ == "__main__":
     try:
         if args.mode == "probe":
             run_probe(Path(args.manifest).expanduser().resolve())
+        elif args.mode == "retime":
+            if args.source_duration is None or args.target_duration is None:
+                cli_parser.error("--source-duration and --target-duration are required for --mode retime")
+            retime_clip(
+                Path(args.manifest).expanduser().resolve(), args.source_duration, args.target_duration,
+                Path(args.output).expanduser().resolve(),
+            )
+            print(f"Output: {args.output}", flush=True)
         elif args.mode == "bundle":
             run_bundle(Path(args.manifest).expanduser().resolve(), Path(args.output).expanduser().resolve())
         else:

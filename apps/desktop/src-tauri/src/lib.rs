@@ -2,9 +2,9 @@ mod projects;
 
 use base64::Engine;
 use projects::{
-    CaptionSet, Channel, ExportResult, ImageJob, ImageRender, ImageWorkspace, InputAsset,
-    ProjectRepository, PromptVersion, ResumeState, Timeline, Video, VideoInputs, VideoProgress,
-    VisualPlan,
+    AnimationJob, CaptionSet, Channel, ExportResult, ImageJob, ImageRender, ImageWorkspace,
+    InputAsset, ProjectRepository, PromptVersion, ResumeState, Timeline, Video, VideoAsset,
+    VideoInputs, VideoProgress, VisualPlan,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -1108,6 +1108,227 @@ fn control_image_job(
     Ok(job)
 }
 
+// Mirrors `spawn_job_workers` exactly, but each attempt is a full Veo
+// submit+poll+download cycle (`generate_animation_clip`) rather than a single
+// synchronous Gemini call, so it needs the Python export engine's directory
+// to probe/trim the downloaded clip. A single paced worker avoids parallel
+// 429 storms against Veo's quota the same way the image job worker does.
+fn spawn_animation_job_workers(
+    database_path: std::path::PathBuf,
+    projects_dir: std::path::PathBuf,
+    engine_dir: std::path::PathBuf,
+    job_id: String,
+) {
+    for _ in 0..1 {
+        let database_path = database_path.clone();
+        let projects_dir = projects_dir.clone();
+        let engine_dir = engine_dir.clone();
+        let job_id = job_id.clone();
+        thread::spawn(move || {
+            let Ok(repository) = ProjectRepository::open(&database_path, &projects_dir) else {
+                return;
+            };
+            loop {
+                let Ok(Some(item)) = repository.claim_animation_job_item(&job_id) else {
+                    break;
+                };
+                let mut last_error = String::new();
+                let mut video_asset_id = None;
+                for attempt in 0..5 {
+                    if matches!(
+                        repository.animation_job_status(&job_id).ok().as_deref(),
+                        Some("stopped") | Some("failed")
+                    ) {
+                        break;
+                    }
+                    match repository.generate_animation_clip(
+                        &item.video_id,
+                        &item.clip_id,
+                        &item.resolution,
+                        &item.prompt,
+                        &engine_dir,
+                    ) {
+                        Ok(asset) => {
+                            video_asset_id = Some(asset.id);
+                            break;
+                        }
+                        Err(error) => {
+                            last_error = error;
+                            if attempt < 4 {
+                                let rate_limited = last_error.contains("429")
+                                    || last_error
+                                        .to_ascii_lowercase()
+                                        .contains("resource exhausted");
+                                let delay = if rate_limited {
+                                    30 * 2_u64.pow(attempt)
+                                } else {
+                                    3 * 2_u64.pow(attempt)
+                                };
+                                let mut remaining = delay.min(240);
+                                while remaining > 0 {
+                                    if matches!(
+                                        repository.animation_job_status(&job_id).ok().as_deref(),
+                                        Some("stopped") | Some("failed")
+                                    ) {
+                                        break;
+                                    }
+                                    thread::sleep(Duration::from_secs(1));
+                                    remaining -= 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                if matches!(
+                    repository.animation_job_status(&job_id).ok().as_deref(),
+                    Some("stopped") | Some("failed")
+                ) {
+                    break;
+                }
+                let result = video_asset_id.ok_or(last_error);
+                let _ = repository.finish_animation_job_item(&job_id, &item.id, result);
+                for _ in 0..8 {
+                    if matches!(
+                        repository.animation_job_status(&job_id).ok().as_deref(),
+                        Some("stopped") | Some("failed")
+                    ) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+            }
+        });
+    }
+}
+
+fn resolve_engine_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    if cfg!(debug_assertions) {
+        Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../services/python-engine"))
+    } else {
+        app.path()
+            .resource_dir()
+            .map(|dir| dir.join("python-engine"))
+            .map_err(|e| format!("Could not locate app resource directory: {e}"))
+    }
+}
+
+#[tauri::command]
+fn create_animation_job(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    resolution: String,
+    prompt: String,
+) -> Result<AnimationJob, String> {
+    let engine_dir = resolve_engine_dir(&app)?;
+    let (job, paths) = with_repository(state, |repository| {
+        let job = repository.create_animation_job(&video_id, &clip_id, &resolution, &prompt)?;
+        Ok((job, repository.paths()))
+    })?;
+    spawn_animation_job_workers(paths.0, paths.1, engine_dir, job.id.clone());
+    Ok(job)
+}
+
+#[tauri::command]
+fn suggest_animation_prompt(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_id: String,
+) -> Result<String, String> {
+    with_repository(state, |repository| repository.suggest_animation_prompt(&video_id, &group_id))
+}
+
+#[tauri::command]
+fn get_latest_animation_job(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Option<AnimationJob>, String> {
+    with_repository(state, |repository| repository.latest_animation_job(&video_id))
+}
+
+#[tauri::command]
+fn control_animation_job(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    job_id: String,
+    action: String,
+) -> Result<AnimationJob, String> {
+    let engine_dir = resolve_engine_dir(&app)?;
+    let (job, paths) = with_repository(state, |repository| {
+        let status = match action.as_str() {
+            "pause" => "paused",
+            "resume" => "queued",
+            "stop" => "stopped",
+            "cancel" => "failed",
+            _ => return Err("Unknown job action.".into()),
+        };
+        let job = repository.set_animation_job_status(&job_id, status)?;
+        Ok((job, repository.paths()))
+    })?;
+    if action == "resume" {
+        spawn_animation_job_workers(paths.0, paths.1, engine_dir, job.id.clone());
+    }
+    Ok(job)
+}
+
+#[tauri::command]
+async fn retime_animation_clip(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+) -> Result<Timeline, String> {
+    let engine_dir = resolve_engine_dir(&app)?;
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.retime_animation_clip(&video_id, &clip_id, &engine_dir)
+    })
+    .await
+    .map_err(|error| format!("Retime worker stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
+fn revert_animation_clip_to_still(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| repository.revert_animation_clip_to_still(&video_id, &clip_id))
+}
+
+#[tauri::command]
+fn restore_animation_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| repository.restore_animation_clip(&video_id, &clip_id))
+}
+
+#[tauri::command]
+fn get_video_asset_file_path(
+    state: State<'_, RepositoryState>,
+    video_asset_id: String,
+) -> Result<String, String> {
+    with_repository(state, |repository| {
+        repository
+            .video_asset_file_path(&video_asset_id)
+            .map(|path| path.to_string_lossy().into_owned())
+    })
+}
+
+#[tauri::command]
+fn get_video_asset_record(
+    state: State<'_, RepositoryState>,
+    video_asset_id: String,
+) -> Result<VideoAsset, String> {
+    with_repository(state, |repository| {
+        repository.get_video_asset_record(&video_asset_id)
+    })
+}
+
 #[tauri::command]
 fn pick_and_import_asset(
     app: tauri::AppHandle,
@@ -1659,6 +1880,9 @@ pub fn run() {
             repository
                 .recover_image_jobs()
                 .map_err(std::io::Error::other)?;
+            repository
+                .recover_animation_jobs()
+                .map_err(std::io::Error::other)?;
             if repository
                 .get_app_setting("gemini_model")
                 .map_err(std::io::Error::other)?
@@ -1725,6 +1949,15 @@ pub fn run() {
             create_image_job,
             get_latest_image_job,
             control_image_job,
+            create_animation_job,
+            suggest_animation_prompt,
+            get_latest_animation_job,
+            control_animation_job,
+            retime_animation_clip,
+            revert_animation_clip_to_still,
+            restore_animation_clip,
+            get_video_asset_file_path,
+            get_video_asset_record,
             edit_image_render,
             set_final_render,
             delete_image_render,

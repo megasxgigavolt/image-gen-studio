@@ -183,9 +183,33 @@ export type ImageJobRecord = {
 export type ExportResultRecord = { path: string; fileCount: number };
 export type MotionPreset = "none" | "zoom-in" | "zoom-out" | "pan-left" | "pan-right";
 export type TransitionPreset = "cut" | "fade";
+export type ClipKind = "still" | "animation";
 export type TimelineClipRecord = {
   id: string; groupId: string; renderId: string | null; ordinal: number; startSeconds: number; endSeconds: number; label: string;
   motionPreset: MotionPreset; transitionIn: TransitionPreset; transitionOut: TransitionPreset; motionIntensity: number;
+  clipKind: ClipKind; videoAssetId: string | null;
+};
+export type VeoResolution = "720p" | "1080p";
+export type VideoAssetRecord = {
+  id: string; videoId: string; groupId: string; sourceRenderId: string; version: number;
+  parentVideoAssetId: string | null; kind: "generation" | "retimed"; fileName: string; relativePath: string;
+  resolution: VeoResolution; requestedDurationSeconds: number; veoDurationSeconds: number;
+  actualDurationSeconds: number; veoModel: string; veoOperationName: string | null; prompt: string; createdAt: string;
+};
+export type AnimationJobRecord = {
+  id: string;
+  videoId: string;
+  status: "queued" | "running" | "paused" | "stopped" | "completed" | "failed";
+  totalItems: number;
+  completedItems: number;
+  failedItems: number;
+  createdAt: string;
+  updatedAt: string;
+  items: {
+    id: string; videoId: string; clipId: string; groupId: string; sourceRenderId: string; resolution: VeoResolution;
+    requestedDurationSeconds: number; veoDurationSeconds: number; prompt: string; status: string; attempts: number;
+    lastError: string | null; videoAssetId: string | null;
+  }[];
 };
 export type TimelineCaptionClipRecord = { id: string; sourceChunkIndex: number | null; text: string; ordinal: number; startSeconds: number; endSeconds: number };
 export type TimelineRecord = {
@@ -622,6 +646,42 @@ export const projectsClient = {
   async controlImageJob(jobId: string, action: "pause" | "resume" | "stop" | "cancel"): Promise<ImageJobRecord> {
     if (isTauri()) return invoke("control_image_job", { jobId, action });
     throw new Error("Bulk jobs require the native application.");
+  },
+  async createAnimationJob(videoId: string, clipId: string, resolution: VeoResolution, prompt: string): Promise<AnimationJobRecord> {
+    if (isTauri()) return invoke("create_animation_job", { videoId, clipId, resolution, prompt });
+    throw new Error("Animation generation requires the native application.");
+  },
+  async suggestAnimationPrompt(videoId: string, groupId: string): Promise<string> {
+    if (isTauri()) return invoke("suggest_animation_prompt", { videoId, groupId });
+    throw new Error("Prompt suggestions require the native application.");
+  },
+  async getLatestAnimationJob(videoId: string): Promise<AnimationJobRecord | null> {
+    if (isTauri()) return invoke("get_latest_animation_job", { videoId });
+    return null;
+  },
+  async controlAnimationJob(jobId: string, action: "pause" | "resume" | "stop" | "cancel"): Promise<AnimationJobRecord> {
+    if (isTauri()) return invoke("control_animation_job", { jobId, action });
+    throw new Error("Animation generation requires the native application.");
+  },
+  async retimeAnimationClip(videoId: string, clipId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("retime_animation_clip", { videoId, clipId });
+    throw new Error("Adjusting an animation's duration requires the native application.");
+  },
+  async revertAnimationClipToStill(videoId: string, clipId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("revert_animation_clip_to_still", { videoId, clipId });
+    throw new Error("Undoing an animation requires the native application.");
+  },
+  async restoreAnimationClip(videoId: string, clipId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("restore_animation_clip", { videoId, clipId });
+    throw new Error("Restoring an animation requires the native application.");
+  },
+  async getVideoAssetFilePath(videoAssetId: string): Promise<string> {
+    if (isTauri()) return invoke("get_video_asset_file_path", { videoAssetId });
+    return "";
+  },
+  async getVideoAssetRecord(videoAssetId: string): Promise<VideoAssetRecord> {
+    if (isTauri()) return invoke("get_video_asset_record", { videoAssetId });
+    throw new Error("Animation clips require the native application.");
   },
   async saveVideoInputs(videoId: string, scriptText: string, pacingSeconds: number) {
     if (isTauri()) return invoke<VideoInputsRecord>("save_video_inputs", { videoId, scriptText, pacingSeconds });

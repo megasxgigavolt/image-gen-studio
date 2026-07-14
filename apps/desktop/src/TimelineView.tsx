@@ -17,6 +17,7 @@ import {
   Square,
   Trash2,
   Undo2,
+  Upload,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
@@ -131,16 +132,17 @@ export function TimelineView() {
   const [canvasSize, setCanvasSize] = useState({ width: 960, height: 540 });
   const [previewTime, setPreviewTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [sourceTab, setSourceTab] = useState<"stills" | "animations">("stills");
   const [inspectorTab, setInspectorTab] = useState<"clip" | "global">("clip");
   const [globalIntensity, setGlobalIntensity] = useState(0.22);
   const [videoAssetUrls, setVideoAssetUrls] = useState<Record<string, string>>({});
   const [animationResolution, setAnimationResolution] = useState<VeoResolution>("720p");
   const [animationPrompt, setAnimationPrompt] = useState("");
+  const [animateMode, setAnimateMode] = useState<"choose" | "generate">("choose");
   const [suggestingPrompt, setSuggestingPrompt] = useState(false);
   const [animationJob, setAnimationJob] = useState<AnimationJobRecord | null>(null);
   const [selectedClipVideoAsset, setSelectedClipVideoAsset] = useState<VideoAssetRecord | null>(null);
   const [retiming, setRetiming] = useState(false);
+  const [uploadingAnimation, setUploadingAnimation] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -253,6 +255,7 @@ export function TimelineView() {
   // to the next one the user picks.
   useEffect(() => {
     setAnimationPrompt("");
+    setAnimateMode("choose");
   }, [selectedClip?.id]);
 
   // Fetches the animation clip's real stored duration so the inspector can
@@ -733,6 +736,23 @@ export function TimelineView() {
     }
   }
 
+  async function uploadAnimation() {
+    if (!activeVideoId || !selectedClip || selectedClip.clipKind !== "still") return;
+    setUploadingAnimation(true);
+    setError(null);
+    try {
+      const next = await projectsClient.importAnimationClip(activeVideoId, selectedClip.id);
+      if (!next) return; // user cancelled the file picker
+      setCachedData(`tl-timeline:${activeVideoId}`, next);
+      setTimeline(next);
+      addToast("Animation uploaded and fitted to this clip's timeline slot.", "success");
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setUploadingAnimation(false);
+    }
+  }
+
   async function suggestAnimationPrompt() {
     if (!activeVideoId || !selectedClip || selectedClip.clipKind !== "still") return;
     setSuggestingPrompt(true);
@@ -901,86 +921,23 @@ export function TimelineView() {
       <>
         <div className="tl-workspace">
           <aside className="tl-media-pane">
-            <div className="tl-source-tabs">
-              <button className={sourceTab === "stills" ? "tl-source-tab active" : "tl-source-tab"} onClick={() => setSourceTab("stills")}>Stills</button>
-              <button className={sourceTab === "animations" ? "tl-source-tab active" : "tl-source-tab"} onClick={() => setSourceTab("animations")}>Animations</button>
+            <div className="tl-source-section">
+              <strong>Stills<span>{workspace?.groups.length ?? 0}</span></strong>
+              <div className="tl-source-grid">
+                {workspace?.groups.map((group) => (
+                  <button
+                    key={group.group.id}
+                    className="tl-source-thumb-btn"
+                    title={`Jump to still ${group.group.ordinal}`}
+                    onClick={() => void selectStillInSource(group.group.id)}
+                  >
+                    <span className="tl-source-badge">{group.group.ordinal}</span>
+                    {renderUrls[group.imageRenders[0]?.id] ? <img src={renderUrls[group.imageRenders[0]?.id]} alt="" /> : <ImageOff size={16} />}
+                  </button>
+                ))}
+                {!workspace?.groups.length && <div className="tl-source-empty">No stills yet.</div>}
+              </div>
             </div>
-            {sourceTab === "stills" && (
-              <div className="tl-source-section">
-                <strong>Stills<span>{workspace?.groups.length ?? 0}</span></strong>
-                <div className="tl-source-grid">
-                  {workspace?.groups.map((group) => (
-                    <button
-                      key={group.group.id}
-                      className="tl-source-thumb-btn"
-                      title={`Jump to still ${group.group.ordinal}`}
-                      onClick={() => void selectStillInSource(group.group.id)}
-                    >
-                      <span className="tl-source-badge">{group.group.ordinal}</span>
-                      {renderUrls[group.imageRenders[0]?.id] ? <img src={renderUrls[group.imageRenders[0]?.id]} alt="" /> : <ImageOff size={16} />}
-                    </button>
-                  ))}
-                  {!workspace?.groups.length && <div className="tl-source-empty">No stills yet.</div>}
-                </div>
-              </div>
-            )}
-            {sourceTab === "animations" && (
-              <div className="tl-source-section tl-broll-panel">
-                <strong><Clapperboard size={14} />Animations</strong>
-                {selectedClip && selectedClip.clipKind === "still" ? (
-                  <>
-                    <div className="tl-source-thumb-preview">
-                      {selectedClip.renderId && renderUrls[selectedClip.renderId]
-                        ? <img src={renderUrls[selectedClip.renderId]} alt="" />
-                        : <ImageOff size={16} />}
-                    </div>
-                    <div className="tl-inspector-group">
-                      <span className="tl-inspector-label">Resolution</span>
-                      <div className="tl-preset-grid two">
-                        {(["720p", "1080p"] as VeoResolution[]).map((option) => (
-                          <button
-                            key={option}
-                            className={animationResolution === option ? "tl-preset-btn active" : "tl-preset-btn"}
-                            onClick={() => setAnimationResolution(option)}
-                          >
-                            <span>{option}</span>
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                    <div className="tl-inspector-group">
-                      <div className="tl-inspector-label-row">
-                        <span className="tl-inspector-label">Animation prompt</span>
-                        <button className="tl-apply-all-btn" disabled={suggestingPrompt} onClick={() => void suggestAnimationPrompt()}>
-                          {suggestingPrompt ? "Suggesting…" : "Suggest prompt"}
-                        </button>
-                      </div>
-                      <textarea
-                        className="tl-prompt-textarea"
-                        placeholder="Describe the motion to add (camera drift, wind, gestures…) — leave blank to let Veo decide, or click Suggest prompt for an AI variation based on this still's narration."
-                        value={animationPrompt}
-                        onChange={(event) => setAnimationPrompt(event.target.value)}
-                        rows={4}
-                      />
-                      <p className="tl-source-hint">
-                        This exact text is sent to Veo alongside the still. Edit it freely, or click "Suggest prompt"
-                        again for a different variation grounded in this still's narration.
-                      </p>
-                    </div>
-                    <p className="tl-source-hint">
-                      Veo only generates 4s, 6s, or 8s clips — this will generate as{" "}
-                      {pickVeoDuration(selectedClip.endSeconds - selectedClip.startSeconds)}s. Use "Adjust animation to
-                      duration" afterward to stretch it to exactly fill this {formatTime(selectedClip.endSeconds - selectedClip.startSeconds)} slot.
-                    </p>
-                    <button className="primary full" onClick={() => void generateAnimation()}>
-                      <Clapperboard size={14} />Generate Animation
-                    </button>
-                  </>
-                ) : (
-                  <p className="tl-source-hint">Select a still on the timeline to animate it.</p>
-                )}
-              </div>
-            )}
           </aside>
           <div className="tl-preview-pane">
             <div className="tl-preview-frame">
@@ -1044,8 +1001,13 @@ export function TimelineView() {
             {inspectorTab === "clip" && (selectedClip ? (
               <div className="tl-inspector">
                 <div className="tl-inspector-header">
-                  <strong>Still</strong>
+                  <strong>{selectedClip.clipKind === "animation" ? "Animated" : "Still"}</strong>
                   <span>{formatTime(selectedClip.startSeconds)} – {formatTime(selectedClip.endSeconds)}</span>
+                  {selectedClip.clipKind === "animation" && selectedClipVideoAsset && (
+                    <span className={Math.abs(selectedClipVideoAsset.actualDurationSeconds - (selectedClip.endSeconds - selectedClip.startSeconds)) > 0.05 ? "tl-duration-pill mismatch" : "tl-duration-pill fit"}>
+                      {Math.abs(selectedClipVideoAsset.actualDurationSeconds - (selectedClip.endSeconds - selectedClip.startSeconds)) > 0.05 ? "Duration mismatch" : "Fits slot"}
+                    </span>
+                  )}
                 </div>
                 {selectedClipRenders.length > 1 && (
                   <div className="tl-inspector-group">
@@ -1063,51 +1025,102 @@ export function TimelineView() {
                     </div>
                   </div>
                 )}
-                {selectedClip.clipKind === "animation" && (
-                  <div className="tl-inspector-group">
-                    <span className="tl-inspector-label">Prompt sent to Veo</span>
-                    <p className="tl-source-hint tl-prompt-readout">
-                      {selectedClipVideoAsset?.prompt ? selectedClipVideoAsset.prompt : "(no prompt — Veo decided the motion on its own)"}
-                    </p>
-                  </div>
-                )}
-                {selectedClip.clipKind === "animation" && (
-                  <div className="tl-inspector-group">
-                    <span className="tl-inspector-label"><Clock size={12} />Animation duration</span>
-                    {selectedClipVideoAsset && Math.abs(selectedClipVideoAsset.actualDurationSeconds - (selectedClip.endSeconds - selectedClip.startSeconds)) > 0.05 ? (
-                      <>
-                        <p className="tl-source-hint">
-                          Doesn't match its slot ({selectedClipVideoAsset.actualDurationSeconds.toFixed(1)}s vs{" "}
-                          {(selectedClip.endSeconds - selectedClip.startSeconds).toFixed(1)}s).
-                        </p>
-                        <button className="secondary" disabled={retiming} onClick={() => void adjustAnimationToDuration()}>
-                          <Clock size={14} />{retiming ? "Adjusting…" : "Adjust animation to duration"}
+                <div className="tl-inspector-group">
+                  <span className="tl-inspector-label"><Clapperboard size={12} />Animate this clip</span>
+
+                  {selectedClip.clipKind === "still" && !selectedClip.videoAssetId && animateMode === "choose" && (
+                    <>
+                      <div className="tl-preset-grid two">
+                        <button className="primary" onClick={() => setAnimateMode("generate")}>
+                          <Clapperboard size={14} />Generate with AI
                         </button>
-                      </>
-                    ) : (
-                      <p className="tl-source-hint">Matches its timeline slot.</p>
-                    )}
-                  </div>
-                )}
-                {selectedClip.clipKind === "animation" && (
-                  <div className="tl-inspector-group">
-                    <button className="secondary" onClick={() => void undoAnimation()}>
-                      <Undo2 size={14} />Undo animation
-                    </button>
-                    <p className="tl-source-hint">
-                      Reverts to the still. The generated animation stays cached — restore it any time from the
-                      Animations tab, unless you generate a new one first.
-                    </p>
-                  </div>
-                )}
-                {selectedClip.clipKind === "still" && selectedClip.videoAssetId && (
-                  <div className="tl-inspector-group">
-                    <button className="secondary" onClick={() => void restoreAnimation()}>
-                      <Redo2 size={14} />Restore cached animation
-                    </button>
-                    <p className="tl-source-hint">A previously generated animation for this still is cached and ready to bring back.</p>
-                  </div>
-                )}
+                        <button className="secondary" disabled={uploadingAnimation} onClick={() => void uploadAnimation()}>
+                          <Upload size={14} />{uploadingAnimation ? "Uploading…" : "Upload your own"}
+                        </button>
+                      </div>
+                      <p className="tl-source-hint">
+                        Generate motion with Veo from a prompt, or bring your own clip — either way it's automatically
+                        stretched or trimmed to exactly fill this {formatTime(selectedClip.endSeconds - selectedClip.startSeconds)} slot.
+                      </p>
+                    </>
+                  )}
+
+                  {selectedClip.clipKind === "still" && !selectedClip.videoAssetId && animateMode === "generate" && (
+                    <>
+                      <button className="tl-apply-all-btn" style={{ alignSelf: "flex-start" }} onClick={() => setAnimateMode("choose")}>← Back</button>
+                      <span className="tl-inspector-label">Resolution</span>
+                      <div className="tl-preset-grid two">
+                        {(["720p", "1080p"] as VeoResolution[]).map((option) => (
+                          <button
+                            key={option}
+                            className={animationResolution === option ? "tl-preset-btn active" : "tl-preset-btn"}
+                            onClick={() => setAnimationResolution(option)}
+                          >
+                            <span>{option}</span>
+                          </button>
+                        ))}
+                      </div>
+                      <div className="tl-inspector-label-row">
+                        <span className="tl-inspector-label">Animation prompt</span>
+                        <button className="tl-apply-all-btn" disabled={suggestingPrompt} onClick={() => void suggestAnimationPrompt()}>
+                          {suggestingPrompt ? "Suggesting…" : "Suggest prompt"}
+                        </button>
+                      </div>
+                      <textarea
+                        className="tl-prompt-textarea"
+                        placeholder="Describe the motion to add (camera drift, wind, gestures…) — leave blank to let Veo decide, or click Suggest prompt for an AI variation based on this still's narration."
+                        value={animationPrompt}
+                        onChange={(event) => setAnimationPrompt(event.target.value)}
+                        rows={4}
+                      />
+                      <p className="tl-source-hint">
+                        Veo only generates 4s, 6s, or 8s clips — this will generate as{" "}
+                        {pickVeoDuration(selectedClip.endSeconds - selectedClip.startSeconds)}s. Use "Adjust animation to
+                        duration" afterward to stretch it to exactly fill this {formatTime(selectedClip.endSeconds - selectedClip.startSeconds)} slot.
+                      </p>
+                      <button className="primary full" onClick={() => void generateAnimation()}>
+                        <Clapperboard size={14} />Generate Animation
+                      </button>
+                    </>
+                  )}
+
+                  {selectedClip.clipKind === "animation" && (
+                    <>
+                      <p className="tl-source-hint tl-prompt-readout">
+                        {selectedClipVideoAsset?.prompt ? selectedClipVideoAsset.prompt : "(no prompt — Veo decided the motion on its own)"}
+                      </p>
+                      {selectedClipVideoAsset && Math.abs(selectedClipVideoAsset.actualDurationSeconds - (selectedClip.endSeconds - selectedClip.startSeconds)) > 0.05 ? (
+                        <>
+                          <p className="tl-source-hint">
+                            Doesn't match its slot ({selectedClipVideoAsset.actualDurationSeconds.toFixed(1)}s vs{" "}
+                            {(selectedClip.endSeconds - selectedClip.startSeconds).toFixed(1)}s).
+                          </p>
+                          <button className="secondary" disabled={retiming} onClick={() => void adjustAnimationToDuration()}>
+                            <Clock size={14} />{retiming ? "Adjusting…" : "Adjust animation to duration"}
+                          </button>
+                        </>
+                      ) : (
+                        <p className="tl-source-hint">Matches its timeline slot.</p>
+                      )}
+                      <button className="secondary" onClick={() => void undoAnimation()}>
+                        <Undo2 size={14} />Undo animation
+                      </button>
+                      <p className="tl-source-hint">
+                        Reverts to the still. The generated animation stays cached — restore it any time, unless
+                        you generate or upload a new one first.
+                      </p>
+                    </>
+                  )}
+
+                  {selectedClip.clipKind === "still" && selectedClip.videoAssetId && (
+                    <>
+                      <button className="secondary" onClick={() => void restoreAnimation()}>
+                        <Redo2 size={14} />Restore cached animation
+                      </button>
+                      <p className="tl-source-hint">A previously generated animation for this still is cached and ready to bring back.</p>
+                    </>
+                  )}
+                </div>
                 {selectedClip.clipKind !== "animation" && (
                   <div className="tl-inspector-group">
                     <div className="tl-inspector-label-row">

@@ -239,3 +239,9 @@
 - Added Undo/Restore for generated animations — reverting to the still keeps the animation cached until a new one is generated.
 - Added live video playback of animation clips on the timeline preview canvas.
 - Fixed a Timeline UI misalignment where the Animations tab heading and the zoom/camera-intensity sliders picked up unrelated global CSS.
+# 2.2.0
+
+- Added uploading your own video as a clip's animation, alongside Veo generation — it's automatically stretched or trimmed to exactly fill the clip's timeline slot, the same fit used for generated clips.
+- Redesigned the Timeline tab's animation controls: generate, upload, adjust-to-duration, undo, and restore now live in one "Animate this clip" section in the right inspector instead of being split across the left media pane and right inspector.
+- Simplified the left media pane to a single always-visible Stills browser, removing the separate "Animations" tab.
+- Fixed the clip inspector header always reading "Still" even for animated clips; it now shows the clip's real state plus a Fits/Duration-mismatch pill.

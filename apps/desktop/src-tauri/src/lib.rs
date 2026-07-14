@@ -1290,6 +1290,33 @@ async fn retime_animation_clip(
 }
 
 #[tauri::command]
+async fn import_animation_clip(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+) -> Result<Option<Timeline>, String> {
+    let Some(source) = app
+        .dialog()
+        .file()
+        .add_filter("Video files", &["mp4", "mov", "webm", "mkv", "m4v"])
+        .blocking_pick_file()
+        .and_then(|file| file.as_path().map(ToOwned::to_owned))
+    else {
+        return Ok(None);
+    };
+    let engine_dir = resolve_engine_dir(&app)?;
+    let (database_path, projects_dir) = with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.import_animation_clip(&video_id, &clip_id, &source, &engine_dir)
+    })
+    .await
+    .map_err(|error| format!("Import worker stopped unexpectedly: {error}"))?
+    .map(Some)
+}
+
+#[tauri::command]
 fn revert_animation_clip_to_still(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -1954,6 +1981,7 @@ pub fn run() {
             get_latest_animation_job,
             control_animation_job,
             retime_animation_clip,
+            import_animation_clip,
             revert_animation_clip_to_still,
             restore_animation_clip,
             get_video_asset_file_path,

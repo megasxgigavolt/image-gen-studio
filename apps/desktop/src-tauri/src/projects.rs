@@ -4483,15 +4483,11 @@ Return JSON only:
         let veo_duration_seconds = pick_veo_duration(requested_duration_seconds);
 
         let auth = self.gemini_auth()?;
-        // The "Lite" model only exists under that name on the Gemini Developer
-        // API (API-key auth); Vertex AI's equivalent low-cost tier is named
-        // "fast" instead. An explicit `veo_model` app setting always wins.
-        let model = self.get_app_setting("veo_model")?.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| {
-            match &auth {
-                GeminiAuth::ApiKey(_) => "veo-3.1-lite-generate-preview".to_string(),
-                GeminiAuth::Vertex { .. } => "veo-3.0-fast-generate-001".to_string(),
-            }
-        });
+        // "veo-3.1-lite-generate-preview" is the same model ID on both the
+        // Gemini Developer API (API-key auth) and Vertex AI, and is the
+        // cheapest Veo 3.1 tier ($0.05/sec @720p). An explicit `veo_model`
+        // app setting always wins.
+        let model = self.get_app_setting("veo_model")?.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "veo-3.1-lite-generate-preview".to_string());
 
         let operation_name = request_veo_generate(
             &auth, &model, prompt, &source_bytes, mime_type, resolution, veo_duration_seconds,
@@ -4572,10 +4568,102 @@ Return JSON only:
         self.get_video_asset(&id)
     }
 
+    /// Imports a user-supplied video file as this clip's animation. Unlike
+    /// `generate_animation_clip`, an upload can land on either side of the
+    /// slot's duration, so it's unconditionally run through `run_retime` to
+    /// stretch or trim it to fit — the same fit-to-slot step Veo output gets
+    /// only when it overshoots. This also normalizes the container/codec to
+    /// the same libx264 MP4 every generated clip uses, so playback and
+    /// export behave identically regardless of the source file's format.
+    /// From here on the clip behaves exactly like a generated one: same
+    /// revert/restore-to-still controls, same re-adjust-to-duration button.
+    pub fn import_animation_clip(
+        &self,
+        video_id: &str,
+        clip_id: &str,
+        source: &Path,
+        engine_dir: &Path,
+    ) -> Result<Timeline, String> {
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !["mp4", "mov", "webm", "mkv", "m4v"].contains(&extension.as_str()) {
+            return Err("Unsupported video file type. Use MP4, MOV, WebM, MKV, or M4V.".into());
+        }
+        let (group_id, render_id, start_seconds, end_seconds): (String, Option<String>, f64, f64) = self.connection.query_row(
+            "SELECT group_id,render_id,start_seconds,end_seconds FROM timeline_clips WHERE id=?1 AND video_id=?2",
+            params![clip_id, video_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).map_err(|_| "Timeline clip was not found.".to_string())?;
+        let source_render_id = render_id.ok_or("Select a still with a generated image before animating it.")?;
+        let requested_duration_seconds = (end_seconds - start_seconds).max(0.1);
+
+        let channel_id: String = self
+            .connection
+            .query_row(
+                "SELECT channel_id FROM videos WHERE id = ?1 AND trashed_at IS NULL",
+                [video_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Video was not found.".to_string())?;
+        let animation_dir = self.projects_dir.join(&channel_id).join(video_id).join("animations").join(&group_id);
+        fs::create_dir_all(&animation_dir).map_err(|e| e.to_string())?;
+        let version: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM video_assets WHERE video_id = ?1 AND group_id = ?2",
+                params![video_id, group_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let file_name = format!("animation-v{}.mp4", version);
+        let relative_path = format!("animations/{}/{}", group_id, file_name);
+        let raw_path = animation_dir.join(format!("animation-v{}.upload.{}", version, extension));
+        fs::copy(source, &raw_path).map_err(|_| "Could not read the selected video file.".to_string())?;
+        let raw_duration = Self::probe_audio_duration(engine_dir, &raw_path).map_err(|_| {
+            let _ = fs::remove_file(&raw_path);
+            "Could not read the selected file as a video.".to_string()
+        })?;
+
+        let out_path = animation_dir.join(&file_name);
+        Self::run_retime(engine_dir, &raw_path, raw_duration, requested_duration_seconds, &out_path)?;
+        let _ = fs::remove_file(&raw_path);
+        let actual_duration_seconds = Self::probe_audio_duration(engine_dir, &out_path)?;
+
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO video_assets(id,video_id,group_id,source_render_id,version,parent_video_asset_id,kind,file_name,relative_path,resolution,requested_duration_seconds,veo_duration_seconds,actual_duration_seconds,veo_model,veo_operation_name,prompt,created_at) VALUES(?1,?2,?3,?4,?5,NULL,'upload',?6,?7,'original',?8,?9,?10,'upload',NULL,'',?11)",
+            params![id, video_id, group_id, source_render_id, version, file_name, relative_path, requested_duration_seconds, raw_duration.round() as i64, actual_duration_seconds, now],
+        ).map_err(|e| e.to_string())?;
+
+        self.connection.execute(
+            "UPDATE timeline_clips SET clip_kind='animation', video_asset_id=?1 WHERE id=?2",
+            params![id, clip_id],
+        ).map_err(|e| e.to_string())?;
+
+        self.create_snapshot(
+            video_id,
+            &json!({
+                "reason": "animation-uploaded",
+                "groupId": group_id,
+                "clipId": clip_id,
+                "videoAssetId": id,
+                "version": version,
+            })
+            .to_string(),
+        )?;
+
+        self.get_timeline(video_id)
+    }
+
     /// Slows a generated animation clip down (or trims it) to exactly fill
     /// its current timeline slot. Always re-derives from the ORIGINAL Veo
-    /// output (`kind='generation'`), never from a previously-retimed version,
-    /// so repeated clicks don't compound re-encode quality loss.
+    /// output or upload (`kind` in `'generation'`/`'upload'`), never from a
+    /// previously-retimed version, so repeated clicks don't compound
+    /// re-encode quality loss.
     pub fn retime_animation_clip(
         &self,
         video_id: &str,
@@ -4592,7 +4680,7 @@ Return JSON only:
         }
         let asset_id = video_asset_id.ok_or("This clip has no generated animation yet.")?;
         let mut root_asset = self.get_video_asset(&asset_id)?;
-        while root_asset.kind != "generation" {
+        while !matches!(root_asset.kind.as_str(), "generation" | "upload") {
             let Some(parent_id) = root_asset.parent_video_asset_id.clone() else { break };
             root_asset = self.get_video_asset(&parent_id)?;
         }
@@ -7632,6 +7720,53 @@ mod tests {
 
         // A still with no cached animation at all can't be "restored".
         assert!(repo.restore_animation_clip(&video.id, "clip2").is_err());
+    }
+
+    #[test]
+    fn imports_uploaded_video_as_clip_animation_and_allows_retime() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let prompt = repo
+            .create_prompt_version(&video.id, "g1", "{}", "system", "scene")
+            .unwrap();
+        let render_dir = temp.path().join("Projects").join(&channel.id).join(&video.id).join("renders").join("g1");
+        fs::create_dir_all(&render_dir).unwrap();
+        fs::write(render_dir.join("render-v1.png"), b"source").unwrap();
+        let render = repo
+            .insert_image_render(
+                "render1", &video.id, "g1", 1, &prompt.id, "render-v1.png", "renders/g1/render-v1.png", None, None, "generation",
+            )
+            .unwrap();
+
+        repo.connection.execute(
+            "INSERT INTO timelines(video_id,duration_seconds,playhead_seconds,zoom,updated_at) VALUES(?1,10,0,1,'now')",
+            [&video.id],
+        ).unwrap();
+        repo.connection.execute(
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label) VALUES('clip1',?1,'g1',?2,1,0,5,'Scene 1')",
+            params![video.id, render.id],
+        ).unwrap();
+
+        let uploaded = temp.path().join("my-clip.mov");
+        fs::write(&uploaded, b"uploaded-video").unwrap();
+
+        let timeline = repo.import_animation_clip(&video.id, "clip1", &uploaded, temp.path()).unwrap();
+        let clip = timeline.clips.iter().find(|c| c.id == "clip1").unwrap();
+        assert_eq!(clip.clip_kind, "animation");
+        let asset_id = clip.video_asset_id.clone().unwrap();
+        let asset = repo.get_video_asset_record(&asset_id).unwrap();
+        assert_eq!(asset.kind, "upload");
+        assert_eq!(asset.requested_duration_seconds, 5.0);
+        assert!(repo.video_asset_file_path(&asset_id).unwrap().exists());
+
+        // Rejects an unsupported file type up front.
+        let bad = temp.path().join("notes.txt");
+        fs::write(&bad, b"nope").unwrap();
+        assert!(repo.import_animation_clip(&video.id, "clip1", &bad, temp.path()).is_err());
+
+        // The relaxed retime root-lookup treats an upload as a valid re-derivation root.
+        assert!(repo.retime_animation_clip(&video.id, "clip1", temp.path()).is_ok());
     }
 
     #[test]

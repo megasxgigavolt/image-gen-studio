@@ -192,8 +192,8 @@ export type TimelineClipRecord = {
 export type VeoResolution = "720p" | "1080p";
 export type VideoAssetRecord = {
   id: string; videoId: string; groupId: string; sourceRenderId: string; version: number;
-  parentVideoAssetId: string | null; kind: "generation" | "retimed"; fileName: string; relativePath: string;
-  resolution: VeoResolution; requestedDurationSeconds: number; veoDurationSeconds: number;
+  parentVideoAssetId: string | null; kind: "generation" | "retimed" | "upload"; fileName: string; relativePath: string;
+  resolution: VeoResolution | "original"; requestedDurationSeconds: number; veoDurationSeconds: number;
   actualDurationSeconds: number; veoModel: string; veoOperationName: string | null; prompt: string; createdAt: string;
 };
 export type AnimationJobRecord = {
@@ -666,6 +666,10 @@ export const projectsClient = {
   async retimeAnimationClip(videoId: string, clipId: string): Promise<TimelineRecord> {
     if (isTauri()) return invoke("retime_animation_clip", { videoId, clipId });
     throw new Error("Adjusting an animation's duration requires the native application.");
+  },
+  async importAnimationClip(videoId: string, clipId: string): Promise<TimelineRecord | null> {
+    if (isTauri()) return invoke("import_animation_clip", { videoId, clipId });
+    throw new Error("Uploading an animation requires the native application.");
   },
   async revertAnimationClipToStill(videoId: string, clipId: string): Promise<TimelineRecord> {
     if (isTauri()) return invoke("revert_animation_clip_to_still", { videoId, clipId });

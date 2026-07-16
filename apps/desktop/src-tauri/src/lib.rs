@@ -759,6 +759,17 @@ fn update_timeline_clip(
 }
 
 #[tauri::command]
+fn set_narration_offset(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    offset_seconds: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_narration_offset(&video_id, offset_seconds)
+    })
+}
+
+#[tauri::command]
 fn populate_timeline_from_sources(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -784,11 +795,12 @@ fn add_stills_clip(
 fn add_caption_clip(
     state: State<'_, RepositoryState>,
     video_id: String,
-    chunk_index: i64,
+    chunk_index: Option<i64>,
+    text: Option<String>,
     start_seconds: f64,
 ) -> Result<Timeline, String> {
     with_repository(state, |repository| {
-        repository.add_caption_clip(&video_id, chunk_index, start_seconds)
+        repository.add_caption_clip(&video_id, chunk_index, text, start_seconds)
     })
 }
 
@@ -802,6 +814,67 @@ fn update_timeline_caption_clip(
 ) -> Result<Timeline, String> {
     with_repository(state, |repository| {
         repository.update_timeline_caption_clip(&video_id, &clip_id, start, end)
+    })
+}
+
+#[tauri::command]
+fn update_caption_clip_text(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    text: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.update_caption_clip_text(&video_id, &clip_id, &text)
+    })
+}
+
+#[tauri::command]
+fn split_caption_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    split_at_seconds: f64,
+    left_text: String,
+    right_text: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.split_caption_clip(&video_id, &clip_id, split_at_seconds, &left_text, &right_text)
+    })
+}
+
+#[tauri::command]
+fn merge_caption_clips(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    first_clip_id: String,
+    second_clip_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.merge_caption_clips(&video_id, &first_clip_id, &second_clip_id)
+    })
+}
+
+#[tauri::command]
+fn set_timeline_caption_style(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    style: serde_json::Value,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_timeline_caption_style(&video_id, &style)
+    })
+}
+
+#[tauri::command]
+fn set_caption_clip_style(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    style: Option<serde_json::Value>,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_caption_clip_style(&video_id, &clip_id, style.as_ref())
     })
 }
 
@@ -970,6 +1043,16 @@ fn clear_timeline_track(
 ) -> Result<Timeline, String> {
     with_repository(state, |repository| {
         repository.clear_timeline_track(&video_id, &track)
+    })
+}
+
+#[tauri::command]
+fn reset_timeline_to_default(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.reset_timeline_to_default(&video_id)
     })
 }
 
@@ -1508,21 +1591,6 @@ fn get_captions(state: State<'_, RepositoryState>, video_id: String) -> Result<C
 }
 
 #[tauri::command]
-async fn optimize_captions(
-    state: State<'_, RepositoryState>,
-    video_id: String,
-) -> Result<CaptionSet, String> {
-    let (database_path, projects_dir) =
-        with_repository(state, |repository| Ok(repository.paths()))?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
-        repository.optimize_captions(&video_id)
-    })
-    .await
-    .map_err(|error| format!("Caption optimization worker stopped unexpectedly: {error}"))?
-}
-
-#[tauri::command]
 fn save_captions_file(
     app: tauri::AppHandle,
     srt_text: String,
@@ -1564,6 +1632,31 @@ async fn probe_narration_duration(
     })
     .await
     .map_err(|error| format!("Duration probe worker stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
+async fn detect_render_subject(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    render_id: String,
+) -> Result<(f64, f64), String> {
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
+    let engine_dir = if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../services/python-engine")
+    } else {
+        app.path()
+            .resource_dir()
+            .map_err(|e| format!("Could not locate app resource directory: {e}"))?
+            .join("python-engine")
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.detect_render_subject(&video_id, &render_id, &engine_dir)
+    })
+    .await
+    .map_err(|error| format!("Subject detection worker stopped unexpectedly: {error}"))?
 }
 
 #[tauri::command]
@@ -1960,7 +2053,6 @@ pub fn run() {
             get_visual_plan,
             generate_captions,
             get_captions,
-            optimize_captions,
             save_captions_file,
             move_plan_sentence,
             create_plan_group,
@@ -2015,10 +2107,16 @@ pub fn run() {
             get_timeline,
             update_timeline_view,
             update_timeline_clip,
+            set_narration_offset,
             populate_timeline_from_sources,
             add_stills_clip,
             add_caption_clip,
             update_timeline_caption_clip,
+            update_caption_clip_text,
+            split_caption_clip,
+            merge_caption_clips,
+            set_timeline_caption_style,
+            set_caption_clip_style,
             set_timeline_clip_render,
             set_timeline_clip_motion,
             set_timeline_clip_transition,
@@ -2034,7 +2132,9 @@ pub fn run() {
             delete_timeline_clip,
             delete_timeline_caption_clip,
             clear_timeline_track,
+            reset_timeline_to_default,
             probe_narration_duration,
+            detect_render_subject,
             export_timeline_video,
             pick_export_project_destination,
             export_timeline_project,

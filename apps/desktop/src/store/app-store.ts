@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { originalDemoPlan } from "../data/demo";
 import type { VisualPlanGroup } from "../domain/visual-plan";
 
-export type AppStage = "home" | "inputs" | "visual-plan" | "captions" | "images" | "timeline" | "tools";
+export type AppStage = "home" | "inputs" | "visual-plan" | "images" | "timeline" | "tools";
 export type Theme = "light" | "dark";
 
 type Toast = { id: number; message: string; kind: "success" | "error" | "info" };
@@ -15,7 +15,7 @@ type AppState = {
   activeChannelName: string | null;
   activeVideoId: string | null;
   activeVideoTitle: string | null;
-  lastProductionStage: "inputs" | "visual-plan" | "captions";
+  lastProductionStage: "inputs" | "visual-plan";
   toast: Toast | null;
   setStage: (stage: AppStage) => void;
   toggleTheme: () => void;
@@ -27,6 +27,7 @@ type AppState = {
     videoId: string,
     videoTitle: string,
   ) => void;
+  clearActiveProject: () => void;
   addToast: (message: string, kind?: Toast["kind"]) => void;
   dismissToast: () => void;
 };
@@ -53,7 +54,7 @@ export const useAppStore = create<AppState>((set) => ({
     set((state) => ({
       stage,
       lastProductionStage:
-        stage === "inputs" || stage === "visual-plan" || stage === "captions"
+        stage === "inputs" || stage === "visual-plan"
           ? stage
           : state.lastProductionStage,
     })),
@@ -66,6 +67,13 @@ export const useAppStore = create<AppState>((set) => ({
       activeChannelName: channelName,
       activeVideoId: videoId,
       activeVideoTitle: videoTitle,
+    }),
+  clearActiveProject: () =>
+    set({
+      activeChannelId: null,
+      activeChannelName: null,
+      activeVideoId: null,
+      activeVideoTitle: null,
     }),
   addToast: (message, kind = "info") =>
     set({ toast: { id: ++toastCounter, message, kind } }),

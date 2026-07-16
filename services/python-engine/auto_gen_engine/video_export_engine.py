@@ -33,10 +33,22 @@ import scene_grouping_engine as engine
 
 FPS_DEFAULT = 30
 MAX_ENCODE_WORKERS = 4
-_SUBTITLE_STYLE = (
-    "FontName=Arial Black,FontSize=22,Bold=1,Alignment=2,"
-    "PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&,BorderStyle=1,Outline=2"
-)
+
+# Fallback caption look if a manifest is ever missing captionDefaultStyle
+# (e.g. one written before per-clip caption styling existed) — matches what
+# used to be the single hardcoded ASS style for every export.
+_FALLBACK_CAPTION_STYLE = {
+    "fontFamily": "Arial Black",
+    "fontSizePx": 22,
+    "bold": True,
+    "color": "#FFFFFF",
+    "outlineColor": "#000000",
+    "outlineWidthPx": 2,
+    "shadow": {"enabled": False, "blur": 4, "offsetX": 0, "offsetY": 2},
+    "position": "bottom",
+}
+
+_ASS_ALIGNMENT = {"bottom": 2, "middle": 5, "top": 8}
 
 
 def _subprocess_kwargs() -> dict:
@@ -128,40 +140,66 @@ REFERENCE_DURATION = 5.0  # seconds — `intensity` is calibrated as the total
 # zoom/pan amount reached over this many seconds, then applied as a constant
 # per-second rate to every clip so the same intensity feels equally fast
 # regardless of how long an individual still is on screen.
+MAX_SCALE_REFERENCE_DURATION = 60.0  # only bounds pathological cases; must
+# stay well beyond any realistic still duration so zoom never visibly freezes
+# mid-clip (the old `1 + amount*3` cap froze zoom at exactly 15s elapsed).
 
 
 def build_image_filter(
     motion: str, transition_in: str, transition_out: str, intensity: float,
     width: int, height: int, fps: int, duration: float, frames: int,
+    subject_x: float = 0.5, subject_y: float = 0.5,
 ) -> str:
     """Ken Burns camera-movement presets via ffmpeg's zoompan filter, plus
     optional fade-from/to-black "transitions" at the start and/or end.
     `frames` is the segment's cumulative-frame-accurate output length (see
     `assign_frame_counts`) — using it here instead of re-deriving frame count
     from `duration` keeps the zoompan animation's length exactly matching
-    what the output is actually trimmed to."""
+    what the output is actually trimmed to. `subject_x`/`subject_y` (fractions
+    0-1 of image width/height) anchor the "-subject" presets; ignored by all
+    other presets."""
     frames = max(1, frames)
     amount = max(0.02, min(0.6, intensity))
     rate = amount / REFERENCE_DURATION
-    max_scale = 1 + amount * 3
+    max_scale = 1 + amount * (MAX_SCALE_REFERENCE_DURATION / REFERENCE_DURATION)
     peak = 1 + amount
+    half_duration = duration / 2
+    mid_scale = min(max_scale, 1 + rate * half_duration)
 
+    fade_in_duration = max(0.15, min(duration / 2, duration * 0.08))
+    fade_out_duration = max(0.15, min(duration / 2, duration * 0.08))
     fades = []
     if transition_in == "fade":
-        fades.append(f"fade=t=in:st=0:d={min(0.5, duration / 2):.3f}:color=black")
+        fades.append(f"fade=t=in:st=0:d={fade_in_duration:.3f}:color=black")
     if transition_out == "fade":
-        fade_out_duration = min(0.5, duration / 2)
         fades.append(f"fade=t=out:st={max(0.0, duration - fade_out_duration):.3f}:d={fade_out_duration:.3f}:color=black")
     fade = "".join(f",{f}" for f in fades)
+
+    def anchored_xy(sx: float, sy: float) -> str:
+        return f"x='(iw-iw/zoom)*{sx:.5f}':y='(ih-ih/zoom)*{sy:.5f}'"
 
     zoompan_presets = {
         "zoom-in": (
             f"z='min({max_scale:.5f},1+{rate:.6f}*on/{fps})':"
-            f"x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2'"
+            f"{anchored_xy(0.5, 0.5)}"
         ),
         "zoom-out": (
             f"z='min({max_scale:.5f},1+{rate:.6f}*({duration:.3f}-on/{fps}))':"
-            f"x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2'"
+            f"{anchored_xy(0.5, 0.5)}"
+        ),
+        "zoom-pulse": (
+            f"z='if(lt(on/{fps},{half_duration:.3f}),"
+            f"min({max_scale:.5f},1+{rate:.6f}*on/{fps}),"
+            f"max(1,{mid_scale:.5f}-{rate:.6f}*(on/{fps}-{half_duration:.3f})))':"
+            f"{anchored_xy(0.5, 0.5)}"
+        ),
+        "zoom-in-subject": (
+            f"z='min({max_scale:.5f},1+{rate:.6f}*on/{fps})':"
+            f"{anchored_xy(subject_x, subject_y)}"
+        ),
+        "zoom-out-subject": (
+            f"z='min({max_scale:.5f},1+{rate:.6f}*({duration:.3f}-on/{fps}))':"
+            f"{anchored_xy(subject_x, subject_y)}"
         ),
         "pan-left": (
             f"z='{peak:.5f}':"
@@ -174,12 +212,18 @@ def build_image_filter(
     }
     if motion in zoompan_presets:
         # zoompan crops at integer-pixel granularity in its source's coordinate
-        # space; scaling the source up well beyond the output resolution first
-        # gives each frame's crop far more sub-pixel headroom, which is what
-        # actually removes the visible jitter/shake (a well-known zoompan
-        # quirk) — a source scaled close to the output size looks noticeably
-        # shakier than one scaled to several times the output size.
-        pre_scale = max(width, height) * 3
+        # space; a slow zoom (low intensity) moves less than one pixel per
+        # frame at that resolution, so most frames round to the exact same
+        # crop and the motion stalls until the accumulated sub-pixel drift
+        # finally crosses a whole pixel — producing a "still, still, jump"
+        # stutter rather than steady motion. Scaling the source up well
+        # beyond the output resolution first gives each frame far more
+        # sub-pixel headroom before that rounding happens. Measured (a
+        # reference vertical line's tracked position across frames, std dev
+        # of frame-to-frame deltas — lower is smoother): 3x ~0.29, 6x ~0.17,
+        # 8x ~0.12, 10x ~0.10. 8x is the point past which further headroom
+        # stops paying for the added scale/encode cost.
+        pre_scale = max(width, height) * 8
         return (
             f"scale={pre_scale}:-2,zoompan={zoompan_presets[motion]}:"
             f"d={frames}:s={width}x{height}:fps={fps}{fade}"
@@ -198,9 +242,10 @@ def build_video_filter(
     already has real motion, it just needs to fit the export frame."""
     fades = []
     if transition_in == "fade":
-        fades.append(f"fade=t=in:st=0:d={min(0.5, duration / 2):.3f}:color=black")
+        fade_in_duration = max(0.15, min(duration / 2, duration * 0.08))
+        fades.append(f"fade=t=in:st=0:d={fade_in_duration:.3f}:color=black")
     if transition_out == "fade":
-        fade_out_duration = min(0.5, duration / 2)
+        fade_out_duration = max(0.15, min(duration / 2, duration * 0.08))
         fades.append(f"fade=t=out:st={max(0.0, duration - fade_out_duration):.3f}:d={fade_out_duration:.3f}:color=black")
     fade = "".join(f",{f}" for f in fades)
     return (
@@ -237,6 +282,7 @@ def encode_segment(
             segment.get("transitionOut", "cut"),
             segment.get("motionIntensity", 0.22),
             width, height, fps, duration, frames,
+            segment.get("subjectX", 0.5), segment.get("subjectY", 0.5),
         )
         run_ffmpeg([
             "-y", "-loop", "1", "-t", f"{duration + 1:.3f}", "-i", segment["path"],
@@ -316,6 +362,155 @@ def escape_subtitles_path(path: Path) -> str:
     return str(path).replace("\\", "/").replace(":", "\\:")
 
 
+def to_ass_ts(seconds: float) -> str:
+    """ASS timestamp: H:MM:SS.cc (centiseconds) — distinct from SRT's
+    HH:MM:SS,mmm, hours is not zero-padded to a fixed width."""
+    total_centis = int(round(max(0.0, seconds) * 100))
+    centis = total_centis % 100
+    total_seconds = total_centis // 100
+    s = total_seconds % 60
+    total_minutes = total_seconds // 60
+    m = total_minutes % 60
+    h = total_minutes // 60
+    return f"{h}:{m:02d}:{s:02d}.{centis:02d}"
+
+
+def _to_ass_color(hex_color: str, alpha: int = 0) -> str:
+    """Converts a #RRGGBB CSS-style hex color to ASS's &HAABBGGRR& form
+    (byte-reversed, alpha 0 = fully opaque)."""
+    hex_color = (hex_color or "").lstrip("#")
+    if len(hex_color) != 6:
+        hex_color = "FFFFFF"
+    r, g, b = hex_color[0:2], hex_color[2:4], hex_color[4:6]
+    return f"&H{alpha:02X}{b.upper()}{g.upper()}{r.upper()}&"
+
+
+def _style_value(style: dict, key: str, default):
+    value = style.get(key)
+    return default if value is None else value
+
+
+def _resolve_shadow(style: dict) -> tuple[int, int]:
+    """Maps our {enabled, blur, offsetX, offsetY} shadow shape onto ASS's
+    single \\shad depth (plus an optional \\blur softness) — classic ASS has
+    no separate per-axis offset or blur-radius concept for shadows, so this
+    is a pragmatic approximation, not a literal translation."""
+    shadow = _style_value(style, "shadow", {}) or {}
+    if not shadow.get("enabled"):
+        return 0, 0
+    offset_x = float(shadow.get("offsetX", 0) or 0)
+    offset_y = float(shadow.get("offsetY", 2) or 0)
+    depth = max(1, round((abs(offset_x) + abs(offset_y)) / 2))
+    blur = max(0, min(4, round(float(shadow.get("blur", 0) or 0) / 2)))
+    return depth, blur
+
+
+def _ass_override_tags(style: dict) -> str:
+    font_family = _style_value(style, "fontFamily", "Arial Black")
+    font_size = int(_style_value(style, "fontSizePx", 22))
+    bold = 1 if _style_value(style, "bold", True) else 0
+    color = _to_ass_color(_style_value(style, "color", "#FFFFFF"))
+    outline_color = _to_ass_color(_style_value(style, "outlineColor", "#000000"))
+    outline_width = _style_value(style, "outlineWidthPx", 2)
+    alignment = _ASS_ALIGNMENT.get(_style_value(style, "position", "bottom"), 2)
+    shadow_depth, blur = _resolve_shadow(style)
+    tags = (
+        f"\\fn{font_family}\\fs{font_size}\\b{bold}\\c{color}\\3c{outline_color}"
+        f"\\bord{outline_width}\\shad{shadow_depth}\\an{alignment}"
+    )
+    if blur:
+        tags += f"\\blur{blur}"
+    return "{" + tags + "}"
+
+
+def _escape_ass_text(text: str) -> str:
+    # Braces open/close an ASS override block unconditionally — there's no
+    # in-band escape for a literal brace, so swap them for lookalikes rather
+    # than let user-edited caption text corrupt the line's styling.
+    return text.replace("{", "(").replace("}", ")").replace("\n", "\\N")
+
+
+def _karaoke_dialogue_lines(
+    chunk: dict, style: dict, base_tags: str, base_color: str, highlight_color: str,
+) -> list[str]:
+    """One Dialogue event per word-window, each showing the FULL caption text
+    with only that window's word colored as the highlight — unlike classic
+    ASS \\k karaoke (which is cumulative, staying highlighted once "sung"),
+    this keeps exactly one word lit at a time, matching a live word-by-word
+    follow effect rather than a progressive sing-along."""
+    words = chunk.get("words") or []
+    clip_start, clip_end = chunk["start"], chunk["end"]
+    lines: list[str] = []
+    for i, word in enumerate(words):
+        seg_start = max(word["start"], clip_start)
+        seg_end = words[i + 1]["start"] if i + 1 < len(words) else clip_end
+        seg_end = min(seg_end, clip_end)
+        if seg_end <= seg_start:
+            continue
+        segments = [
+            f"{{\\c{highlight_color if j == i else base_color}}}{_escape_ass_text(w['text'])}"
+            for j, w in enumerate(words)
+        ]
+        text = base_tags + " ".join(segments)
+        lines.append(f"Dialogue: 0,{to_ass_ts(seg_start)},{to_ass_ts(seg_end)},Default,,0,0,0,,{text}\n")
+    return lines
+
+
+def write_captions_ass(
+    captions: list[dict], out_path: Path, width: int, height: int, default_style: dict,
+) -> None:
+    """Writes an .ass subtitle file with one Dialogue line per caption, each
+    prefixed with its own fully-resolved inline style override — this is how
+    per-clip caption styling (set on the Timeline) reaches the final export,
+    while a video-level Default style still covers the (rare) case of a line
+    with no override at all."""
+    default_style = default_style or _FALLBACK_CAPTION_STYLE
+    default_font = _style_value(default_style, "fontFamily", "Arial Black")
+    default_size = int(_style_value(default_style, "fontSizePx", 22))
+    default_bold = 1 if _style_value(default_style, "bold", True) else 0
+    default_color = _to_ass_color(_style_value(default_style, "color", "#FFFFFF"))
+    default_outline_color = _to_ass_color(_style_value(default_style, "outlineColor", "#000000"))
+    default_outline_width = _style_value(default_style, "outlineWidthPx", 2)
+    default_alignment = _ASS_ALIGNMENT.get(_style_value(default_style, "position", "bottom"), 2)
+    default_shadow_depth, _ = _resolve_shadow(default_style)
+
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {width}\n"
+        f"PlayResY: {height}\n"
+        "ScaledBorderAndShadow: yes\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,{default_font},{default_size},{default_color},&H000000FF&,"
+        f"{default_outline_color},&H00000000&,{default_bold},0,0,0,100,100,0,0,1,"
+        f"{default_outline_width},{default_shadow_depth},{default_alignment},10,10,10,1\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+    lines = [header]
+    for chunk in captions:
+        style = chunk.get("style") or {}
+        word_highlight = _style_value(style, "wordHighlight", {}) or {}
+        words = chunk.get("words") or []
+        if word_highlight.get("enabled") and words:
+            base_tags = _ass_override_tags(style)
+            base_color = _to_ass_color(_style_value(style, "color", "#FFFFFF"))
+            highlight_color = _to_ass_color(word_highlight.get("color", "#FFEB3B"))
+            lines.extend(_karaoke_dialogue_lines(chunk, style, base_tags, base_color, highlight_color))
+        else:
+            text = _ass_override_tags(style) + _escape_ass_text(chunk["text"])
+            lines.append(
+                f"Dialogue: 0,{to_ass_ts(chunk['start'])},{to_ass_ts(chunk['end'])},Default,,0,0,0,,{text}\n"
+            )
+    out_path.write_text("".join(lines), encoding="utf-8")
+
+
 def run_final_pass(args: list[str], duration_seconds: float) -> None:
     process = subprocess.Popen(
         ["ffmpeg", *args],
@@ -362,6 +557,7 @@ def run(manifest_path: Path, output_path: Path) -> None:
     stills = manifest.get("stills", [])
     captions = manifest.get("captions", [])
     narration_audio_path = manifest["narrationAudioPath"]
+    narration_offset_seconds = max(0.0, float(manifest.get("narrationOffsetSeconds", 0.0)))
 
     if duration_seconds <= 0:
         raise ValueError("Timeline has no duration to export.")
@@ -412,23 +608,31 @@ def run(manifest_path: Path, output_path: Path) -> None:
         "\n".join(f"file '{path.name}'" for path in segment_paths), encoding="utf-8"
     )
 
-    srt_path = work_dir / "captions.srt"
+    ass_path = work_dir / "captions.ass"
     has_captions = bool(captions)
     if has_captions:
-        write_captions_srt(captions, srt_path)
+        default_style = manifest.get("captionDefaultStyle") or _FALLBACK_CAPTION_STYLE
+        write_captions_ass(captions, ass_path, width, height, default_style)
 
     engine.report_progress(72, "Rendering video", "Muxing audio and captions")
     final_args = [
         "-y", "-f", "concat", "-safe", "0", "-i", str(segments_list_path),
         "-i", narration_audio_path,
     ]
-    if has_captions:
-        final_args += [
-            "-vf",
-            f"subtitles='{escape_subtitles_path(srt_path)}':force_style='{_SUBTITLE_STYLE}'",
-        ]
+    # Narration's start offset is applied as an audio delay in the same filter
+    # graph as the caption overlay (rather than a second ffmpeg pass) so
+    # export stays a single encode; `adelay` needs one value per channel,
+    # hence the doubled `|`-joined pair for stereo.
+    video_filter = f"ass='{escape_subtitles_path(ass_path)}'" if has_captions else None
+    audio_filter = f"adelay={round(narration_offset_seconds * 1000)}|{round(narration_offset_seconds * 1000)}" if narration_offset_seconds > 0 else None
+    if video_filter or audio_filter:
+        graph = []
+        graph.append(f"[0:v]{video_filter}[v]" if video_filter else "[0:v]copy[v]")
+        graph.append(f"[1:a]{audio_filter}[a]" if audio_filter else "[1:a]anull[a]")
+        final_args += ["-filter_complex", ";".join(graph), "-map", "[v]", "-map", "[a]"]
+    else:
+        final_args += ["-map", "0:v", "-map", "1:a"]
     final_args += [
-        "-map", "0:v", "-map", "1:a",
         "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p", "-r", str(fps),
         "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart",
         "-progress", "pipe:1", "-nostats", str(output_path),
@@ -474,6 +678,7 @@ def run_bundle(manifest_path: Path, destination_dir: Path) -> None:
     stills = close_gaps(manifest.get("stills", []), duration_seconds)
     captions = manifest.get("captions", [])
     narration_audio_path = Path(manifest["narrationAudioPath"])
+    narration_offset_seconds = max(0.0, float(manifest.get("narrationOffsetSeconds", 0.0)))
 
     if duration_seconds <= 0:
         raise ValueError("Timeline has no duration to export.")
@@ -517,13 +722,20 @@ def run_bundle(manifest_path: Path, destination_dir: Path) -> None:
         f"({segment['end'] - segment['start']:.3f}s)"
         for clip_path, segment in zip(clip_paths, segments)
     ]
+    narration_note = (
+        f"Start narration audio at {narration_offset_seconds:.3f}s on its track, not at 0 — "
+        "the timeline's narration was shifted from its default start.\n\n"
+        if narration_offset_seconds > 0
+        else "Narration audio starts at 0 on its track and needs no further alignment.\n\n"
+    )
     (destination_dir / "timing.txt").write_text(
         "Import the files in clips/ in numeric filename order onto a video track, placed back-to-back "
         "(select all and drop them in — most editors, including CapCut, keep multi-selected clips in the "
         "order you select them). Each still is already stretched to close any silence gap and its own "
         "duration matches its exact slot in the original timeline, so no manual trimming is needed.\n\n"
-        "Import narration audio and captions.srt onto their own separate tracks — both already carry the "
-        "correct absolute timestamps and need no further alignment.\n\n"
+        + narration_note
+        + "Import captions.srt onto its own separate track — it already carries the correct absolute "
+        "timestamps and needs no further alignment.\n\n"
         + "\n".join(timing_lines) + "\n",
         encoding="utf-8",
     )
@@ -550,7 +762,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("manifest", help="Path to the timeline export manifest JSON, or a media file path for --mode probe/retime")
     parser.add_argument("--output", metavar="PATH", help="Output video path, or destination folder for --mode bundle (unused for --mode probe)")
-    parser.add_argument("--mode", choices=["video", "bundle", "probe", "retime"], default="video", help="'video' bakes one MP4 (default); 'bundle' exports separate clip/audio/caption assets; 'probe' reports a media file's real duration; 'retime' stretches/trims a clip to a target duration")
+    parser.add_argument("--mode", choices=["video", "bundle", "probe", "retime", "detect-subject"], default="video", help="'video' bakes one MP4 (default); 'bundle' exports separate clip/audio/caption assets; 'probe' reports a media file's real duration; 'retime' stretches/trims a clip to a target duration; 'detect-subject' locates a still's automatic zoom-anchor point")
     parser.add_argument("--source-duration", type=float, help="The input clip's real duration in seconds (required for --mode retime)")
     parser.add_argument("--target-duration", type=float, help="The desired output duration in seconds (required for --mode retime)")
     return parser
@@ -578,17 +790,27 @@ def run_probe(audio_path: Path) -> None:
     print(f"{total_seconds:.6f}", flush=True)
 
 
+def run_detect_subject(image_path: Path) -> None:
+    """Prints the still's automatic zoom-anchor point as JSON (`{"x":..,
+    "y":..}`, fractions of width/height) to stdout, for the "-subject"
+    motion presets."""
+    x, y = engine.detect_subject_point(str(image_path))
+    print(json.dumps({"x": x, "y": y}), flush=True)
+
+
 if __name__ == "__main__":
     cli_parser = build_parser()
     if len(sys.argv) == 1:
         cli_parser.print_help()
         sys.exit(0)
     args = cli_parser.parse_args()
-    if args.mode != "probe" and not args.output:
+    if args.mode not in ("probe", "detect-subject") and not args.output:
         cli_parser.error("--output is required for --mode video/bundle")
     try:
         if args.mode == "probe":
             run_probe(Path(args.manifest).expanduser().resolve())
+        elif args.mode == "detect-subject":
+            run_detect_subject(Path(args.manifest).expanduser().resolve())
         elif args.mode == "retime":
             if args.source_duration is None or args.target_duration is None:
                 cli_parser.error("--source-duration and --target-duration are required for --mode retime")

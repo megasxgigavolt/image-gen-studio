@@ -61,7 +61,8 @@ export type PlanSentenceRecord = { id: string; ordinal: number; text: string; st
 export type PlanGroupRecord = { id: string; ordinal: number; label: string; kind: string; sentenceIds: string[]; settingsLocked: boolean; promptLocked: boolean };
 export type VisualPlanRecord = { videoId: string; timingSource: string; sentences: PlanSentenceRecord[]; groups: PlanGroupRecord[]; updatedAt: string };
 
-export type CaptionChunkRecord = { index: number; text: string; startSeconds: number; endSeconds: number };
+export type CaptionWordRecord = { text: string; startSeconds: number; endSeconds: number };
+export type CaptionChunkRecord = { index: number; text: string; startSeconds: number; endSeconds: number; words: CaptionWordRecord[] };
 export type CaptionSetRecord = {
   videoId: string;
   intervalSeconds: number;
@@ -98,6 +99,8 @@ export type ImageRenderRecord = {
   maskPath: string | null;
   maskUsed: boolean;
   createdAt: string;
+  subjectX: number | null;
+  subjectY: number | null;
 };
 
 export type AppSettingRecord = {
@@ -181,7 +184,15 @@ export type ImageJobRecord = {
   items: { id: string; groupId: string; promptVersionId: string; status: string; attempts: number; lastError: string | null; renderId: string | null }[];
 };
 export type ExportResultRecord = { path: string; fileCount: number };
-export type MotionPreset = "none" | "zoom-in" | "zoom-out" | "pan-left" | "pan-right";
+export type MotionPreset =
+  | "none"
+  | "zoom-in"
+  | "zoom-out"
+  | "pan-left"
+  | "pan-right"
+  | "zoom-pulse"
+  | "zoom-in-subject"
+  | "zoom-out-subject";
 export type TransitionPreset = "cut" | "fade";
 export type ClipKind = "still" | "animation";
 export type TimelineClipRecord = {
@@ -211,11 +222,30 @@ export type AnimationJobRecord = {
     lastError: string | null; videoAssetId: string | null;
   }[];
 };
-export type TimelineCaptionClipRecord = { id: string; sourceChunkIndex: number | null; text: string; ordinal: number; startSeconds: number; endSeconds: number };
+export type CaptionStyle = {
+  fontFamily?: string;
+  fontSizePx?: number;
+  bold?: boolean;
+  color?: string;
+  outlineColor?: string;
+  outlineWidthPx?: number;
+  shadow?: { enabled?: boolean; blur?: number; offsetX?: number; offsetY?: number };
+  position?: "bottom" | "middle" | "top";
+  wordHighlight?: { enabled?: boolean; color?: string };
+};
+export type TimelineCaptionClipRecord = {
+  id: string; sourceChunkIndex: number | null; text: string; ordinal: number; startSeconds: number; endSeconds: number;
+  style: CaptionStyle | null;
+  /** Real per-word timestamps carried over from the source chunk; null once
+   * hand-edited or for a fully user-authored caption. */
+  words: CaptionWordRecord[] | null;
+};
 export type TimelineRecord = {
   videoId: string; durationSeconds: number; playheadSeconds: number; zoom: number; updatedAt: string;
   clips: TimelineClipRecord[];
   captionClips: TimelineCaptionClipRecord[];
+  captionStyle: CaptionStyle;
+  narrationOffsetSeconds: number;
 };
 
 type BrowserData = {
@@ -253,6 +283,10 @@ function formatSrtTimestamp(seconds: number): string {
 }
 
 export const projectsClient = {
+  async getApplicationVersion(): Promise<string> {
+    if (isTauri()) return invoke("application_version");
+    return "";
+  },
   async startupDiagnostic(): Promise<string | null> {
     if (isTauri()) return invoke("startup_diagnostic");
     return null;
@@ -485,6 +519,8 @@ export const projectsClient = {
       maskPath: null,
       maskUsed: false,
       createdAt: now(),
+      subjectX: null,
+      subjectY: null,
     };
   },
   async editImageRender(sourceRenderId: string, instruction: string, maskDataUrl?: string, editStrength = "Low"): Promise<ImageRenderRecord> {
@@ -539,6 +575,10 @@ export const projectsClient = {
     if (isTauri()) return invoke("update_timeline_clip", { videoId, clipId, start, end });
     throw new Error("Timeline requires the native application.");
   },
+  async setNarrationOffset(videoId: string, offsetSeconds: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_narration_offset", { videoId, offsetSeconds });
+    throw new Error("Timeline requires the native application.");
+  },
   async populateTimelineFromSources(videoId: string): Promise<TimelineRecord> {
     if (isTauri()) return invoke("populate_timeline_from_sources", { videoId });
     throw new Error("Timeline requires the native application.");
@@ -547,12 +587,32 @@ export const projectsClient = {
     if (isTauri()) return invoke("add_stills_clip", { videoId, groupId, startSeconds });
     throw new Error("Timeline requires the native application.");
   },
-  async addCaptionClip(videoId: string, chunkIndex: number, startSeconds: number): Promise<TimelineRecord> {
-    if (isTauri()) return invoke("add_caption_clip", { videoId, chunkIndex, startSeconds });
+  async addCaptionClip(videoId: string, chunkIndex: number | null, text: string | null, startSeconds: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("add_caption_clip", { videoId, chunkIndex, text, startSeconds });
     throw new Error("Timeline requires the native application.");
   },
   async updateTimelineCaptionClip(videoId: string, clipId: string, start: number, end: number): Promise<TimelineRecord> {
     if (isTauri()) return invoke("update_timeline_caption_clip", { videoId, clipId, start, end });
+    throw new Error("Timeline requires the native application.");
+  },
+  async updateCaptionClipText(videoId: string, clipId: string, text: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("update_caption_clip_text", { videoId, clipId, text });
+    throw new Error("Timeline requires the native application.");
+  },
+  async splitCaptionClip(videoId: string, clipId: string, splitAtSeconds: number, leftText: string, rightText: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("split_caption_clip", { videoId, clipId, splitAtSeconds, leftText, rightText });
+    throw new Error("Timeline requires the native application.");
+  },
+  async mergeCaptionClips(videoId: string, firstClipId: string, secondClipId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("merge_caption_clips", { videoId, firstClipId, secondClipId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setTimelineCaptionStyle(videoId: string, style: CaptionStyle): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_timeline_caption_style", { videoId, style });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setCaptionClipStyle(videoId: string, clipId: string, style: CaptionStyle | null): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_caption_clip_style", { videoId, clipId, style });
     throw new Error("Timeline requires the native application.");
   },
   async setTimelineClipRender(videoId: string, clipId: string, renderId: string): Promise<TimelineRecord> {
@@ -615,8 +675,16 @@ export const projectsClient = {
     if (isTauri()) return invoke("clear_timeline_track", { videoId, track });
     throw new Error("Timeline requires the native application.");
   },
+  async resetTimelineToDefault(videoId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("reset_timeline_to_default", { videoId });
+    throw new Error("Timeline requires the native application.");
+  },
   async probeNarrationDuration(videoId: string): Promise<number> {
     if (isTauri()) return invoke("probe_narration_duration", { videoId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async detectRenderSubject(videoId: string, renderId: string): Promise<[number, number]> {
+    if (isTauri()) return invoke("detect_render_subject", { videoId, renderId });
     throw new Error("Timeline requires the native application.");
   },
   async exportTimelineVideo(videoId: string, destinationPath: string): Promise<string | null> {
@@ -906,7 +974,7 @@ export const projectsClient = {
     for (let i = 0; i < words.length; i += 3) {
       const group = words.slice(i, i + 3);
       const index = chunks.length + 1;
-      chunks.push({ index, text: group.join(" "), startSeconds: chunks.length, endSeconds: chunks.length + 1 });
+      chunks.push({ index, text: group.join(" "), startSeconds: chunks.length, endSeconds: chunks.length + 1, words: [] });
     }
     const srtText = chunks
       .map((c) => `${c.index}\n${formatSrtTimestamp(c.startSeconds)} --> ${formatSrtTimestamp(c.endSeconds)}\n${c.text}\n`)
@@ -920,10 +988,6 @@ export const projectsClient = {
     const stored = localStorage.getItem(`${STORAGE_KEY}.captions.${videoId}`);
     if (!stored) throw new Error("Captions have not been generated.");
     return JSON.parse(stored) as CaptionSetRecord;
-  },
-  async optimizeCaptions(videoId: string): Promise<CaptionSetRecord> {
-    if (isTauri()) return invoke("optimize_captions", { videoId });
-    throw new Error("AI caption optimization requires the native application.");
   },
   async saveCaptionsFile(srtText: string, defaultName: string): Promise<string | null> {
     if (isTauri()) return invoke("save_captions_file", { srtText, defaultName });

@@ -17,6 +17,17 @@ export function formatTime(seconds: number) {
   return `${pad(hours)}:${pad(minutes)}:${pad(wholeSeconds)}:${pad(frames)}`;
 }
 
+export function formatTimeShort(seconds: number): string {
+  const totalSeconds = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const wholeSeconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}:${pad(minutes)}:${pad(wholeSeconds)}`;
+  }
+  return `${pad(minutes)}:${pad(wholeSeconds)}`;
+}
+
 export function secondsToPixels(seconds: number, pixelsPerSecond: number): number {
   return seconds * pixelsPerSecond;
 }

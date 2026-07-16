@@ -70,7 +70,8 @@ except ImportError:
 def _check_deps():
     import subprocess as _sp
     _required = [("openai", "openai"), ("pydantic", "pydantic"),
-                 ("xlsxwriter", "xlsxwriter"), ("imageio-ffmpeg", "imageio_ffmpeg")]
+                 ("xlsxwriter", "xlsxwriter"), ("imageio-ffmpeg", "imageio_ffmpeg"),
+                 ("opencv-python-headless", "cv2")]
     missing = []
     for pkg, mod in _required:
         try:
@@ -1959,6 +1960,46 @@ def preview_groups(
             f"{group.confidence:<6} | {sentence_text}"
         )
     print("=" * 120)
+
+
+def detect_subject_point(image_path: str) -> tuple[float, float]:
+    """Automatically locates the visual "subject" of a still, for anchoring
+    subject-aware Ken Burns zoom presets. Returns (x, y) as fractions (0-1)
+    of the image's width/height. Frontal-face detection (fast, offline,
+    ships with opencv's own data files) is tried first since faces are the
+    most reliable subject signal; when none is found, falls back to the
+    centroid of the image's strongest edge-energy region (a cheap proxy for
+    "the visually busiest part of the frame", without a second ML
+    dependency). Never raises — any failure degrades to frame-center (0.5,
+    0.5), which is exactly today's fixed-center behavior."""
+    import cv2
+    import numpy as np
+
+    image = cv2.imread(image_path)
+    if image is None:
+        return (0.5, 0.5)
+    height, width = image.shape[:2]
+    if width <= 0 or height <= 0:
+        return (0.5, 0.5)
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+    cascade = cv2.CascadeClassifier(cascade_path)
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(int(width * 0.05), int(height * 0.05)))
+    if len(faces) > 0:
+        fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+        return (clamp((fx + fw / 2) / width, 0.0, 1.0), clamp((fy + fh / 2) / height, 0.0, 1.0))
+
+    edges = np.abs(cv2.Laplacian(gray, cv2.CV_32F))
+    threshold = np.percentile(edges, 85)
+    mask = edges >= threshold
+    if not mask.any():
+        return (0.5, 0.5)
+    ys, xs = np.nonzero(mask)
+    weights = edges[ys, xs]
+    cx = float(np.average(xs, weights=weights))
+    cy = float(np.average(ys, weights=weights))
+    return (clamp(cx / width, 0.0, 1.0), clamp(cy / height, 0.0, 1.0))
 
 
 def run(args: argparse.Namespace) -> None:

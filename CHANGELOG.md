@@ -245,3 +245,11 @@
 - Redesigned the Timeline tab's animation controls: generate, upload, adjust-to-duration, undo, and restore now live in one "Animate this clip" section in the right inspector instead of being split across the left media pane and right inspector.
 - Simplified the left media pane to a single always-visible Stills browser, removing the separate "Animations" tab.
 - Fixed the clip inspector header always reading "Still" even for animated clips; it now shows the clip's real state plus a Fits/Duration-mismatch pill.
+# 2.3.0
+
+- Added "Zoom pulse" (in, then back out) and automatic subject-anchored "Zoom in/out on subject" camera-movement presets — subject detection runs locally (face detection with an edge-density fallback) and is cached per still.
+- Zoom no longer freezes partway through a long still, and fade-in/out duration now scales with each still's own screen time instead of a fixed 0.5s cap.
+- Renamed "Generate with AI" to "Generate" and moved "Upload your own" to a secondary action, decoupled from the primary animate flow.
+- Added drag-to-move and drag-to-resize for stills and captions on the Timeline, and a draggable narration start-offset for re-syncing narration audio.
+- Added a "Reset timeline to default" action that discards all customization and rebuilds the timeline fresh from the visual plan and captions.
+- Replaced the sidebar's "Preferences · soon" placeholder with the actual app version number.

@@ -16,6 +16,7 @@ import {
   Sparkles,
   Square,
   Trash2,
+  Type,
   Undo2,
   Upload,
   ZoomIn,
@@ -31,9 +32,11 @@ import {
   projectsClient,
   type AnimationJobRecord,
   type CaptionSetRecord,
+  type CaptionStyle,
   type ImageRenderRecord,
   type ImageWorkspaceRecord,
   type MotionPreset,
+  type TimelineCaptionClipRecord,
   type TimelineClipRecord,
   type TimelineRecord,
   type VeoResolution,
@@ -47,9 +50,40 @@ const CAPTIONS_LANE_HEIGHT = 40;
 const ZOOM_MIN = 0.5;
 const ZOOM_MAX = 4;
 
+// Mirrors the Rust default_caption_style() exactly, so an all-default style
+// looks identical to what used to be hardcoded in the export engine.
+const DEFAULT_CAPTION_STYLE: Required<CaptionStyle> = {
+  fontFamily: "Arial Black",
+  fontSizePx: 22,
+  bold: true,
+  color: "#FFFFFF",
+  outlineColor: "#000000",
+  outlineWidthPx: 2,
+  shadow: { enabled: false, blur: 4, offsetX: 0, offsetY: 2 },
+  position: "bottom",
+  wordHighlight: { enabled: false, color: "#FFEB3B" },
+};
+
+const CAPTION_FONT_OPTIONS = ["Arial Black", "Arial", "Impact", "Verdana", "Georgia", "Courier New"];
+
+const CAPTION_STYLE_PRESETS: { label: string; style: Partial<CaptionStyle> }[] = [
+  { label: "Clean White", style: { color: "#FFFFFF", outlineColor: "#000000", bold: true, shadow: { enabled: false, blur: 4, offsetX: 0, offsetY: 2 } } },
+  { label: "Bold Yellow", style: { color: "#FFEB3B", outlineColor: "#000000", outlineWidthPx: 3, bold: true, shadow: { enabled: false, blur: 4, offsetX: 0, offsetY: 2 } } },
+  { label: "Impact Red", style: { color: "#FFFFFF", outlineColor: "#D32F2F", outlineWidthPx: 3, bold: true, shadow: { enabled: false, blur: 4, offsetX: 0, offsetY: 2 } } },
+  { label: "Soft Shadow", style: { color: "#FFFFFF", outlineColor: "#000000", outlineWidthPx: 1, bold: false, shadow: { enabled: true, blur: 6, offsetX: 0, offsetY: 3 } } },
+];
+
+/** Shallow-merges a partial style onto a base — mirrors the Rust merge_style. */
+function resolveCaptionStyle(base: CaptionStyle, overlay?: CaptionStyle | null): Required<CaptionStyle> {
+  return { ...DEFAULT_CAPTION_STYLE, ...base, ...(overlay ?? {}) };
+}
+
 const MOTION_OPTIONS: { value: MotionPreset; label: string; icon: typeof Move }[] = [
   { value: "zoom-in", label: "Zoom in", icon: ZoomIn },
   { value: "zoom-out", label: "Zoom out", icon: ZoomOut },
+  { value: "zoom-pulse", label: "Zoom pulse", icon: Shuffle },
+  { value: "zoom-in-subject", label: "Zoom in on subject", icon: ZoomIn },
+  { value: "zoom-out-subject", label: "Zoom out on subject", icon: ZoomOut },
 ];
 
 function motionLabel(preset: MotionPreset): string {
@@ -59,7 +93,11 @@ function motionLabel(preset: MotionPreset): string {
 // Matches the export engine: `intensity` is the total zoom/pan amount over
 // REFERENCE_DURATION seconds, applied as a constant per-second rate to every
 // clip so the effect feels equally fast regardless of a still's own duration.
+// `MAX_SCALE_REFERENCE_DURATION` only bounds pathological cases (it's well
+// beyond any realistic still duration) — it must never be reached in normal
+// use, unlike the old `1 + amount*3` cap which froze zoom at exactly 15s.
 const MOTION_REFERENCE_DURATION = 5.0;
+const MAX_SCALE_REFERENCE_DURATION = 60.0;
 
 function applyMotion(
   motion: MotionPreset,
@@ -67,40 +105,51 @@ function applyMotion(
   duration: number,
   intensity: number,
   rect: { x: number; y: number; w: number; h: number },
+  subject?: { x: number; y: number },
 ) {
   if (motion === "none") return rect;
   const amount = Math.max(0.02, Math.min(0.6, intensity));
   const rate = amount / MOTION_REFERENCE_DURATION;
-  const maxScale = 1 + amount * 3;
+  const maxScale = 1 + amount * (MAX_SCALE_REFERENCE_DURATION / MOTION_REFERENCE_DURATION);
   const peak = 1 + amount;
   let scaleMul = 1;
-  let panX = 0.5;
-  const panY = 0.5;
-  if (motion === "zoom-in") {
+  let panX = subject?.x ?? 0.5;
+  let panY = subject?.y ?? 0.5;
+  if (motion === "zoom-in" || motion === "zoom-in-subject") {
     scaleMul = Math.min(maxScale, 1 + rate * elapsedSeconds);
-  } else if (motion === "zoom-out") {
+  } else if (motion === "zoom-out" || motion === "zoom-out-subject") {
     scaleMul = Math.min(maxScale, 1 + rate * (duration - elapsedSeconds));
+  } else if (motion === "zoom-pulse") {
+    const half = duration / 2;
+    scaleMul = elapsedSeconds < half
+      ? Math.min(maxScale, 1 + rate * elapsedSeconds)
+      : Math.max(1, Math.min(maxScale, 1 + rate * half) - rate * (elapsedSeconds - half));
+    panX = 0.5;
+    panY = 0.5;
   } else if (motion === "pan-left") {
     scaleMul = peak;
     panX = 1 - Math.min(1, elapsedSeconds / MOTION_REFERENCE_DURATION);
+    panY = 0.5;
   } else if (motion === "pan-right") {
     scaleMul = peak;
     panX = Math.min(1, elapsedSeconds / MOTION_REFERENCE_DURATION);
+    panY = 0.5;
   }
   const w = rect.w * scaleMul;
   const h = rect.h * scaleMul;
   return { x: rect.x - (w - rect.w) * panX, y: rect.y - (h - rect.h) * panY, w, h };
 }
 
-// Matches the export engine's fade window: `min(0.5, duration / 2)` seconds
-// of fade-from/to-black at the start/end of the clip.
+// Matches the export engine's fade window: proportional to the clip's own
+// duration (~8%), floored so short clips still get a perceptible fade, and
+// capped at half the duration so in+out fades on a short clip never overlap.
 function fadeOverlayAlpha(
   transitionIn: string,
   transitionOut: string,
   elapsedSeconds: number,
   duration: number,
 ): number {
-  const fadeDuration = Math.min(0.5, duration / 2);
+  const fadeDuration = Math.max(0.15, Math.min(duration / 2, duration * 0.08));
   if (fadeDuration <= 0) return 0;
   let alpha = 0;
   if (transitionIn === "fade" && elapsedSeconds < fadeDuration) {
@@ -120,6 +169,7 @@ export function TimelineView() {
   const [captionSet, setCaptionSet] = useState<CaptionSetRecord | null>(null);
   const [audioDataUrl, setAudioDataUrl] = useState<string | null>(null);
   const [renderUrls, setRenderUrls] = useState<Record<string, string>>({});
+  const [subjectByRender, setSubjectByRender] = useState<Record<string, { x: number; y: number }>>({});
   const [narrationDuration, setNarrationDuration] = useState(0);
   const [nativeAudioDuration, setNativeAudioDuration] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -132,7 +182,7 @@ export function TimelineView() {
   const [canvasSize, setCanvasSize] = useState({ width: 960, height: 540 });
   const [previewTime, setPreviewTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [inspectorTab, setInspectorTab] = useState<"clip" | "global">("clip");
+  const [inspectorTab, setInspectorTab] = useState<"clip" | "global" | "captions">("clip");
   const [globalIntensity, setGlobalIntensity] = useState(0.22);
   const [videoAssetUrls, setVideoAssetUrls] = useState<Record<string, string>>({});
   const [animationResolution, setAnimationResolution] = useState<VeoResolution>("720p");
@@ -142,7 +192,19 @@ export function TimelineView() {
   const [animationJob, setAnimationJob] = useState<AnimationJobRecord | null>(null);
   const [selectedClipVideoAsset, setSelectedClipVideoAsset] = useState<VideoAssetRecord | null>(null);
   const [retiming, setRetiming] = useState(false);
+  const [extrapolating, setExtrapolating] = useState(false);
   const [uploadingAnimation, setUploadingAnimation] = useState(false);
+  const [selectedCaptionClip, setSelectedCaptionClip] = useState<TimelineCaptionClipRecord | null>(null);
+  const [captionText, setCaptionText] = useState("");
+  const [captionInterval, setCaptionInterval] = useState(1);
+  const [generatingCaptions, setGeneratingCaptions] = useState(false);
+  const [captionProgress, setCaptionProgress] = useState({ percent: 0, stage: "Preparing captions", detail: "" });
+  const [confirmRegenerateCaptions, setConfirmRegenerateCaptions] = useState(false);
+  const [confirmResetTimeline, setConfirmResetTimeline] = useState(false);
+  const [resettingTimeline, setResettingTimeline] = useState(false);
+  const [captionDragPreview, setCaptionDragPreview] = useState<{ clipId: string; start: number; end: number } | null>(null);
+  const [stillsDragPreview, setStillsDragPreview] = useState<{ clipId: string; start: number; end: number } | null>(null);
+  const [narrationDragPreview, setNarrationDragPreview] = useState<number | null>(null);
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -160,12 +222,16 @@ export function TimelineView() {
   const canvasScrollRef = useRef<HTMLDivElement>(null);
   const stillsClipsRef = useRef<TimelineClipRecord[]>([]);
   const playheadDragRef = useRef(false);
+  const captionDragRef = useRef<{ clipId: string; mode: "start" | "end" | "move"; originalStart: number; originalEnd: number; pointerStartSeconds: number } | null>(null);
+  const stillsDragRef = useRef<{ clipId: string; mode: "start" | "end" | "move"; originalStart: number; originalEnd: number; pointerStartSeconds: number } | null>(null);
+  const narrationDragRef = useRef<{ pointerStartSeconds: number; originalOffset: number } | null>(null);
 
   useEffect(() => {
     if (!activeVideoId) return;
     let cancelled = false;
     setError(null);
     setSelectedClip(null);
+    setSelectedCaptionClip(null);
 
     // Stale-while-revalidate: show whatever we already have for this video
     // instantly (no spinner flash on every tab switch), then refresh quietly.
@@ -192,6 +258,7 @@ export function TimelineView() {
           if (!cancelled) {
             setCachedData(`tl-captions:${activeVideoId}`, captions);
             setCaptionSet(captions);
+            setCaptionInterval(captions.intervalSeconds);
           }
         } catch {
           if (!cancelled) {
@@ -233,6 +300,22 @@ export function TimelineView() {
       setRenderUrls((current) => ({ ...current, [id]: url }));
     }));
   }, [timeline, renderUrls]);
+
+  useEffect(() => {
+    if (!activeVideoId) return;
+    const subjectRenderIds = (timeline?.clips ?? [])
+      .filter((clip) => clip.motionPreset === "zoom-in-subject" || clip.motionPreset === "zoom-out-subject")
+      .map((clip) => clip.renderId)
+      .filter(Boolean) as string[];
+    void Promise.all(subjectRenderIds.filter((id) => !subjectByRender[id]).map(async (id) => {
+      try {
+        const [x, y] = await projectsClient.detectRenderSubject(activeVideoId, id);
+        setSubjectByRender((current) => ({ ...current, [id]: { x, y } }));
+      } catch {
+        // Leave unresolved — applyMotion falls back to frame-center until it succeeds.
+      }
+    }));
+  }, [timeline, activeVideoId, subjectByRender]);
 
   useEffect(() => {
     const videoAssetIds = (timeline?.clips ?? []).map((clip) => clip.videoAssetId).filter(Boolean) as string[];
@@ -282,6 +365,18 @@ export function TimelineView() {
     });
   }, [timeline]);
 
+  // Same for the selected caption clip, and keep the text editor in sync
+  // whenever the underlying clip's text changes (including our own edits).
+  useEffect(() => {
+    setSelectedCaptionClip((current) => {
+      if (!current || !timeline) return current;
+      return timeline.captionClips.find((clip) => clip.id === current.id) ?? null;
+    });
+  }, [timeline]);
+  useEffect(() => {
+    setCaptionText(selectedCaptionClip?.text ?? "");
+  }, [selectedCaptionClip?.id, selectedCaptionClip?.text]);
+
   const zoom = timeline?.zoom ?? 1;
   const pixelsPerSecond = BASE_PIXELS_PER_SECOND * zoom;
   // Prefer the native <audio> element's duration (the same value export uses
@@ -293,7 +388,8 @@ export function TimelineView() {
   const totalDuration = Math.max(timeline?.durationSeconds ?? 0, nativeAudioDuration || narrationDuration, 1);
   const totalWidthPx = secondsToPixels(totalDuration, pixelsPerSecond);
   const stillsClips = [...(timeline?.clips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds);
-  const captionClips = captionSet?.chunks ?? [];
+  const captionClips = [...(timeline?.captionClips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds);
+  const globalCaptionStyle = timeline?.captionStyle ?? {};
   const playheadPx = secondsToPixels(previewTime, pixelsPerSecond);
   stillsClipsRef.current = stillsClips;
 
@@ -343,43 +439,83 @@ export function TimelineView() {
     return img.complete && img.naturalWidth ? img : null;
   }
 
-  // Same style as the export engine's burned-in subtitles: bold white text
-  // with a black outline, no background box. Sized for legibility in the
-  // editor rather than an exact pixel-ratio match to the export resolution —
-  // the export's fixed 22px is comfortably readable on a full 1080p playback
-  // but would be nearly invisible at the small preview canvas size.
-  function drawCaptionText(ctx: CanvasRenderingContext2D, width: number, height: number, text: string) {
-    const fontSize = Math.max(18, Math.round(height * 0.045));
-    ctx.font = `900 ${fontSize}px "Arial Black", Arial, sans-serif`;
-    ctx.textAlign = "center";
+  // Mirrors the export engine's ASS burn-in (font, weight, color, outline,
+  // shadow, position), scaled for legibility at the editor's small preview
+  // canvas rather than an exact pixel-ratio match to the export resolution —
+  // the default 22px is comfortably readable on a full 1080p export but
+  // would be nearly invisible at the preview canvas's native size.
+  // `activeWordIndex` (index into `text.split(/\s+/)`) recolors just that one
+  // word — mirrors the export's per-word-window ASS Dialogue lines, so the
+  // in-app preview matches what gets burned in.
+  function drawCaptionText(
+    ctx: CanvasRenderingContext2D, width: number, height: number, text: string, style: Required<CaptionStyle>,
+    activeWordIndex: number | null,
+  ) {
+    const fontSize = Math.max(14, Math.round((style.fontSizePx / 22) * height * 0.045));
+    const weight = style.bold ? 900 : 400;
+    ctx.font = `${weight} ${fontSize}px "${style.fontFamily}", Arial, sans-serif`;
     ctx.textBaseline = "alphabetic";
     const maxWidth = width * 0.86;
     const words = text.split(/\s+/);
-    const lines: string[] = [];
-    let line = "";
-    for (const word of words) {
-      const test = line ? `${line} ${word}` : word;
-      if (line && ctx.measureText(test).width > maxWidth) {
+    const lines: { word: string; index: number }[][] = [];
+    let line: { word: string; index: number }[] = [];
+    let lineText = "";
+    words.forEach((word, index) => {
+      const test = lineText ? `${lineText} ${word}` : word;
+      if (lineText && ctx.measureText(test).width > maxWidth) {
         lines.push(line);
-        line = word;
+        line = [{ word, index }];
+        lineText = word;
       } else {
-        line = test;
+        line.push({ word, index });
+        lineText = test;
       }
-    }
-    if (line) lines.push(line);
+    });
+    if (line.length) lines.push(line);
+
     const lineHeight = fontSize * 1.25;
     const blockHeight = lines.length * lineHeight;
-    const bottomMargin = height * 0.05;
-    const startY = height - bottomMargin - blockHeight + lineHeight * 0.8;
-    const outlineWidth = Math.max(2, fontSize * 0.16);
+    const margin = height * 0.05;
+    let startY: number;
+    if (style.position === "top") {
+      startY = margin + lineHeight * 0.8;
+    } else if (style.position === "middle") {
+      startY = (height - blockHeight) / 2 + lineHeight * 0.8;
+    } else {
+      startY = height - margin - blockHeight + lineHeight * 0.8;
+    }
+    const outlineWidth = Math.max(1, (style.outlineWidthPx / 2) * fontSize * 0.16);
     ctx.lineJoin = "round";
-    lines.forEach((textLine, index) => {
-      const y = startY + index * lineHeight;
-      ctx.lineWidth = outlineWidth;
-      ctx.strokeStyle = "#000000";
-      ctx.strokeText(textLine, width / 2, y);
-      ctx.fillStyle = "#ffffff";
-      ctx.fillText(textLine, width / 2, y);
+    ctx.textAlign = "left";
+    const highlightEnabled = style.wordHighlight.enabled && activeWordIndex !== null;
+    const highlightColor = style.wordHighlight.color ?? "#FFEB3B";
+
+    lines.forEach((lineWords, lineIndex) => {
+      const y = startY + lineIndex * lineHeight;
+      const fullLineText = lineWords.map((w) => w.word).join(" ");
+      let x = width / 2 - ctx.measureText(fullLineText).width / 2;
+      lineWords.forEach(({ word, index }, wordPos) => {
+        const isActive = highlightEnabled && index === activeWordIndex;
+        if (outlineWidth > 0) {
+          ctx.shadowColor = "transparent";
+          ctx.lineWidth = outlineWidth;
+          ctx.strokeStyle = style.outlineColor;
+          ctx.strokeText(word, x, y);
+        }
+        if (style.shadow.enabled) {
+          ctx.shadowColor = "rgba(0,0,0,0.7)";
+          ctx.shadowBlur = style.shadow.blur ?? 4;
+          ctx.shadowOffsetX = style.shadow.offsetX ?? 0;
+          ctx.shadowOffsetY = style.shadow.offsetY ?? 2;
+        } else {
+          ctx.shadowColor = "transparent";
+        }
+        ctx.fillStyle = isActive ? highlightColor : style.color;
+        ctx.fillText(word, x, y);
+        ctx.shadowColor = "transparent";
+        const wordWithTrailingSpace = wordPos < lineWords.length - 1 ? `${word} ` : word;
+        x += ctx.measureText(wordWithTrailingSpace).width;
+      });
     });
   }
 
@@ -461,7 +597,8 @@ export function TimelineView() {
         // clip's first frame instead of extrapolating zoom/fade backwards.
         const elapsedSeconds = Math.max(0, time - clip.startSeconds);
         const clipDuration = clip.endSeconds - clip.startSeconds;
-        const rect = applyMotion(clip.motionPreset, elapsedSeconds, clipDuration, clip.motionIntensity, base);
+        const subject = clip.renderId ? subjectByRender[clip.renderId] : undefined;
+        const rect = applyMotion(clip.motionPreset, elapsedSeconds, clipDuration, clip.motionIntensity, base, subject);
         ctx.drawImage(img, rect.x, rect.y, rect.w, rect.h);
         // A fade-in/out at the two hard edges of the whole timeline has
         // nothing to fade from/to, so it just opens or closes on black —
@@ -483,13 +620,28 @@ export function TimelineView() {
       }
     }
     const caption = captionClips.find((c) => time >= c.startSeconds && time < c.endSeconds);
-    if (caption) drawCaptionText(ctx, canvas.width, canvas.height, caption.text);
+    if (caption) {
+      const resolved = resolveCaptionStyle(globalCaptionStyle, caption.style);
+      // Extend each word's effective window to the next word's start (or the
+      // clip's end for the last one) so there's no highlight gap between
+      // words — mirrors the export's per-word-window Dialogue lines exactly.
+      let activeWordIndex: number | null = null;
+      const words = caption.words;
+      if (words && words.length) {
+        const idx = words.findIndex((w, i) => {
+          const effectiveEnd = i + 1 < words.length ? words[i + 1].startSeconds : caption.endSeconds;
+          return time >= w.startSeconds && time < effectiveEnd;
+        });
+        activeWordIndex = idx >= 0 ? idx : null;
+      }
+      drawCaptionText(ctx, canvas.width, canvas.height, caption.text, resolved, activeWordIndex);
+    }
   }
   drawFrameRef.current = drawFrame;
 
   useEffect(() => {
     drawFrameRef.current(previewTimeRef.current);
-  }, [stillsClips, captionClips, renderUrls, videoAssetUrls, canvasSize]);
+  }, [stillsClips, captionClips, globalCaptionStyle, renderUrls, videoAssetUrls, canvasSize, subjectByRender]);
 
   useEffect(() => {
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
@@ -497,15 +649,24 @@ export function TimelineView() {
 
   function stepFrame() {
     const audio = audioRef.current;
+    const narrationOffset = timeline?.narrationOffsetSeconds ?? 0;
     let t = previewTimeRef.current;
-    if (audio && audioDataUrl) {
-      t = audio.currentTime;
+    if (audio && audioDataUrl && !audio.paused) {
+      t = audio.currentTime + narrationOffset;
       if (audio.ended) {
         pausePreview();
         return;
       }
     } else if (playStartRef.current) {
       t = playStartRef.current.timeStart + (performance.now() - playStartRef.current.wallStart) / 1000;
+      // Narration hasn't started yet (still inside its lead-in offset) — keep
+      // advancing on the wall clock until we cross into its range, then hand
+      // off to the audio element so the two stay in lockstep from there on.
+      if (audio && audioDataUrl && t >= narrationOffset) {
+        audio.currentTime = Math.max(0, t - narrationOffset);
+        void audio.play();
+        playStartRef.current = null;
+      }
     }
     if (t >= totalDuration) {
       previewTimeRef.current = totalDuration;
@@ -530,8 +691,9 @@ export function TimelineView() {
     setIsPlaying(true);
     previewTimeRef.current = startAt;
     setPreviewTime(startAt);
-    if (audioRef.current && audioDataUrl) {
-      audioRef.current.currentTime = startAt;
+    const narrationOffset = timeline?.narrationOffsetSeconds ?? 0;
+    if (audioRef.current && audioDataUrl && startAt >= narrationOffset) {
+      audioRef.current.currentTime = startAt - narrationOffset;
       void audioRef.current.play();
     } else {
       playStartRef.current = { wallStart: performance.now(), timeStart: startAt };
@@ -552,8 +714,18 @@ export function TimelineView() {
     const clamped = Math.max(0, Math.min(totalDuration, time));
     previewTimeRef.current = clamped;
     setPreviewTime(clamped);
-    if (audioRef.current && audioDataUrl) audioRef.current.currentTime = clamped;
-    if (isPlayingRef.current && (!audioRef.current || !audioDataUrl)) {
+    const narrationOffset = timeline?.narrationOffsetSeconds ?? 0;
+    const pastOffset = clamped >= narrationOffset;
+    if (audioRef.current && audioDataUrl && pastOffset) {
+      audioRef.current.currentTime = clamped - narrationOffset;
+      if (isPlayingRef.current) {
+        void audioRef.current.play();
+        playStartRef.current = null;
+      }
+    } else if (audioRef.current && audioDataUrl) {
+      audioRef.current.pause();
+    }
+    if (isPlayingRef.current && (!audioRef.current || !audioDataUrl || !pastOffset)) {
       playStartRef.current = { wallStart: performance.now(), timeStart: clamped };
     }
     drawFrameRef.current(clamped);
@@ -583,14 +755,119 @@ export function TimelineView() {
     playheadDragRef.current = true;
   }
 
+  // Shared move/resize math for both the stills and captions lanes: edge
+  // handles clamp to the clip's own opposite edge (a minimum 0.1s length),
+  // while a body drag shifts both edges by the same delta so the clip's own
+  // duration never changes — only its position on the timeline does.
+  function nextDragBounds(
+    mode: "start" | "end" | "move",
+    originalStart: number,
+    originalEnd: number,
+    pointerStartSeconds: number,
+    time: number,
+  ): { start: number; end: number } {
+    if (mode === "start") {
+      return { start: Math.max(0, Math.min(time, originalEnd - 0.1)), end: originalEnd };
+    }
+    if (mode === "end") {
+      return { start: originalStart, end: Math.max(originalStart + 0.1, time) };
+    }
+    const delta = time - pointerStartSeconds;
+    const duration = originalEnd - originalStart;
+    const start = Math.max(0, originalStart + delta);
+    return { start, end: start + duration };
+  }
+
   function onDragPointerMove(event: ReactPointerEvent) {
-    if (!playheadDragRef.current) return;
     const rect = canvasInnerRef.current?.getBoundingClientRect();
-    if (rect) seekPreview(pixelsToSeconds(event.clientX - rect.left, pixelsPerSecond));
+    if (!rect) return;
+    if (playheadDragRef.current) {
+      seekPreview(pixelsToSeconds(event.clientX - rect.left, pixelsPerSecond));
+      return;
+    }
+    const time = pixelsToSeconds(event.clientX - rect.left, pixelsPerSecond);
+    const captionDrag = captionDragRef.current;
+    if (captionDrag) {
+      setCaptionDragPreview((current) => {
+        if (!current || current.clipId !== captionDrag.clipId) return current;
+        return { clipId: current.clipId, ...nextDragBounds(captionDrag.mode, captionDrag.originalStart, captionDrag.originalEnd, captionDrag.pointerStartSeconds, time) };
+      });
+    }
+    const stillsDrag = stillsDragRef.current;
+    if (stillsDrag) {
+      setStillsDragPreview((current) => {
+        if (!current || current.clipId !== stillsDrag.clipId) return current;
+        return { clipId: current.clipId, ...nextDragBounds(stillsDrag.mode, stillsDrag.originalStart, stillsDrag.originalEnd, stillsDrag.pointerStartSeconds, time) };
+      });
+    }
+    const narrationDrag = narrationDragRef.current;
+    if (narrationDrag) {
+      const delta = time - narrationDrag.pointerStartSeconds;
+      setNarrationDragPreview(Math.max(0, narrationDrag.originalOffset + delta));
+    }
+  }
+
+  function beginCaptionDrag(clip: TimelineCaptionClipRecord, mode: "start" | "end" | "move", event: ReactPointerEvent) {
+    event.stopPropagation();
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    const rect = canvasInnerRef.current?.getBoundingClientRect();
+    const pointerStartSeconds = rect ? pixelsToSeconds(event.clientX - rect.left, pixelsPerSecond) : clip.startSeconds;
+    captionDragRef.current = { clipId: clip.id, mode, originalStart: clip.startSeconds, originalEnd: clip.endSeconds, pointerStartSeconds };
+    setCaptionDragPreview({ clipId: clip.id, start: clip.startSeconds, end: clip.endSeconds });
+  }
+
+  function beginStillsDrag(clip: TimelineClipRecord, mode: "start" | "end" | "move", event: ReactPointerEvent) {
+    event.stopPropagation();
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    const rect = canvasInnerRef.current?.getBoundingClientRect();
+    const pointerStartSeconds = rect ? pixelsToSeconds(event.clientX - rect.left, pixelsPerSecond) : clip.startSeconds;
+    stillsDragRef.current = { clipId: clip.id, mode, originalStart: clip.startSeconds, originalEnd: clip.endSeconds, pointerStartSeconds };
+    setStillsDragPreview({ clipId: clip.id, start: clip.startSeconds, end: clip.endSeconds });
+  }
+
+  function beginNarrationDrag(event: ReactPointerEvent) {
+    event.stopPropagation();
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    const rect = canvasInnerRef.current?.getBoundingClientRect();
+    const pointerStartSeconds = rect ? pixelsToSeconds(event.clientX - rect.left, pixelsPerSecond) : 0;
+    narrationDragRef.current = { pointerStartSeconds, originalOffset: timeline?.narrationOffsetSeconds ?? 0 };
+    setNarrationDragPreview(timeline?.narrationOffsetSeconds ?? 0);
   }
 
   function endDrag() {
     playheadDragRef.current = false;
+    const captionDrag = captionDragRef.current;
+    if (captionDrag) {
+      captionDragRef.current = null;
+      setCaptionDragPreview((preview) => {
+        if (activeVideoId && preview && preview.clipId === captionDrag.clipId
+          && (preview.start !== captionDrag.originalStart || preview.end !== captionDrag.originalEnd)) {
+          void refresh(projectsClient.updateTimelineCaptionClip(activeVideoId, captionDrag.clipId, preview.start, preview.end));
+        }
+        return null;
+      });
+    }
+    const stillsDrag = stillsDragRef.current;
+    if (stillsDrag) {
+      stillsDragRef.current = null;
+      setStillsDragPreview((preview) => {
+        if (activeVideoId && preview && preview.clipId === stillsDrag.clipId
+          && (preview.start !== stillsDrag.originalStart || preview.end !== stillsDrag.originalEnd)) {
+          void refresh(projectsClient.updateTimelineClip(activeVideoId, stillsDrag.clipId, preview.start, preview.end));
+        }
+        return null;
+      });
+    }
+    const narrationDrag = narrationDragRef.current;
+    if (narrationDrag) {
+      narrationDragRef.current = null;
+      setNarrationDragPreview((preview) => {
+        if (activeVideoId && preview !== null && preview !== narrationDrag.originalOffset) {
+          void refresh(projectsClient.setNarrationOffset(activeVideoId, preview));
+        }
+        return null;
+      });
+    }
   }
 
   function scrollTimelineToTime(time: number) {
@@ -710,20 +987,165 @@ export function TimelineView() {
     addToast("Removed camera movement, transitions, and any gap-filling stretch from every still.", "success");
   }
 
-  async function extrapolateStills() {
-    if (!activeVideoId) return;
-    // Use ffmpeg's own measured duration (the same value export computes
-    // video length from) rather than a browser-measured one, so extrapolated
-    // stills always reach exactly as far as the exported audio/captions do.
-    let duration = totalDuration;
+  async function resetTimelineToDefault() {
+    if (!activeVideoId || resettingTimeline) return;
+    setResettingTimeline(true);
     try {
-      duration = await projectsClient.probeNarrationDuration(activeVideoId);
-    } catch {
-      // No narration audio yet, or the probe failed — fall back rather than
-      // blocking the action entirely.
+      setSelectedClip(null);
+      setSelectedCaptionClip(null);
+      await refresh(projectsClient.resetTimelineToDefault(activeVideoId));
+      addToast("Timeline reset to its default order and settings.", "success");
+    } finally {
+      setResettingTimeline(false);
     }
-    await refresh(projectsClient.extrapolateStillsToFillGaps(activeVideoId, duration));
-    addToast("Stills stretched to close every gap.", "success");
+  }
+
+  async function extrapolateStills() {
+    if (!activeVideoId || extrapolating) return;
+    setExtrapolating(true);
+    try {
+      // Use ffmpeg's own measured duration (the same value export computes
+      // video length from) rather than a browser-measured one, so extrapolated
+      // stills always reach exactly as far as the exported audio/captions do.
+      // Probing spawns a real ffmpeg process and can take a couple of seconds —
+      // the button stays disabled with a spinner for that whole window so a
+      // single click isn't mistaken for a no-op and clicked again.
+      let duration = totalDuration;
+      try {
+        duration = await projectsClient.probeNarrationDuration(activeVideoId);
+      } catch {
+        // No narration audio yet, or the probe failed — fall back rather than
+        // blocking the action entirely.
+      }
+      await refresh(projectsClient.extrapolateStillsToFillGaps(activeVideoId, duration));
+      addToast("Stills stretched to close every gap.", "success");
+    } finally {
+      setExtrapolating(false);
+    }
+  }
+
+  async function runCaptionGeneration() {
+    if (!activeVideoId) return;
+    setGeneratingCaptions(true);
+    setError(null);
+    setCaptionProgress({ percent: 0, stage: "Preparing captions", detail: "" });
+    let unlisten: (() => void) | undefined;
+    try {
+      try {
+        unlisten = await listen<{ videoId: string; percent: number; stage: string; detail: string }>(
+          "caption-progress",
+          ({ payload }) => {
+            if (payload.videoId === activeVideoId) {
+              setCaptionProgress({ percent: payload.percent, stage: payload.stage, detail: payload.detail });
+            }
+          },
+        );
+      } catch {
+        // Browser preview has no native event bridge.
+      }
+      const generated = await projectsClient.generateCaptions(activeVideoId, captionInterval);
+      setCaptionSet(generated);
+      setCachedData(`tl-captions:${activeVideoId}`, generated);
+      // populate_timeline_from_sources only ADDS clips for chunk indices not
+      // already on the timeline — a regenerate produces an entirely new set
+      // of chunk indices/text/timings, so the old caption clips must be
+      // cleared first or the new captions would either be skipped or
+      // duplicated alongside stale ones.
+      if (timeline && timeline.captionClips.length > 0) {
+        await projectsClient.clearTimelineTrack(activeVideoId, "captions");
+      }
+      await refresh(projectsClient.populateTimelineFromSources(activeVideoId));
+      setSelectedCaptionClip(null);
+      addToast("Captions generated.", "success");
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      unlisten?.();
+      setGeneratingCaptions(false);
+    }
+  }
+
+  function generateCaptions() {
+    if (timeline && timeline.captionClips.length > 0) {
+      setConfirmRegenerateCaptions(true);
+      return;
+    }
+    void runCaptionGeneration();
+  }
+
+  async function saveCaptionsAs() {
+    if (!captionSet) return;
+    const safeTitle = (activeVideoTitle || "Video").replace(/[\\/:*?"<>|]/g, "").trim() || "Video";
+    try {
+      const path = await projectsClient.saveCaptionsFile(captionSet.srtText, `${safeTitle} Captions.srt`);
+      if (path) addToast(`Captions saved to ${path}`, "success");
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  function selectCaptionClip(clip: TimelineCaptionClipRecord) {
+    setSelectedCaptionClip(clip);
+    setInspectorTab("captions");
+  }
+
+  async function commitCaptionText() {
+    if (!activeVideoId || !selectedCaptionClip) return;
+    const trimmed = captionText.trim();
+    if (!trimmed || trimmed === selectedCaptionClip.text) return;
+    await refresh(projectsClient.updateCaptionClipText(activeVideoId, selectedCaptionClip.id, trimmed));
+  }
+
+  async function deleteCaptionClip() {
+    if (!activeVideoId || !selectedCaptionClip) return;
+    await refresh(projectsClient.deleteTimelineCaptionClip(activeVideoId, selectedCaptionClip.id));
+    setSelectedCaptionClip(null);
+  }
+
+  async function splitCaptionClipAtPlayhead() {
+    if (!activeVideoId || !selectedCaptionClip) return;
+    const { startSeconds, endSeconds, text } = selectedCaptionClip;
+    if (previewTime <= startSeconds || previewTime >= endSeconds) return;
+    const words = text.trim().split(/\s+/);
+    if (words.length < 2) {
+      addToast("This caption is too short to split — add more words first.", "error");
+      return;
+    }
+    const fraction = (previewTime - startSeconds) / (endSeconds - startSeconds);
+    const splitIndex = Math.max(1, Math.min(words.length - 1, Math.round(words.length * fraction)));
+    const leftText = words.slice(0, splitIndex).join(" ");
+    const rightText = words.slice(splitIndex).join(" ");
+    await refresh(projectsClient.splitCaptionClip(activeVideoId, selectedCaptionClip.id, previewTime, leftText, rightText));
+  }
+
+  async function mergeCaptionClipWithNext() {
+    if (!activeVideoId || !selectedCaptionClip) return;
+    const next = captionClips.find((clip) => Math.abs(clip.startSeconds - selectedCaptionClip.endSeconds) < 0.01);
+    if (!next) return;
+    await refresh(projectsClient.mergeCaptionClips(activeVideoId, selectedCaptionClip.id, next.id));
+  }
+
+  async function addCaptionAtPlayhead() {
+    if (!activeVideoId) return;
+    try {
+      const next = await projectsClient.addCaptionClip(activeVideoId, null, "New caption", previewTime);
+      setCachedData(`tl-timeline:${activeVideoId}`, next);
+      setTimeline(next);
+      const added = next.captionClips.find((clip) => Math.abs(clip.startSeconds - previewTime) < 0.01 && clip.text === "New caption");
+      if (added) selectCaptionClip(added);
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  async function updateGlobalCaptionStyle(next: CaptionStyle) {
+    if (!activeVideoId) return;
+    await refresh(projectsClient.setTimelineCaptionStyle(activeVideoId, next));
+  }
+
+  async function updateSelectedCaptionStyle(next: CaptionStyle | null) {
+    if (!activeVideoId || !selectedCaptionClip) return;
+    await refresh(projectsClient.setCaptionClipStyle(activeVideoId, selectedCaptionClip.id, next));
   }
 
   async function generateAnimation() {
@@ -908,8 +1330,8 @@ export function TimelineView() {
     <section className="view timeline-view">
       <div className="page-heading">
         <div>
-          <p className="eyebrow">Editor</p>
-          <h1>Timeline</h1>
+          <p className="eyebrow">Timeline</p>
+          <h1>Editor</h1>
           <p>Arrange your stills and preview the finished video — captions and narration stay perfectly synced automatically.</p>
         </div>
         <div className="heading-actions">
@@ -918,6 +1340,51 @@ export function TimelineView() {
         </div>
       </div>
       {error && <div className="inline-error">{error}</div>}
+      {confirmResetTimeline && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setConfirmResetTimeline(false)}>
+          <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
+            <p className="eyebrow">Reset timeline</p>
+            <h2>Reset everything to default?</h2>
+            <p style={{ color: "var(--muted)", fontSize: "13px", lineHeight: 1.55, marginTop: "8px" }}>
+              This discards the current still order, timing, camera movement, transitions, caption edits and styles,
+              and narration sync, then rebuilds the timeline fresh from the visual plan and captions. This can't be undone.
+            </p>
+            <div className="footer-actions">
+              <button className="secondary" onClick={() => setConfirmResetTimeline(false)}>Cancel</button>
+              <button className="primary" onClick={() => { setConfirmResetTimeline(false); void resetTimelineToDefault(); }}>Reset</button>
+            </div>
+          </section>
+        </div>
+      )}
+      {confirmRegenerateCaptions && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setConfirmRegenerateCaptions(false)}>
+          <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
+            <p className="eyebrow">Regenerate captions</p>
+            <h2>Discard existing caption edits?</h2>
+            <p style={{ color: "var(--muted)", fontSize: "13px", lineHeight: 1.55, marginTop: "8px" }}>
+              Regenerating rebuilds the caption track from scratch — any retiming, text edits, splits, merges, or per-clip
+              style overrides you've made on the current captions will be lost.
+            </p>
+            <div className="footer-actions">
+              <button className="secondary" onClick={() => setConfirmRegenerateCaptions(false)}>Cancel</button>
+              <button className="primary" onClick={() => { setConfirmRegenerateCaptions(false); void runCaptionGeneration(); }}>Regenerate</button>
+            </div>
+          </section>
+        </div>
+      )}
+      {generatingCaptions && (
+        <div className="loading-overlay" role="status" aria-live="polite">
+          <div className="loading-card generation-progress">
+            <div className="progress-heading">
+              <LoaderCircle className="spin" size={26} />
+              <strong>{captionProgress.stage}</strong>
+              <b>{captionProgress.percent}%</b>
+            </div>
+            <span>{captionProgress.detail || "Starting the local caption engine…"}</span>
+            <div className="loading-bar determinate"><i style={{ width: `${captionProgress.percent}%` }} /></div>
+          </div>
+        </div>
+      )}
       <>
         <div className="tl-workspace">
           <aside className="tl-media-pane">
@@ -952,6 +1419,7 @@ export function TimelineView() {
             <div className="tl-source-tabs">
               <button className={inspectorTab === "clip" ? "tl-source-tab active" : "tl-source-tab"} onClick={() => setInspectorTab("clip")}>Clip</button>
               <button className={inspectorTab === "global" ? "tl-source-tab active" : "tl-source-tab"} onClick={() => setInspectorTab("global")}>Global</button>
+              <button className={inspectorTab === "captions" ? "tl-source-tab active" : "tl-source-tab"} onClick={() => setInspectorTab("captions")}>Captions</button>
             </div>
             {inspectorTab === "global" && (
               <div className="tl-source-section">
@@ -987,7 +1455,9 @@ export function TimelineView() {
                 </div>
                 <div className="tl-inspector-group">
                   <span className="tl-inspector-label">Gaps</span>
-                  <button className="secondary" onClick={() => void extrapolateStills()}><Move size={14} />Extrapolate stills to fill gaps</button>
+                  <button className="secondary" disabled={extrapolating} onClick={() => void extrapolateStills()}>
+                    {extrapolating ? <><LoaderCircle className="spin" size={14} />Closing gaps…</> : <><Move size={14} />Extrapolate stills to fill gaps</>}
+                  </button>
                   <p className="tl-source-hint">
                     Stretches every still to close gaps between them (from silence between sentences), so they tile
                     back-to-back — this is what makes transitions actually visible.
@@ -996,6 +1466,105 @@ export function TimelineView() {
                 <div className="tl-inspector-group">
                   <button className="secondary danger-action" onClick={() => void removeAllEffects()}><Trash2 size={14} />Remove all effects</button>
                 </div>
+                <div className="tl-inspector-group">
+                  <button className="secondary danger-action" disabled={resettingTimeline} onClick={() => setConfirmResetTimeline(true)}>
+                    {resettingTimeline ? <LoaderCircle className="spin" size={14} /> : <Undo2 size={14} />}Reset timeline to default
+                  </button>
+                  <p className="tl-source-hint">
+                    Discards every customization — still order, timing, camera movement, transitions, caption edits and
+                    styles, and narration sync — and rebuilds the timeline from scratch.
+                  </p>
+                </div>
+              </div>
+            )}
+            {inspectorTab === "captions" && (
+              <div className="tl-inspector">
+                {selectedCaptionClip ? (
+                  <>
+                    <div className="tl-inspector-header">
+                      <button className="tl-apply-all-btn" style={{ alignSelf: "flex-start" }} onClick={() => setSelectedCaptionClip(null)}>← Back</button>
+                      <strong><Type size={14} />Caption</strong>
+                      <span>{formatTime(selectedCaptionClip.startSeconds)} – {formatTime(selectedCaptionClip.endSeconds)}</span>
+                    </div>
+                    <div className="tl-inspector-group">
+                      <span className="tl-inspector-label">Text</span>
+                      <textarea
+                        className="tl-prompt-textarea"
+                        rows={3}
+                        value={captionText}
+                        onChange={(event) => setCaptionText(event.target.value)}
+                        onBlur={() => void commitCaptionText()}
+                      />
+                      <div className="tl-preset-grid two">
+                        <button
+                          className="secondary"
+                          disabled={previewTime <= selectedCaptionClip.startSeconds || previewTime >= selectedCaptionClip.endSeconds}
+                          onClick={() => void splitCaptionClipAtPlayhead()}
+                        >
+                          <Scissors size={14} />Split at playhead
+                        </button>
+                        <button
+                          className="secondary"
+                          disabled={!captionClips.some((clip) => Math.abs(clip.startSeconds - selectedCaptionClip.endSeconds) < 0.01)}
+                          onClick={() => void mergeCaptionClipWithNext()}
+                        >
+                          Merge with next
+                        </button>
+                      </div>
+                      <button className="secondary danger-action" onClick={() => void deleteCaptionClip()}><Trash2 size={14} />Delete caption</button>
+                    </div>
+                    <div className="tl-inspector-group">
+                      <div className="tl-inspector-label-row">
+                        <span className="tl-inspector-label">Style override</span>
+                        {selectedCaptionClip.style && (
+                          <button className="tl-apply-all-btn" onClick={() => void updateSelectedCaptionStyle(null)}>Reset to default</button>
+                        )}
+                      </div>
+                      {!selectedCaptionClip.style && <p className="tl-source-hint">Inheriting the global default — adjust anything below to customize just this caption.</p>}
+                      {!selectedCaptionClip.words?.length && (
+                        <p className="tl-source-hint">
+                          No original narration timing on this caption (it was hand-edited or added manually) — word
+                          highlight won't apply here even if turned on; the whole caption stays one color.
+                        </p>
+                      )}
+                      <CaptionStyleEditor
+                        style={resolveCaptionStyle(globalCaptionStyle, selectedCaptionClip.style)}
+                        onChange={(patch) => void updateSelectedCaptionStyle({ ...(selectedCaptionClip.style ?? {}), ...patch })}
+                      />
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="tl-inspector-group">
+                      <span className="tl-inspector-label">Generate</span>
+                      <label className="caption-interval" title="Maximum seconds of narration per caption">
+                        <span>Window</span>
+                        <input
+                          type="number" min="0.2" max="5" step="0.1"
+                          value={captionInterval} disabled={generatingCaptions}
+                          onChange={(event) => setCaptionInterval(Number(event.target.value))}
+                        />
+                        <span>sec</span>
+                      </label>
+                      <button className="secondary full" disabled={generatingCaptions} onClick={generateCaptions}>
+                        {generatingCaptions ? <><LoaderCircle className="spin" size={16} />Generating…</> : <><Type size={16} />{captionSet ? "Regenerate captions" : "Generate captions"}</>}
+                      </button>
+                      <button className="secondary full" disabled={!captionSet} onClick={() => void saveCaptionsAs()}><Download size={16} />Save captions as…</button>
+                    </div>
+                    <div className="tl-inspector-group">
+                      <button className="secondary full" onClick={() => void addCaptionAtPlayhead()}><Plus size={14} />Add caption at playhead</button>
+                      <p className="tl-source-hint">Select a caption on the lane below to edit, retime, split, merge, or style it individually.</p>
+                    </div>
+                    <div className="tl-inspector-group">
+                      <span className="tl-inspector-label">Global default style</span>
+                      <p className="tl-source-hint">Applies to every caption that hasn't been given its own style override.</p>
+                      <CaptionStyleEditor
+                        style={resolveCaptionStyle(globalCaptionStyle, null)}
+                        onChange={(patch) => void updateGlobalCaptionStyle({ ...globalCaptionStyle, ...patch })}
+                      />
+                    </div>
+                  </>
+                )}
               </div>
             )}
             {inspectorTab === "clip" && (selectedClip ? (
@@ -1030,18 +1599,16 @@ export function TimelineView() {
 
                   {selectedClip.clipKind === "still" && !selectedClip.videoAssetId && animateMode === "choose" && (
                     <>
-                      <div className="tl-preset-grid two">
-                        <button className="primary" onClick={() => setAnimateMode("generate")}>
-                          <Clapperboard size={14} />Generate with AI
-                        </button>
-                        <button className="secondary" disabled={uploadingAnimation} onClick={() => void uploadAnimation()}>
-                          <Upload size={14} />{uploadingAnimation ? "Uploading…" : "Upload your own"}
-                        </button>
-                      </div>
+                      <button className="primary tl-generate-btn" onClick={() => setAnimateMode("generate")}>
+                        <Clapperboard size={14} />Generate
+                      </button>
                       <p className="tl-source-hint">
-                        Generate motion with Veo from a prompt, or bring your own clip — either way it's automatically
-                        stretched or trimmed to exactly fill this {formatTime(selectedClip.endSeconds - selectedClip.startSeconds)} slot.
+                        Generates motion with Veo from a prompt, automatically stretched or trimmed to exactly fill
+                        this {formatTime(selectedClip.endSeconds - selectedClip.startSeconds)} slot.
                       </p>
+                      <button className="tl-upload-secondary" disabled={uploadingAnimation} onClick={() => void uploadAnimation()}>
+                        <Upload size={12} />{uploadingAnimation ? "Uploading…" : "Or upload your own clip instead"}
+                      </button>
                     </>
                   )}
 
@@ -1219,34 +1786,64 @@ export function TimelineView() {
                   <span className="tl-playhead-tag" onPointerDown={beginPlayheadDrag}>{formatTime(previewTime)}</span>
                 </div>
                 <div className="tl-lane-track tl-narration-track" style={{ height: NARRATION_LANE_HEIGHT }}>
-                  <NarrationWaveform audioDataUrl={audioDataUrl} pixelsPerSecond={pixelsPerSecond} canvasRef={waveformCanvasRef} onDuration={setNarrationDuration} />
+                  {audioDataUrl && (
+                    <div
+                      className="tl-narration-offset"
+                      style={{ left: secondsToPixels(narrationDragPreview ?? timeline?.narrationOffsetSeconds ?? 0, pixelsPerSecond) }}
+                      onPointerDown={beginNarrationDrag}
+                      title="Drag to shift when narration starts"
+                    >
+                      <NarrationWaveform audioDataUrl={audioDataUrl} pixelsPerSecond={pixelsPerSecond} canvasRef={waveformCanvasRef} onDuration={setNarrationDuration} />
+                    </div>
+                  )}
+                  {!audioDataUrl && <NarrationWaveform audioDataUrl={audioDataUrl} pixelsPerSecond={pixelsPerSecond} canvasRef={waveformCanvasRef} onDuration={setNarrationDuration} />}
                 </div>
                 <div className="tl-lane-track" style={{ height: STILLS_LANE_HEIGHT }}>
-                  {stillsClips.map((clip) => (
-                    <div
-                      key={clip.id}
-                      className={selectedClip?.id === clip.id ? "tl-clip tl-clip-stills active" : "tl-clip tl-clip-stills"}
-                      style={{ left: secondsToPixels(clip.startSeconds, pixelsPerSecond), width: Math.max(4, secondsToPixels(clip.endSeconds - clip.startSeconds, pixelsPerSecond)) }}
-                      onClick={(event) => { event.stopPropagation(); seekPreview(clip.startSeconds); }}
-                    >
-                      {clip.renderId && renderUrls[clip.renderId] ? <img src={renderUrls[clip.renderId]} alt="" draggable={false} /> : <span className="tl-clip-fallback">{clip.label}</span>}
-                      {clip.transitionIn === "fade" && <span className="tl-clip-badge tl-clip-badge-fade" title="Fade in"><Sparkles size={10} /></span>}
-                      {clip.motionPreset !== "none" && <span className="tl-clip-badge tl-clip-badge-motion" title={`Camera: ${motionLabel(clip.motionPreset)}`}><Move size={10} /></span>}
-                      {clip.clipKind === "animation" && <span className="tl-clip-badge tl-clip-badge-animation" title="Animated with Veo"><Clapperboard size={10} /></span>}
-                    </div>
-                  ))}
-                </div>
-                <div className="tl-lane-track tl-captions-track" style={{ height: CAPTIONS_LANE_HEIGHT }}>
-                  {captionClips.map((chunk) => {
-                    const chunkWidth = Math.max(3, secondsToPixels(chunk.endSeconds - chunk.startSeconds, pixelsPerSecond));
+                  {stillsClips.map((clip) => {
+                    const isDragging = stillsDragPreview?.clipId === clip.id;
+                    const start = isDragging ? stillsDragPreview.start : clip.startSeconds;
+                    const end = isDragging ? stillsDragPreview.end : clip.endSeconds;
                     return (
                       <div
-                        key={chunk.index}
-                        className={chunkWidth >= 46 ? "tl-clip tl-clip-captions readonly" : "tl-clip tl-clip-captions readonly narrow"}
-                        style={{ left: secondsToPixels(chunk.startSeconds, pixelsPerSecond), width: chunkWidth }}
-                        title={chunk.text}
+                        key={clip.id}
+                        className={selectedClip?.id === clip.id ? "tl-clip tl-clip-stills active" : "tl-clip tl-clip-stills"}
+                        style={{ left: secondsToPixels(start, pixelsPerSecond), width: Math.max(4, secondsToPixels(end - start, pixelsPerSecond)) }}
+                        onPointerDown={(event) => beginStillsDrag(clip, "move", event)}
+                        onClick={(event) => { event.stopPropagation(); seekPreview(clip.startSeconds); }}
                       >
-                        {chunkWidth >= 46 && <span className="tl-clip-text">{chunk.text}</span>}
+                        <div className="tl-clip-resize-handle left" onPointerDown={(event) => beginStillsDrag(clip, "start", event)} />
+                        {clip.renderId && renderUrls[clip.renderId] ? <img src={renderUrls[clip.renderId]} alt="" draggable={false} /> : <span className="tl-clip-fallback">{clip.label}</span>}
+                        {clip.transitionIn === "fade" && <span className="tl-clip-badge tl-clip-badge-fade" title="Fade in"><Sparkles size={10} /></span>}
+                        {clip.motionPreset !== "none" && <span className="tl-clip-badge tl-clip-badge-motion" title={`Camera: ${motionLabel(clip.motionPreset)}`}><Move size={10} /></span>}
+                        {clip.clipKind === "animation" && <span className="tl-clip-badge tl-clip-badge-animation" title="Animated with Veo"><Clapperboard size={10} /></span>}
+                        <div className="tl-clip-resize-handle right" onPointerDown={(event) => beginStillsDrag(clip, "end", event)} />
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="tl-lane-track tl-captions-track" style={{ height: CAPTIONS_LANE_HEIGHT }}>
+                  {captionClips.map((clip) => {
+                    const isDragging = captionDragPreview?.clipId === clip.id;
+                    const start = isDragging ? captionDragPreview.start : clip.startSeconds;
+                    const end = isDragging ? captionDragPreview.end : clip.endSeconds;
+                    const clipWidth = Math.max(3, secondsToPixels(end - start, pixelsPerSecond));
+                    const isSelected = selectedCaptionClip?.id === clip.id;
+                    return (
+                      <div
+                        key={clip.id}
+                        className={[
+                          "tl-clip", "tl-clip-captions",
+                          isSelected ? "active" : "",
+                          clipWidth < 46 ? "narrow" : "",
+                        ].filter(Boolean).join(" ")}
+                        style={{ left: secondsToPixels(start, pixelsPerSecond), width: clipWidth }}
+                        title={clip.text}
+                        onPointerDown={(event) => beginCaptionDrag(clip, "move", event)}
+                        onClick={(event) => { event.stopPropagation(); selectCaptionClip(clip); seekPreview(clip.startSeconds); }}
+                      >
+                        <div className="tl-clip-resize-handle left" onPointerDown={(event) => beginCaptionDrag(clip, "start", event)} />
+                        {clipWidth >= 46 && <span className="tl-clip-text">{clip.text}</span>}
+                        <div className="tl-clip-resize-handle right" onPointerDown={(event) => beginCaptionDrag(clip, "end", event)} />
                       </div>
                     );
                   })}
@@ -1309,6 +1906,102 @@ export function TimelineView() {
         onLoadedMetadata={(event) => setNativeAudioDuration(event.currentTarget.duration || 0)}
       />
     </section>
+  );
+}
+
+function CaptionStyleEditor({
+  style,
+  onChange,
+}: {
+  style: Required<CaptionStyle>;
+  onChange: (patch: Partial<CaptionStyle>) => void;
+}) {
+  return (
+    <div className="tl-caption-style-editor">
+      <div className="tl-preset-grid two">
+        {CAPTION_STYLE_PRESETS.map((preset) => (
+          <button key={preset.label} className="tl-preset-btn" onClick={() => onChange(preset.style)}>{preset.label}</button>
+        ))}
+      </div>
+      <label className="tl-style-field">
+        <span>Font</span>
+        <select value={style.fontFamily} onChange={(event) => onChange({ fontFamily: event.target.value })}>
+          {CAPTION_FONT_OPTIONS.map((font) => <option key={font} value={font}>{font}</option>)}
+        </select>
+      </label>
+      <label className="tl-style-field">
+        <span>Size <b>{style.fontSizePx}px</b></span>
+        <input type="range" className="tl-slider" min={14} max={48} step={1} value={style.fontSizePx} onChange={(event) => onChange({ fontSizePx: Number(event.target.value) })} />
+      </label>
+      <label className="tl-style-field tl-style-checkbox">
+        <input type="checkbox" checked={style.bold} onChange={(event) => onChange({ bold: event.target.checked })} />
+        <span>Bold</span>
+      </label>
+      <label className="tl-style-field">
+        <span>Color</span>
+        <input type="color" value={style.color} onChange={(event) => onChange({ color: event.target.value })} />
+      </label>
+      <label className="tl-style-field">
+        <span>Outline color</span>
+        <input type="color" value={style.outlineColor} onChange={(event) => onChange({ outlineColor: event.target.value })} />
+      </label>
+      <label className="tl-style-field">
+        <span>Outline width <b>{style.outlineWidthPx}px</b></span>
+        <input type="range" className="tl-slider" min={0} max={6} step={1} value={style.outlineWidthPx} onChange={(event) => onChange({ outlineWidthPx: Number(event.target.value) })} />
+      </label>
+      <label className="tl-style-field tl-style-checkbox">
+        <input type="checkbox" checked={style.shadow.enabled} onChange={(event) => onChange({ shadow: { ...style.shadow, enabled: event.target.checked } })} />
+        <span>Shadow</span>
+      </label>
+      {style.shadow.enabled && (
+        <>
+          <label className="tl-style-field">
+            <span>Shadow blur <b>{style.shadow.blur}</b></span>
+            <input type="range" className="tl-slider" min={0} max={12} step={1} value={style.shadow.blur} onChange={(event) => onChange({ shadow: { ...style.shadow, blur: Number(event.target.value) } })} />
+          </label>
+          <label className="tl-style-field">
+            <span>Shadow offset X <b>{style.shadow.offsetX}</b></span>
+            <input type="range" className="tl-slider" min={-8} max={8} step={1} value={style.shadow.offsetX} onChange={(event) => onChange({ shadow: { ...style.shadow, offsetX: Number(event.target.value) } })} />
+          </label>
+          <label className="tl-style-field">
+            <span>Shadow offset Y <b>{style.shadow.offsetY}</b></span>
+            <input type="range" className="tl-slider" min={-8} max={8} step={1} value={style.shadow.offsetY} onChange={(event) => onChange({ shadow: { ...style.shadow, offsetY: Number(event.target.value) } })} />
+          </label>
+        </>
+      )}
+      <div className="tl-style-field">
+        <span>Position</span>
+        <div className="tl-preset-grid three">
+          {(["top", "middle", "bottom"] as const).map((position) => (
+            <button
+              key={position}
+              className={style.position === position ? "tl-preset-btn active" : "tl-preset-btn"}
+              onClick={() => onChange({ position })}
+            >
+              {position}
+            </button>
+          ))}
+        </div>
+      </div>
+      <label className="tl-style-field tl-style-checkbox">
+        <input
+          type="checkbox"
+          checked={style.wordHighlight.enabled}
+          onChange={(event) => onChange({ wordHighlight: { ...style.wordHighlight, enabled: event.target.checked } })}
+        />
+        <span>Highlight the word being spoken</span>
+      </label>
+      {style.wordHighlight.enabled && (
+        <label className="tl-style-field">
+          <span>Highlight color</span>
+          <input
+            type="color"
+            value={style.wordHighlight.color}
+            onChange={(event) => onChange({ wordHighlight: { ...style.wordHighlight, color: event.target.value } })}
+          />
+        </label>
+      )}
+    </div>
   );
 }
 

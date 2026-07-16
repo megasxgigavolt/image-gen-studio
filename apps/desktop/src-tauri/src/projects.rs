@@ -380,6 +380,26 @@ ALTER TABLE video_assets ADD COLUMN prompt TEXT NOT NULL DEFAULT '';
 ALTER TABLE animation_job_items ADD COLUMN prompt TEXT NOT NULL DEFAULT '';
 "#;
 
+const MIGRATION_020: &str = r#"
+ALTER TABLE timelines ADD COLUMN caption_style_json TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE timeline_caption_clips ADD COLUMN style_json TEXT;
+UPDATE videos SET stage = 'timeline' WHERE stage = 'captions';
+UPDATE resume_state SET stage = 'timeline' WHERE stage = 'captions';
+"#;
+
+const MIGRATION_021: &str = r#"
+ALTER TABLE timeline_caption_clips ADD COLUMN words_json TEXT;
+"#;
+
+const MIGRATION_022: &str = r#"
+ALTER TABLE image_renders ADD COLUMN subject_x REAL;
+ALTER TABLE image_renders ADD COLUMN subject_y REAL;
+"#;
+
+const MIGRATION_023: &str = r#"
+ALTER TABLE timelines ADD COLUMN narration_offset_seconds REAL NOT NULL DEFAULT 0;
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -450,11 +470,21 @@ pub struct VideoInputs {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct CaptionWord {
+    pub text: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct CaptionChunk {
     pub index: i64,
     pub text: String,
     pub start_seconds: f64,
     pub end_seconds: f64,
+    #[serde(default)]
+    pub words: Vec<CaptionWord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -499,6 +529,8 @@ pub struct ImageRender {
     pub mask_path: Option<String>,
     pub mask_used: bool,
     pub created_at: String,
+    pub subject_x: Option<f64>,
+    pub subject_y: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -694,6 +726,14 @@ pub struct TimelineCaptionClip {
     pub ordinal: i64,
     pub start_seconds: f64,
     pub end_seconds: f64,
+    /// Partial style override, shallow-merged onto the timeline's caption_style.
+    /// `None` means this clip fully inherits the timeline default.
+    pub style: Option<serde_json::Value>,
+    /// Whisper's real per-word timestamps, carried over from the source
+    /// caption chunk — enables word-by-word highlight styling. `None` once
+    /// the clip's text has been hand-edited (the old timings no longer
+    /// correspond to the new words) or for a fully user-authored clip.
+    pub words: Option<Vec<CaptionWord>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -706,6 +746,49 @@ pub struct Timeline {
     pub updated_at: String,
     pub clips: Vec<TimelineClip>,
     pub caption_clips: Vec<TimelineCaptionClip>,
+    /// Global default caption style for this video's timeline; `{}` = built-in defaults.
+    pub caption_style: serde_json::Value,
+    /// Seconds of delay before narration audio starts, relative to the visual
+    /// timeline (0 = plays from the very start, matching legacy behavior).
+    pub narration_offset_seconds: f64,
+}
+
+/// The built-in caption look, chosen to exactly match what was previously
+/// hardcoded in the export engine, so an empty style ({}) is a visual no-op.
+pub fn default_caption_style() -> serde_json::Value {
+    json!({
+        "fontFamily": "Arial Black",
+        "fontSizePx": 22,
+        "bold": true,
+        "color": "#FFFFFF",
+        "outlineColor": "#000000",
+        "outlineWidthPx": 2,
+        "shadow": { "enabled": false, "blur": 4, "offsetX": 0, "offsetY": 2 },
+        "position": "bottom",
+        "wordHighlight": { "enabled": false, "color": "#FFEB3B" },
+    })
+}
+
+/// Shallow-merges `overlay`'s present top-level keys onto `base`. Used to
+/// layer a video's global caption default and then a clip's own partial
+/// override on top of it.
+pub fn merge_style(base: &serde_json::Value, overlay: &serde_json::Value) -> serde_json::Value {
+    let mut merged = base.clone();
+    if let (Some(merged_obj), Some(overlay_obj)) = (merged.as_object_mut(), overlay.as_object()) {
+        for (key, value) in overlay_obj {
+            merged_obj.insert(key.clone(), value.clone());
+        }
+    }
+    merged
+}
+
+/// Serializes a clip's per-word timestamps for storage, or `None` if there's
+/// nothing precise to save (an empty list is treated the same as "no timing").
+fn words_to_json(words: &[CaptionWord]) -> Option<String> {
+    if words.is_empty() {
+        return None;
+    }
+    serde_json::to_string(words).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1055,6 +1138,66 @@ impl ProjectRepository {
         }
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(19, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_caption_style: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timelines') WHERE name='caption_style_json')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_caption_style {
+            self.connection.execute_batch(MIGRATION_020).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(20, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_words_json: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timeline_caption_clips') WHERE name='words_json')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_words_json {
+            self.connection.execute_batch(MIGRATION_021).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(21, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_subject_x: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('image_renders') WHERE name='subject_x')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_subject_x {
+            self.connection.execute_batch(MIGRATION_022).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(22, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_narration_offset: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timelines') WHERE name='narration_offset_seconds')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_narration_offset {
+            self.connection.execute_batch(MIGRATION_023).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(23, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -1808,7 +1951,7 @@ impl ProjectRepository {
         group_id: &str,
     ) -> Result<Vec<ImageRender>, String> {
         let mut statement = self.connection.prepare(
-            "SELECT id, video_id, group_id, version, prompt_version_id, file_name, relative_path, parent_render_id, edit_instruction, kind, is_final, edit_strength, mask_path, mask_used, created_at
+            "SELECT id, video_id, group_id, version, prompt_version_id, file_name, relative_path, parent_render_id, edit_instruction, kind, is_final, edit_strength, mask_path, mask_used, created_at, subject_x, subject_y
              FROM image_renders WHERE video_id = ?1 AND group_id = ?2 ORDER BY version DESC",
         ).map_err(|e| e.to_string())?;
         let rows = statement
@@ -1829,6 +1972,8 @@ impl ProjectRepository {
                     mask_path: row.get(12)?,
                     mask_used: row.get::<_, i64>(13)? != 0,
                     created_at: row.get(14)?,
+                    subject_x: row.get(15)?,
+                    subject_y: row.get(16)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -1892,6 +2037,8 @@ impl ProjectRepository {
             mask_path: None,
             mask_used: false,
             created_at,
+            subject_x: None,
+            subject_y: None,
         })
     }
 
@@ -1917,7 +2064,7 @@ impl ProjectRepository {
 
     pub fn delete_image_render(&self, render_id: &str) -> Result<(), String> {
         let render = self.connection.query_row(
-            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,is_final,edit_strength,mask_path,mask_used,created_at FROM image_renders WHERE id=?1",
+            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,is_final,edit_strength,mask_path,mask_used,created_at,subject_x,subject_y FROM image_renders WHERE id=?1",
             [render_id], |row| Ok(ImageRender {
                 id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?,
                 version: row.get(3)?, prompt_version_id: row.get(4)?, file_name: row.get(5)?,
@@ -1925,7 +2072,7 @@ impl ProjectRepository {
                 edit_instruction: row.get(8)?, kind: row.get(9)?,
                 is_final: row.get::<_, i64>(10)? != 0, edit_strength: row.get(11)?,
                 mask_path: row.get(12)?, mask_used: row.get::<_, i64>(13)? != 0,
-                created_at: row.get(14)?,
+                created_at: row.get(14)?, subject_x: row.get(15)?, subject_y: row.get(16)?,
             }),
         ).map_err(|_| "Image version was not found.".to_string())?;
         let path = self.render_absolute_path(&render)?;
@@ -1958,7 +2105,7 @@ impl ProjectRepository {
 
     pub fn copy_render_to_folder(&self, render_id: &str, dest_folder: &str) -> Result<String, String> {
         let render: ImageRender = self.connection.query_row(
-            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,is_final,edit_strength,mask_path,mask_used,created_at FROM image_renders WHERE id=?1",
+            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,is_final,edit_strength,mask_path,mask_used,created_at,subject_x,subject_y FROM image_renders WHERE id=?1",
             [render_id],
             |row| Ok(ImageRender {
                 id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?,
@@ -1968,6 +2115,7 @@ impl ProjectRepository {
                 kind: row.get(9)?, is_final: row.get(10)?,
                 edit_strength: row.get(11)?, mask_path: row.get(12)?,
                 mask_used: row.get(13)?, created_at: row.get(14)?,
+                subject_x: row.get(15)?, subject_y: row.get(16)?,
             }),
         ).map_err(|_| "Render not found.".to_string())?;
         let src = self.render_absolute_path(&render)?;
@@ -3029,7 +3177,7 @@ Return JSON only:
             return Err("Describe the requested image change.".into());
         }
         let source: ImageRender = self.connection.query_row(
-            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,is_final,edit_strength,mask_path,mask_used,created_at FROM image_renders WHERE id=?1",
+            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,is_final,edit_strength,mask_path,mask_used,created_at,subject_x,subject_y FROM image_renders WHERE id=?1",
             [source_render_id],
             |row| Ok(ImageRender {
                 id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?,
@@ -3038,7 +3186,7 @@ Return JSON only:
                 edit_instruction: row.get(8)?, kind: row.get(9)?,
                 is_final: row.get::<_, i64>(10)? != 0, edit_strength: row.get(11)?,
                 mask_path: row.get(12)?, mask_used: row.get::<_, i64>(13)? != 0,
-                created_at: row.get(14)?,
+                created_at: row.get(14)?, subject_x: row.get(15)?, subject_y: row.get(16)?,
             }),
         ).map_err(|_| "Source image version was not found.".to_string())?;
         let channel_id: String = self
@@ -3483,11 +3631,37 @@ Return JSON only:
         self.get_timeline(video_id)
     }
 
+    /// A timeline clip's `render_id` is only ever set once, at the moment the
+    /// clip is first created (`populate_timeline_from_sources`/`add_stills_clip`)
+    /// — if that still's image hadn't finished generating yet at that exact
+    /// moment, the clip was left pointing at nothing, and nothing ever
+    /// revisits it once a final render does show up later (regenerating
+    /// stills, or just finishing a bulk-generate job after the timeline was
+    /// already built, is a completely normal order of operations). Self-heals
+    /// on every read instead of leaving affected stills permanently blank.
+    fn backfill_missing_clip_renders(&self, video_id: &str) -> Result<(), String> {
+        self.connection.execute(
+            "UPDATE timeline_clips
+             SET render_id = (
+                 SELECT id FROM image_renders
+                 WHERE image_renders.video_id = timeline_clips.video_id
+                   AND image_renders.group_id = timeline_clips.group_id
+                   AND image_renders.is_final = 1
+                 ORDER BY image_renders.version DESC LIMIT 1
+             )
+             WHERE video_id = ?1 AND (render_id IS NULL OR render_id = '')",
+            [video_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn get_timeline(&self, video_id: &str) -> Result<Timeline, String> {
-        let (duration_seconds, playhead_seconds, zoom, updated_at) = self.connection.query_row(
-            "SELECT duration_seconds,playhead_seconds,zoom,updated_at FROM timelines WHERE video_id=?1",
-            [video_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        let (duration_seconds, playhead_seconds, zoom, updated_at, caption_style_raw, narration_offset_seconds): (f64, f64, f64, String, String, f64) = self.connection.query_row(
+            "SELECT duration_seconds,playhead_seconds,zoom,updated_at,caption_style_json,narration_offset_seconds FROM timelines WHERE video_id=?1",
+            [video_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
         ).map_err(|_| "Timeline has not been built.".to_string())?;
+        let caption_style = serde_json::from_str(&caption_style_raw).unwrap_or_else(|_| json!({}));
+        self.backfill_missing_clip_renders(video_id)?;
         let mut statement = self.connection.prepare(
             "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
         ).map_err(|e| e.to_string())?;
@@ -3513,10 +3687,12 @@ Return JSON only:
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         let mut caption_statement = self.connection.prepare(
-            "SELECT id,source_chunk_index,text,ordinal,start_seconds,end_seconds FROM timeline_caption_clips WHERE video_id=?1 ORDER BY start_seconds"
+            "SELECT id,source_chunk_index,text,ordinal,start_seconds,end_seconds,style_json,words_json FROM timeline_caption_clips WHERE video_id=?1 ORDER BY start_seconds"
         ).map_err(|e| e.to_string())?;
         let caption_clips = caption_statement
             .query_map([video_id], |row| {
+                let style_raw: Option<String> = row.get(6)?;
+                let words_raw: Option<String> = row.get(7)?;
                 Ok(TimelineCaptionClip {
                     id: row.get(0)?,
                     source_chunk_index: row.get(1)?,
@@ -3524,6 +3700,8 @@ Return JSON only:
                     ordinal: row.get(3)?,
                     start_seconds: row.get(4)?,
                     end_seconds: row.get(5)?,
+                    style: style_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
+                    words: words_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
                 })
             })
             .map_err(|e| e.to_string())?
@@ -3537,6 +3715,8 @@ Return JSON only:
             updated_at,
             clips,
             caption_clips,
+            caption_style,
+            narration_offset_seconds,
         })
     }
 
@@ -3556,6 +3736,19 @@ Return JSON only:
                     Utc::now().to_rfc3339(),
                     video_id
                 ],
+            )
+            .map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    /// Shifts when narration audio starts relative to the visual timeline
+    /// (re-syncing narration, or skipping leading silence) without altering
+    /// the audio file itself — trimming the tail is out of scope for now.
+    pub fn set_narration_offset(&self, video_id: &str, offset_seconds: f64) -> Result<Timeline, String> {
+        self.connection
+            .execute(
+                "UPDATE timelines SET narration_offset_seconds=?1,updated_at=?2 WHERE video_id=?3",
+                params![offset_seconds.max(0.0), Utc::now().to_rfc3339(), video_id],
             )
             .map_err(|e| e.to_string())?;
         self.get_timeline(video_id)
@@ -3656,9 +3849,10 @@ Return JSON only:
                 if exists {
                     continue;
                 }
+                let words_json = words_to_json(&chunk.words);
                 self.connection.execute(
-                    "INSERT INTO timeline_caption_clips(id,video_id,source_chunk_index,text,ordinal,start_seconds,end_seconds) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                    params![Uuid::new_v4().to_string(), video_id, chunk.index, chunk.text, chunk.index, chunk.start_seconds, chunk.end_seconds],
+                    "INSERT INTO timeline_caption_clips(id,video_id,source_chunk_index,text,ordinal,start_seconds,end_seconds,words_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![Uuid::new_v4().to_string(), video_id, chunk.index, chunk.text, chunk.index, chunk.start_seconds, chunk.end_seconds, words_json],
                 ).map_err(|e| e.to_string())?;
             }
         }
@@ -3704,15 +3898,30 @@ Return JSON only:
         self.get_timeline(video_id)
     }
 
-    pub fn add_caption_clip(&self, video_id: &str, chunk_index: i64, start_seconds: f64) -> Result<Timeline, String> {
+    /// `chunk_index` sources the clip's text/duration from a generated caption
+    /// chunk; when `None`, `text` must be provided instead for a fully
+    /// user-authored clip with no backing chunk.
+    pub fn add_caption_clip(
+        &self,
+        video_id: &str,
+        chunk_index: Option<i64>,
+        text: Option<String>,
+        start_seconds: f64,
+    ) -> Result<Timeline, String> {
         if start_seconds < 0.0 {
             return Err("Clip position is invalid.".into());
         }
         self.ensure_timeline_row(video_id)?;
-        let captions = self.get_captions(video_id)?;
-        let chunk = captions.chunks.iter().find(|c| c.index == chunk_index)
-            .ok_or("Caption chunk was not found.")?;
-        let duration = (chunk.end_seconds - chunk.start_seconds).max(0.3);
+        let (resolved_text, duration, words_json) = if let Some(index) = chunk_index {
+            let captions = self.get_captions(video_id)?;
+            let chunk = captions.chunks.iter().find(|c| c.index == index)
+                .ok_or("Caption chunk was not found.")?;
+            (chunk.text.clone(), (chunk.end_seconds - chunk.start_seconds).max(0.3), words_to_json(&chunk.words))
+        } else {
+            let text = text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
+                .ok_or("Caption text is required.")?;
+            (text, 2.0, None)
+        };
         let end_seconds = start_seconds + duration;
         let overlap: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM timeline_caption_clips WHERE video_id=?1 AND ?2 < end_seconds AND ?3 > start_seconds)",
@@ -3722,8 +3931,8 @@ Return JSON only:
             return Err("That position overlaps an existing clip on the captions track.".into());
         }
         self.connection.execute(
-            "INSERT INTO timeline_caption_clips(id,video_id,source_chunk_index,text,ordinal,start_seconds,end_seconds) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![Uuid::new_v4().to_string(), video_id, chunk_index, chunk.text, chunk_index, start_seconds, end_seconds],
+            "INSERT INTO timeline_caption_clips(id,video_id,source_chunk_index,text,ordinal,start_seconds,end_seconds,words_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![Uuid::new_v4().to_string(), video_id, chunk_index, resolved_text, chunk_index.unwrap_or(0), start_seconds, end_seconds, words_json],
         ).map_err(|e| e.to_string())?;
         self.recompute_timeline_duration(video_id)?;
         self.get_timeline(video_id)
@@ -3745,6 +3954,134 @@ Return JSON only:
             params![start, end, clip_id, video_id],
         ).map_err(|e| e.to_string())?;
         self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn update_caption_clip_text(&self, video_id: &str, clip_id: &str, text: &str) -> Result<Timeline, String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err("Caption text is required.".into());
+        }
+        // The old per-word timestamps no longer correspond to the new text,
+        // so drop them — the caption falls back to the estimated word-timing
+        // renderer until it's regenerated.
+        self.connection.execute(
+            "UPDATE timeline_caption_clips SET text=?1,words_json=NULL WHERE id=?2 AND video_id=?3",
+            params![trimmed, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    /// Splits one caption clip into two at `split_at_seconds`, assigning
+    /// `left_text`/`right_text` to the resulting halves. There's no word-level
+    /// timing within a single chunk to auto-split by, so the caller (driven by
+    /// where the user's caret was) supplies both resulting texts directly.
+    /// If the clip carries real per-word timestamps, they're partitioned by
+    /// `split_at_seconds` and preserved on each half.
+    pub fn split_caption_clip(
+        &self,
+        video_id: &str,
+        clip_id: &str,
+        split_at_seconds: f64,
+        left_text: &str,
+        right_text: &str,
+    ) -> Result<Timeline, String> {
+        let (start, end, words_raw): (f64, f64, Option<String>) = self.connection.query_row(
+            "SELECT start_seconds,end_seconds,words_json FROM timeline_caption_clips WHERE id=?1 AND video_id=?2",
+            params![clip_id, video_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(|_| "Caption clip was not found.".to_string())?;
+        if split_at_seconds <= start || split_at_seconds >= end {
+            return Err("Split point must fall inside the clip.".into());
+        }
+        let left_text = left_text.trim();
+        let right_text = right_text.trim();
+        if left_text.is_empty() || right_text.is_empty() {
+            return Err("Both halves of a split caption need text.".into());
+        }
+        let (left_words, right_words) = match words_raw.and_then(|raw| serde_json::from_str::<Vec<CaptionWord>>(&raw).ok()) {
+            Some(words) => {
+                let (left, right): (Vec<_>, Vec<_>) = words.into_iter().partition(|w| w.end_seconds <= split_at_seconds);
+                (words_to_json(&left), words_to_json(&right))
+            }
+            None => (None, None),
+        };
+        self.connection.execute(
+            "UPDATE timeline_caption_clips SET text=?1,end_seconds=?2,words_json=?3 WHERE id=?4 AND video_id=?5",
+            params![left_text, split_at_seconds, left_words, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "INSERT INTO timeline_caption_clips(id,video_id,source_chunk_index,text,ordinal,start_seconds,end_seconds,words_json) VALUES(?1,?2,NULL,?3,0,?4,?5,?6)",
+            params![Uuid::new_v4().to_string(), video_id, right_text, split_at_seconds, end, right_words],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    /// Merges two adjacent caption clips into one, keeping the first clip's
+    /// id and style override. The two clips must already be touching
+    /// (first.end == second.start) — the caller is expected to only offer
+    /// this action for clips that are genuinely adjacent on the lane. Per-word
+    /// timestamps are preserved only if BOTH halves still have them.
+    pub fn merge_caption_clips(&self, video_id: &str, first_clip_id: &str, second_clip_id: &str) -> Result<Timeline, String> {
+        let (first_text, first_end, first_words_raw): (String, f64, Option<String>) = self.connection.query_row(
+            "SELECT text,end_seconds,words_json FROM timeline_caption_clips WHERE id=?1 AND video_id=?2",
+            params![first_clip_id, video_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(|_| "Caption clip was not found.".to_string())?;
+        let (second_text, second_start, second_end, second_words_raw): (String, f64, f64, Option<String>) = self.connection.query_row(
+            "SELECT text,start_seconds,end_seconds,words_json FROM timeline_caption_clips WHERE id=?1 AND video_id=?2",
+            params![second_clip_id, video_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).map_err(|_| "Caption clip was not found.".to_string())?;
+        if (first_end - second_start).abs() > 0.01 {
+            return Err("Only adjacent captions can be merged.".into());
+        }
+        let merged_words = match (
+            first_words_raw.and_then(|raw| serde_json::from_str::<Vec<CaptionWord>>(&raw).ok()),
+            second_words_raw.and_then(|raw| serde_json::from_str::<Vec<CaptionWord>>(&raw).ok()),
+        ) {
+            (Some(mut first), Some(second)) => {
+                first.extend(second);
+                words_to_json(&first)
+            }
+            _ => None,
+        };
+        self.connection.execute(
+            "UPDATE timeline_caption_clips SET text=?1,end_seconds=?2,words_json=?3 WHERE id=?4 AND video_id=?5",
+            params![format!("{first_text} {second_text}"), second_end, merged_words, first_clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "DELETE FROM timeline_caption_clips WHERE id=?1 AND video_id=?2",
+            params![second_clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    /// Sets this video's global default caption style (used by any caption
+    /// clip that has no override of its own).
+    pub fn set_timeline_caption_style(&self, video_id: &str, style: &serde_json::Value) -> Result<Timeline, String> {
+        if !style.is_object() {
+            return Err("Caption style must be a JSON object.".into());
+        }
+        self.ensure_timeline_row(video_id)?;
+        self.connection.execute(
+            "UPDATE timelines SET caption_style_json=?1,updated_at=?2 WHERE video_id=?3",
+            params![style.to_string(), Utc::now().to_rfc3339(), video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    /// Sets (or, with `None`, clears back to fully inheriting) one caption
+    /// clip's own style override.
+    pub fn set_caption_clip_style(&self, video_id: &str, clip_id: &str, style: Option<&serde_json::Value>) -> Result<Timeline, String> {
+        if let Some(value) = style {
+            if !value.is_object() {
+                return Err("Caption style must be a JSON object.".into());
+            }
+        }
+        let style_raw = style.map(|v| v.to_string());
+        self.connection.execute(
+            "UPDATE timeline_caption_clips SET style_json=?1 WHERE id=?2 AND video_id=?3",
+            params![style_raw, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
         self.get_timeline(video_id)
     }
 
@@ -3802,7 +4139,10 @@ Return JSON only:
     }
 
     pub fn set_timeline_clip_motion(&self, video_id: &str, clip_id: &str, motion_preset: &str) -> Result<Timeline, String> {
-        const VALID: [&str; 5] = ["none", "zoom-in", "zoom-out", "pan-left", "pan-right"];
+        const VALID: [&str; 8] = [
+            "none", "zoom-in", "zoom-out", "pan-left", "pan-right",
+            "zoom-pulse", "zoom-in-subject", "zoom-out-subject",
+        ];
         if !VALID.contains(&motion_preset) {
             return Err("Unknown camera movement preset.".into());
         }
@@ -3847,7 +4187,10 @@ Return JSON only:
     }
 
     pub fn apply_motion_to_all_clips(&self, video_id: &str, motion_preset: &str, intensity: f64) -> Result<Timeline, String> {
-        const VALID: [&str; 5] = ["none", "zoom-in", "zoom-out", "pan-left", "pan-right"];
+        const VALID: [&str; 8] = [
+            "none", "zoom-in", "zoom-out", "pan-left", "pan-right",
+            "zoom-pulse", "zoom-in-subject", "zoom-out-subject",
+        ];
         if !VALID.contains(&motion_preset) {
             return Err("Unknown camera movement preset.".into());
         }
@@ -4012,6 +4355,30 @@ Return JSON only:
         }
         self.recompute_timeline_duration(video_id)?;
         self.get_timeline(video_id)
+    }
+
+    /// Discards every timeline customization (still order/timing/motion/
+    /// transitions, caption edits/styles, narration offset, zoom/playhead)
+    /// and rebuilds fresh from the visual plan and the last-generated
+    /// captions — as if the timeline had just been opened for the first time.
+    pub fn reset_timeline_to_default(&self, video_id: &str) -> Result<Timeline, String> {
+        // animation_job_items.clip_id has a hard FK to timeline_clips(id) —
+        // clear that generation bookkeeping first (the cached video_asset it
+        // points to is left untouched, same as revert_animation_clip_to_still,
+        // so nothing actually generated is lost, only the job history).
+        self.connection.execute("DELETE FROM animation_job_items WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM animation_jobs WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM timeline_clips WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM timeline_caption_clips WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "UPDATE timelines SET caption_style_json='{}', narration_offset_seconds=0, zoom=1, playhead_seconds=0, updated_at=?1 WHERE video_id=?2",
+            params![Utc::now().to_rfc3339(), video_id],
+        ).map_err(|e| e.to_string())?;
+        self.populate_timeline_from_sources(video_id)
     }
 
     pub fn save_provider_key(&self, provider: &str, api_key: &str) -> Result<(), String> {
@@ -5086,6 +5453,7 @@ Return JSON only:
                     text: group.join(" "),
                     start_seconds: index as f64,
                     end_seconds: index as f64 + 1.0,
+                    words: Vec::new(),
                 });
             }
             self.save_caption_set(video_id, interval_seconds, "1\n00:00:00,000 --> 00:00:01,000\ntest\n", &chunks)?;
@@ -5229,6 +5597,11 @@ Return JSON only:
                     text: item["text"].as_str().unwrap_or_default().to_string(),
                     start_seconds: item["start"].as_f64().unwrap_or(0.0),
                     end_seconds: item["end"].as_f64().unwrap_or(0.0),
+                    words: item["words"].as_array().map(|words| words.iter().map(|w| CaptionWord {
+                        text: w["text"].as_str().unwrap_or_default().to_string(),
+                        start_seconds: w["start"].as_f64().unwrap_or(0.0),
+                        end_seconds: w["end"].as_f64().unwrap_or(0.0),
+                    }).collect()).unwrap_or_default(),
                 })
                 .collect::<Vec<_>>();
             self.save_caption_set(video_id, interval_seconds, &srt_text, &chunks)?;
@@ -5282,43 +5655,9 @@ Return JSON only:
         })
     }
 
-    /// Uses AI to fix ONLY capitalization (proper nouns, the channel name,
-    /// sentence starts) across every caption line — timing and wording are
-    /// left untouched, so a mismatched response length is rejected outright
-    /// rather than risking corrupted sync.
-    pub fn optimize_captions(&self, video_id: &str) -> Result<CaptionSet, String> {
-        let set = self.get_captions(video_id)?;
-        if set.chunks.is_empty() {
-            return Err("No captions to optimize yet. Generate captions first.".into());
-        }
-        let openai_key = self.get_provider_key("openai")?
-            .ok_or("Add an OpenAI API key in Settings to use AI caption optimization.")?;
-        let channel_name: String = self.connection.query_row(
-            "SELECT c.name FROM channels c JOIN videos v ON v.channel_id = c.id WHERE v.id = ?1",
-            [video_id],
-            |row| row.get(0),
-        ).unwrap_or_default();
-        let texts: Vec<String> = set.chunks.iter().map(|chunk| chunk.text.clone()).collect();
-        let fixed = request_openai_caption_fix(&openai_key, &channel_name, &texts)?;
-        if fixed.len() != texts.len() {
-            return Err("AI caption optimization returned a different number of lines than expected; no changes were made.".into());
-        }
-        let new_chunks: Vec<CaptionChunk> = set.chunks.iter().zip(fixed.into_iter())
-            .map(|(chunk, text)| CaptionChunk {
-                index: chunk.index,
-                text: text.trim().to_string(),
-                start_seconds: chunk.start_seconds,
-                end_seconds: chunk.end_seconds,
-            })
-            .collect();
-        let srt_text = build_srt_text(&new_chunks);
-        self.save_caption_set(video_id, set.interval_seconds, &srt_text, &new_chunks)?;
-        self.get_captions(video_id)
-    }
-
     fn get_render_by_id(&self, render_id: &str) -> Result<ImageRender, String> {
         self.connection.query_row(
-            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,is_final,edit_strength,mask_path,mask_used,created_at FROM image_renders WHERE id=?1",
+            "SELECT id,video_id,group_id,version,prompt_version_id,file_name,relative_path,parent_render_id,edit_instruction,kind,is_final,edit_strength,mask_path,mask_used,created_at,subject_x,subject_y FROM image_renders WHERE id=?1",
             [render_id],
             |row| Ok(ImageRender {
                 id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?,
@@ -5327,7 +5666,7 @@ Return JSON only:
                 edit_instruction: row.get(8)?, kind: row.get(9)?,
                 is_final: row.get::<_, i64>(10)? != 0, edit_strength: row.get(11)?,
                 mask_path: row.get(12)?, mask_used: row.get::<_, i64>(13)? != 0,
-                created_at: row.get(14)?,
+                created_at: row.get(14)?, subject_x: row.get(15)?, subject_y: row.get(16)?,
             }),
         ).map_err(|_| "Image render was not found.".to_string())
     }
@@ -5389,6 +5728,8 @@ Return JSON only:
                 "motionIntensity": clip.motion_intensity,
                 "transitionIn": clip.transition_in,
                 "transitionOut": clip.transition_out,
+                "subjectX": render.subject_x.unwrap_or(0.5),
+                "subjectY": render.subject_y.unwrap_or(0.5),
             }));
         }
         if stills.is_empty() {
@@ -5411,16 +5752,25 @@ Return JSON only:
             }
         }
 
-        // Captions are always burned in exactly as generated — never a user-editable
-        // copy — so export reads straight from the caption engine's own output.
-        let captions: Vec<serde_json::Value> = self
-            .get_captions(video_id)
-            .map(|set| set.chunks.iter().map(|chunk| json!({
-                "text": chunk.text,
-                "start": chunk.start_seconds,
-                "end": chunk.end_seconds,
-            })).collect())
-            .unwrap_or_default();
+        // Captions burn in from the user-editable timeline copy (timeline_caption_clips),
+        // not the frozen caption-engine output, so retiming/text-edits/splits/merges/style
+        // overrides made on the Timeline lane are reflected in the final export.
+        let caption_default_style = merge_style(&default_caption_style(), &timeline.caption_style);
+        let captions: Vec<serde_json::Value> = timeline.caption_clips.iter().map(|clip| {
+            let resolved_style = match &clip.style {
+                Some(overlay) => merge_style(&caption_default_style, overlay),
+                None => caption_default_style.clone(),
+            };
+            json!({
+                "text": clip.text,
+                "start": clip.start_seconds,
+                "end": clip.end_seconds,
+                "style": resolved_style,
+                "words": clip.words.as_ref().map(|words| words.iter().map(|w| json!({
+                    "text": w.text, "start": w.start_seconds, "end": w.end_seconds,
+                })).collect::<Vec<_>>()),
+            })
+        }).collect();
 
         let settings_raw = self.get_app_setting("image_settings")?.unwrap_or_default();
         let settings: serde_json::Value =
@@ -5434,7 +5784,7 @@ Return JSON only:
         let last_caption_end = captions.iter()
             .filter_map(|c| c.get("end").and_then(|v| v.as_f64()))
             .fold(0.0f64, f64::max);
-        let duration_seconds = [last_still_end, last_caption_end, narration_duration_seconds]
+        let duration_seconds = [last_still_end, last_caption_end, timeline.narration_offset_seconds + narration_duration_seconds]
             .into_iter()
             .fold(0.0f64, f64::max);
 
@@ -5443,8 +5793,10 @@ Return JSON only:
             "height": height,
             "fps": 30,
             "narrationAudioPath": narration_audio_path.to_string_lossy(),
+            "narrationOffsetSeconds": timeline.narration_offset_seconds,
             "stills": stills,
             "captions": captions,
+            "captionDefaultStyle": caption_default_style,
             "durationSeconds": duration_seconds,
         });
 
@@ -5509,6 +5861,77 @@ Return JSON only:
             let stdout = String::from_utf8_lossy(&output.stdout);
             stdout.trim().parse::<f64>()
                 .map_err(|_| format!("Could not parse narration duration from engine output: {}", stdout.trim()))
+        }
+    }
+
+    /// Resolves the automatic zoom-anchor point for a still, for the
+    /// "-subject" motion presets. Subject position is intrinsic to the image
+    /// itself (a still can have multiple render versions), so it's cached on
+    /// `image_renders.subject_x/y` after the first detection — later calls
+    /// for the same render are free.
+    pub fn detect_render_subject(
+        &self,
+        video_id: &str,
+        render_id: &str,
+        engine_dir: &Path,
+    ) -> Result<(f64, f64), String> {
+        let render = self.get_render_by_id(render_id)?;
+        if render.video_id != video_id {
+            return Err("Image render was not found.".to_string());
+        }
+        if let (Some(x), Some(y)) = (render.subject_x, render.subject_y) {
+            return Ok((x, y));
+        }
+        let image_path = self.render_absolute_path(&render)?;
+        let (x, y) = Self::run_detect_subject(engine_dir, &image_path)?;
+        self.connection.execute(
+            "UPDATE image_renders SET subject_x=?2, subject_y=?3 WHERE id=?1",
+            params![render_id, x, y],
+        ).map_err(|e| e.to_string())?;
+        Ok((x, y))
+    }
+
+    fn run_detect_subject(engine_dir: &Path, image_path: &Path) -> Result<(f64, f64), String> {
+        #[cfg(test)]
+        {
+            let _ = (engine_dir, image_path);
+            Ok((0.5, 0.5))
+        }
+        #[cfg(not(test))]
+        {
+            let export_engine = engine_dir.join("auto_gen_engine/video_export_engine.py");
+            if !export_engine.exists() {
+                return Err(format!(
+                    "Internal video export engine was not found at {}.",
+                    export_engine.display()
+                ));
+            }
+            let mut command = Command::new(find_python());
+            command
+                .arg(&export_engine)
+                .arg(image_path)
+                .arg("--mode")
+                .arg("detect-subject")
+                .current_dir(engine_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            command.creation_flags(0x08000000);
+            let output = command
+                .output()
+                .map_err(|e| format!("Could not start the video export engine: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Could not detect the image's subject: {}", stderr.trim()));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let value: serde_json::Value = serde_json::from_str(stdout.trim())
+                .map_err(|_| format!("Could not parse subject detection from engine output: {}", stdout.trim()))?;
+            let x = value.get("x").and_then(|v| v.as_f64())
+                .ok_or_else(|| "Subject detection output was missing 'x'.".to_string())?;
+            let y = value.get("y").and_then(|v| v.as_f64())
+                .ok_or_else(|| "Subject detection output was missing 'y'.".to_string())?;
+            Ok((x, y))
         }
     }
 
@@ -6164,99 +6587,6 @@ fn request_openai_text(api_key: &str, prompt: &str) -> Result<String, String> {
     body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
         .map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
         .ok_or_else(|| "OpenAI returned no prompt text.".to_string())
-}
-
-fn to_srt_timestamp(seconds: f64) -> String {
-    let millis_total = (seconds.max(0.0) * 1000.0).round() as i64;
-    let ms = millis_total % 1000;
-    let total_seconds = millis_total / 1000;
-    let s = total_seconds % 60;
-    let total_minutes = total_seconds / 60;
-    let m = total_minutes % 60;
-    let h = total_minutes / 60;
-    format!("{h:02}:{m:02}:{s:02},{ms:03}")
-}
-
-fn build_srt_text(chunks: &[CaptionChunk]) -> String {
-    let mut out = String::new();
-    for chunk in chunks {
-        out.push_str(&chunk.index.to_string());
-        out.push('\n');
-        out.push_str(&to_srt_timestamp(chunk.start_seconds));
-        out.push_str(" --> ");
-        out.push_str(&to_srt_timestamp(chunk.end_seconds));
-        out.push('\n');
-        out.push_str(&chunk.text);
-        out.push_str("\n\n");
-    }
-    out
-}
-
-#[derive(Deserialize)]
-struct CaptionFixResponse {
-    lines: Vec<String>,
-}
-
-fn request_openai_caption_fix(api_key: &str, channel_name: &str, texts: &[String]) -> Result<Vec<String>, String> {
-    let input_json = serde_json::to_string(texts).map_err(|e| e.to_string())?;
-    let channel_hint = if channel_name.trim().is_empty() {
-        String::new()
-    } else {
-        format!("The channel name is \"{channel_name}\" — capitalize it correctly wherever it appears. ")
-    };
-    let count = texts.len();
-    let prompt = format!(
-        r#"You are a professional caption editor preparing burned-in video captions to industry standard.
-
-Fix ONLY capitalization in each caption line below: capitalize proper nouns (people, places, organizations, universities, brand names), capitalize "I", fix sentence-start capitalization, and correct obviously wrong casing (e.g. a proper noun written in all lowercase, or a whole line in ALL CAPS). {channel_hint}Do NOT reword anything, do NOT change punctuation beyond what capitalization requires, do NOT merge, split, add, or remove lines — return exactly the same number of lines in the same order.
-
-Input lines (JSON array, {count} items):
-{input_json}
-
-Respond with ONLY this JSON shape: {{"lines": ["<line 1>", "<line 2>", ...]}} — exactly {count} strings, same order as input."#
-    );
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build().map_err(|e| format!("Could not initialize OpenAI client: {e}"))?;
-    for attempt in 0u32..4 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_secs(5 * 2_u64.pow(attempt - 1)));
-        }
-        let response = match client.post("https://api.openai.com/v1/chat/completions")
-            .bearer_auth(api_key)
-            .json(&json!({
-                "model": "gpt-4.1-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 8000,
-                "response_format": {"type": "json_object"}
-            }))
-            .send() {
-            Ok(r) => r,
-            Err(_) if attempt < 3 => continue,
-            Err(e) => return Err(format!("Could not reach OpenAI: {e}")),
-        };
-        let status = response.status();
-        let body: serde_json::Value = match response.json() {
-            Ok(value) => value,
-            Err(_) if attempt < 3 => continue,
-            Err(e) => return Err(format!("OpenAI returned an unreadable response: {e}")),
-        };
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            if attempt < 3 { continue; }
-            return Err(format!("OpenAI caption optimization failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("server error")));
-        }
-        if !status.is_success() {
-            return Err(format!("OpenAI caption optimization failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
-        }
-        let text = body.pointer("/choices/0/message/content").and_then(|v| v.as_str())
-            .ok_or("OpenAI returned no caption optimization result.")?;
-        let cleaned = extract_json_from_text(text);
-        let parsed: CaptionFixResponse = serde_json::from_str(cleaned)
-            .map_err(|_| "OpenAI caption optimization response was not valid JSON.".to_string())?;
-        return Ok(parsed.lines);
-    }
-    Err("OpenAI caption optimization failed after retries.".to_string())
 }
 
 #[derive(Debug, Clone, Deserialize)]

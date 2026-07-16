@@ -39,10 +39,11 @@ import {
 } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
 import { type ChangeEvent, type FormEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { type AppStage, useAppStore } from "./store/app-store";
 import { log } from "./infrastructure/logger";
 import { resolveAssetUrl, resolveRenderUrl } from "./infrastructure/media-cache";
-import { formatTime } from "./domain/timecode";
+import { formatTimeShort } from "./domain/timecode";
 import {
   projectsClient,
   type ChannelRecord,
@@ -57,13 +58,11 @@ import {
 import { TimelineView } from "./TimelineView";
 
 const navItems: { stage: AppStage; label: string; icon: typeof Home; alwaysEnabled?: boolean }[] = [
-  { stage: "home", label: "Home", icon: Home },
   { stage: "inputs", label: "Production", icon: Upload },
   { stage: "images", label: "Images", icon: Image },
-  { stage: "timeline", label: "Timeline", icon: Film },
+  { stage: "timeline", label: "Editor", icon: Film },
 ];
 const MAX_CACHE_SIZE = 20;
-const STILLS_PER_BATCH = 6;
 const imageWorkspaceCache = new Map<string, ImageWorkspaceRecord>();
 const lastSelectedStill = new Map<string, string>(); // videoId → groupId
 
@@ -163,19 +162,39 @@ function TitleBar() {
 }
 
 function Sidebar() {
-  const { stage, setStage, activeVideoId, lastProductionStage } = useAppStore();
+  const { stage, setStage, activeVideoId, lastProductionStage, clearActiveProject } = useAppStore();
+  const [confirmHome, setConfirmHome] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
+
+  useEffect(() => {
+    void projectsClient.getApplicationVersion().then(setAppVersion);
+  }, []);
+
+  function handleHomeClick() {
+    if (stage === "home") return;
+    if (activeVideoId) {
+      setConfirmHome(true);
+    } else {
+      setStage("home");
+    }
+  }
+
   return (
     <aside className="sidebar">
-      <button className="brand" onClick={() => setStage("home")}>
+      <button
+        className={stage === "home" ? "brand active" : "brand"}
+        onClick={handleHomeClick}
+        aria-current={stage === "home" ? "page" : undefined}
+      >
         <span className="brand-mark"><span /></span>
         <span>Auto Gen <strong>Studio</strong></span>
       </button>
       <nav>
         {navItems.map(({ stage: itemStage, label, icon: Icon, alwaysEnabled }) => {
           const isActive = itemStage === "inputs"
-            ? ["inputs", "visual-plan", "captions"].includes(stage)
+            ? ["inputs", "visual-plan"].includes(stage)
             : stage === itemStage;
-          const isDisabled = !alwaysEnabled && itemStage !== "home" && !activeVideoId;
+          const isDisabled = !alwaysEnabled && !activeVideoId;
           return (
             <button
               className={isActive ? "nav-item active" : "nav-item"}
@@ -191,7 +210,24 @@ function Sidebar() {
           );
         })}
       </nav>
-      <button className="nav-item settings" disabled title="Coming soon"><Settings size={18} /><span>Preferences · soon</span></button>
+      <button className="nav-item settings" disabled title="Coming soon">
+        <Settings size={18} /><span>Preferences</span>
+        {appVersion && <span className="app-version">v{appVersion}</span>}
+      </button>
+      {confirmHome && createPortal(
+        <ConfirmDialog
+          title="Leave this project?"
+          message="Your work is saved automatically. Returning home will close this project — you can resume it anytime from the home screen."
+          confirmLabel="Save & Return Home"
+          onConfirm={() => {
+            setConfirmHome(false);
+            clearActiveProject();
+            setStage("home");
+          }}
+          onCancel={() => setConfirmHome(false)}
+        />,
+        document.body,
+      )}
     </aside>
   );
 }
@@ -226,8 +262,15 @@ function Header() {
   );
 }
 
+let hasShownResumeBannerThisSession = false;
+
 function HomeView() {
   const { setStage, setActiveProject, activeChannelId, addToast } = useAppStore();
+  const [showResumeBanner] = useState(() => {
+    const isFirstVisit = !hasShownResumeBannerThisSession;
+    hasShownResumeBannerThisSession = true;
+    return isFirstVisit;
+  });
   const [channels, setChannels] = useState<ChannelRecord[]>([]);
   const [videos, setVideos] = useState<VideoRecord[]>([]);
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(activeChannelId);
@@ -438,9 +481,9 @@ function HomeView() {
         <div><p className="eyebrow">Workspace</p><h1>{getGreeting()}</h1><p>Continue a video or begin a new production.</p></div>
         <button className="primary" disabled={!selectedChannelId} onClick={() => setDialog("video")}><Plus size={17} />New video</button>
       </div>
-      {resume && (
+      {resume && showResumeBanner && (
         <button className="resume-band" onClick={() => void resumeVideo()}>
-          <div><span>CONTINUE WHERE YOU LEFT OFF</span><h2>{resumeVideoRecord?.title ?? "Resume last video"}</h2><p>{resume.stage.replace("-", " ")} · Saved locally</p></div>
+          <div><span>CONTINUE WHERE YOU LEFT OFF</span><h2>{resumeVideoRecord?.title ?? "Resume last video"}</h2><p>{resume.stage === "timeline" ? "editor" : resume.stage.replace("-", " ")} · Saved locally</p></div>
           <strong>→</strong>
         </button>
       )}
@@ -508,7 +551,7 @@ function HomeView() {
                       {previewUrl && <img src={previewUrl} alt="" />}
                       <span>{percent}%</span>
                     </div>
-                    <div><small>{video.stage.replace("-", " ").toUpperCase()}</small><h3>{video.title}</h3><p>Saved locally · {new Date(video.updatedAt).toLocaleDateString()}</p><i style={{ width: `${percent}%` }} /></div>
+                    <div><small>{video.stage === "timeline" ? "EDITOR" : video.stage.replace("-", " ").toUpperCase()}</small><h3>{video.title}</h3><p>Saved locally · {new Date(video.updatedAt).toLocaleDateString()}</p><i style={{ width: `${percent}%` }} /></div>
                   </button>
                 );
               })()}
@@ -713,8 +756,8 @@ function InputsView() {
       <input ref={scriptFileRef} className="visually-hidden" type="file" accept=".txt,text/plain" onChange={(event) => void importBrowserScript(event)} />
       <input ref={audioFileRef} className="visually-hidden" type="file" accept=".wav,.mp3,.m4a,.aac,.flac,audio/*" onChange={(event) => void importBrowserAudio(event)} />
       {generating && <GenerationProgress progress={generationProgress} />}
-      <div className="workflow-tabs" role="tablist"><button role="tab" aria-selected={true} className="active">1 · Source & pacing</button><button role="tab" aria-selected={false} disabled={!hasPlan} onClick={() => setStage("visual-plan")}>2 · Visual plan</button><button role="tab" aria-selected={false} disabled={!ready} onClick={() => setStage("captions")}>3 · Captions</button></div>
-      <div className="page-heading"><div><p className="eyebrow">Stage 1 of 3</p><h1>Source material</h1><p>Add narration and references that will guide the visual plan.</p></div><span className="save-state">{status}</span></div>
+      <div className="workflow-tabs" role="tablist"><button role="tab" aria-selected={true} className="active">1 · Source & pacing</button><button role="tab" aria-selected={false} disabled={!hasPlan} onClick={() => setStage("visual-plan")}>2 · Visual plan</button></div>
+      <div className="page-heading"><div><p className="eyebrow">Stage 1 of 2</p><h1>Source material</h1><p>Add narration and references that will guide the visual plan.</p></div><span className="save-state">{status}</span></div>
       {!activeVideoId && <div className="inline-error">Open or create a video before adding source material.</div>}
       {error && <div className="inline-error">{error}</div>}
       <div className="inputs-grid">
@@ -779,15 +822,15 @@ function VisualPlanView() {
 
   return (
     <section className="view">
-      <div className="workflow-tabs" role="tablist"><button role="tab" aria-selected={false} onClick={() => setStage("inputs")}>1 · Source & pacing</button><button role="tab" aria-selected={true} className="active">2 · Visual plan</button><button role="tab" aria-selected={false} onClick={() => setStage("captions")}>3 · Captions</button></div>
+      <div className="workflow-tabs" role="tablist"><button role="tab" aria-selected={false} onClick={() => setStage("inputs")}>1 · Source & pacing</button><button role="tab" aria-selected={true} className="active">2 · Visual plan</button></div>
       <div className="page-heading">
-        <div><p className="eyebrow">Stage 2 of 3</p><h1>Visual plan</h1><p>Drag a sentence into an adjacent still to regroup it. Chronological order remains enforced.</p></div>
+        <div><p className="eyebrow">Stage 2 of 2</p><h1>Visual plan</h1><p>Drag a sentence into an adjacent still to regroup it. Chronological order remains enforced.</p></div>
         <div className="heading-actions"><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
       </div>
       {error && <div className="inline-error">{error}</div>}
       {!plan && !error && <div className="empty-state">Loading visual plan…</div>}
       {confirmReset && <ConfirmDialog title="Reset visual plan?" message="This restores the original AI-generated groupings. All custom drag-and-drop changes will be lost." confirmLabel="Reset" onConfirm={() => { setConfirmReset(false); void resetPlan(); }} onCancel={() => setConfirmReset(false)} />}
-      {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{formatTime(plan.sentences.at(-1)?.endSeconds ?? 0)} total · Average {((plan.sentences.at(-1)?.endSeconds ?? 0) / plan.groups.length).toFixed(1)} sec · {plan.timingSource}</span></div>
+      {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{formatTimeShort(plan.sentences.at(-1)?.endSeconds ?? 0)} total · Average {((plan.sentences.at(-1)?.endSeconds ?? 0) / plan.groups.length).toFixed(1)} sec · {plan.timingSource}</span></div>
       <div className="plan-scroll"><DndContext
         sensors={sensors}
         onDragStart={(event) => setDraggedSentenceId(String(event.active.id).replace(/^sentence:/, ""))}
@@ -803,7 +846,7 @@ function VisualPlanView() {
           return <div className="plan-group-shell" key={group.id}>
             <DroppableStill groupId={group.id} active={dropTarget === `group:${group.id}`}>
               <span className="plan-index">{String(index + 1).padStart(2, "0")}</span>
-              <div className="timing"><strong>{formatTime(timing.startSeconds)} – {formatTime(timing.endSeconds)}</strong><small>{timing.durationSeconds.toFixed(1)} sec</small></div>
+              <div className="timing"><strong>{formatTimeShort(timing.startSeconds)} – {formatTimeShort(timing.endSeconds)}</strong><small>{timing.durationSeconds.toFixed(1)} sec</small></div>
               <div className="sentences">
                 {timing.members.map((sentence) => (
                   <DraggableSentence key={sentence.id} sentence={sentence} active={draggedSentenceId === sentence.id} />
@@ -832,7 +875,7 @@ function DraggableSentence({ sentence, active }: { sentence: PlanSentenceRecord;
   >
     <b title="Drag sentence"><GripVertical size={18} /></b>
     <span>{sentence.text}</span>
-    <small>{formatTime(sentence.startSeconds)}</small>
+    <small>{formatTimeShort(sentence.startSeconds)}</small>
   </div>;
 }
 
@@ -869,170 +912,7 @@ export function GenerationProgress({ progress }: { progress: { percent: number; 
 function ProductionView() {
   const { stage } = useAppStore();
   if (stage === "visual-plan") return <VisualPlanView />;
-  if (stage === "captions") return <CaptionsView />;
   return <InputsView />;
-}
-
-function CaptionsView() {
-  const { activeVideoId, activeVideoTitle, setStage, addToast } = useAppStore();
-  const [ready, setReady] = useState(false);
-  const [audioDataUrl, setAudioDataUrl] = useState<string | null>(null);
-  const [captions, setCaptions] = useState<import("./infrastructure/projects-client").CaptionSetRecord | null>(null);
-  const [intervalSeconds, setIntervalSeconds] = useState(1);
-  const [generating, setGenerating] = useState(false);
-  const [optimizing, setOptimizing] = useState(false);
-  const [progress, setProgress] = useState({ percent: 0, stage: "Preparing captions", detail: "" });
-  const [error, setError] = useState<string | null>(null);
-  const [currentTime, setCurrentTime] = useState(0);
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const listRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!activeVideoId) return;
-    setCaptions(null);
-    setAudioDataUrl(null);
-    void projectsClient.getVideoInputs(activeVideoId).then((inputs) => {
-      setReady(Boolean(inputs.scriptText.trim() && inputs.audio));
-      if (inputs.audio) {
-        void resolveAssetUrl(inputs.audio.id).then(setAudioDataUrl).catch(() => {});
-      }
-    }).catch((caught) => setError(String(caught)));
-    void projectsClient.getCaptions(activeVideoId).then((set) => { setCaptions(set); setIntervalSeconds(set.intervalSeconds); }).catch(() => setCaptions(null));
-  }, [activeVideoId]);
-
-  const activeChunk = captions?.chunks.find((chunk) => currentTime >= chunk.startSeconds && currentTime < chunk.endSeconds) ?? null;
-
-  useEffect(() => {
-    if (activeChunk == null) return;
-    const row = listRef.current?.querySelector<HTMLElement>(`[data-index="${activeChunk.index}"]`);
-    row?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-  }, [activeChunk?.index]);
-
-  async function generate() {
-    if (!activeVideoId) return;
-    setGenerating(true);
-    setError(null);
-    setProgress({ percent: 0, stage: "Preparing captions", detail: "" });
-    let unlisten: (() => void) | undefined;
-    try {
-      try {
-        unlisten = await listen<{
-          videoId: string;
-          percent: number;
-          stage: string;
-          detail: string;
-        }>("caption-progress", ({ payload }) => {
-          if (payload.videoId === activeVideoId) {
-            setProgress({ percent: payload.percent, stage: payload.stage, detail: payload.detail });
-          }
-        });
-      } catch {
-        // Browser preview has no native event bridge.
-      }
-      const result = await projectsClient.generateCaptions(activeVideoId, intervalSeconds);
-      setCaptions(result);
-      addToast("Captions generated.", "success");
-    } catch (caught) {
-      setError(String(caught));
-    } finally {
-      unlisten?.();
-      setGenerating(false);
-    }
-  }
-
-  async function optimizeWithAi() {
-    if (!activeVideoId) return;
-    setOptimizing(true);
-    setError(null);
-    try {
-      const result = await projectsClient.optimizeCaptions(activeVideoId);
-      setCaptions(result);
-      addToast("Captions optimized with AI.", "success");
-    } catch (caught) {
-      setError(String(caught));
-    } finally {
-      setOptimizing(false);
-    }
-  }
-
-  async function saveAs() {
-    if (!captions) return;
-    const safeTitle = (activeVideoTitle || "Video").replace(/[\\/:*?"<>|]/g, "").trim() || "Video";
-    try {
-      const path = await projectsClient.saveCaptionsFile(captions.srtText, `${safeTitle} Captions.srt`);
-      if (path) addToast(`Captions saved to ${path}`, "success");
-    } catch (caught) {
-      setError(String(caught));
-    }
-  }
-
-  return (
-    <section className="view">
-      {generating && <GenerationProgress progress={progress} />}
-      <div className="workflow-tabs" role="tablist">
-        <button role="tab" aria-selected={false} onClick={() => setStage("inputs")}>1 · Source & pacing</button>
-        <button role="tab" aria-selected={false} onClick={() => setStage("visual-plan")}>2 · Visual plan</button>
-        <button role="tab" aria-selected={true} className="active">3 · Captions</button>
-      </div>
-      <div className="page-heading">
-        <div><p className="eyebrow">Captions</p><h1>Captions</h1><p>Generate an SRT caption file from the narration audio and script already added in Source material.</p></div>
-        <div className="heading-actions">
-          <label className="caption-interval" title="Maximum seconds of narration per caption">
-            <span>Window</span>
-            <input type="number" min="0.2" max="5" step="0.1" value={intervalSeconds} disabled={generating} onChange={(event) => setIntervalSeconds(Number(event.target.value))} />
-            <span>sec</span>
-          </label>
-          <button className="primary" disabled={!ready || !activeVideoId || generating} onClick={() => void generate()}>
-            {generating ? <><LoaderCircle className="spin" size={16} />Generating…</> : captions ? <>Regenerate captions</> : <>Generate captions</>}
-          </button>
-          <button
-            className="secondary"
-            disabled={!captions || generating || optimizing}
-            title="Uses AI to fix capitalization of proper nouns, your channel name, and other names to industry-standard caption style"
-            onClick={() => void optimizeWithAi()}
-          >
-            {optimizing ? <><LoaderCircle className="spin" size={16} />Optimizing…</> : <><WandSparkles size={16} />Optimize with AI</>}
-          </button>
-        </div>
-      </div>
-      {!ready && <div className="inline-error">Add a script and narration audio in Source material before generating captions.</div>}
-      {error && <div className="inline-error">{error}</div>}
-      {!captions && ready && !generating && <div className="empty-state">No captions generated yet.<span>Choose a caption window and generate to build an SRT file.</span></div>}
-      {captions && (
-        <div className="caption-workspace">
-          {audioDataUrl && (
-            <audio
-              ref={audioRef}
-              controls
-              src={audioDataUrl}
-              className="caption-audio"
-              onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-            />
-          )}
-          <div className="caption-preview-stage">
-            <span className="caption-preview-text">{activeChunk?.text ?? captions.chunks[0]?.text ?? ""}</span>
-          </div>
-          <div className="caption-list" ref={listRef}>
-            {captions.chunks.map((chunk) => (
-              <div
-                key={chunk.index}
-                data-index={chunk.index}
-                className={activeChunk?.index === chunk.index ? "caption-row active" : "caption-row"}
-                onClick={() => { if (audioRef.current) { audioRef.current.currentTime = chunk.startSeconds; audioRef.current.play(); } }}
-              >
-                <span className="caption-time">{formatTime(chunk.startSeconds)} – {formatTime(chunk.endSeconds)}</span>
-                <span>{chunk.text}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      <div className="footer-actions">
-        <button className="secondary" onClick={() => setStage("visual-plan")}>Back</button>
-        <button className="primary" disabled={!captions} onClick={() => void saveAs()}><Download size={16} />Save captions as…</button>
-      </div>
-    </section>
-  );
 }
 
 type ImageSettings = {
@@ -1203,7 +1083,6 @@ function ImagesView() {
   const promptPrepTask = useRef<{ items: ImageWorkspaceRecord["groups"]; index: number } | null>(null);
   const [referenceUrl, setReferenceUrl] = useState("");
   const promptPrepSettingKey = activeVideoId ? `prompt_prep.${activeVideoId}` : "";
-  const [expandedBatch, setExpandedBatch] = useState<number | null>(0);
 
   const selectedGroup = useMemo(
     () => workspace?.groups.find((group) => group.group.id === selectedGroupId) ?? null,
@@ -1219,26 +1098,6 @@ function ImagesView() {
     start: selectedSentences[0].startSeconds,
     end: selectedSentences.at(-1)!.endSeconds,
   } : null;
-  const stillBatches = useMemo(() => {
-    const groups = workspace?.groups ?? [];
-    const batches: typeof groups[] = [];
-    for (let index = 0; index < groups.length; index += STILLS_PER_BATCH) {
-      batches.push(groups.slice(index, index + STILLS_PER_BATCH));
-    }
-    return batches;
-  }, [workspace]);
-
-  useEffect(() => {
-    if (!selectedGroupId || !workspace) return;
-    const index = workspace.groups.findIndex((group) => group.group.id === selectedGroupId);
-    if (index < 0) return;
-    setExpandedBatch(Math.floor(index / STILLS_PER_BATCH));
-  }, [selectedGroupId, workspace]);
-
-  function toggleBatch(index: number) {
-    setExpandedBatch((current) => (current === index ? null : index));
-  }
-
   useEffect(() => {
     function handleArrowNavigation(event: KeyboardEvent) {
       if (zoomOpen || editOpen) return;
@@ -1898,55 +1757,40 @@ function ImagesView() {
             <span className="stills-heading-label">Stills</span>
             <span className="stills-heading-count">{stillCount}</span>
           </div>
-          {stillBatches.map((batch, batchIndex) => {
-            const start = batchIndex * STILLS_PER_BATCH;
-            const expanded = expandedBatch === batchIndex;
-            const generatedCount = batch.filter((group) => group.imageRenders.length > 0).length;
-            return (
-              <div className="still-batch" key={batchIndex}>
-                <button type="button" className="still-batch-header" aria-expanded={expanded} onClick={() => toggleBatch(batchIndex)}>
-                  <span className="still-batch-title">Stills {start + 1}–{start + batch.length}</span>
-                  <span className="still-batch-meta"><span className={`still-batch-count${generatedCount === batch.length ? " all-done" : ""}`}>{generatedCount}/{batch.length}</span><ChevronRight size={14} className={expanded ? "chevron expanded" : "chevron"} /></span>
-                </button>
-                {expanded && (
-                  <div className="still-batch-body">
-                    {batch.map((group) => {
-                      const newestPrompt = group.promptVersions[0];
-                      const newestRender = group.imageRenders[0];
-                      const thumbUrl = newestRender ? renderUrls[newestRender.id] : undefined;
-                      const item = job?.items.find((candidate) => candidate.groupId === group.group.id);
-                      const isPreparing = preparingGroupIds.has(group.group.id);
-                      const isGenerating = item?.status === "running" || generatingGroupId === group.group.id;
-                      const statusKey = isPreparing || isGenerating ? "generating" : item?.status === "failed" ? "failed" : newestRender && newestPrompt && newestRender.promptVersionId !== newestPrompt.id ? "outdated" : newestRender ? "generated" : newestPrompt ? "ready" : "empty";
-                      const statusLabel = isPreparing ? "Preparing prompt" : isGenerating ? "Generating" : statusKey === "failed" ? "Failed" : statusKey === "outdated" ? "Outdated — regenerate" : statusKey === "generated" ? "Generated" : statusKey === "ready" ? "Prompt ready" : "No prompt yet";
-                      return (
-                        <button
-                          key={group.group.id}
-                          className={`still-select${group.group.id === selectedGroupId ? " active" : ""}`}
-                          title={statusLabel}
-                          onClick={() => selectGroup(group.group.id)}
-                        >
-                          <div className={`still-thumb ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}${thumbUrl ? "" : " empty"}`}>
-                            {thumbUrl ? <img src={thumbUrl} alt={`Still ${group.group.ordinal} preview`} /> : <div className="still-thumb-empty"><Image size={18} /><span>No image generated yet</span></div>}
-                            <span className="still-number">{group.group.ordinal}</span>
-                            {statusKey !== "empty" && (
-                              <span className={`still-status-badge ${statusKey}`} aria-label={statusLabel}>
-                                {statusKey === "generated" && <Check size={11} />}
-                                {statusKey === "ready" && <Sparkles size={11} />}
-                                {statusKey === "generating" && <LoaderCircle size={11} className="spin" />}
-                                {statusKey === "failed" && <X size={11} />}
-                                {statusKey === "outdated" && <Undo2 size={11} />}
-                              </span>
-                            )}
-                          </div>
-                        </button>
-                      );
-                    })}
+          <div className="still-list">
+            {(workspace?.groups ?? []).map((group) => {
+              const newestPrompt = group.promptVersions[0];
+              const newestRender = group.imageRenders[0];
+              const thumbUrl = newestRender ? renderUrls[newestRender.id] : undefined;
+              const item = job?.items.find((candidate) => candidate.groupId === group.group.id);
+              const isPreparing = preparingGroupIds.has(group.group.id);
+              const isGenerating = item?.status === "running" || generatingGroupId === group.group.id;
+              const statusKey = isPreparing || isGenerating ? "generating" : item?.status === "failed" ? "failed" : newestRender && newestPrompt && newestRender.promptVersionId !== newestPrompt.id ? "outdated" : newestRender ? "generated" : newestPrompt ? "ready" : "empty";
+              const statusLabel = isPreparing ? "Preparing prompt" : isGenerating ? "Generating" : statusKey === "failed" ? "Failed" : statusKey === "outdated" ? "Outdated — regenerate" : statusKey === "generated" ? "Generated" : statusKey === "ready" ? "Prompt ready" : "No prompt yet";
+              return (
+                <button
+                  key={group.group.id}
+                  className={`still-select${group.group.id === selectedGroupId ? " active" : ""}`}
+                  title={statusLabel}
+                  onClick={() => selectGroup(group.group.id)}
+                >
+                  <div className={`still-thumb ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}${thumbUrl ? "" : " empty"}`}>
+                    {thumbUrl ? <img src={thumbUrl} alt={`Still ${group.group.ordinal} preview`} /> : <div className="still-thumb-empty"><Image size={18} /><span>No image generated yet</span></div>}
+                    <span className="still-number">{group.group.ordinal}</span>
+                    {statusKey !== "empty" && (
+                      <span className={`still-status-badge ${statusKey}`} aria-label={statusLabel}>
+                        {statusKey === "generated" && <Check size={11} />}
+                        {statusKey === "ready" && <Sparkles size={11} />}
+                        {statusKey === "generating" && <LoaderCircle size={11} className="spin" />}
+                        {statusKey === "failed" && <X size={11} />}
+                        {statusKey === "outdated" && <Undo2 size={11} />}
+                      </span>
+                    )}
                   </div>
-                )}
-              </div>
-            );
-          })}
+                </button>
+              );
+            })}
+          </div>
           {!workspace && <div className="empty-state">Loading stills…</div>}
         </aside>
         <div className="preview">
@@ -1963,7 +1807,7 @@ function ImagesView() {
           )}
           {bulkProgress && <div className="bulk-live-progress"><div><strong>{bulkProgress.label}</strong>{bulkProgress.total > 0 && <span>{bulkProgress.current} / {bulkProgress.total}</span>}</div>{bulkProgress.total > 0 ? <progress value={bulkProgress.current} max={bulkProgress.total} /> : <progress />}{bulkProgress.total > 0 && <div className="prompt-progress-actions">{promptPrepStatus === "running" && <button className="secondary" onClick={() => controlPromptPreparation("pause")}>Pause</button>}{promptPrepStatus === "paused" && <button className="secondary" onClick={() => controlPromptPreparation("resume")}>Resume</button>}<button className="secondary" onClick={() => controlPromptPreparation("stop")}>Stop</button></div>}</div>}
           <header>
-            <div><span className="timestamp-heading">{selectedTiming ? `${formatTime(selectedTiming.start)} – ${formatTime(selectedTiming.end)}` : previewLabel}</span><strong className="production-copy narration-preview">{selectedSentences.map((sentence) => sentence.text).join(" ")}</strong></div>
+            <div><span className="timestamp-heading">{selectedTiming ? `${formatTimeShort(selectedTiming.start)} – ${formatTimeShort(selectedTiming.end)}` : previewLabel}</span><strong className="production-copy narration-preview">{selectedSentences.map((sentence) => sentence.text).join(" ")}</strong></div>
           </header>
           <div className="preview-art">
             {selectedRenderId && renderUrls[selectedRenderId] ? (
@@ -2137,7 +1981,7 @@ function ImagesView() {
             {bulkPlan.stills.map((still) => (
               <div key={still.visualPlanRowId} className="overview-table-row">
                 <span>{still.ordinal}</span>
-                <span>{formatTime(still.timestampStart)}–{formatTime(still.timestampEnd)}</span>
+                <span>{formatTimeShort(still.timestampStart)}–{formatTimeShort(still.timestampEnd)}</span>
                 <span title={still.narrationPreview} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }}>{still.narrationPreview}</span>
                 <span>{still.visualType}</span>
                 <span title={still.userPrompt}>{still.userPrompt.slice(0, 70)}{still.userPrompt.length > 70 ? "…" : ""}</span>
@@ -2224,7 +2068,7 @@ export function App() {
     <div className="app-shell">
       <TitleBar />
       <Sidebar />
-      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan", "captions"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
+      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
       <ToastDisplay />
     </div>
   );

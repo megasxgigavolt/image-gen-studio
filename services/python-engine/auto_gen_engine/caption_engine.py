@@ -133,7 +133,7 @@ def reconcile_with_script(
 
 def chunk_words(word_data: list[dict], interval: float = CAPTION_INTERVAL) -> list[dict]:
     chunks: list[dict] = []
-    buf_words: list[str] = []
+    buf_words: list[dict] = []
     buf_start: float | None = None
     buf_end: float | None = None
     sentence_start = True
@@ -141,12 +141,16 @@ def chunk_words(word_data: list[dict], interval: float = CAPTION_INTERVAL) -> li
     def flush(end_time: float) -> None:
         nonlocal buf_words, buf_start, buf_end, sentence_start
         if buf_words:
-            last = buf_words[-1]
+            last = buf_words[-1]["word"]
             chunks.append({
-                "text": " ".join(buf_words),
+                "text": " ".join(w["word"] for w in buf_words),
                 "start": buf_start,
                 "end": end_time,
                 "sentence_start": sentence_start,
+                # Whisper's own per-word timestamps, kept alongside the
+                # aggregate chunk so the app can highlight the exact word
+                # being spoken (karaoke-style) instead of just the whole line.
+                "words": list(buf_words),
             })
             sentence_start = bool(_SENTENCE_END_RE.search(last))
             buf_words = []
@@ -161,7 +165,7 @@ def chunk_words(word_data: list[dict], interval: float = CAPTION_INTERVAL) -> li
             continue
         if buf_start is None:
             buf_start = start
-        buf_words.append(word)
+        buf_words.append({"word": word, "start": start, "end": end})
         buf_end = end
         is_break = bool(_BREAK_RE.search(word))
         if is_break or (end - buf_start) >= interval:
@@ -174,11 +178,34 @@ def chunk_words(word_data: list[dict], interval: float = CAPTION_INTERVAL) -> li
 
 
 def format_caption_text(text: str, sentence_start: bool = True) -> str:
+    # Words are already correctly cased by reconcile_with_script() (proper nouns,
+    # channel names, etc. come straight from the authoritative script) — only
+    # strip caption punctuation and fix genuine sentence-start capitalization,
+    # never blanket-lowercase the line.
     text = re.sub(r"[,.]", "", text)
-    text = re.sub(r"\s+", " ", text).strip().lower()
+    text = re.sub(r"\s+", " ", text).strip()
     if sentence_start and text:
         text = text[0].upper() + text[1:]
-    return re.sub(r"\bi\b", "I", text)
+    return text
+
+
+def format_caption_words(words: list[dict], sentence_start: bool = True) -> list[dict]:
+    """Per-word counterpart of format_caption_text — same punctuation
+    stripping and sentence-start capitalization, applied word by word so
+    each word keeps its own timestamp for karaoke-style highlighting."""
+    cleaned = []
+    for w in words:
+        text = re.sub(r"[,.]", "", w["word"]).strip()
+        if not text:
+            continue
+        cleaned.append({"text": text, "start": round(w["start"], 3), "end": round(w["end"], 3)})
+    if sentence_start and cleaned and cleaned[0]["text"]:
+        first = cleaned[0]["text"]
+        cleaned[0]["text"] = first[0].upper() + first[1:]
+    for w in cleaned:
+        if w["text"].lower() == "i":
+            w["text"] = "I"
+    return cleaned
 
 
 def write_srt(chunks: list[dict], out_path: Path) -> None:
@@ -198,6 +225,7 @@ def write_json(chunks: list[dict], out_path: Path) -> None:
             "text": format_caption_text(c["text"], c.get("sentence_start", True)),
             "start": round(c["start"], 3),
             "end": round(c["end"], 3),
+            "words": format_caption_words(c.get("words", []), c.get("sentence_start", True)),
         }
         for i, c in enumerate(chunks)
     ]

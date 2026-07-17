@@ -227,9 +227,22 @@ export type CaptionStyle = {
   fontSizePx?: number;
   bold?: boolean;
   color?: string;
+  /** Blend opacity (0-100) applied to the text fill and stroke. */
+  opacity?: number;
   outlineColor?: string;
   outlineWidthPx?: number;
-  shadow?: { enabled?: boolean; blur?: number; offsetX?: number; offsetY?: number };
+  shadow?: {
+    enabled?: boolean;
+    color?: string;
+    /** 0-100 */
+    opacity?: number;
+    /** 0-100 */
+    blur?: number;
+    /** px */
+    distance?: number;
+    /** degrees, 0 = right, clockwise */
+    angle?: number;
+  };
   position?: "bottom" | "middle" | "top";
   wordHighlight?: { enabled?: boolean; color?: string };
 };

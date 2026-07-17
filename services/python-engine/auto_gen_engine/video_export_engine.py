@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -38,13 +39,14 @@ MAX_ENCODE_WORKERS = 4
 # (e.g. one written before per-clip caption styling existed) — matches what
 # used to be the single hardcoded ASS style for every export.
 _FALLBACK_CAPTION_STYLE = {
-    "fontFamily": "Arial Black",
+    "fontFamily": "Rubik",
     "fontSizePx": 22,
     "bold": True,
     "color": "#FFFFFF",
+    "opacity": 100,
     "outlineColor": "#000000",
     "outlineWidthPx": 2,
-    "shadow": {"enabled": False, "blur": 4, "offsetX": 0, "offsetY": 2},
+    "shadow": {"enabled": False, "color": "#000000", "opacity": 70, "blur": 30, "distance": 2, "angle": 90},
     "position": "bottom",
 }
 
@@ -362,6 +364,12 @@ def escape_subtitles_path(path: Path) -> str:
     return str(path).replace("\\", "/").replace(":", "\\:")
 
 
+# "Rubik" (the caption default font) isn't a built-in OS font — bundling it
+# here and pointing libass at this folder via the ass filter's `fontsdir`
+# lets it render correctly without needing a system-wide font install.
+_BUNDLED_FONTS_DIR = Path(__file__).resolve().parent / "fonts"
+
+
 def to_ass_ts(seconds: float) -> str:
     """ASS timestamp: H:MM:SS.cc (centiseconds) — distinct from SRT's
     HH:MM:SS,mmm, hours is not zero-padded to a fixed width."""
@@ -390,33 +398,74 @@ def _style_value(style: dict, key: str, default):
     return default if value is None else value
 
 
-def _resolve_shadow(style: dict) -> tuple[int, int]:
-    """Maps our {enabled, blur, offsetX, offsetY} shadow shape onto ASS's
-    single \\shad depth (plus an optional \\blur softness) — classic ASS has
-    no separate per-axis offset or blur-radius concept for shadows, so this
-    is a pragmatic approximation, not a literal translation."""
+def _opacity_to_alpha_byte(opacity_percent) -> int:
+    """ASS alpha is inverted transparency (00 = opaque, FF = fully
+    transparent), the reverse of our 0-100 "opacity" sliders."""
+    opacity = max(0.0, min(100.0, float(opacity_percent) if opacity_percent is not None else 100.0))
+    return round((1 - opacity / 100) * 255)
+
+
+# The Timeline's canvas preview renders caption text at
+# `(fontSizePx/22) * canvasHeight * 0.045` canvas px, so a still/caption
+# looks the same proportion of the frame regardless of the video's actual
+# resolution. The export previously used fontSizePx literally as the ASS
+# \fs value — correct-looking only by coincidence when PlayResY happened to
+# be small, and tiny at any real 1080p/1920px export. This reference height
+# is the canvas's own default preview size, so the same formula reproduces
+# the exact on-screen proportion at whatever the export's real height is.
+_REFERENCE_CAPTION_HEIGHT = 540.0
+
+
+def _scaled_font_size(style: dict, height: int) -> float:
+    raw = float(_style_value(style, "fontSizePx", 22) or 22)
+    return max(14.0, (raw / 22.0) * height * 0.045)
+
+
+def _scaled_outline_width(style: dict, font_size: float) -> float:
+    raw = float(_style_value(style, "outlineWidthPx", 2) or 0)
+    return max(0.0, (raw / 2.0) * font_size * 0.16)
+
+
+def _resolve_shadow(style: dict, height: int) -> tuple[float, float, int, str, int]:
+    """Maps our {enabled, color, opacity, blur%, distance, angle} shadow shape
+    onto ASS's independent \\xshad/\\yshad offsets (computed from distance +
+    angle, unlike classic ASS's single diagonal \\shad depth) plus a \\blur
+    softness and a shadow color/alpha for \\4c/\\4a. Distance and blur scale
+    with height the same way font size does (see _scaled_font_size), so a
+    shadow tuned in preview stays proportionally the same size at any export
+    resolution instead of shrinking to nothing at 1080p/1920px. Returns
+    (xshad, yshad, blur, shadow_color_hex, shadow_alpha_byte)."""
     shadow = _style_value(style, "shadow", {}) or {}
     if not shadow.get("enabled"):
-        return 0, 0
-    offset_x = float(shadow.get("offsetX", 0) or 0)
-    offset_y = float(shadow.get("offsetY", 2) or 0)
-    depth = max(1, round((abs(offset_x) + abs(offset_y)) / 2))
-    blur = max(0, min(4, round(float(shadow.get("blur", 0) or 0) / 2)))
-    return depth, blur
+        return 0.0, 0.0, 0, "#000000", 255
+    scale = height / _REFERENCE_CAPTION_HEIGHT
+    distance = float(shadow.get("distance", 2) or 0) * scale
+    angle_rad = math.radians(float(shadow.get("angle", 90) or 0))
+    xshad = round(distance * math.cos(angle_rad), 2)
+    yshad = round(distance * math.sin(angle_rad), 2)
+    # ASS's \blur is a small softness radius, not a percentage — this keeps
+    # the same practical 0-4 range (at the reference height) the export was
+    # already tuned against, just fed from a 0-100% slider instead of a raw
+    # 0-12 unit value.
+    blur = max(0, min(4, round((float(shadow.get("blur", 30) or 0) / 100) * 8 * scale)))
+    shadow_alpha = _opacity_to_alpha_byte(shadow.get("opacity", 70))
+    return xshad, yshad, blur, shadow.get("color") or "#000000", shadow_alpha
 
 
-def _ass_override_tags(style: dict) -> str:
+def _ass_override_tags(style: dict, height: int) -> str:
     font_family = _style_value(style, "fontFamily", "Arial Black")
-    font_size = int(_style_value(style, "fontSizePx", 22))
+    font_size = round(_scaled_font_size(style, height))
     bold = 1 if _style_value(style, "bold", True) else 0
-    color = _to_ass_color(_style_value(style, "color", "#FFFFFF"))
-    outline_color = _to_ass_color(_style_value(style, "outlineColor", "#000000"))
-    outline_width = _style_value(style, "outlineWidthPx", 2)
+    blend_alpha = _opacity_to_alpha_byte(_style_value(style, "opacity", 100))
+    color = _to_ass_color(_style_value(style, "color", "#FFFFFF"), blend_alpha)
+    outline_color = _to_ass_color(_style_value(style, "outlineColor", "#000000"), blend_alpha)
+    outline_width = round(_scaled_outline_width(style, font_size), 2)
     alignment = _ASS_ALIGNMENT.get(_style_value(style, "position", "bottom"), 2)
-    shadow_depth, blur = _resolve_shadow(style)
+    xshad, yshad, blur, shadow_color, shadow_alpha = _resolve_shadow(style, height)
+    shadow_color_ass = _to_ass_color(shadow_color, shadow_alpha)
     tags = (
-        f"\\fn{font_family}\\fs{font_size}\\b{bold}\\c{color}\\3c{outline_color}"
-        f"\\bord{outline_width}\\shad{shadow_depth}\\an{alignment}"
+        f"\\fn{font_family}\\fs{font_size}\\b{bold}\\c{color}\\3c{outline_color}\\4c{shadow_color_ass}"
+        f"\\bord{outline_width}\\xshad{xshad}\\yshad{yshad}\\an{alignment}"
     )
     if blur:
         tags += f"\\blur{blur}"
@@ -466,13 +515,18 @@ def write_captions_ass(
     with no override at all."""
     default_style = default_style or _FALLBACK_CAPTION_STYLE
     default_font = _style_value(default_style, "fontFamily", "Arial Black")
-    default_size = int(_style_value(default_style, "fontSizePx", 22))
+    default_size = round(_scaled_font_size(default_style, height))
     default_bold = 1 if _style_value(default_style, "bold", True) else 0
-    default_color = _to_ass_color(_style_value(default_style, "color", "#FFFFFF"))
-    default_outline_color = _to_ass_color(_style_value(default_style, "outlineColor", "#000000"))
-    default_outline_width = _style_value(default_style, "outlineWidthPx", 2)
+    default_blend_alpha = _opacity_to_alpha_byte(_style_value(default_style, "opacity", 100))
+    default_color = _to_ass_color(_style_value(default_style, "color", "#FFFFFF"), default_blend_alpha)
+    default_outline_color = _to_ass_color(_style_value(default_style, "outlineColor", "#000000"), default_blend_alpha)
+    default_outline_width = round(_scaled_outline_width(default_style, default_size), 2)
     default_alignment = _ASS_ALIGNMENT.get(_style_value(default_style, "position", "bottom"), 2)
-    default_shadow_depth, _ = _resolve_shadow(default_style)
+    # The base [V4+ Styles] entry only supports a single diagonal shadow
+    # depth (no separate X/Y) — irrelevant in practice since every Dialogue
+    # line below always carries its own full \xshad/\yshad override anyway.
+    default_xshad, default_yshad, _, _, _ = _resolve_shadow(default_style, height)
+    default_shadow_depth = round((abs(default_xshad) + abs(default_yshad)) / 2)
 
     header = (
         "[Script Info]\n"
@@ -499,12 +553,13 @@ def write_captions_ass(
         word_highlight = _style_value(style, "wordHighlight", {}) or {}
         words = chunk.get("words") or []
         if word_highlight.get("enabled") and words:
-            base_tags = _ass_override_tags(style)
-            base_color = _to_ass_color(_style_value(style, "color", "#FFFFFF"))
-            highlight_color = _to_ass_color(word_highlight.get("color", "#FFEB3B"))
+            base_tags = _ass_override_tags(style, height)
+            blend_alpha = _opacity_to_alpha_byte(_style_value(style, "opacity", 100))
+            base_color = _to_ass_color(_style_value(style, "color", "#FFFFFF"), blend_alpha)
+            highlight_color = _to_ass_color(word_highlight.get("color", "#FFEB3B"), blend_alpha)
             lines.extend(_karaoke_dialogue_lines(chunk, style, base_tags, base_color, highlight_color))
         else:
-            text = _ass_override_tags(style) + _escape_ass_text(chunk["text"])
+            text = _ass_override_tags(style, height) + _escape_ass_text(chunk["text"])
             lines.append(
                 f"Dialogue: 0,{to_ass_ts(chunk['start'])},{to_ass_ts(chunk['end'])},Default,,0,0,0,,{text}\n"
             )
@@ -623,7 +678,7 @@ def run(manifest_path: Path, output_path: Path) -> None:
     # graph as the caption overlay (rather than a second ffmpeg pass) so
     # export stays a single encode; `adelay` needs one value per channel,
     # hence the doubled `|`-joined pair for stereo.
-    video_filter = f"ass='{escape_subtitles_path(ass_path)}'" if has_captions else None
+    video_filter = f"ass='{escape_subtitles_path(ass_path)}':fontsdir='{escape_subtitles_path(_BUNDLED_FONTS_DIR)}'" if has_captions else None
     audio_filter = f"adelay={round(narration_offset_seconds * 1000)}|{round(narration_offset_seconds * 1000)}" if narration_offset_seconds > 0 else None
     if video_filter or audio_filter:
         graph = []

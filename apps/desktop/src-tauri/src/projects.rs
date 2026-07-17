@@ -757,13 +757,14 @@ pub struct Timeline {
 /// hardcoded in the export engine, so an empty style ({}) is a visual no-op.
 pub fn default_caption_style() -> serde_json::Value {
     json!({
-        "fontFamily": "Arial Black",
+        "fontFamily": "Rubik",
         "fontSizePx": 22,
         "bold": true,
         "color": "#FFFFFF",
+        "opacity": 100,
         "outlineColor": "#000000",
         "outlineWidthPx": 2,
-        "shadow": { "enabled": false, "blur": 4, "offsetX": 0, "offsetY": 2 },
+        "shadow": { "enabled": false, "color": "#000000", "opacity": 70, "blur": 30, "distance": 2, "angle": 90 },
         "position": "bottom",
         "wordHighlight": { "enabled": false, "color": "#FFEB3B" },
     })

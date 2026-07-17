@@ -1,5 +1,6 @@
 import {
   Clapperboard,
+  ChevronDown,
   Clock,
   Download,
   ImageOff,
@@ -23,7 +24,7 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from "react";
 import { useAppStore } from "./store/app-store";
 import { formatTime, pixelsToSeconds, secondsToPixels } from "./domain/timecode";
 import { pickVeoDuration } from "./domain/animation";
@@ -49,33 +50,50 @@ const STILLS_LANE_HEIGHT = 96;
 const CAPTIONS_LANE_HEIGHT = 40;
 const ZOOM_MIN = 0.5;
 const ZOOM_MAX = 4;
+// Caption shadow "Bluriness" is authored as a 0-100% slider; this is the
+// canvas shadowBlur radius (px) that 100% maps to.
+const MAX_SHADOW_BLUR_PX = 20;
 
 // Mirrors the Rust default_caption_style() exactly, so an all-default style
 // looks identical to what used to be hardcoded in the export engine.
 const DEFAULT_CAPTION_STYLE: Required<CaptionStyle> = {
-  fontFamily: "Arial Black",
+  fontFamily: "Rubik",
   fontSizePx: 22,
   bold: true,
   color: "#FFFFFF",
+  opacity: 100,
   outlineColor: "#000000",
   outlineWidthPx: 2,
-  shadow: { enabled: false, blur: 4, offsetX: 0, offsetY: 2 },
+  shadow: { enabled: false, color: "#000000", opacity: 70, blur: 30, distance: 2, angle: 90 },
   position: "bottom",
   wordHighlight: { enabled: false, color: "#FFEB3B" },
 };
 
-const CAPTION_FONT_OPTIONS = ["Arial Black", "Arial", "Impact", "Verdana", "Georgia", "Courier New"];
+// "Rubik" is listed first to match the default — it renders correctly if the
+// font is installed on the system (or another app/font manager has added
+// it), and otherwise falls back silently like any other missing font.
+const CAPTION_FONT_OPTIONS = ["Rubik", "Arial Black", "Arial", "Impact", "Verdana", "Georgia", "Courier New"];
 
 const CAPTION_STYLE_PRESETS: { label: string; style: Partial<CaptionStyle> }[] = [
-  { label: "Clean White", style: { color: "#FFFFFF", outlineColor: "#000000", bold: true, shadow: { enabled: false, blur: 4, offsetX: 0, offsetY: 2 } } },
-  { label: "Bold Yellow", style: { color: "#FFEB3B", outlineColor: "#000000", outlineWidthPx: 3, bold: true, shadow: { enabled: false, blur: 4, offsetX: 0, offsetY: 2 } } },
-  { label: "Impact Red", style: { color: "#FFFFFF", outlineColor: "#D32F2F", outlineWidthPx: 3, bold: true, shadow: { enabled: false, blur: 4, offsetX: 0, offsetY: 2 } } },
-  { label: "Soft Shadow", style: { color: "#FFFFFF", outlineColor: "#000000", outlineWidthPx: 1, bold: false, shadow: { enabled: true, blur: 6, offsetX: 0, offsetY: 3 } } },
+  { label: "Clean White", style: { color: "#FFFFFF", outlineColor: "#000000", bold: true, shadow: { enabled: false, color: "#000000", opacity: 70, blur: 30, distance: 2, angle: 90 } } },
+  { label: "Bold Yellow", style: { color: "#FFEB3B", outlineColor: "#000000", outlineWidthPx: 3, bold: true, shadow: { enabled: false, color: "#000000", opacity: 70, blur: 30, distance: 2, angle: 90 } } },
+  { label: "Impact Red", style: { color: "#FFFFFF", outlineColor: "#D32F2F", outlineWidthPx: 3, bold: true, shadow: { enabled: false, color: "#000000", opacity: 70, blur: 30, distance: 2, angle: 90 } } },
+  { label: "Soft Shadow", style: { color: "#FFFFFF", outlineColor: "#000000", outlineWidthPx: 1, bold: false, shadow: { enabled: true, color: "#000000", opacity: 60, blur: 45, distance: 3, angle: 90 } } },
 ];
 
 /** Shallow-merges a partial style onto a base — mirrors the Rust merge_style. */
 function resolveCaptionStyle(base: CaptionStyle, overlay?: CaptionStyle | null): Required<CaptionStyle> {
   return { ...DEFAULT_CAPTION_STYLE, ...base, ...(overlay ?? {}) };
+}
+
+/** Converts a #RRGGBB color + 0-100 opacity into a canvas rgba() string. */
+function withAlpha(hex: string, opacityPercent: number): string {
+  const clean = (hex || "#000000").replace("#", "");
+  const r = parseInt(clean.slice(0, 2), 16) || 0;
+  const g = parseInt(clean.slice(2, 4), 16) || 0;
+  const b = parseInt(clean.slice(4, 6), 16) || 0;
+  const a = Math.max(0, Math.min(100, opacityPercent)) / 100;
+  return `rgba(${r},${g},${b},${a})`;
 }
 
 const MOTION_OPTIONS: { value: MotionPreset; label: string; icon: typeof Move }[] = [
@@ -203,9 +221,18 @@ export function TimelineView() {
   const [confirmResetTimeline, setConfirmResetTimeline] = useState(false);
   const [resettingTimeline, setResettingTimeline] = useState(false);
   const [captionDragPreview, setCaptionDragPreview] = useState<{ clipId: string; start: number; end: number } | null>(null);
+  // Caption style sliders update these synchronously (so the canvas preview
+  // reacts on every drag tick), while the actual backend commit — a full
+  // timeline round-trip — is debounced. `undefined` means "no draft, defer to
+  // the committed value"; `null` is itself a valid draft (pending reset to
+  // inherit-default), so it can't double as the "no draft" sentinel.
+  const [pendingGlobalCaptionStyle, setPendingGlobalCaptionStyle] = useState<CaptionStyle | null | undefined>(undefined);
+  const [pendingSelectedCaptionStyle, setPendingSelectedCaptionStyle] = useState<CaptionStyle | null | undefined>(undefined);
   const [stillsDragPreview, setStillsDragPreview] = useState<{ clipId: string; start: number; end: number } | null>(null);
   const [narrationDragPreview, setNarrationDragPreview] = useState<number | null>(null);
 
+  const globalStyleCommitRef = useRef<number | null>(null);
+  const selectedStyleCommitRef = useRef<number | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const waveformCanvasRef = useRef<HTMLCanvasElement>(null);
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -376,6 +403,16 @@ export function TimelineView() {
   useEffect(() => {
     setCaptionText(selectedCaptionClip?.text ?? "");
   }, [selectedCaptionClip?.id, selectedCaptionClip?.text]);
+  // A per-clip style draft belongs to whichever caption was selected when it
+  // started — switching to a different caption (or none) must drop it,
+  // otherwise the new selection would render with the previous one's
+  // in-progress edit.
+  useEffect(() => {
+    setPendingSelectedCaptionStyle(undefined);
+  }, [selectedCaptionClip?.id]);
+  useEffect(() => {
+    setPendingGlobalCaptionStyle(undefined);
+  }, [activeVideoId]);
 
   const zoom = timeline?.zoom ?? 1;
   const pixelsPerSecond = BASE_PIXELS_PER_SECOND * zoom;
@@ -390,6 +427,11 @@ export function TimelineView() {
   const stillsClips = [...(timeline?.clips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds);
   const captionClips = [...(timeline?.captionClips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds);
   const globalCaptionStyle = timeline?.captionStyle ?? {};
+  // Draft takes priority over the committed value while a style edit's
+  // backend commit is still debounced/in flight — see the comment on
+  // pendingGlobalCaptionStyle's declaration.
+  const effectiveGlobalCaptionStyle = pendingGlobalCaptionStyle !== undefined ? pendingGlobalCaptionStyle ?? {} : globalCaptionStyle;
+  const effectiveSelectedCaptionStyle = pendingSelectedCaptionStyle !== undefined ? pendingSelectedCaptionStyle : (selectedCaptionClip?.style ?? null);
   const playheadPx = secondsToPixels(previewTime, pixelsPerSecond);
   stillsClipsRef.current = stillsClips;
 
@@ -499,18 +541,20 @@ export function TimelineView() {
         if (outlineWidth > 0) {
           ctx.shadowColor = "transparent";
           ctx.lineWidth = outlineWidth;
-          ctx.strokeStyle = style.outlineColor;
+          ctx.strokeStyle = withAlpha(style.outlineColor, style.opacity);
           ctx.strokeText(word, x, y);
         }
         if (style.shadow.enabled) {
-          ctx.shadowColor = "rgba(0,0,0,0.7)";
-          ctx.shadowBlur = style.shadow.blur ?? 4;
-          ctx.shadowOffsetX = style.shadow.offsetX ?? 0;
-          ctx.shadowOffsetY = style.shadow.offsetY ?? 2;
+          const distance = style.shadow.distance ?? 2;
+          const angleRad = ((style.shadow.angle ?? 90) * Math.PI) / 180;
+          ctx.shadowColor = withAlpha(style.shadow.color ?? "#000000", style.shadow.opacity ?? 70);
+          ctx.shadowBlur = ((style.shadow.blur ?? 30) / 100) * MAX_SHADOW_BLUR_PX;
+          ctx.shadowOffsetX = distance * Math.cos(angleRad);
+          ctx.shadowOffsetY = distance * Math.sin(angleRad);
         } else {
           ctx.shadowColor = "transparent";
         }
-        ctx.fillStyle = isActive ? highlightColor : style.color;
+        ctx.fillStyle = isActive ? highlightColor : withAlpha(style.color, style.opacity);
         ctx.fillText(word, x, y);
         ctx.shadowColor = "transparent";
         const wordWithTrailingSpace = wordPos < lineWords.length - 1 ? `${word} ` : word;
@@ -621,7 +665,9 @@ export function TimelineView() {
     }
     const caption = captionClips.find((c) => time >= c.startSeconds && time < c.endSeconds);
     if (caption) {
-      const resolved = resolveCaptionStyle(globalCaptionStyle, caption.style);
+      const isEditingThisCaption = selectedCaptionClip?.id === caption.id && pendingSelectedCaptionStyle !== undefined;
+      const captionStyleOverride = isEditingThisCaption ? pendingSelectedCaptionStyle : caption.style;
+      const resolved = resolveCaptionStyle(effectiveGlobalCaptionStyle, captionStyleOverride);
       // Extend each word's effective window to the next word's start (or the
       // clip's end for the last one) so there's no highlight gap between
       // words — mirrors the export's per-word-window Dialogue lines exactly.
@@ -641,10 +687,17 @@ export function TimelineView() {
 
   useEffect(() => {
     drawFrameRef.current(previewTimeRef.current);
-  }, [stillsClips, captionClips, globalCaptionStyle, renderUrls, videoAssetUrls, canvasSize, subjectByRender]);
+  }, [stillsClips, captionClips, effectiveGlobalCaptionStyle, pendingSelectedCaptionStyle, selectedCaptionClip, renderUrls, videoAssetUrls, canvasSize, subjectByRender]);
 
   useEffect(() => {
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (globalStyleCommitRef.current) window.clearTimeout(globalStyleCommitRef.current);
+      if (selectedStyleCommitRef.current) window.clearTimeout(selectedStyleCommitRef.current);
+    };
   }, []);
 
   function stepFrame() {
@@ -1148,6 +1201,42 @@ export function TimelineView() {
     await refresh(projectsClient.setCaptionClipStyle(activeVideoId, selectedCaptionClip.id, next));
   }
 
+  // Every style-slider tick updates the pending draft synchronously (so the
+  // canvas preview reacts immediately), while the actual backend commit — a
+  // full timeline round-trip — is debounced so a fast drag doesn't fire one
+  // request per pixel.
+  function handleGlobalCaptionStyleChange(patch: Partial<CaptionStyle>) {
+    const next: CaptionStyle = { ...effectiveGlobalCaptionStyle, ...patch };
+    setPendingGlobalCaptionStyle(next);
+    if (globalStyleCommitRef.current) window.clearTimeout(globalStyleCommitRef.current);
+    globalStyleCommitRef.current = window.setTimeout(() => {
+      void updateGlobalCaptionStyle(next).finally(() => setPendingGlobalCaptionStyle(undefined));
+    }, 400);
+  }
+
+  function handleSelectedCaptionStyleChange(patch: Partial<CaptionStyle>) {
+    if (!selectedCaptionClip) return;
+    const base = pendingSelectedCaptionStyle !== undefined ? (pendingSelectedCaptionStyle ?? {}) : (selectedCaptionClip.style ?? {});
+    const next: CaptionStyle = { ...base, ...patch };
+    setPendingSelectedCaptionStyle(next);
+    if (selectedStyleCommitRef.current) window.clearTimeout(selectedStyleCommitRef.current);
+    selectedStyleCommitRef.current = window.setTimeout(() => {
+      void updateSelectedCaptionStyle(next).finally(() => setPendingSelectedCaptionStyle(undefined));
+    }, 400);
+  }
+
+  function resetSelectedCaptionStyle() {
+    if (selectedStyleCommitRef.current) window.clearTimeout(selectedStyleCommitRef.current);
+    setPendingSelectedCaptionStyle(null);
+    void updateSelectedCaptionStyle(null).finally(() => setPendingSelectedCaptionStyle(undefined));
+  }
+
+  function resetGlobalCaptionStyle() {
+    if (globalStyleCommitRef.current) window.clearTimeout(globalStyleCommitRef.current);
+    setPendingGlobalCaptionStyle(DEFAULT_CAPTION_STYLE);
+    void updateGlobalCaptionStyle(DEFAULT_CAPTION_STYLE).finally(() => setPendingGlobalCaptionStyle(undefined));
+  }
+
   async function generateAnimation() {
     if (!activeVideoId || !selectedClip || selectedClip.clipKind !== "still") return;
     try {
@@ -1516,11 +1605,11 @@ export function TimelineView() {
                     <div className="tl-inspector-group">
                       <div className="tl-inspector-label-row">
                         <span className="tl-inspector-label">Style override</span>
-                        {selectedCaptionClip.style && (
-                          <button className="tl-apply-all-btn" onClick={() => void updateSelectedCaptionStyle(null)}>Reset to default</button>
+                        {effectiveSelectedCaptionStyle && (
+                          <button className="tl-apply-all-btn" onClick={() => resetSelectedCaptionStyle()}>Reset to default</button>
                         )}
                       </div>
-                      {!selectedCaptionClip.style && <p className="tl-source-hint">Inheriting the global default — adjust anything below to customize just this caption.</p>}
+                      {!effectiveSelectedCaptionStyle && <p className="tl-source-hint">Inheriting the global default — adjust anything below to customize just this caption.</p>}
                       {!selectedCaptionClip.words?.length && (
                         <p className="tl-source-hint">
                           No original narration timing on this caption (it was hand-edited or added manually) — word
@@ -1528,8 +1617,8 @@ export function TimelineView() {
                         </p>
                       )}
                       <CaptionStyleEditor
-                        style={resolveCaptionStyle(globalCaptionStyle, selectedCaptionClip.style)}
-                        onChange={(patch) => void updateSelectedCaptionStyle({ ...(selectedCaptionClip.style ?? {}), ...patch })}
+                        style={resolveCaptionStyle(effectiveGlobalCaptionStyle, effectiveSelectedCaptionStyle)}
+                        onChange={(patch) => handleSelectedCaptionStyleChange(patch)}
                       />
                     </div>
                   </>
@@ -1556,11 +1645,14 @@ export function TimelineView() {
                       <p className="tl-source-hint">Select a caption on the lane below to edit, retime, split, merge, or style it individually.</p>
                     </div>
                     <div className="tl-inspector-group">
-                      <span className="tl-inspector-label">Global default style</span>
+                      <div className="tl-inspector-label-row">
+                        <span className="tl-inspector-label">Global default style</span>
+                        <button className="tl-apply-all-btn" onClick={() => resetGlobalCaptionStyle()}>Reset to default</button>
+                      </div>
                       <p className="tl-source-hint">Applies to every caption that hasn't been given its own style override.</p>
                       <CaptionStyleEditor
-                        style={resolveCaptionStyle(globalCaptionStyle, null)}
-                        onChange={(patch) => void updateGlobalCaptionStyle({ ...globalCaptionStyle, ...patch })}
+                        style={resolveCaptionStyle(effectiveGlobalCaptionStyle, null)}
+                        onChange={(patch) => handleGlobalCaptionStyleChange(patch)}
                       />
                     </div>
                   </>
@@ -1909,6 +2001,59 @@ export function TimelineView() {
   );
 }
 
+/** A range slider paired with a synced number input, so an exact value can
+ * be typed instead of only dragged. */
+function SliderField({
+  label, value, min, max, step = 1, suffix, onChange,
+}: {
+  label: string; value: number; min: number; max: number; step?: number; suffix?: string;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label className="tl-style-field">
+      <span>{label}</span>
+      <div className="tl-slider-row">
+        <input type="range" className="tl-slider" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+        <input
+          type="number"
+          className="tl-slider-number"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          onChange={(event) => {
+            const next = Number(event.target.value);
+            if (!Number.isNaN(next)) onChange(Math.min(max, Math.max(min, next)));
+          }}
+        />
+        {suffix && <span className="tl-slider-suffix">{suffix}</span>}
+      </div>
+    </label>
+  );
+}
+
+/** One collapsible section of the caption style editor. Only one section is
+ * open at a time (the parent tracks which), so the panel shows one focused
+ * group of controls instead of every control at once. `extra` renders an
+ * interactive control (an enable checkbox) inline in the header — its own
+ * clicks are stopped from also toggling the section open/closed. */
+function AccordionSection({
+  title, isOpen, onToggle, extra, children,
+}: {
+  title: string; isOpen: boolean; onToggle: () => void; extra?: ReactNode; children: ReactNode;
+}) {
+  return (
+    <div className={isOpen ? "tl-style-section open" : "tl-style-section"}>
+      <button type="button" className="tl-style-section-header" onClick={onToggle}>
+        <ChevronDown size={14} className="tl-style-section-chevron" />
+        <h4>{title}</h4>
+        {extra && <span onClick={(event) => event.stopPropagation()}>{extra}</span>}
+      </button>
+      {isOpen && <div className="tl-style-section-body">{children}</div>}
+    </div>
+  );
+}
+
 function CaptionStyleEditor({
   style,
   onChange,
@@ -1916,6 +2061,25 @@ function CaptionStyleEditor({
   style: Required<CaptionStyle>;
   onChange: (patch: Partial<CaptionStyle>) => void;
 }) {
+  const [openSection, setOpenSection] = useState("font");
+  function toggleSection(name: string) {
+    setOpenSection((current) => (current === name ? "" : name));
+  }
+
+  // A timeline saved before the shadow fields below existed has an
+  // old-shaped shadow object (just enabled/blur/offsetX/offsetY) — since
+  // resolveCaptionStyle's merge replaces the whole "shadow" key rather than
+  // filling in individual missing fields, default them here so the controls
+  // never bind to `undefined`. Every onChange below spreads from this fully-
+  // defaulted object, so touching any shadow control also backfills the rest.
+  const shadow = {
+    enabled: style.shadow.enabled ?? false,
+    color: style.shadow.color ?? "#000000",
+    opacity: style.shadow.opacity ?? 70,
+    blur: style.shadow.blur ?? 30,
+    distance: style.shadow.distance ?? 2,
+    angle: style.shadow.angle ?? 90,
+  };
   return (
     <div className="tl-caption-style-editor">
       <div className="tl-preset-grid two">
@@ -1923,54 +2087,59 @@ function CaptionStyleEditor({
           <button key={preset.label} className="tl-preset-btn" onClick={() => onChange(preset.style)}>{preset.label}</button>
         ))}
       </div>
-      <label className="tl-style-field">
-        <span>Font</span>
-        <select value={style.fontFamily} onChange={(event) => onChange({ fontFamily: event.target.value })}>
-          {CAPTION_FONT_OPTIONS.map((font) => <option key={font} value={font}>{font}</option>)}
-        </select>
-      </label>
-      <label className="tl-style-field">
-        <span>Size <b>{style.fontSizePx}px</b></span>
-        <input type="range" className="tl-slider" min={14} max={48} step={1} value={style.fontSizePx} onChange={(event) => onChange({ fontSizePx: Number(event.target.value) })} />
-      </label>
-      <label className="tl-style-field tl-style-checkbox">
-        <input type="checkbox" checked={style.bold} onChange={(event) => onChange({ bold: event.target.checked })} />
-        <span>Bold</span>
-      </label>
-      <label className="tl-style-field">
-        <span>Color</span>
-        <input type="color" value={style.color} onChange={(event) => onChange({ color: event.target.value })} />
-      </label>
-      <label className="tl-style-field">
-        <span>Outline color</span>
-        <input type="color" value={style.outlineColor} onChange={(event) => onChange({ outlineColor: event.target.value })} />
-      </label>
-      <label className="tl-style-field">
-        <span>Outline width <b>{style.outlineWidthPx}px</b></span>
-        <input type="range" className="tl-slider" min={0} max={6} step={1} value={style.outlineWidthPx} onChange={(event) => onChange({ outlineWidthPx: Number(event.target.value) })} />
-      </label>
-      <label className="tl-style-field tl-style-checkbox">
-        <input type="checkbox" checked={style.shadow.enabled} onChange={(event) => onChange({ shadow: { ...style.shadow, enabled: event.target.checked } })} />
-        <span>Shadow</span>
-      </label>
-      {style.shadow.enabled && (
-        <>
+      <AccordionSection title="Font" isOpen={openSection === "font"} onToggle={() => toggleSection("font")}>
+        <div className="tl-style-row">
           <label className="tl-style-field">
-            <span>Shadow blur <b>{style.shadow.blur}</b></span>
-            <input type="range" className="tl-slider" min={0} max={12} step={1} value={style.shadow.blur} onChange={(event) => onChange({ shadow: { ...style.shadow, blur: Number(event.target.value) } })} />
+            <span>Font</span>
+            <select value={style.fontFamily} onChange={(event) => onChange({ fontFamily: event.target.value })}>
+              {CAPTION_FONT_OPTIONS.map((font) => <option key={font} value={font}>{font}</option>)}
+            </select>
           </label>
-          <label className="tl-style-field">
-            <span>Shadow offset X <b>{style.shadow.offsetX}</b></span>
-            <input type="range" className="tl-slider" min={-8} max={8} step={1} value={style.shadow.offsetX} onChange={(event) => onChange({ shadow: { ...style.shadow, offsetX: Number(event.target.value) } })} />
+          <label className="tl-style-field tl-style-color">
+            <span>Color</span>
+            <input type="color" value={style.color} onChange={(event) => onChange({ color: event.target.value })} />
           </label>
-          <label className="tl-style-field">
-            <span>Shadow offset Y <b>{style.shadow.offsetY}</b></span>
-            <input type="range" className="tl-slider" min={-8} max={8} step={1} value={style.shadow.offsetY} onChange={(event) => onChange({ shadow: { ...style.shadow, offsetY: Number(event.target.value) } })} />
+        </div>
+        <div className="tl-style-row">
+          <SliderField label="Size" value={style.fontSizePx} min={14} max={48} suffix="px" onChange={(value) => onChange({ fontSizePx: value })} />
+          <label className="tl-style-field tl-style-checkbox tl-style-bold">
+            <input type="checkbox" checked={style.bold} onChange={(event) => onChange({ bold: event.target.checked })} />
+            <span>Bold</span>
           </label>
-        </>
-      )}
-      <div className="tl-style-field">
-        <span>Position</span>
+        </div>
+      </AccordionSection>
+      <AccordionSection title="Blend" isOpen={openSection === "blend"} onToggle={() => toggleSection("blend")}>
+        <SliderField label="Opacity" value={style.opacity} min={0} max={100} suffix="%" onChange={(value) => onChange({ opacity: value })} />
+      </AccordionSection>
+      <AccordionSection title="Stroke" isOpen={openSection === "stroke"} onToggle={() => toggleSection("stroke")}>
+        <div className="tl-style-row">
+          <label className="tl-style-field tl-style-color">
+            <span>Color</span>
+            <input type="color" value={style.outlineColor} onChange={(event) => onChange({ outlineColor: event.target.value })} />
+          </label>
+          <SliderField label="Thickness" value={style.outlineWidthPx} min={0} max={6} onChange={(value) => onChange({ outlineWidthPx: value })} />
+        </div>
+      </AccordionSection>
+      <AccordionSection
+        title="Shadow"
+        isOpen={openSection === "shadow"}
+        onToggle={() => toggleSection("shadow")}
+        extra={<input type="checkbox" checked={shadow.enabled} onChange={(event) => onChange({ shadow: { ...shadow, enabled: event.target.checked } })} />}
+      >
+        <div className="tl-style-row">
+          <label className="tl-style-field tl-style-color">
+            <span>Color</span>
+            <input type="color" value={shadow.color} onChange={(event) => onChange({ shadow: { ...shadow, color: event.target.value } })} />
+          </label>
+          <SliderField label="Opacity" value={shadow.opacity} min={0} max={100} suffix="%" onChange={(value) => onChange({ shadow: { ...shadow, opacity: value } })} />
+        </div>
+        <div className="tl-style-row">
+          <SliderField label="Bluriness" value={shadow.blur} min={0} max={100} suffix="%" onChange={(value) => onChange({ shadow: { ...shadow, blur: value } })} />
+          <SliderField label="Distance" value={shadow.distance} min={0} max={20} onChange={(value) => onChange({ shadow: { ...shadow, distance: value } })} />
+        </div>
+        <SliderField label="Angle" value={shadow.angle} min={0} max={360} suffix="°" onChange={(value) => onChange({ shadow: { ...shadow, angle: value } })} />
+      </AccordionSection>
+      <AccordionSection title="Position" isOpen={openSection === "position"} onToggle={() => toggleSection("position")}>
         <div className="tl-preset-grid three">
           {(["top", "middle", "bottom"] as const).map((position) => (
             <button
@@ -1982,25 +2151,34 @@ function CaptionStyleEditor({
             </button>
           ))}
         </div>
-      </div>
-      <label className="tl-style-field tl-style-checkbox">
-        <input
-          type="checkbox"
-          checked={style.wordHighlight.enabled}
-          onChange={(event) => onChange({ wordHighlight: { ...style.wordHighlight, enabled: event.target.checked } })}
-        />
-        <span>Highlight the word being spoken</span>
-      </label>
-      {style.wordHighlight.enabled && (
-        <label className="tl-style-field">
-          <span>Highlight color</span>
+      </AccordionSection>
+      <AccordionSection
+        title="Word highlight"
+        isOpen={openSection === "highlight"}
+        onToggle={() => toggleSection("highlight")}
+        extra={
+          <input
+            type="checkbox"
+            checked={style.wordHighlight.enabled}
+            onChange={(event) => onChange({ wordHighlight: { ...style.wordHighlight, enabled: event.target.checked } })}
+          />
+        }
+      >
+        <label className="tl-style-field tl-style-color">
+          <span>Color</span>
           <input
             type="color"
             value={style.wordHighlight.color}
             onChange={(event) => onChange({ wordHighlight: { ...style.wordHighlight, color: event.target.value } })}
           />
         </label>
-      )}
+      </AccordionSection>
+      {/* Guarantees real trailing space below the last control when scrolled
+          all the way down — the scroll container's own bottom padding isn't
+          reliably respected once its content overflows its declared height,
+          which otherwise left the last color swatch flush against the
+          panel's edge. */}
+      <div className="tl-style-bottom-spacer" />
     </div>
   );
 }

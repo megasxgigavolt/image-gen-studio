@@ -53,7 +53,6 @@ import {
   type ImageWorkspaceRecord,
   type ImageJobRecord,
   type ImageRenderRecord,
-  type PromptVersionRecord,
 } from "./infrastructure/projects-client";
 import { TimelineView } from "./TimelineView";
 
@@ -1273,12 +1272,6 @@ function ImagesView() {
     }
   }
 
-  function selectVersion(version: PromptVersionRecord) {
-    setSystemPrompt(version.systemPrompt);
-    setUserPrompt(version.userPrompt);
-    setImageSettings(parseImageSettings(version.settingsJson));
-  }
-
   function selectGroup(groupId: string) {
     setError(null);
     setSelectedGroupId(groupId);
@@ -1576,8 +1569,8 @@ function ImagesView() {
 
   const previewLabel = selectedGroup?.group.label ?? "Still preview";
   const stillCount = workspace?.groups.length ?? 0;
-  const promptVersions = selectedGroup?.promptVersions ?? [];
   const imageRenders = selectedGroup?.imageRenders ?? [];
+  const selectedRender = imageRenders.find((render) => render.id === selectedRenderId);
 
   useEffect(() => {
     const ids = [selectedRenderId].filter(Boolean) as string[];
@@ -1641,12 +1634,17 @@ function ImagesView() {
     if (canvas) canvas.dataset.painted = "false";
   }
 
-  async function restorePromptsAndMarkFinal(render: ImageRenderRecord) {
-    const version = promptVersions.find((item) => item.id === render.promptVersionId);
-    if (version) selectVersion(version);
+  async function toggleFinalRender(render: ImageRenderRecord) {
+    if (!activeVideoId) return;
     try {
-      await projectsClient.setFinalRender(render.id, true);
-      await refreshWorkspace();
+      await projectsClient.setFinalRender(render.id, !render.isFinal);
+      // Reload the workspace data directly instead of via refreshWorkspace(),
+      // which jumps the selection to the group's newest version — here the
+      // user is looking at (and just toggled) a specific version and should
+      // stay on it, not get bounced to a different one.
+      const loaded = await projectsClient.getImageWorkspace(activeVideoId);
+      setCached(activeVideoId, loaded);
+      setWorkspace(loaded);
     } catch (caught) { setError(String(caught)); }
   }
 
@@ -1816,7 +1814,11 @@ function ImagesView() {
                 <div className="image-actions">
                   <button className="image-action-btn" title="Inspect" onClick={() => { setZoom(1); setZoomOpen(true); }}><Maximize2 size={16} /><span>Inspect</span></button>
                   <button className="image-action-btn" title="Download this image" onClick={() => { if (selectedRenderId) void downloadStill(selectedRenderId); }}><Download size={16} /><span>Download</span></button>
-                  <button className="image-action-btn" title="Restore this version's prompts for editing and mark it as the final still" onClick={() => { const render = imageRenders.find((item) => item.id === selectedRenderId); if (render) void restorePromptsAndMarkFinal(render); }}><Undo2 size={16} /><span>Restore prompt</span></button>
+                  <button
+                    className={`image-action-btn${selectedRender?.isFinal ? " active" : ""}`}
+                    title={selectedRender?.isFinal ? "This is the final still for this group — click to unmark." : "Mark this version as the final still for this group."}
+                    onClick={() => { if (selectedRender) void toggleFinalRender(selectedRender); }}
+                  ><Check size={16} /><span>{selectedRender?.isFinal ? "Unmark final" : "Mark final"}</span></button>
                 </div>
               </figure>
             ) : <div className={`image-frame empty-frame ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}`}><div className="image-empty"><Image size={34} /><strong>No image generated yet</strong><span>{imageSettings.aspectRatio === "9:16" ? "YouTube Short · 9:16" : "YouTube Video · 16:9"}</span></div></div>}

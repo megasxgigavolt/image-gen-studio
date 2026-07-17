@@ -253,3 +253,12 @@
 - Added drag-to-move and drag-to-resize for stills and captions on the Timeline, and a draggable narration start-offset for re-syncing narration audio.
 - Added a "Reset timeline to default" action that discards all customization and rebuilds the timeline fresh from the visual plan and captions.
 - Replaced the sidebar's "Preferences · soon" placeholder with the actual app version number.
+# 2.4.0
+
+- Rebuilt caption styling around Font, Blend, Stroke, and Shadow — shadow now has independent color, opacity, bluriness, distance, and angle instead of a fixed diagonal offset, and defaults to the Rubik font.
+- Bundled the Rubik font (self-hosted in the app, plus a TTF passed to ffmpeg's ass filter) so it actually renders instead of silently falling back to Arial.
+- Fixed exported captions rendering far smaller than the preview showed — the export was passing the raw font-size setting directly as an absolute subtitle unit regardless of the video's real resolution; font size, stroke thickness, and shadow distance/blur now scale to the export's actual height the same way the preview already did.
+- Caption style edits (sliders, color pickers) now update the preview instantly while you drag, with the actual save debounced — previously every tick sent a full save, so fast changes could lag or even revert to an earlier value.
+- Redesigned the caption style panel as a collapsible accordion (one section open at a time) instead of a single long scrolling list, and added a "Reset to default" action for the global caption style.
+- Fixed a mark-final toggle bug where marking an older still version final would jump the preview to a different version instead of staying put.
+- Fixed the last control in the caption style panel sitting flush against the panel's edge when scrolled to the bottom.

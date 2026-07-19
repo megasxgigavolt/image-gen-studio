@@ -21,9 +21,10 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
-  Maximize2,
   ZoomIn,
   ZoomOut,
+  MoreHorizontal,
+  ImageOff,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -150,7 +151,7 @@ function TitleBar() {
   const win = getCurrentWindow();
   return (
     <div className="titlebar">
-      <span className="titlebar-title" data-tauri-drag-region>Auto Gen Studio</span>
+      <span className="titlebar-title" data-tauri-drag-region />
       <div className="titlebar-controls">
         <button className="titlebar-btn minimize" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.minimize()} aria-label="Minimize"><Minus size={13} strokeWidth={2} /></button>
         <button className="titlebar-btn maximize" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.toggleMaximize()} aria-label="Maximize"><Square size={11} strokeWidth={1.8} /></button>
@@ -162,15 +163,14 @@ function TitleBar() {
 
 function Sidebar() {
   const { stage, setStage, activeVideoId, lastProductionStage, clearActiveProject } = useAppStore();
-  const [confirmHome, setConfirmHome] = useState(false);
   const [appVersion, setAppVersion] = useState("");
+  const [confirmHome, setConfirmHome] = useState(false);
 
   useEffect(() => {
     void projectsClient.getApplicationVersion().then(setAppVersion);
   }, []);
 
-  function handleHomeClick() {
-    if (stage === "home") return;
+  function handleBrandClick() {
     if (activeVideoId) {
       setConfirmHome(true);
     } else {
@@ -180,11 +180,7 @@ function Sidebar() {
 
   return (
     <aside className="sidebar">
-      <button
-        className={stage === "home" ? "brand active" : "brand"}
-        onClick={handleHomeClick}
-        aria-current={stage === "home" ? "page" : undefined}
-      >
+      <button className="brand" onClick={handleBrandClick}>
         <span className="brand-mark"><span /></span>
         <span>Auto Gen <strong>Studio</strong></span>
       </button>
@@ -211,8 +207,8 @@ function Sidebar() {
       </nav>
       <button className="nav-item settings" disabled title="Coming soon">
         <Settings size={18} /><span>Preferences</span>
-        {appVersion && <span className="app-version">v{appVersion}</span>}
       </button>
+      {appVersion && <small className="app-version-line">v{appVersion}</small>}
       {confirmHome && createPortal(
         <ConfirmDialog
           title="Leave this project?"
@@ -232,12 +228,7 @@ function Sidebar() {
 }
 
 function Header() {
-  const {
-    theme,
-    toggleTheme,
-    activeChannelName,
-    activeVideoTitle,
-  } = useAppStore();
+  const { stage, theme, toggleTheme, activeVideoTitle } = useAppStore();
 
   function handleToggleTheme() {
     toggleTheme();
@@ -248,8 +239,13 @@ function Header() {
   return (
     <header className="topbar">
       <div>
-        <span>{activeChannelName ?? "Auto Gen Studio"}</span>
-        {activeVideoTitle && <><b>/</b><strong>{activeVideoTitle}</strong></>}
+        {stage === "home" && (
+          <button className="brand active" aria-current="page">
+            <span className="brand-mark"><span /></span>
+            <span>Auto Gen <strong>Studio</strong></span>
+          </button>
+        )}
+        {activeVideoTitle && <strong>{activeVideoTitle}</strong>}
       </div>
       <div className="top-actions">
         <span className="saved">Saved locally</span>
@@ -261,10 +257,72 @@ function Header() {
   );
 }
 
+function RowMenu({ anchorRect, onRename, onDelete, onClose }: {
+  anchorRect: DOMRect;
+  onRename: () => void;
+  onDelete: () => void;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    function handlePointerDown(event: PointerEvent) {
+      if (ref.current && !ref.current.contains(event.target as Node)) onClose();
+    }
+    function handleKey(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKey);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKey);
+    };
+  }, [onClose]);
+  return createPortal(
+    <div
+      className="row-menu"
+      ref={ref}
+      role="menu"
+      style={{ position: "fixed", top: anchorRect.bottom + 4, left: anchorRect.right, transform: "translateX(-100%)" }}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <button role="menuitem" onClick={() => { onRename(); onClose(); }}>Rename</button>
+      <button role="menuitem" className="danger-action" onClick={() => { onDelete(); onClose(); }}>Delete</button>
+    </div>,
+    document.body,
+  );
+}
+
+function stageLabel(stage: AppStage): string {
+  if (stage === "timeline") return "Editor";
+  if (stage === "visual-plan") return "Plan";
+  if (stage === "images") return "Visuals";
+  if (stage === "inputs") return "Inputs";
+  return stage;
+}
+
+const PIPELINE_STAGES: { stage: AppStage; label: string }[] = [
+  { stage: "inputs", label: "Inputs" },
+  { stage: "visual-plan", label: "Plan" },
+  { stage: "images", label: "Visuals" },
+  { stage: "timeline", label: "Editor" },
+];
+
+function StageProgress({ stage }: { stage: AppStage }) {
+  const current = PIPELINE_STAGES.findIndex((entry) => entry.stage === stage);
+  return (
+    <div className="stage-bar">
+      {PIPELINE_STAGES.map((entry, index) => (
+        <i key={entry.stage} className={index < current ? "done" : index === current ? "active" : undefined} />
+      ))}
+    </div>
+  );
+}
+
 let hasShownResumeBannerThisSession = false;
 
 function HomeView() {
-  const { setStage, setActiveProject, activeChannelId, addToast } = useAppStore();
+  const { setStage, setActiveProject, activeChannelId } = useAppStore();
   const [showResumeBanner] = useState(() => {
     const isFirstVisit = !hasShownResumeBannerThisSession;
     hasShownResumeBannerThisSession = true;
@@ -274,17 +332,22 @@ function HomeView() {
   const [videos, setVideos] = useState<VideoRecord[]>([]);
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(activeChannelId);
   const [resume, setResume] = useState<ResumeRecord | null>(null);
-  const [dialog, setDialog] = useState<"channel" | "video" | "trash" | null>(null);
-  const [trashedChannels, setTrashedChannels] = useState<ChannelRecord[]>([]);
-  const [trashedVideos, setTrashedVideos] = useState<VideoRecord[]>([]);
+  const [dialog, setDialog] = useState<"channel" | "video" | null>(null);
   const [name, setName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [renamingChannelId, setRenamingChannelId] = useState<string | null>(null);
   const [renamingVideoId, setRenamingVideoId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
-  const [videoProgress, setVideoProgress] = useState<Record<string, import("./infrastructure/projects-client").VideoProgressRecord>>({});
   const [videoPreviewUrls, setVideoPreviewUrls] = useState<Record<string, string>>({});
+  const [channelMenu, setChannelMenu] = useState<{ id: string; rect: DOMRect } | null>(null);
+  const [videoMenu, setVideoMenu] = useState<{ id: string; rect: DOMRect } | null>(null);
+  const [appVersion, setAppVersion] = useState("");
+  const clickTimers = useRef<Record<string, number>>({});
+
+  useEffect(() => {
+    void projectsClient.getApplicationVersion().then(setAppVersion);
+  }, []);
 
   const loadWorkspace = useCallback(async () => {
     setLoading(true);
@@ -318,18 +381,29 @@ function HomeView() {
     void Promise.all(videos.map(async (video) => {
       try {
         const progress = await projectsClient.getVideoProgress(video.id);
-        if (cancelled) return;
-        setVideoProgress((current) => ({ ...current, [video.id]: progress }));
-        if (progress.previewRenderId) {
-          const url = await resolveRenderUrl(progress.previewRenderId);
-          if (!cancelled) setVideoPreviewUrls((current) => ({ ...current, [video.id]: url }));
-        }
+        if (cancelled || !progress.previewRenderId) return;
+        const url = await resolveRenderUrl(progress.previewRenderId);
+        if (!cancelled) setVideoPreviewUrls((current) => ({ ...current, [video.id]: url }));
       } catch {
         // A video without a visual plan yet has no progress to show.
       }
     }));
     return () => { cancelled = true; };
   }, [videos]);
+
+  const handleSingleOrDoubleClick = useCallback((id: string, onSingle: () => void, onDouble: () => void) => {
+    const pending = clickTimers.current[id];
+    if (pending) {
+      window.clearTimeout(pending);
+      delete clickTimers.current[id];
+      onDouble();
+    } else {
+      clickTimers.current[id] = window.setTimeout(() => {
+        delete clickTimers.current[id];
+        onSingle();
+      }, 250);
+    }
+  }, []);
 
   async function selectChannel(channelId: string) {
     setSelectedChannelId(channelId);
@@ -395,38 +469,6 @@ function HomeView() {
     await loadWorkspace();
   }
 
-  async function openTrash() {
-    const channelTrash = await projectsClient.listChannels(true);
-    const videoTrash = (
-      await Promise.all([...channels, ...channelTrash].map((channel) => projectsClient.listVideos(channel.id, true)))
-    ).flat();
-    setTrashedChannels(channelTrash);
-    setTrashedVideos(videoTrash);
-    setDialog("trash");
-  }
-
-  async function restoreChannel(channelId: string) {
-    await projectsClient.restoreChannel(channelId);
-    setTrashedChannels((items) => items.filter((item) => item.id !== channelId));
-    await loadWorkspace();
-  }
-
-  async function restoreVideo(videoId: string) {
-    await projectsClient.restoreVideo(videoId);
-    setTrashedVideos((items) => items.filter((item) => item.id !== videoId));
-    await loadWorkspace();
-  }
-
-  async function importBundle() {
-    try {
-      const imported = await projectsClient.importProjectBundle();
-      if (imported) {
-        setSelectedChannelId(imported.channelId);
-        await loadWorkspace();
-      }
-    } catch (caught) { setError(String(caught)); }
-  }
-
   async function startRenameChannel(channel: ChannelRecord) {
     setRenamingChannelId(channel.id);
     setRenameValue(channel.name);
@@ -457,130 +499,124 @@ function HomeView() {
     } catch (caught) { setError(String(caught)); }
   }
 
-  async function permanentlyDeleteChannel(channelId: string) {
-    try {
-      await projectsClient.permanentlyDeleteChannel(channelId);
-      setTrashedChannels((items) => items.filter((item) => item.id !== channelId));
-      addToast("Channel permanently deleted.", "success");
-    } catch (caught) { setError(String(caught)); }
-  }
-
-  async function permanentlyDeleteVideo(videoId: string) {
-    try {
-      await projectsClient.permanentlyDeleteVideo(videoId);
-      setTrashedVideos((items) => items.filter((item) => item.id !== videoId));
-      addToast("Video permanently deleted.", "success");
-    } catch (caught) { setError(String(caught)); }
-  }
-
   const resumeVideoRecord = videos.find((video) => video.id === resume?.videoId);
+  const selectedChannel = channels.find((channel) => channel.id === selectedChannelId);
   return (
-    <section className="view">
-      <div className="page-heading">
-        <div><p className="eyebrow">Workspace</p><h1>{getGreeting()}</h1><p>Continue a video or begin a new production.</p></div>
-        <button className="primary" disabled={!selectedChannelId} onClick={() => setDialog("video")}><Plus size={17} />New video</button>
-      </div>
-      {resume && showResumeBanner && (
-        <button className="resume-band" onClick={() => void resumeVideo()}>
-          <div><span>CONTINUE WHERE YOU LEFT OFF</span><h2>{resumeVideoRecord?.title ?? "Resume last video"}</h2><p>{resume.stage === "timeline" ? "editor" : resume.stage.replace("-", " ")} · Saved locally</p></div>
-          <strong>→</strong>
-        </button>
-      )}
-      <div className="section-heading"><h2>Channels</h2><div><button onClick={() => void importBundle()}><Upload size={14} /> Import project</button><button onClick={() => void openTrash()}><Trash2 size={14} /> Trash</button><button onClick={() => setDialog("channel")}>+ Add channel</button></div></div>
-      {error && <div className="inline-error">{error}</div>}
-      {loading && <div className="empty-state">Loading local workspace…</div>}
-      {!loading && channels.length === 0 && (
-        <div className="empty-state"><FolderOpen size={28} /><h2>Create your first channel</h2><p>Videos and assets will be stored locally in its project folder.</p><button className="primary" onClick={() => setDialog("channel")}><Plus size={16} />Add channel</button></div>
-      )}
-      {!loading && channels.length > 0 && (
-      <div className="home-grid">
-        <div className="channel-list">
-          {channels.map((channel) => (
-            <div className={selectedChannelId === channel.id ? "channel active" : "channel"} key={channel.id}>
-              {renamingChannelId === channel.id ? (
-                <div style={{ padding: "10px", display: "flex", gap: "6px", alignItems: "center", flex: 1 }}>
-                  <input
-                    autoFocus
-                    className="rename-input"
-                    value={renameValue}
-                    maxLength={80}
-                    onChange={(e) => setRenameValue(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") void commitRenameChannel(channel.id); if (e.key === "Escape") setRenamingChannelId(null); }}
-                    onBlur={() => void commitRenameChannel(channel.id)}
-                  />
-                </div>
-              ) : (
-                <button onClick={() => void selectChannel(channel.id)}>
-                  <span>{channel.name.split(/\s+/).slice(0, 2).map((word) => ([...word][0] ?? "")).join("").toUpperCase()}</span>
-                  <div><strong>{channel.name}</strong><small>{channel.videoCount} videos</small></div>
-                </button>
-              )}
-              <div style={{ display: "flex" }}>
-                <button className="row-action" aria-label={`Rename ${channel.name}`} title="Rename" onClick={() => void startRenameChannel(channel)}><Check size={13} /></button>
-                <button className="row-action" aria-label={`Move ${channel.name} to trash`} onClick={() => void deleteChannel(channel.id)}><Trash2 size={14} /></button>
-              </div>
-            </div>
-          ))}
-        </div>
-        <div className="video-grid">
-          {videos.map((video, index) => (
-            <article className="video-card" key={video.id}>
-              {renamingVideoId === video.id ? (
-                <div style={{ padding: "14px", display: "flex", gap: "6px", alignItems: "center" }}>
-                  <input
-                    autoFocus
-                    className="rename-input"
-                    value={renameValue}
-                    maxLength={80}
-                    onChange={(e) => setRenameValue(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === "Enter") void commitRenameVideo(video.id); if (e.key === "Escape") setRenamingVideoId(null); }}
-                    onBlur={() => void commitRenameVideo(video.id)}
-                    style={{ flex: 1 }}
-                  />
-                </div>
-              ) : (() => {
-                const progress = videoProgress[video.id];
-                const percent = progress && progress.totalStills > 0
-                  ? Math.round((progress.generatedStills / progress.totalStills) * 100)
-                  : 0;
-                const previewUrl = videoPreviewUrls[video.id];
-                return (
-                  <button className="video-open" onClick={() => void openVideo(video)}>
-                    <div className={previewUrl ? "video-art has-preview" : `video-art art-${(index % 3) + 1}`}>
-                      {previewUrl && <img src={previewUrl} alt="" />}
-                      <span>{percent}%</span>
-                    </div>
-                    <div><small>{video.stage === "timeline" ? "EDITOR" : video.stage.replace("-", " ").toUpperCase()}</small><h3>{video.title}</h3><p>Saved locally · {new Date(video.updatedAt).toLocaleDateString()}</p><i style={{ width: `${percent}%` }} /></div>
-                  </button>
-                );
-              })()}
-              <button className="card-rename" aria-label={`Rename ${video.title}`} title="Rename" onClick={() => void startRenameVideo(video)}><Check size={13} /></button>
-              <button className="card-trash" aria-label={`Move ${video.title} to trash`} onClick={() => void deleteVideo(video.id)}><Trash2 size={15} /></button>
-            </article>
-          ))}
-          {videos.length === 0 && <div className="empty-state compact"><h2>No videos yet</h2><button className="primary" onClick={() => setDialog("video")}><Plus size={16} />Create video</button></div>}
-        </div>
-      </div>
-      )}
-      {dialog === "trash" && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => setDialog(null)}>
-          <section className="modal trash-modal" onMouseDown={(event) => event.stopPropagation()}>
-            <p className="eyebrow">Recoverable items</p><h2>Trash</h2>
-            {trashedChannels.length === 0 && trashedVideos.length === 0 && <p>Trash is empty.</p>}
-            {[...trashedChannels.map((channel) => ({ id: channel.id, label: channel.name, kind: "Channel" as const })),
-              ...trashedVideos.map((video) => ({ id: video.id, label: video.title, kind: "Video" as const }))].map((item) => (
-                <div className="trash-row" key={`${item.kind}-${item.id}`}>
-                  <div><strong>{item.label}</strong><small>{item.kind}</small></div>
-                  <div style={{ display: "flex", gap: "8px" }}>
-                    <button className="secondary" onClick={() => void (item.kind === "Channel" ? restoreChannel(item.id) : restoreVideo(item.id))}><Undo2 size={14} />Restore</button>
-                    <button className="secondary danger-action" title="Permanently delete — cannot be undone" onClick={() => void (item.kind === "Channel" ? permanentlyDeleteChannel(item.id) : permanentlyDeleteVideo(item.id))}><Trash2 size={14} />Delete forever</button>
+    <div className="view launcher">
+      <aside className="launcher-panel">
+        <h1>{getGreeting()}</h1>
+        <p>Select a project or start something new.</p>
+        {error && <div className="inline-error">{error}</div>}
+        {loading && <div className="empty-state compact">Loading local workspace…</div>}
+        {!loading && channels.length === 0 && (
+          <div className="empty-state compact"><FolderOpen size={26} /><h2>Create your first channel</h2><p>Videos and assets will be stored locally in its project folder.</p></div>
+        )}
+        {!loading && (
+          <div className="section-heading"><h2>Channels</h2><div><button onClick={() => setDialog("channel")}><Plus size={14} /> Add channel</button></div></div>
+        )}
+        {!loading && (
+          <div className="channel-list">
+            {channels.map((channel) => (
+              <div className={selectedChannelId === channel.id ? "channel active" : "channel"} key={channel.id}>
+                {renamingChannelId === channel.id ? (
+                  <div style={{ padding: "10px", display: "flex", gap: "6px", alignItems: "center", flex: 1 }}>
+                    <input
+                      autoFocus
+                      className="rename-input"
+                      value={renameValue}
+                      maxLength={80}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") void commitRenameChannel(channel.id); if (e.key === "Escape") setRenamingChannelId(null); }}
+                      onBlur={() => void commitRenameChannel(channel.id)}
+                    />
                   </div>
-                </div>
-              ))}
-            <div className="footer-actions"><button className="secondary" onClick={() => setDialog(null)}>Close</button></div>
-          </section>
-        </div>
-      )}
+                ) : (
+                  <button onClick={() => handleSingleOrDoubleClick(channel.id, () => void selectChannel(channel.id), () => void startRenameChannel(channel))}>
+                    <span>{channel.name.split(/\s+/).slice(0, 2).map((word) => ([...word][0] ?? "")).join("").toUpperCase()}</span>
+                    <div><strong>{channel.name}</strong><small>{channel.videoCount === 1 ? "1 video" : `${channel.videoCount} videos`}</small></div>
+                  </button>
+                )}
+                <button
+                  className={channelMenu?.id === channel.id ? "row-menu-trigger menu-open" : "row-menu-trigger"}
+                  aria-label={`Options for ${channel.name}`}
+                  onClick={(e) => setChannelMenu({ id: channel.id, rect: e.currentTarget.getBoundingClientRect() })}
+                ><MoreHorizontal size={16} /></button>
+                {channelMenu?.id === channel.id && (
+                  <RowMenu
+                    anchorRect={channelMenu.rect}
+                    onRename={() => void startRenameChannel(channel)}
+                    onDelete={() => void deleteChannel(channel.id)}
+                    onClose={() => setChannelMenu(null)}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        <button className="nav-item settings" disabled title="Coming soon">
+          <Settings size={18} /><span>Preferences</span>
+        </button>
+        {appVersion && <small className="app-version-line">v{appVersion}</small>}
+      </aside>
+      <section className="launcher-videos">
+        {resume && showResumeBanner && resume.channelId === selectedChannelId && (
+          <button className="resume-band" onClick={() => void resumeVideo()}>
+            <div><span>Continue</span><h2>{resumeVideoRecord?.title ?? "Resume last video"}</h2><p>{selectedChannel?.name} · {stageLabel(resume.stage)}</p></div>
+            <strong>→</strong>
+          </button>
+        )}
+        <div className="section-heading"><h2>Videos</h2><div><button disabled={!selectedChannelId} onClick={() => setDialog("video")}><Plus size={14} /> New video</button></div></div>
+        {!loading && channels.length > 0 && (
+          <div className="video-grid">
+            {videos.map((video) => (
+              <article className="video-card" key={video.id}>
+                {renamingVideoId === video.id ? (
+                  <div style={{ padding: "14px", display: "flex", gap: "6px", alignItems: "center" }}>
+                    <input
+                      autoFocus
+                      className="rename-input"
+                      value={renameValue}
+                      maxLength={80}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter") void commitRenameVideo(video.id); if (e.key === "Escape") setRenamingVideoId(null); }}
+                      onBlur={() => void commitRenameVideo(video.id)}
+                      style={{ flex: 1 }}
+                    />
+                  </div>
+                ) : (() => {
+                  const previewUrl = videoPreviewUrls[video.id];
+                  return (
+                    <button className="video-open" onClick={() => handleSingleOrDoubleClick(video.id, () => void openVideo(video), () => void startRenameVideo(video))}>
+                      <div className={previewUrl ? "video-art has-preview" : "video-art video-art-empty"}>
+                        {previewUrl ? <img src={previewUrl} alt="" /> : <ImageOff size={26} />}
+                        {previewUrl && <span className="pill-badge">{stageLabel(video.stage)}</span>}
+                      </div>
+                      <div><h3>{video.title}</h3><p>{new Date(video.updatedAt).toLocaleDateString()}</p><StageProgress stage={video.stage} /></div>
+                    </button>
+                  );
+                })()}
+                <button
+                  className={videoMenu?.id === video.id ? "row-menu-trigger card-menu-trigger menu-open" : "row-menu-trigger card-menu-trigger"}
+                  aria-label={`Options for ${video.title}`}
+                  onClick={(e) => setVideoMenu({ id: video.id, rect: e.currentTarget.getBoundingClientRect() })}
+                ><MoreHorizontal size={16} /></button>
+                {videoMenu?.id === video.id && (
+                  <RowMenu
+                    anchorRect={videoMenu.rect}
+                    onRename={() => void startRenameVideo(video)}
+                    onDelete={() => void deleteVideo(video.id)}
+                    onClose={() => setVideoMenu(null)}
+                  />
+                )}
+              </article>
+            ))}
+            <button className="video-card ghost" onClick={() => setDialog("video")}><Plus size={20} /><span>New video</span></button>
+          </div>
+        )}
+        {!loading && channels.length === 0 && (
+          <div className="empty-state"><FolderOpen size={28} /><h2>Create your first channel</h2><p>Add a channel on the left to start browsing videos.</p></div>
+        )}
+      </section>
       {(dialog === "channel" || dialog === "video") && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => { setDialog(null); setName(""); }}>
           <form className="modal" onSubmit={(event) => void submitCreate(event)} onMouseDown={(event) => event.stopPropagation()}>
@@ -592,7 +628,7 @@ function HomeView() {
           </form>
         </div>
       )}
-    </section>
+    </div>
   );
 }
 
@@ -755,8 +791,7 @@ function InputsView() {
       <input ref={scriptFileRef} className="visually-hidden" type="file" accept=".txt,text/plain" onChange={(event) => void importBrowserScript(event)} />
       <input ref={audioFileRef} className="visually-hidden" type="file" accept=".wav,.mp3,.m4a,.aac,.flac,audio/*" onChange={(event) => void importBrowserAudio(event)} />
       {generating && <GenerationProgress progress={generationProgress} />}
-      <div className="workflow-tabs" role="tablist"><button role="tab" aria-selected={true} className="active">1 · Source & pacing</button><button role="tab" aria-selected={false} disabled={!hasPlan} onClick={() => setStage("visual-plan")}>2 · Visual plan</button></div>
-      <div className="page-heading"><div><p className="eyebrow">Stage 1 of 2</p><h1>Source material</h1><p>Add narration and references that will guide the visual plan.</p></div><span className="save-state">{status}</span></div>
+      <div className="page-heading"><div><h1>Source material</h1><p>Add narration and references that will guide the visual plan.</p></div><span className="save-state">{status}</span></div>
       {!activeVideoId && <div className="inline-error">Open or create a video before adding source material.</div>}
       {error && <div className="inline-error">{error}</div>}
       <div className="inputs-grid">
@@ -821,10 +856,9 @@ function VisualPlanView() {
 
   return (
     <section className="view">
-      <div className="workflow-tabs" role="tablist"><button role="tab" aria-selected={false} onClick={() => setStage("inputs")}>1 · Source & pacing</button><button role="tab" aria-selected={true} className="active">2 · Visual plan</button></div>
       <div className="page-heading">
-        <div><p className="eyebrow">Stage 2 of 2</p><h1>Visual plan</h1><p>Drag a sentence into an adjacent still to regroup it. Chronological order remains enforced.</p></div>
-        <div className="heading-actions"><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
+        <div><h1>Visual plan</h1><p>Drag a sentence into an adjacent still to regroup it. Chronological order remains enforced.</p></div>
+        <div className="heading-actions"><button className="secondary" onClick={() => setStage("inputs")}>← Back</button><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
       </div>
       {error && <div className="inline-error">{error}</div>}
       {!plan && !error && <div className="empty-state">Loading visual plan…</div>}
@@ -1421,13 +1455,6 @@ function ImagesView() {
     return () => { void unlisten.then((fn) => fn()); };
   }, []);
 
-  useEffect(() => {
-    const unlisten = listen<{ done: number; total: number }>("creative_apply_progress", (event) => {
-      setApplyInstrProgress({ done: event.payload.done, total: event.payload.total });
-    });
-    return () => { void unlisten.then((fn) => fn()); };
-  }, []);
-
   // Reattach to an in-flight plan if the user navigated away and came back
   useEffect(() => {
     if (_planningPromise && _planningVideoId === activeVideoId) {
@@ -1490,15 +1517,8 @@ function ImagesView() {
         }
       }
       setBulkPlan(null);
-    } catch (caught) { setError(String(caught)); }
-    finally { setLoading(false); }
-  }
-
-  async function generateAll() {
-    if (!activeVideoId) return;
-    setLoading(true);
-    setError(null);
-    try {
+      // Planning and generating are one action from the user's perspective —
+      // approving the plan immediately kicks off rendering for every still.
       const newJob = await projectsClient.createImageJob(activeVideoId);
       setJob(newJob);
     } catch (caught) { setError(String(caught)); }
@@ -1570,7 +1590,6 @@ function ImagesView() {
   const previewLabel = selectedGroup?.group.label ?? "Still preview";
   const stillCount = workspace?.groups.length ?? 0;
   const imageRenders = selectedGroup?.imageRenders ?? [];
-  const selectedRender = imageRenders.find((render) => render.id === selectedRenderId);
 
   useEffect(() => {
     const ids = [selectedRenderId].filter(Boolean) as string[];
@@ -1610,6 +1629,18 @@ function ImagesView() {
 
   function selectRender(render: ImageRenderRecord) {
     setSelectedRenderId(render.id);
+    // The version the user navigates to becomes the one used downstream
+    // (export/timeline), so browsing to it also marks it final — no
+    // separate "Mark final" action needed.
+    if (!activeVideoId || render.isFinal) return;
+    void (async () => {
+      try {
+        await projectsClient.setFinalRender(render.id, true);
+        const loaded = await projectsClient.getImageWorkspace(activeVideoId);
+        setCached(activeVideoId, loaded);
+        setWorkspace(loaded);
+      } catch (caught) { setError(String(caught)); }
+    })();
   }
 
   function paintMask(event: ReactPointerEvent<HTMLCanvasElement>) {
@@ -1632,20 +1663,6 @@ function ImagesView() {
     const canvas = maskCanvasRef.current;
     canvas?.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
     if (canvas) canvas.dataset.painted = "false";
-  }
-
-  async function toggleFinalRender(render: ImageRenderRecord) {
-    if (!activeVideoId) return;
-    try {
-      await projectsClient.setFinalRender(render.id, !render.isFinal);
-      // Reload the workspace data directly instead of via refreshWorkspace(),
-      // which jumps the selection to the group's newest version — here the
-      // user is looking at (and just toggled) a specific version and should
-      // stay on it, not get bounced to a different one.
-      const loaded = await projectsClient.getImageWorkspace(activeVideoId);
-      setCached(activeVideoId, loaded);
-      setWorkspace(loaded);
-    } catch (caught) { setError(String(caught)); }
   }
 
   async function doResetImages() {
@@ -1715,26 +1732,6 @@ function ImagesView() {
     finally { setApplyingStyle(false); }
   }
 
-  const [applyingInstructions, setApplyingInstructions] = useState(false);
-  const [applyInstrProgress, setApplyInstrProgress] = useState<{ done: number; total: number } | null>(null);
-  async function applyCreativeInstructionsToAll() {
-    if (!activeVideoId || !bulkInstruction.trim()) return;
-    setApplyingInstructions(true);
-    setApplyInstrProgress(null);
-    try {
-      const count = await projectsClient.applyCreativeInstructionsToAll(activeVideoId, bulkInstruction);
-      const live = await projectsClient.getImageWorkspace(activeVideoId);
-      setCached(activeVideoId, live);
-      setWorkspace(live);
-      if (selectedGroupId) {
-        const pv = live.groups.find((g) => g.group.id === selectedGroupId)?.promptVersions[0];
-        if (pv) setUserPrompt(pv.userPrompt);
-      }
-      addToast(`Creative rules applied to ${count} still${count !== 1 ? "s" : ""}.`, "success");
-    } catch (caught) { setError(String(caught)); }
-    finally { setApplyingInstructions(false); setApplyInstrProgress(null); }
-  }
-
   return (
     <section className="view images-view">
       {loading && <LoadingOverlay label="Working on your images" />}
@@ -1742,24 +1739,32 @@ function ImagesView() {
       {confirmingStop && <ConfirmDialog title="Stop bulk generation?" message="This will permanently stop the current job. Any stills already generated are kept, but remaining stills will not be generated and the job cannot be resumed." confirmLabel="Stop generation" onConfirm={() => { setConfirmingStop(false); void controlJob("cancel"); }} onCancel={() => setConfirmingStop(false)} />}
       <div className="page-heading">
         <div>
-          <p className="eyebrow">Stage 3 of 3</p>
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <div className="heading-actions"><button className="secondary danger-action" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={16} />Reset Images</button><button className="secondary" onClick={() => void exportStills()}><Download size={16} />Download All</button><button className="secondary" onClick={() => void generateAll()} disabled={loading || Boolean(job && ["queued", "running", "paused"].includes(job.status))}><WandSparkles size={16} />Generate All</button><button className="secondary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading}><WandSparkles size={17} />Bulk Gen Config</button><button className="primary" onClick={() => setStage("timeline")} disabled={!workspace?.groups.length}><Film size={17} />Continue to timeline →</button></div>
+        <div className="heading-actions"><button className="secondary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading}><WandSparkles size={17} />Bulk Gen Config</button><button className="primary" onClick={() => setStage("timeline")} disabled={!workspace?.groups.length}><Film size={17} />Continue to timeline →</button></div>
       </div>
       {error && <div className="error-toast" role="alert"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
       <div className="image-workspace">
         <aside className="stills">
           <div className="stills-heading">
-            <span className="stills-heading-label">Stills</span>
-            <span className="stills-heading-count">{stillCount}</span>
+            <div className="stills-heading-left">
+              <span className="stills-heading-label">Stills</span>
+              <span className="stills-heading-count">{stillCount}</span>
+            </div>
+            <div className="stills-heading-actions">
+              <button className="icon-button" title="Download all" aria-label="Download all" onClick={() => void exportStills()}><Download size={15} /></button>
+              <button className="icon-button danger-action" title="Reset images" aria-label="Reset images" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={15} /></button>
+            </div>
           </div>
           <div className="still-list">
             {(workspace?.groups ?? []).map((group) => {
               const newestPrompt = group.promptVersions[0];
               const newestRender = group.imageRenders[0];
-              const thumbUrl = newestRender ? renderUrls[newestRender.id] : undefined;
+              const isSelectedGroup = group.group.id === selectedGroupId;
+              const thumbUrl = isSelectedGroup && selectedRenderId
+                ? renderUrls[selectedRenderId]
+                : newestRender ? renderUrls[newestRender.id] : undefined;
               const item = job?.items.find((candidate) => candidate.groupId === group.group.id);
               const isPreparing = preparingGroupIds.has(group.group.id);
               const isGenerating = item?.status === "running" || generatingGroupId === group.group.id;
@@ -1809,16 +1814,10 @@ function ImagesView() {
           </header>
           <div className="preview-art">
             {selectedRenderId && renderUrls[selectedRenderId] ? (
-              <figure className={`image-frame ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}`}>
-                <img src={renderUrls[selectedRenderId]} alt="Selected image version" />
+              <figure className={`image-frame clickable-frame ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}`}>
+                <img src={renderUrls[selectedRenderId]} alt="Selected image version" onClick={() => { setZoom(1); setZoomOpen(true); }} />
                 <div className="image-actions">
-                  <button className="image-action-btn" title="Inspect" onClick={() => { setZoom(1); setZoomOpen(true); }}><Maximize2 size={16} /><span>Inspect</span></button>
                   <button className="image-action-btn" title="Download this image" onClick={() => { if (selectedRenderId) void downloadStill(selectedRenderId); }}><Download size={16} /><span>Download</span></button>
-                  <button
-                    className={`image-action-btn${selectedRender?.isFinal ? " active" : ""}`}
-                    title={selectedRender?.isFinal ? "This is the final still for this group — click to unmark." : "Mark this version as the final still for this group."}
-                    onClick={() => { if (selectedRender) void toggleFinalRender(selectedRender); }}
-                  ><Check size={16} /><span>{selectedRender?.isFinal ? "Unmark final" : "Mark final"}</span></button>
                 </div>
               </figure>
             ) : <div className={`image-frame empty-frame ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}`}><div className="image-empty"><Image size={34} /><strong>No image generated yet</strong><span>{imageSettings.aspectRatio === "9:16" ? "YouTube Short · 9:16" : "YouTube Video · 16:9"}</span></div></div>}
@@ -1908,7 +1907,7 @@ function ImagesView() {
       {zoomOpen && selectedRenderId && renderUrls[selectedRenderId] && <div className="modal-backdrop image-lightbox" onClick={() => setZoomOpen(false)}>
         <div className="lightbox-shell" onClick={(event) => event.stopPropagation()}>
           <div className="lightbox-toolbar"><strong>Image inspection</strong><button onClick={() => setZoom((value) => Math.max(.25, value - .25))}><ZoomOut size={17} /></button><button onClick={() => setZoom(1)}>Reset</button><button onClick={() => setZoom((value) => Math.min(5, value + .25))}><ZoomIn size={17} /></button><button onClick={() => setZoomOpen(false)}><X size={17} /></button></div>
-          <div className="lightbox-canvas"><img src={renderUrls[selectedRenderId]} alt="Zoomed selected version" style={{ transform: `scale(${zoom})` }} /></div>
+          <div className="lightbox-canvas"><img src={renderUrls[selectedRenderId]} alt="Zoomed selected version" style={{ transform: `scale(${zoom})` }} onClick={() => setZoomOpen(false)} /></div>
         </div>
       </div>}
       {editOpen && selectedRenderId && renderUrls[selectedRenderId] && <div className="modal-backdrop image-lightbox">
@@ -1955,11 +1954,6 @@ function ImagesView() {
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still. Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
           <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cat as the main character. Show visible emotions and varied body language. Avoid showing text, labels, or close-ups on faces." rows={4} />
-          <button className="secondary full" style={{marginTop:"10px"}} onClick={() => void applyCreativeInstructionsToAll()} disabled={applyingInstructions || !bulkInstruction.trim() || !workspace?.groups.length}>
-            {applyingInstructions
-              ? (applyInstrProgress ? `Applying… ${applyInstrProgress.done}/${applyInstrProgress.total}` : "Applying…")
-              : "Apply Creative Instructions to All Stills"}
-          </button>
           <button className="primary full" style={{marginTop:"10px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length || bulkProgress !== null || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>
             {bulkPlanLoading ? "Planning…" : <><WandSparkles size={16} />Plan Video</>}
           </button>
@@ -1991,7 +1985,7 @@ function ImagesView() {
             ))}
           </div>
           <div className="overview-actions">
-            <button className="primary" onClick={() => void approveBulkPlan()} disabled={loading}>Apply to All Stills</button>
+            <button className="primary" onClick={() => void approveBulkPlan()} disabled={loading}>Apply & Generate All</button>
             <button className="secondary" onClick={() => { setBulkOverviewOpen(false); setBulkOpen(true); }}>Back</button>
             <button className="secondary" onClick={() => { setBulkOverviewOpen(false); setBulkPlan(null); }}>Cancel</button>
           </div>
@@ -2067,9 +2061,9 @@ export function App() {
     return () => window.clearInterval(checkpoint);
   }, [activeVideoId]);
   return (
-    <div className="app-shell">
+    <div className={stage === "home" ? "app-shell app-shell-home" : "app-shell"}>
       <TitleBar />
-      <Sidebar />
+      {stage !== "home" && <Sidebar />}
       <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
       <ToastDisplay />
     </div>

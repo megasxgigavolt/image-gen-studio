@@ -1419,7 +1419,6 @@ export function TimelineView() {
     <section className="view timeline-view">
       <div className="page-heading">
         <div>
-          <p className="eyebrow">Timeline</p>
           <h1>Editor</h1>
           <p>Arrange your stills and preview the finished video — captions and narration stay perfectly synced automatically.</p>
         </div>

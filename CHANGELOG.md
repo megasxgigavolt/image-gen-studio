@@ -262,3 +262,13 @@
 - Redesigned the caption style panel as a collapsible accordion (one section open at a time) instead of a single long scrolling list, and added a "Reset to default" action for the global caption style.
 - Fixed a mark-final toggle bug where marking an older still version final would jump the preview to a different version instead of staying put.
 - Fixed the last control in the caption style panel sitting flush against the panel's edge when scrolled to the bottom.
+# 2.5.0
+
+- Redesigned the Home screen as a standalone two-panel launcher: the pipeline sidebar (Production/Images/Editor) no longer appears until a video is open, the brand/logo sits in a shared, theme-aware header consistent across every screen, and the left panel's typography now matches the same global scale used everywhere else instead of one-off smaller sizes.
+- Channel and video rows can now be renamed by double-clicking them, in addition to the existing "Rename" menu option — both edit the name in place.
+- Video card thumbnails now show the actual first generated still (falling back to a placeholder only when nothing's been generated yet), sized to a proper 16:9 frame, with the stage-name badge only appearing over a real thumbnail instead of floating over an empty placeholder.
+- Fixed the channel/video "⋯" menu triggering a spurious scrollbar by rendering it through a portal instead of inside the scrolling list.
+- Removed the "Stage X of Y" labels and tab navigation from the Production and Editor screens; Production now flows through a single "View visual plan" / "Back" pair of buttons.
+- Images tab cleanup: removed the redundant "Apply Creative Instructions to All Stills" button (Plan Video already applies them), removed the manual "Mark final" toggle (browsing to a version now marks it final automatically), replaced the separate "Inspect" button with click-to-expand/collapse on the preview image itself, and the Stills list thumbnail now tracks whichever version is currently selected instead of always showing the newest.
+- Merged "Generate All" into the Bulk Gen Config flow — approving a bulk plan now plans and generates in one step, and Download All / Reset Images moved into the Stills panel as compact icon buttons.
+- Switched the app's primary UI font from Inter to Rubik (already bundled for captions) for a more consistent look across the whole app.

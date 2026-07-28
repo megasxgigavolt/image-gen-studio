@@ -63,6 +63,33 @@ enum GeminiAuth {
 
 pub const EDUCATIONAL_VISUAL_PLANNER_VERSION: &str = "3.0.0-bulk-plan-v2";
 
+/// Shared validation list for `timeline_clips.motion_preset` — kept as one
+/// const so `set_timeline_clip_motion`/`apply_motion_to_all_clips` can't drift
+/// out of sync with each other.
+pub const MOTION_PRESETS: [&str; 9] = [
+    "none", "zoom-in", "zoom-out", "pan-left", "pan-right",
+    "zoom-pulse", "zoom-in-subject", "zoom-out-subject", "ken-burns",
+];
+
+/// Shared validation list for `timeline_clips.transition_in`/`transition_out`
+/// — was 4 separate inline `const VALID` arrays that could (and did) drift.
+/// The last 4 ("join" transitions) blend two adjacent clips' pixel data —
+/// the export engine and canvas preview only ever honor them via a clip's
+/// `transition_out` (see `expand_join_transitions` in video_export_engine.py);
+/// `transition_in` still accepts them for schema simplicity, but the picker
+/// UI only offers them on the "out" side to avoid a setting that visibly
+/// does nothing.
+pub const VALID_TRANSITIONS: [&str; 7] = [
+    "cut", "fade", "dip-to-white",
+    "cross-fade", "slide-left", "slide-right", "zoom-blur",
+];
+
+/// Shared validation list for `timeline_clips.color_filter_preset`. The
+/// brightness/contrast/saturation targets each preset maps to live in both
+/// `TimelineView.tsx` (canvas preview) and `video_export_engine.py` (ffmpeg
+/// `eq` filter) — kept numerically identical there so preview and export agree.
+pub const COLOR_FILTER_PRESETS: [&str; 7] = ["none", "warm", "cool", "cinematic", "bright", "muted", "dark"];
+
 const MIGRATION_001: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -400,6 +427,105 @@ const MIGRATION_023: &str = r#"
 ALTER TABLE timelines ADD COLUMN narration_offset_seconds REAL NOT NULL DEFAULT 0;
 "#;
 
+const MIGRATION_024: &str = r#"
+CREATE TABLE IF NOT EXISTS media_library_assets (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    kind TEXT NOT NULL CHECK(kind IN ('still','clip','audio')),
+    original_name TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    duration_seconds REAL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_media_library_assets_video_kind ON media_library_assets(video_id, kind, created_at DESC);
+ALTER TABLE timeline_clips ADD COLUMN media_library_asset_id TEXT REFERENCES media_library_assets(id);
+CREATE INDEX IF NOT EXISTS idx_timeline_clips_media_asset ON timeline_clips(media_library_asset_id);
+"#;
+
+const MIGRATION_025: &str = r#"
+ALTER TABLE timelines ADD COLUMN music_master_volume_percent REAL NOT NULL DEFAULT 100;
+ALTER TABLE timelines ADD COLUMN music_duck_sensitivity_percent REAL NOT NULL DEFAULT 50;
+CREATE TABLE IF NOT EXISTS timeline_music_clips (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    media_library_asset_id TEXT NOT NULL REFERENCES media_library_assets(id),
+    ordinal INTEGER NOT NULL,
+    start_seconds REAL NOT NULL,
+    end_seconds REAL NOT NULL,
+    label TEXT NOT NULL,
+    volume_percent REAL NOT NULL DEFAULT 30,
+    fade_in_enabled INTEGER NOT NULL DEFAULT 0,
+    fade_in_seconds REAL NOT NULL DEFAULT 1.0,
+    fade_out_enabled INTEGER NOT NULL DEFAULT 0,
+    fade_out_seconds REAL NOT NULL DEFAULT 1.0,
+    auto_duck INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_timeline_music_clips_video ON timeline_music_clips(video_id, ordinal);
+"#;
+
+const MIGRATION_026: &str = r#"
+CREATE TABLE IF NOT EXISTS timeline_text_clips (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    start_seconds REAL NOT NULL,
+    end_seconds REAL NOT NULL,
+    text TEXT NOT NULL,
+    font_family TEXT NOT NULL DEFAULT 'Rubik',
+    font_size_px REAL NOT NULL DEFAULT 32,
+    bold INTEGER NOT NULL DEFAULT 0,
+    italic INTEGER NOT NULL DEFAULT 0,
+    color TEXT NOT NULL DEFAULT '#FFFFFF',
+    background_mode TEXT NOT NULL DEFAULT 'none' CHECK(background_mode IN ('none','solid','blur')),
+    background_color TEXT NOT NULL DEFAULT '#000000',
+    position TEXT NOT NULL DEFAULT 'bottom-center',
+    animation TEXT NOT NULL DEFAULT 'none' CHECK(animation IN ('none','fade','slide'))
+);
+CREATE INDEX IF NOT EXISTS idx_timeline_text_clips_video ON timeline_text_clips(video_id, start_seconds);
+"#;
+
+const MIGRATION_027: &str = r#"
+CREATE TABLE IF NOT EXISTS timeline_logo_clips (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    media_library_asset_id TEXT NOT NULL REFERENCES media_library_assets(id),
+    start_seconds REAL NOT NULL,
+    end_seconds REAL NOT NULL,
+    position TEXT NOT NULL DEFAULT 'bottom-right' CHECK(position IN ('top-left','top-right','bottom-left','bottom-right','center')),
+    size_percent REAL NOT NULL DEFAULT 15,
+    opacity_percent REAL NOT NULL DEFAULT 100,
+    show_throughout INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_timeline_logo_clips_video ON timeline_logo_clips(video_id, start_seconds);
+"#;
+
+const MIGRATION_028: &str = r#"
+ALTER TABLE timelines ADD COLUMN sequence_locked INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE timelines ADD COLUMN narration_volume_percent REAL NOT NULL DEFAULT 100;
+ALTER TABLE timelines ADD COLUMN narration_trim_start_seconds REAL NOT NULL DEFAULT 0;
+ALTER TABLE timelines ADD COLUMN narration_trim_end_seconds REAL NOT NULL DEFAULT 0;
+ALTER TABLE timeline_music_clips ADD COLUMN loop_enabled INTEGER NOT NULL DEFAULT 0;
+"#;
+
+const MIGRATION_029: &str = r#"
+ALTER TABLE timeline_clips ADD COLUMN color_filter_preset TEXT NOT NULL DEFAULT 'none';
+ALTER TABLE timeline_clips ADD COLUMN color_filter_intensity REAL NOT NULL DEFAULT 50;
+"#;
+
+const MIGRATION_030: &str = r#"
+CREATE TABLE IF NOT EXISTS export_jobs (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    status TEXT NOT NULL DEFAULT 'running',
+    destination_path TEXT NOT NULL,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_export_jobs_video ON export_jobs(video_id, created_at DESC);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -645,6 +771,73 @@ pub struct ExportResult {
     pub file_count: usize,
 }
 
+/// User-facing export choices for the single-file video export — everything
+/// here used to be implicit/hardcoded (1080p, CRF 18, captions always
+/// burned-in, narration mandatory, music never mixed in).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSettings {
+    /// "2160p" | "1080p" | "720p"
+    pub resolution: String,
+    /// "high" | "balanced" | "compressed"
+    pub quality: String,
+    /// "burned-in" | "srt" | "both"
+    pub captions_mode: String,
+    pub include_narration: bool,
+    pub include_music: bool,
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            resolution: "1080p".into(),
+            quality: "high".into(),
+            captions_mode: "burned-in".into(),
+            include_narration: true,
+            include_music: true,
+        }
+    }
+}
+
+/// One row per export attempt (success or failure) — the titlebar's "Export
+/// history" list reads these back via `list_export_jobs`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportJob {
+    pub id: String,
+    pub video_id: String,
+    /// "running" | "completed" | "failed"
+    pub status: String,
+    pub destination_path: String,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+pub const EXPORT_RESOLUTIONS: [&str; 3] = ["2160p", "1080p", "720p"];
+pub const EXPORT_QUALITIES: [&str; 3] = ["high", "balanced", "compressed"];
+pub const EXPORT_CAPTIONS_MODES: [&str; 3] = ["burned-in", "srt", "both"];
+
+fn resolution_dimensions(resolution: &str, aspect_ratio: &str) -> (i64, i64) {
+    let (w, h) = match resolution {
+        "2160p" => (3840, 2160),
+        "720p" => (1280, 720),
+        _ => (1920, 1080),
+    };
+    if aspect_ratio == "9:16" { (h, w) } else { (w, h) }
+}
+
+/// (crf, preset) for the final muxing pass only — the intermediate
+/// per-segment encodes stay near-lossless regardless of quality choice (see
+/// encode_segment's own comment on why: avoiding double-generation loss).
+fn quality_crf_preset(quality: &str) -> (i64, &'static str) {
+    match quality {
+        "balanced" => (23, "fast"),
+        "compressed" => (28, "faster"),
+        _ => (18, "fast"),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineClip {
@@ -661,6 +854,11 @@ pub struct TimelineClip {
     pub motion_intensity: f64,
     pub clip_kind: String,
     pub video_asset_id: Option<String>,
+    /// Set for `clip_kind` 'imported-still'/'imported-clip' — points at the
+    /// media library asset backing this clip instead of a render/video_asset.
+    pub media_library_asset_id: Option<String>,
+    pub color_filter_preset: String,
+    pub color_filter_intensity: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -738,6 +936,75 @@ pub struct TimelineCaptionClip {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct MediaLibraryAsset {
+    pub id: String,
+    pub video_id: String,
+    /// 'still' | 'clip' | 'audio'
+    pub kind: String,
+    pub original_name: String,
+    pub relative_path: String,
+    pub media_type: String,
+    pub size_bytes: i64,
+    pub duration_seconds: Option<f64>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineMusicClip {
+    pub id: String,
+    pub media_library_asset_id: String,
+    pub ordinal: i64,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub label: String,
+    pub volume_percent: f64,
+    pub fade_in_enabled: bool,
+    pub fade_in_seconds: f64,
+    pub fade_out_enabled: bool,
+    pub fade_out_seconds: f64,
+    pub auto_duck: bool,
+    pub loop_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineTextClip {
+    pub id: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub text: String,
+    pub font_family: String,
+    pub font_size_px: f64,
+    pub bold: bool,
+    pub italic: bool,
+    pub color: String,
+    /// 'none' | 'solid' | 'blur'
+    pub background_mode: String,
+    pub background_color: String,
+    /// One of the 9-point grid values, e.g. "bottom-center".
+    pub position: String,
+    /// 'none' | 'fade' | 'slide'
+    pub animation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineLogoClip {
+    pub id: String,
+    pub media_library_asset_id: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    /// 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right' | 'center'
+    pub position: String,
+    pub size_percent: f64,
+    pub opacity_percent: f64,
+    /// When true, start/end are kept in sync with the full timeline duration.
+    pub show_throughout: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct Timeline {
     pub video_id: String,
     pub duration_seconds: f64,
@@ -751,6 +1018,18 @@ pub struct Timeline {
     /// Seconds of delay before narration audio starts, relative to the visual
     /// timeline (0 = plays from the very start, matching legacy behavior).
     pub narration_offset_seconds: f64,
+    pub music_clips: Vec<TimelineMusicClip>,
+    pub text_clips: Vec<TimelineTextClip>,
+    pub logo_clips: Vec<TimelineLogoClip>,
+    pub music_master_volume_percent: f64,
+    pub music_duck_sensitivity_percent: f64,
+    /// When true (the default), Stills-track clips can't be reordered by
+    /// dragging — only resized/effects-edited — keeping them locked to the
+    /// narration sync they were generated from.
+    pub sequence_locked: bool,
+    pub narration_volume_percent: f64,
+    pub narration_trim_start_seconds: f64,
+    pub narration_trim_end_seconds: f64,
 }
 
 /// The built-in caption look, chosen to exactly match what was previously
@@ -1199,6 +1478,81 @@ impl ProjectRepository {
         }
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(23, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_media_library_asset_id: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timeline_clips') WHERE name='media_library_asset_id')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_media_library_asset_id {
+            self.connection.execute_batch(MIGRATION_024).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(24, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_music_master_volume: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timelines') WHERE name='music_master_volume_percent')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_music_master_volume {
+            self.connection.execute_batch(MIGRATION_025).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(25, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        self.connection.execute_batch(MIGRATION_026).map_err(|error| error.to_string())?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(26, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        self.connection.execute_batch(MIGRATION_027).map_err(|error| error.to_string())?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(27, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_sequence_locked: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timelines') WHERE name='sequence_locked')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_sequence_locked {
+            self.connection.execute_batch(MIGRATION_028).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(28, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_color_filter_preset: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timeline_clips') WHERE name='color_filter_preset')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_color_filter_preset {
+            self.connection.execute_batch(MIGRATION_029).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(29, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        self.connection.execute_batch(MIGRATION_030).map_err(|error| error.to_string())?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(30, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -3657,14 +4011,23 @@ Return JSON only:
     }
 
     pub fn get_timeline(&self, video_id: &str) -> Result<Timeline, String> {
-        let (duration_seconds, playhead_seconds, zoom, updated_at, caption_style_raw, narration_offset_seconds): (f64, f64, f64, String, String, f64) = self.connection.query_row(
-            "SELECT duration_seconds,playhead_seconds,zoom,updated_at,caption_style_json,narration_offset_seconds FROM timelines WHERE video_id=?1",
-            [video_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        #[allow(clippy::type_complexity)]
+        let (
+            duration_seconds, playhead_seconds, zoom, updated_at, caption_style_raw, narration_offset_seconds,
+            music_master_volume_percent, music_duck_sensitivity_percent,
+            sequence_locked, narration_volume_percent, narration_trim_start_seconds, narration_trim_end_seconds,
+        ): (f64, f64, f64, String, String, f64, f64, f64, bool, f64, f64, f64) = self.connection.query_row(
+            "SELECT duration_seconds,playhead_seconds,zoom,updated_at,caption_style_json,narration_offset_seconds,music_master_volume_percent,music_duck_sensitivity_percent,sequence_locked,narration_volume_percent,narration_trim_start_seconds,narration_trim_end_seconds FROM timelines WHERE video_id=?1",
+            [video_id], |row| Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?,
+                row.get(6)?, row.get(7)?,
+                row.get::<_, i64>(8)? != 0, row.get(9)?, row.get(10)?, row.get(11)?,
+            )),
         ).map_err(|_| "Timeline has not been built.".to_string())?;
         let caption_style = serde_json::from_str(&caption_style_raw).unwrap_or_else(|_| json!({}));
         self.backfill_missing_clip_renders(video_id)?;
         let mut statement = self.connection.prepare(
-            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
+            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
         ).map_err(|e| e.to_string())?;
         let clips = statement
             .query_map([video_id], |row| {
@@ -3682,6 +4045,9 @@ Return JSON only:
                     motion_intensity: row.get(10)?,
                     clip_kind: row.get(11)?,
                     video_asset_id: row.get(12)?,
+                    media_library_asset_id: row.get(13)?,
+                    color_filter_preset: row.get(14)?,
+                    color_filter_intensity: row.get(15)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -3708,6 +4074,73 @@ Return JSON only:
             .map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
+        let mut music_statement = self.connection.prepare(
+            "SELECT id,media_library_asset_id,ordinal,start_seconds,end_seconds,label,volume_percent,fade_in_enabled,fade_in_seconds,fade_out_enabled,fade_out_seconds,auto_duck,loop_enabled FROM timeline_music_clips WHERE video_id=?1 ORDER BY ordinal"
+        ).map_err(|e| e.to_string())?;
+        let music_clips = music_statement
+            .query_map([video_id], |row| {
+                Ok(TimelineMusicClip {
+                    id: row.get(0)?,
+                    media_library_asset_id: row.get(1)?,
+                    ordinal: row.get(2)?,
+                    start_seconds: row.get(3)?,
+                    end_seconds: row.get(4)?,
+                    label: row.get(5)?,
+                    volume_percent: row.get(6)?,
+                    fade_in_enabled: row.get::<_, i64>(7)? != 0,
+                    fade_in_seconds: row.get(8)?,
+                    fade_out_enabled: row.get::<_, i64>(9)? != 0,
+                    fade_out_seconds: row.get(10)?,
+                    auto_duck: row.get::<_, i64>(11)? != 0,
+                    loop_enabled: row.get::<_, i64>(12)? != 0,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut text_statement = self.connection.prepare(
+            "SELECT id,start_seconds,end_seconds,text,font_family,font_size_px,bold,italic,color,background_mode,background_color,position,animation FROM timeline_text_clips WHERE video_id=?1 ORDER BY start_seconds"
+        ).map_err(|e| e.to_string())?;
+        let text_clips = text_statement
+            .query_map([video_id], |row| {
+                Ok(TimelineTextClip {
+                    id: row.get(0)?,
+                    start_seconds: row.get(1)?,
+                    end_seconds: row.get(2)?,
+                    text: row.get(3)?,
+                    font_family: row.get(4)?,
+                    font_size_px: row.get(5)?,
+                    bold: row.get::<_, i64>(6)? != 0,
+                    italic: row.get::<_, i64>(7)? != 0,
+                    color: row.get(8)?,
+                    background_mode: row.get(9)?,
+                    background_color: row.get(10)?,
+                    position: row.get(11)?,
+                    animation: row.get(12)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut logo_statement = self.connection.prepare(
+            "SELECT id,media_library_asset_id,start_seconds,end_seconds,position,size_percent,opacity_percent,show_throughout FROM timeline_logo_clips WHERE video_id=?1 ORDER BY start_seconds"
+        ).map_err(|e| e.to_string())?;
+        let logo_clips = logo_statement
+            .query_map([video_id], |row| {
+                Ok(TimelineLogoClip {
+                    id: row.get(0)?,
+                    media_library_asset_id: row.get(1)?,
+                    start_seconds: row.get(2)?,
+                    end_seconds: row.get(3)?,
+                    position: row.get(4)?,
+                    size_percent: row.get(5)?,
+                    opacity_percent: row.get(6)?,
+                    show_throughout: row.get::<_, i64>(7)? != 0,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         Ok(Timeline {
             video_id: video_id.into(),
             duration_seconds,
@@ -3718,6 +4151,15 @@ Return JSON only:
             caption_clips,
             caption_style,
             narration_offset_seconds,
+            music_clips,
+            text_clips,
+            logo_clips,
+            music_master_volume_percent,
+            music_duck_sensitivity_percent,
+            sequence_locked,
+            narration_volume_percent,
+            narration_trim_start_seconds,
+            narration_trim_end_seconds,
         })
     }
 
@@ -3789,9 +4231,22 @@ Return JSON only:
             "SELECT COALESCE(MAX(end_seconds),0) FROM timeline_caption_clips WHERE video_id=?1",
             [video_id], |row| row.get(0),
         ).map_err(|e| e.to_string())?;
+        let music_max: f64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(end_seconds),0) FROM timeline_music_clips WHERE video_id=?1",
+            [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let text_max: f64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(end_seconds),0) FROM timeline_text_clips WHERE video_id=?1",
+            [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        // Logo clips are intentionally excluded here: a `show_throughout` logo
+        // always mirrors the current duration (kept in sync by
+        // `add_logo_clip`/`set_logo_clip_style`), so folding it into this max
+        // would make the duration a one-way ratchet that never shrinks.
+        let duration = stills_max.max(captions_max).max(music_max).max(text_max);
         self.connection.execute(
             "UPDATE timelines SET duration_seconds=?1,updated_at=?2 WHERE video_id=?3",
-            params![stills_max.max(captions_max), Utc::now().to_rfc3339(), video_id],
+            params![duration, Utc::now().to_rfc3339(), video_id],
         ).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -4140,11 +4595,7 @@ Return JSON only:
     }
 
     pub fn set_timeline_clip_motion(&self, video_id: &str, clip_id: &str, motion_preset: &str) -> Result<Timeline, String> {
-        const VALID: [&str; 8] = [
-            "none", "zoom-in", "zoom-out", "pan-left", "pan-right",
-            "zoom-pulse", "zoom-in-subject", "zoom-out-subject",
-        ];
-        if !VALID.contains(&motion_preset) {
+        if !MOTION_PRESETS.contains(&motion_preset) {
             return Err("Unknown camera movement preset.".into());
         }
         self.connection.execute(
@@ -4155,8 +4606,7 @@ Return JSON only:
     }
 
     pub fn set_timeline_clip_transition(&self, video_id: &str, clip_id: &str, transition_in: &str) -> Result<Timeline, String> {
-        const VALID: [&str; 2] = ["cut", "fade"];
-        if !VALID.contains(&transition_in) {
+        if !VALID_TRANSITIONS.contains(&transition_in) {
             return Err("Unknown transition preset.".into());
         }
         self.connection.execute(
@@ -4167,8 +4617,7 @@ Return JSON only:
     }
 
     pub fn set_timeline_clip_transition_out(&self, video_id: &str, clip_id: &str, transition_out: &str) -> Result<Timeline, String> {
-        const VALID: [&str; 2] = ["cut", "fade"];
-        if !VALID.contains(&transition_out) {
+        if !VALID_TRANSITIONS.contains(&transition_out) {
             return Err("Unknown transition preset.".into());
         }
         self.connection.execute(
@@ -4187,12 +4636,32 @@ Return JSON only:
         self.get_timeline(video_id)
     }
 
+    pub fn set_timeline_clip_color_filter(&self, video_id: &str, clip_id: &str, preset: &str, intensity: f64) -> Result<Timeline, String> {
+        if !COLOR_FILTER_PRESETS.contains(&preset) {
+            return Err("Unknown color filter preset.".into());
+        }
+        let clamped = intensity.clamp(0.0, 100.0);
+        self.connection.execute(
+            "UPDATE timeline_clips SET color_filter_preset=?1, color_filter_intensity=?2 WHERE id=?3 AND video_id=?4",
+            params![preset, clamped, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn apply_color_filter_to_all_clips(&self, video_id: &str, preset: &str, intensity: f64) -> Result<Timeline, String> {
+        if !COLOR_FILTER_PRESETS.contains(&preset) {
+            return Err("Unknown color filter preset.".into());
+        }
+        let clamped = intensity.clamp(0.0, 100.0);
+        self.connection.execute(
+            "UPDATE timeline_clips SET color_filter_preset=?1, color_filter_intensity=?2 WHERE video_id=?3",
+            params![preset, clamped, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
     pub fn apply_motion_to_all_clips(&self, video_id: &str, motion_preset: &str, intensity: f64) -> Result<Timeline, String> {
-        const VALID: [&str; 8] = [
-            "none", "zoom-in", "zoom-out", "pan-left", "pan-right",
-            "zoom-pulse", "zoom-in-subject", "zoom-out-subject",
-        ];
-        if !VALID.contains(&motion_preset) {
+        if !MOTION_PRESETS.contains(&motion_preset) {
             return Err("Unknown camera movement preset.".into());
         }
         let clamped = intensity.clamp(0.02, 0.6);
@@ -4204,8 +4673,7 @@ Return JSON only:
     }
 
     pub fn apply_transition_in_to_all_clips(&self, video_id: &str, transition_in: &str) -> Result<Timeline, String> {
-        const VALID: [&str; 2] = ["cut", "fade"];
-        if !VALID.contains(&transition_in) {
+        if !VALID_TRANSITIONS.contains(&transition_in) {
             return Err("Unknown transition preset.".into());
         }
         self.connection.execute(
@@ -4216,8 +4684,7 @@ Return JSON only:
     }
 
     pub fn apply_transition_out_to_all_clips(&self, video_id: &str, transition_out: &str) -> Result<Timeline, String> {
-        const VALID: [&str; 2] = ["cut", "fade"];
-        if !VALID.contains(&transition_out) {
+        if !VALID_TRANSITIONS.contains(&transition_out) {
             return Err("Unknown transition preset.".into());
         }
         self.connection.execute(
@@ -4333,6 +4800,477 @@ Return JSON only:
         self.get_timeline(video_id)
     }
 
+    /// Copies a Stills-track clip's settings (motion/transitions/source) into
+    /// a new clip appended after everything else on the track — appending
+    /// (rather than inserting right next to the original) sidesteps the
+    /// overlap check entirely, which is the least surprising default for a
+    /// context-menu "Duplicate clip" action.
+    #[allow(clippy::type_complexity)]
+    pub fn duplicate_timeline_clip(&self, video_id: &str, clip_id: &str) -> Result<Timeline, String> {
+        let (
+            group_id, render_id, label, motion_preset, transition_in, transition_out, motion_intensity,
+            clip_kind, video_asset_id, media_library_asset_id, start_seconds, end_seconds,
+            color_filter_preset, color_filter_intensity,
+        ): (String, Option<String>, String, String, String, String, f64, String, Option<String>, Option<String>, f64, f64, String, f64) = self.connection.query_row(
+            "SELECT group_id,render_id,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,start_seconds,end_seconds,color_filter_preset,color_filter_intensity FROM timeline_clips WHERE id=?1 AND video_id=?2",
+            params![clip_id, video_id],
+            |row| Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?,
+                row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?,
+            )),
+        ).map_err(|_| "Clip was not found.".to_string())?;
+        let duration = (end_seconds - start_seconds).max(0.5);
+        let timeline_end: f64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(end_seconds),0) FROM timeline_clips WHERE video_id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let new_start = timeline_end;
+        let new_end = new_start + duration;
+        let next_ordinal: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(ordinal),0)+1 FROM timeline_clips WHERE video_id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            params![Uuid::new_v4().to_string(), video_id, group_id, render_id, next_ordinal, new_start, new_end, label, motion_preset, transition_in, transition_out, motion_intensity, clip_kind, video_asset_id, media_library_asset_id, color_filter_preset, color_filter_intensity],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    // ===== Media library (Editor tab: Stills / Clips / Audio tabs) =====
+
+    fn media_library_asset_by_id(&self, id: &str) -> Result<Option<MediaLibraryAsset>, String> {
+        self.connection.query_row(
+            "SELECT id,video_id,kind,original_name,relative_path,media_type,size_bytes,duration_seconds,created_at FROM media_library_assets WHERE id=?1",
+            [id],
+            |row| Ok(MediaLibraryAsset {
+                id: row.get(0)?, video_id: row.get(1)?, kind: row.get(2)?, original_name: row.get(3)?,
+                relative_path: row.get(4)?, media_type: row.get(5)?, size_bytes: row.get(6)?,
+                duration_seconds: row.get(7)?, created_at: row.get(8)?,
+            }),
+        ).optional().map_err(|e| e.to_string())
+    }
+
+    /// Imports a file into the per-video media library. `kind` is `None` for
+    /// the top-level "+ Import" entry point, which has no pre-selected kind —
+    /// the kind is inferred from the file's extension instead.
+    pub fn import_media_library_asset(
+        &self,
+        video_id: &str,
+        source: &Path,
+        kind: Option<&str>,
+        engine_dir: &Path,
+    ) -> Result<MediaLibraryAsset, String> {
+        let extension = source.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+        let resolved_kind = match kind {
+            Some(k) => k,
+            None => media_library_kind_for_extension(&extension)
+                .ok_or("Unsupported file type for the media library.")?,
+        };
+        let allowed = match resolved_kind {
+            "still" => ["png", "jpg", "jpeg", "webp"].contains(&extension.as_str()),
+            "clip" => ["mp4", "mov", "webm", "mkv"].contains(&extension.as_str()),
+            "audio" => ["mp3", "wav", "m4a", "aac", "flac", "ogg"].contains(&extension.as_str()),
+            _ => false,
+        };
+        if !allowed {
+            return Err("Unsupported media library file type.".into());
+        }
+        let (channel_id,): (String,) = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1 AND trashed_at IS NULL",
+            [video_id], |row| Ok((row.get(0)?,)),
+        ).map_err(|_| "Video was not found.".to_string())?;
+        let original_name = source.file_name().and_then(|value| value.to_str())
+            .ok_or("Invalid file name.")?.to_string();
+        let id = Uuid::new_v4().to_string();
+        let folder = match resolved_kind {
+            "still" => "library/stills",
+            "clip" => "library/clips",
+            _ => "library/audio",
+        };
+        let destination_dir = self.projects_dir.join(&channel_id).join(video_id).join(folder);
+        fs::create_dir_all(&destination_dir).map_err(|e| e.to_string())?;
+        let stored_name = format!("{id}.{extension}");
+        let destination = destination_dir.join(&stored_name);
+        fs::copy(source, &destination).map_err(|e| e.to_string())?;
+        let size_bytes = fs::metadata(&destination).map_err(|e| e.to_string())?.len() as i64;
+        let relative_path = format!("{folder}/{stored_name}");
+        let media_type = extension_to_media_type(&extension).to_string();
+        // Stills don't need a probed duration (the timeline gives them a
+        // default slot length); clips and audio do, via the same ffprobe
+        // wrapper used for narration duration.
+        let duration_seconds = if resolved_kind != "still" {
+            Self::probe_audio_duration(engine_dir, &destination).ok()
+        } else {
+            None
+        };
+        let created_at = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO media_library_assets(id,video_id,kind,original_name,relative_path,media_type,size_bytes,duration_seconds,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![id, video_id, resolved_kind, original_name, relative_path, media_type, size_bytes, duration_seconds, created_at],
+        ).map_err(|e| e.to_string())?;
+        Ok(MediaLibraryAsset {
+            id, video_id: video_id.into(), kind: resolved_kind.into(), original_name,
+            relative_path, media_type, size_bytes, duration_seconds, created_at,
+        })
+    }
+
+    pub fn list_media_library_assets(&self, video_id: &str, kind: Option<&str>) -> Result<Vec<MediaLibraryAsset>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,video_id,kind,original_name,relative_path,media_type,size_bytes,duration_seconds,created_at FROM media_library_assets WHERE video_id=?1 AND (?2 IS NULL OR kind=?2) ORDER BY created_at DESC"
+        ).map_err(|e| e.to_string())?;
+        let assets = statement.query_map(params![video_id, kind], |row| {
+            Ok(MediaLibraryAsset {
+                id: row.get(0)?, video_id: row.get(1)?, kind: row.get(2)?, original_name: row.get(3)?,
+                relative_path: row.get(4)?, media_type: row.get(5)?, size_bytes: row.get(6)?,
+                duration_seconds: row.get(7)?, created_at: row.get(8)?,
+            })
+        }).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        Ok(assets)
+    }
+
+    /// Removes a media library asset's file + row, cascading to any timeline
+    /// clips (Stills/Music/Logo tracks) that reference it — the frontend
+    /// confirms this with the user first, listing what will be affected.
+    pub fn remove_media_library_asset(&self, asset_id: &str) -> Result<(), String> {
+        let asset = self.media_library_asset_by_id(asset_id)?.ok_or("Media library asset was not found.")?;
+        let channel_id: String = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1", [&asset.video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let path = self.projects_dir.join(channel_id).join(&asset.video_id).join(&asset.relative_path);
+        if path.exists() {
+            fs::remove_file(path).map_err(|e| e.to_string())?;
+        }
+        self.connection.execute("DELETE FROM timeline_clips WHERE media_library_asset_id=?1", [asset_id]).map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM timeline_music_clips WHERE media_library_asset_id=?1", [asset_id]).map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM timeline_logo_clips WHERE media_library_asset_id=?1", [asset_id]).map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM media_library_assets WHERE id=?1", [asset_id]).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(&asset.video_id)?;
+        Ok(())
+    }
+
+    pub fn media_library_asset_file_path(&self, asset_id: &str) -> Result<PathBuf, String> {
+        let asset = self.media_library_asset_by_id(asset_id)?.ok_or("Media library asset was not found.")?;
+        let channel_id: String = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1", [&asset.video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        Ok(self.projects_dir.join(channel_id).join(&asset.video_id).join(&asset.relative_path))
+    }
+
+    /// All Veo-generated clips for a video (across every still), for the
+    /// Clips tab's "Generated" section — re-placeable onto the Stills track.
+    pub fn list_video_assets(&self, video_id: &str) -> Result<Vec<VideoAsset>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,video_id,group_id,source_render_id,version,parent_video_asset_id,kind,file_name,relative_path,resolution,requested_duration_seconds,veo_duration_seconds,actual_duration_seconds,veo_model,veo_operation_name,prompt,created_at FROM video_assets WHERE video_id=?1 ORDER BY created_at DESC"
+        ).map_err(|e| e.to_string())?;
+        let assets = statement.query_map([video_id], |row| Ok(VideoAsset {
+            id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?, source_render_id: row.get(3)?,
+            version: row.get(4)?, parent_video_asset_id: row.get(5)?, kind: row.get(6)?,
+            file_name: row.get(7)?, relative_path: row.get(8)?, resolution: row.get(9)?,
+            requested_duration_seconds: row.get(10)?, veo_duration_seconds: row.get(11)?,
+            actual_duration_seconds: row.get(12)?, veo_model: row.get(13)?, veo_operation_name: row.get(14)?,
+            prompt: row.get(15)?, created_at: row.get(16)?,
+        })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        Ok(assets)
+    }
+
+    // ===== Placing library/generated assets onto the Stills track =====
+
+    pub fn add_video_asset_clip_to_stills_track(&self, video_id: &str, video_asset_id: &str, start_seconds: f64) -> Result<Timeline, String> {
+        if start_seconds < 0.0 {
+            return Err("Clip position is invalid.".into());
+        }
+        self.ensure_timeline_row(video_id)?;
+        let asset = self.get_video_asset(video_asset_id)?;
+        let duration = asset.actual_duration_seconds.max(0.5);
+        let end_seconds = start_seconds + duration;
+        let overlap: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM timeline_clips WHERE video_id=?1 AND ?2 < end_seconds AND ?3 > start_seconds)",
+            params![video_id, start_seconds, end_seconds], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if overlap {
+            return Err("That position overlaps an existing clip on the stills track.".into());
+        }
+        let next_ordinal: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(ordinal),0)+1 FROM timeline_clips WHERE video_id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label,clip_kind,video_asset_id) VALUES(?1,?2,?3,NULL,?4,?5,?6,?7,'animation',?8)",
+            params![Uuid::new_v4().to_string(), video_id, asset.group_id, next_ordinal, start_seconds, end_seconds, asset.file_name, video_asset_id],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn add_library_asset_to_stills_track(&self, video_id: &str, media_library_asset_id: &str, start_seconds: f64) -> Result<Timeline, String> {
+        if start_seconds < 0.0 {
+            return Err("Clip position is invalid.".into());
+        }
+        self.ensure_timeline_row(video_id)?;
+        let asset = self.media_library_asset_by_id(media_library_asset_id)?.ok_or("Media library asset was not found.")?;
+        let (clip_kind, duration) = match asset.kind.as_str() {
+            "still" => ("imported-still", 3.0),
+            "clip" => ("imported-clip", asset.duration_seconds.unwrap_or(3.0).max(0.5)),
+            _ => return Err("That asset cannot be placed on the stills track.".into()),
+        };
+        let end_seconds = start_seconds + duration;
+        let overlap: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM timeline_clips WHERE video_id=?1 AND ?2 < end_seconds AND ?3 > start_seconds)",
+            params![video_id, start_seconds, end_seconds], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if overlap {
+            return Err("That position overlaps an existing clip on the stills track.".into());
+        }
+        let next_ordinal: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(ordinal),0)+1 FROM timeline_clips WHERE video_id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label,clip_kind,media_library_asset_id) VALUES(?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9)",
+            params![Uuid::new_v4().to_string(), video_id, format!("library:{media_library_asset_id}"), next_ordinal, start_seconds, end_seconds, asset.original_name, clip_kind, media_library_asset_id],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    // ===== Music track =====
+
+    pub fn add_music_clip(&self, video_id: &str, media_library_asset_id: &str, start_seconds: f64) -> Result<Timeline, String> {
+        if start_seconds < 0.0 {
+            return Err("Clip position is invalid.".into());
+        }
+        self.ensure_timeline_row(video_id)?;
+        let asset = self.media_library_asset_by_id(media_library_asset_id)?.ok_or("Media library asset was not found.")?;
+        if asset.kind != "audio" {
+            return Err("Only audio assets can be placed on the music track.".into());
+        }
+        let duration = asset.duration_seconds.unwrap_or(3.0).max(0.5);
+        let end_seconds = start_seconds + duration;
+        let overlap: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM timeline_music_clips WHERE video_id=?1 AND ?2 < end_seconds AND ?3 > start_seconds)",
+            params![video_id, start_seconds, end_seconds], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if overlap {
+            return Err("That position overlaps an existing clip on the music track.".into());
+        }
+        let next_ordinal: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(ordinal),0)+1 FROM timeline_music_clips WHERE video_id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        // 30% matches the spec's stated default for music under narration —
+        // set explicitly rather than relying on the column DEFAULT so it
+        // applies consistently even against a database created before this
+        // default changed.
+        self.connection.execute(
+            "INSERT INTO timeline_music_clips(id,video_id,media_library_asset_id,ordinal,start_seconds,end_seconds,label,volume_percent) VALUES(?1,?2,?3,?4,?5,?6,?7,30)",
+            params![Uuid::new_v4().to_string(), video_id, media_library_asset_id, next_ordinal, start_seconds, end_seconds, asset.original_name],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn update_music_clip(&self, video_id: &str, clip_id: &str, start: f64, end: f64) -> Result<Timeline, String> {
+        if start < 0.0 || end <= start {
+            return Err("Clip boundaries are invalid.".into());
+        }
+        let overlap: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM timeline_music_clips WHERE video_id=?1 AND id<>?2 AND ?3 < end_seconds AND ?4 > start_seconds)",
+            params![video_id, clip_id, start, end], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if overlap {
+            return Err("Timeline clips may not overlap on the same track.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_music_clips SET start_seconds=?1,end_seconds=?2 WHERE id=?3 AND video_id=?4",
+            params![start, end, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_music_clip_settings(
+        &self, video_id: &str, clip_id: &str, volume_percent: f64,
+        fade_in_enabled: bool, fade_in_seconds: f64, fade_out_enabled: bool, fade_out_seconds: f64,
+        auto_duck: bool, loop_enabled: bool,
+    ) -> Result<Timeline, String> {
+        self.connection.execute(
+            "UPDATE timeline_music_clips SET volume_percent=?1,fade_in_enabled=?2,fade_in_seconds=?3,fade_out_enabled=?4,fade_out_seconds=?5,auto_duck=?6,loop_enabled=?7 WHERE id=?8 AND video_id=?9",
+            params![volume_percent.clamp(0.0, 200.0), fade_in_enabled as i64, fade_in_seconds.max(0.0), fade_out_enabled as i64, fade_out_seconds.max(0.0), auto_duck as i64, loop_enabled as i64, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn delete_music_clip(&self, video_id: &str, clip_id: &str) -> Result<Timeline, String> {
+        self.connection.execute("DELETE FROM timeline_music_clips WHERE id=?1 AND video_id=?2", params![clip_id, video_id]).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn set_sequence_locked(&self, video_id: &str, locked: bool) -> Result<Timeline, String> {
+        self.connection.execute(
+            "UPDATE timelines SET sequence_locked=?1,updated_at=?2 WHERE video_id=?3",
+            params![locked as i64, Utc::now().to_rfc3339(), video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn set_narration_settings(&self, video_id: &str, volume_percent: f64, trim_start_seconds: f64, trim_end_seconds: f64) -> Result<Timeline, String> {
+        self.connection.execute(
+            "UPDATE timelines SET narration_volume_percent=?1,narration_trim_start_seconds=?2,narration_trim_end_seconds=?3,updated_at=?4 WHERE video_id=?5",
+            params![volume_percent.clamp(0.0, 200.0), trim_start_seconds.max(0.0), trim_end_seconds.max(0.0), Utc::now().to_rfc3339(), video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn set_music_master_settings(&self, video_id: &str, master_volume_percent: f64, duck_sensitivity_percent: f64) -> Result<Timeline, String> {
+        self.connection.execute(
+            "UPDATE timelines SET music_master_volume_percent=?1,music_duck_sensitivity_percent=?2,updated_at=?3 WHERE video_id=?4",
+            params![master_volume_percent.clamp(0.0, 200.0), duck_sensitivity_percent.clamp(0.0, 100.0), Utc::now().to_rfc3339(), video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    // ===== Overlays track: text =====
+
+    pub fn add_text_overlay_clip(&self, video_id: &str, at_seconds: f64) -> Result<Timeline, String> {
+        if at_seconds < 0.0 {
+            return Err("Clip position is invalid.".into());
+        }
+        self.ensure_timeline_row(video_id)?;
+        let end_seconds = at_seconds + 3.0;
+        let overlap: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM timeline_text_clips WHERE video_id=?1 AND ?2 < end_seconds AND ?3 > start_seconds)",
+            params![video_id, at_seconds, end_seconds], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if overlap {
+            return Err("That position overlaps an existing text overlay. Move the playhead or trim the other overlay first.".into());
+        }
+        self.connection.execute(
+            "INSERT INTO timeline_text_clips(id,video_id,start_seconds,end_seconds,text) VALUES(?1,?2,?3,?4,?5)",
+            params![Uuid::new_v4().to_string(), video_id, at_seconds, end_seconds, "New text"],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn update_text_overlay_clip(&self, video_id: &str, clip_id: &str, start: f64, end: f64) -> Result<Timeline, String> {
+        if start < 0.0 || end <= start {
+            return Err("Clip boundaries are invalid.".into());
+        }
+        let overlap: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM timeline_text_clips WHERE video_id=?1 AND id<>?2 AND ?3 < end_seconds AND ?4 > start_seconds)",
+            params![video_id, clip_id, start, end], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if overlap {
+            return Err("Text overlays may not overlap on the same track.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_text_clips SET start_seconds=?1,end_seconds=?2 WHERE id=?3 AND video_id=?4",
+            params![start, end, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_text_overlay_style(
+        &self, video_id: &str, clip_id: &str, text: &str, font_family: &str, font_size_px: f64,
+        bold: bool, italic: bool, color: &str, background_mode: &str, background_color: &str,
+        position: &str, animation: &str,
+    ) -> Result<Timeline, String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err("Overlay text is required.".into());
+        }
+        if !["none", "solid", "blur"].contains(&background_mode) {
+            return Err("Unsupported background mode.".into());
+        }
+        if !["none", "fade", "slide"].contains(&animation) {
+            return Err("Unsupported animation.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_text_clips SET text=?1,font_family=?2,font_size_px=?3,bold=?4,italic=?5,color=?6,background_mode=?7,background_color=?8,position=?9,animation=?10 WHERE id=?11 AND video_id=?12",
+            params![trimmed, font_family, font_size_px.max(4.0), bold as i64, italic as i64, color, background_mode, background_color, position, animation, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn delete_text_overlay_clip(&self, video_id: &str, clip_id: &str) -> Result<Timeline, String> {
+        self.connection.execute("DELETE FROM timeline_text_clips WHERE id=?1 AND video_id=?2", params![clip_id, video_id]).map_err(|e| e.to_string())?;
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
+    }
+
+    // ===== Overlays track: logo/watermark =====
+
+    pub fn add_logo_clip(&self, video_id: &str, media_library_asset_id: &str) -> Result<Timeline, String> {
+        self.ensure_timeline_row(video_id)?;
+        let asset = self.media_library_asset_by_id(media_library_asset_id)?.ok_or("Media library asset was not found.")?;
+        if asset.kind != "still" {
+            return Err("Logo/watermark must be an image asset.".into());
+        }
+        let duration_seconds: f64 = self.connection.query_row(
+            "SELECT duration_seconds FROM timelines WHERE video_id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "INSERT INTO timeline_logo_clips(id,video_id,media_library_asset_id,start_seconds,end_seconds) VALUES(?1,?2,?3,0,?4)",
+            params![Uuid::new_v4().to_string(), video_id, media_library_asset_id, duration_seconds.max(1.0)],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    /// Manually dragging/resizing a logo clip means it can no longer claim to
+    /// run the entire video, so this turns off `show_throughout` — re-enabling
+    /// it (via `set_logo_clip_style`) resnaps start/end to the full duration.
+    pub fn update_logo_clip(&self, video_id: &str, clip_id: &str, start: f64, end: f64) -> Result<Timeline, String> {
+        if start < 0.0 || end <= start {
+            return Err("Clip boundaries are invalid.".into());
+        }
+        self.connection.execute(
+            "UPDATE timeline_logo_clips SET start_seconds=?1,end_seconds=?2,show_throughout=0 WHERE id=?3 AND video_id=?4",
+            params![start, end, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn set_logo_clip_style(&self, video_id: &str, clip_id: &str, position: &str, size_percent: f64, opacity_percent: f64, show_throughout: bool) -> Result<Timeline, String> {
+        if !["top-left", "top-right", "bottom-left", "bottom-right", "center"].contains(&position) {
+            return Err("Unsupported logo position.".into());
+        }
+        let clamped_size = size_percent.clamp(1.0, 100.0);
+        let clamped_opacity = opacity_percent.clamp(0.0, 100.0);
+        if show_throughout {
+            let duration_seconds: f64 = self.connection.query_row(
+                "SELECT duration_seconds FROM timelines WHERE video_id=?1", [video_id], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            self.connection.execute(
+                "UPDATE timeline_logo_clips SET position=?1,size_percent=?2,opacity_percent=?3,show_throughout=1,start_seconds=0,end_seconds=?4 WHERE id=?5 AND video_id=?6",
+                params![position, clamped_size, clamped_opacity, duration_seconds.max(1.0), clip_id, video_id],
+            ).map_err(|e| e.to_string())?;
+        } else {
+            self.connection.execute(
+                "UPDATE timeline_logo_clips SET position=?1,size_percent=?2,opacity_percent=?3,show_throughout=0 WHERE id=?4 AND video_id=?5",
+                params![position, clamped_size, clamped_opacity, clip_id, video_id],
+            ).map_err(|e| e.to_string())?;
+        }
+        self.get_timeline(video_id)
+    }
+
+    pub fn delete_logo_clip(&self, video_id: &str, clip_id: &str) -> Result<Timeline, String> {
+        self.connection.execute("DELETE FROM timeline_logo_clips WHERE id=?1 AND video_id=?2", params![clip_id, video_id]).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    /// Resets every Stills-track clip's motion/transitions back to defaults —
+    /// distinct from a single clip's "Remove effects" and from
+    /// `clear_timeline_track` (which deletes clips outright).
+    pub fn remove_all_clip_effects(&self, video_id: &str) -> Result<Timeline, String> {
+        self.connection.execute(
+            "UPDATE timeline_clips SET motion_preset='none', transition_in='cut', transition_out='cut', motion_intensity=0.22, color_filter_preset='none', color_filter_intensity=50 WHERE video_id=?1",
+            [video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
     pub fn delete_timeline_caption_clip(&self, video_id: &str, clip_id: &str) -> Result<Timeline, String> {
         self.connection.execute(
             "DELETE FROM timeline_caption_clips WHERE id=?1 AND video_id=?2",
@@ -4352,6 +5290,16 @@ Return JSON only:
                 self.connection.execute("DELETE FROM timeline_caption_clips WHERE video_id=?1", [video_id])
                     .map_err(|e| e.to_string())?;
             }
+            "music" => {
+                self.connection.execute("DELETE FROM timeline_music_clips WHERE video_id=?1", [video_id])
+                    .map_err(|e| e.to_string())?;
+            }
+            "overlays" => {
+                self.connection.execute("DELETE FROM timeline_text_clips WHERE video_id=?1", [video_id])
+                    .map_err(|e| e.to_string())?;
+                self.connection.execute("DELETE FROM timeline_logo_clips WHERE video_id=?1", [video_id])
+                    .map_err(|e| e.to_string())?;
+            }
             _ => return Err("Unknown timeline track.".into()),
         }
         self.recompute_timeline_duration(video_id)?;
@@ -4359,9 +5307,12 @@ Return JSON only:
     }
 
     /// Discards every timeline customization (still order/timing/motion/
-    /// transitions, caption edits/styles, narration offset, zoom/playhead)
-    /// and rebuilds fresh from the visual plan and the last-generated
-    /// captions — as if the timeline had just been opened for the first time.
+    /// transitions, caption edits/styles, narration offset, zoom/playhead,
+    /// music/text/logo placements) and rebuilds fresh from the visual plan
+    /// and the last-generated captions — as if the timeline had just been
+    /// opened for the first time. Imported media library assets themselves
+    /// are NOT deleted (only their placement on a track), since the library
+    /// is a separate concept from any one timeline arrangement.
     pub fn reset_timeline_to_default(&self, video_id: &str) -> Result<Timeline, String> {
         // animation_job_items.clip_id has a hard FK to timeline_clips(id) —
         // clear that generation bookkeeping first (the cached video_asset it
@@ -4375,11 +5326,108 @@ Return JSON only:
             .map_err(|e| e.to_string())?;
         self.connection.execute("DELETE FROM timeline_caption_clips WHERE video_id=?1", [video_id])
             .map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM timeline_music_clips WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM timeline_text_clips WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM timeline_logo_clips WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
         self.connection.execute(
-            "UPDATE timelines SET caption_style_json='{}', narration_offset_seconds=0, zoom=1, playhead_seconds=0, updated_at=?1 WHERE video_id=?2",
+            "UPDATE timelines SET caption_style_json='{}', narration_offset_seconds=0, zoom=1, playhead_seconds=0, music_master_volume_percent=100, music_duck_sensitivity_percent=50, updated_at=?1 WHERE video_id=?2",
             params![Utc::now().to_rfc3339(), video_id],
         ).map_err(|e| e.to_string())?;
         self.populate_timeline_from_sources(video_id)
+    }
+
+    /// Restores every timeline track table from a full `Timeline` snapshot
+    /// (JSON-serialized) — the frontend keeps an in-memory undo/redo stack of
+    /// up to 50 whole-timeline snapshots and calls this to jump back to one.
+    /// Deletes and reinserts every row rather than diffing, which keeps this
+    /// simple and correct regardless of how many fields changed since the
+    /// snapshot was taken. Mirrors `reset_timeline_to_default`'s FK-ordering:
+    /// animation_job_items/animation_jobs reference timeline_clips.id and
+    /// must be cleared before timeline_clips itself.
+    pub fn restore_timeline_snapshot(&self, video_id: &str, snapshot_json: &str) -> Result<Timeline, String> {
+        let snapshot: Timeline = serde_json::from_str(snapshot_json)
+            .map_err(|e| format!("Invalid timeline snapshot: {e}"))?;
+        if snapshot.video_id != video_id {
+            return Err("Snapshot does not belong to this video.".to_string());
+        }
+
+        self.connection.execute("DELETE FROM animation_job_items WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM animation_jobs WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM timeline_clips WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM timeline_caption_clips WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM timeline_music_clips WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM timeline_text_clips WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+        self.connection.execute("DELETE FROM timeline_logo_clips WHERE video_id=?1", [video_id])
+            .map_err(|e| e.to_string())?;
+
+        for clip in &snapshot.clips {
+            self.connection.execute(
+                "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![
+                    clip.id, video_id, clip.group_id, clip.render_id, clip.ordinal, clip.start_seconds, clip.end_seconds,
+                    clip.label, clip.motion_preset, clip.transition_in, clip.transition_out, clip.motion_intensity,
+                    clip.clip_kind, clip.video_asset_id, clip.media_library_asset_id,
+                ],
+            ).map_err(|e| e.to_string())?;
+        }
+        for clip in &snapshot.caption_clips {
+            let style_json = clip.style.as_ref().map(|value| value.to_string());
+            let words_json = clip.words.as_ref().map(serde_json::to_string).transpose().map_err(|e| e.to_string())?;
+            self.connection.execute(
+                "INSERT INTO timeline_caption_clips(id,video_id,source_chunk_index,text,ordinal,start_seconds,end_seconds,style_json,words_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![clip.id, video_id, clip.source_chunk_index, clip.text, clip.ordinal, clip.start_seconds, clip.end_seconds, style_json, words_json],
+            ).map_err(|e| e.to_string())?;
+        }
+        for clip in &snapshot.music_clips {
+            self.connection.execute(
+                "INSERT INTO timeline_music_clips(id,video_id,media_library_asset_id,ordinal,start_seconds,end_seconds,label,volume_percent,fade_in_enabled,fade_in_seconds,fade_out_enabled,fade_out_seconds,auto_duck,loop_enabled) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![
+                    clip.id, video_id, clip.media_library_asset_id, clip.ordinal, clip.start_seconds, clip.end_seconds,
+                    clip.label, clip.volume_percent, clip.fade_in_enabled, clip.fade_in_seconds, clip.fade_out_enabled,
+                    clip.fade_out_seconds, clip.auto_duck, clip.loop_enabled,
+                ],
+            ).map_err(|e| e.to_string())?;
+        }
+        for clip in &snapshot.text_clips {
+            self.connection.execute(
+                "INSERT INTO timeline_text_clips(id,video_id,start_seconds,end_seconds,text,font_family,font_size_px,bold,italic,color,background_mode,background_color,position,animation) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![
+                    clip.id, video_id, clip.start_seconds, clip.end_seconds, clip.text, clip.font_family, clip.font_size_px,
+                    clip.bold, clip.italic, clip.color, clip.background_mode, clip.background_color, clip.position, clip.animation,
+                ],
+            ).map_err(|e| e.to_string())?;
+        }
+        for clip in &snapshot.logo_clips {
+            self.connection.execute(
+                "INSERT INTO timeline_logo_clips(id,video_id,media_library_asset_id,start_seconds,end_seconds,position,size_percent,opacity_percent,show_throughout) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![clip.id, video_id, clip.media_library_asset_id, clip.start_seconds, clip.end_seconds, clip.position, clip.size_percent, clip.opacity_percent, clip.show_throughout],
+            ).map_err(|e| e.to_string())?;
+        }
+
+        self.connection.execute(
+            "UPDATE timelines SET playhead_seconds=?1,zoom=?2,caption_style_json=?3,narration_offset_seconds=?4,music_master_volume_percent=?5,music_duck_sensitivity_percent=?6,sequence_locked=?7,narration_volume_percent=?8,narration_trim_start_seconds=?9,narration_trim_end_seconds=?10,updated_at=?11 WHERE video_id=?12",
+            params![
+                snapshot.playhead_seconds, snapshot.zoom, snapshot.caption_style.to_string(), snapshot.narration_offset_seconds,
+                snapshot.music_master_volume_percent, snapshot.music_duck_sensitivity_percent, snapshot.sequence_locked,
+                snapshot.narration_volume_percent, snapshot.narration_trim_start_seconds, snapshot.narration_trim_end_seconds,
+                Utc::now().to_rfc3339(), video_id,
+            ],
+        ).map_err(|e| e.to_string())?;
+
+        // duration_seconds is always derived from track contents (see
+        // recompute_timeline_duration's own doc comment on why logo clips are
+        // excluded) rather than trusted verbatim from the snapshot.
+        self.recompute_timeline_duration(video_id)?;
+        self.get_timeline(video_id)
     }
 
     pub fn save_provider_key(&self, provider: &str, api_key: &str) -> Result<(), String> {
@@ -5679,6 +6727,7 @@ Return JSON only:
         &self,
         video_id: &str,
         engine_dir: &Path,
+        options: &ExportSettings,
     ) -> Result<(PathBuf, PathBuf), String> {
         let inputs = self.get_video_inputs(video_id)?;
         let audio = inputs.audio.as_ref().ok_or("Narration audio is required to export a video.")?;
@@ -5714,6 +6763,44 @@ Return JSON only:
                     "sourceDurationSeconds": asset.actual_duration_seconds,
                     "transitionIn": clip.transition_in,
                     "transitionOut": clip.transition_out,
+                    "colorFilter": clip.color_filter_preset,
+                    "colorFilterIntensity": clip.color_filter_intensity,
+                }));
+                continue;
+            }
+            if clip.clip_kind == "imported-clip" {
+                let Some(asset_id) = &clip.media_library_asset_id else { continue };
+                let video_path = self.media_library_asset_file_path(asset_id)?;
+                let asset = self.media_library_asset_by_id(asset_id)?.ok_or("Media library asset was not found.")?;
+                stills.push(json!({
+                    "kind": "video",
+                    "videoPath": video_path.to_string_lossy(),
+                    "start": clip.start_seconds,
+                    "end": clip.end_seconds,
+                    "sourceDurationSeconds": asset.duration_seconds.unwrap_or(clip.end_seconds - clip.start_seconds),
+                    "transitionIn": clip.transition_in,
+                    "transitionOut": clip.transition_out,
+                    "colorFilter": clip.color_filter_preset,
+                    "colorFilterIntensity": clip.color_filter_intensity,
+                }));
+                continue;
+            }
+            if clip.clip_kind == "imported-still" {
+                let Some(asset_id) = &clip.media_library_asset_id else { continue };
+                let image_path = self.media_library_asset_file_path(asset_id)?;
+                stills.push(json!({
+                    "kind": "image",
+                    "imagePath": image_path.to_string_lossy(),
+                    "start": clip.start_seconds,
+                    "end": clip.end_seconds,
+                    "motion": clip.motion_preset,
+                    "motionIntensity": clip.motion_intensity,
+                    "transitionIn": clip.transition_in,
+                    "transitionOut": clip.transition_out,
+                    "subjectX": 0.5,
+                    "subjectY": 0.5,
+                    "colorFilter": clip.color_filter_preset,
+                    "colorFilterIntensity": clip.color_filter_intensity,
                 }));
                 continue;
             }
@@ -5731,6 +6818,8 @@ Return JSON only:
                 "transitionOut": clip.transition_out,
                 "subjectX": render.subject_x.unwrap_or(0.5),
                 "subjectY": render.subject_y.unwrap_or(0.5),
+                "colorFilter": clip.color_filter_preset,
+                "colorFilterIntensity": clip.color_filter_intensity,
             }));
         }
         if stills.is_empty() {
@@ -5776,10 +6865,8 @@ Return JSON only:
         let settings_raw = self.get_app_setting("image_settings")?.unwrap_or_default();
         let settings: serde_json::Value =
             serde_json::from_str(&settings_raw).unwrap_or_else(|_| json!({}));
-        let (width, height) = match requested_aspect_ratio(&settings) {
-            "9:16" => (1080, 1920),
-            _ => (1920, 1080),
-        };
+        let (width, height) = resolution_dimensions(&options.resolution, requested_aspect_ratio(&settings));
+        let (crf, preset) = quality_crf_preset(&options.quality);
 
         let last_still_end = timeline.clips.iter().map(|c| c.end_seconds).fold(0.0f64, f64::max);
         let last_caption_end = captions.iter()
@@ -5789,15 +6876,62 @@ Return JSON only:
             .into_iter()
             .fold(0.0f64, f64::max);
 
+        // Auto-duck is a *constant* attenuation for whichever portion of a
+        // music clip overlaps narration's span (not dynamic sidechain
+        // compression against the actual narration waveform) — see
+        // MusicTool.tsx's own "Lowers music volume automatically for the
+        // entire span where narration audio is present" description.
+        let narration_span = (
+            timeline.narration_offset_seconds,
+            timeline.narration_offset_seconds + narration_duration_seconds,
+        );
+        let mut music = Vec::new();
+        if options.include_music {
+            for clip in &timeline.music_clips {
+                let asset_path = self.media_library_asset_file_path(&clip.media_library_asset_id)?;
+                let duck_overlap = if clip.auto_duck {
+                    let overlap_start = clip.start_seconds.max(narration_span.0);
+                    let overlap_end = clip.end_seconds.min(narration_span.1);
+                    if overlap_end > overlap_start { Some((overlap_start, overlap_end)) } else { None }
+                } else {
+                    None
+                };
+                music.push(json!({
+                    "path": asset_path.to_string_lossy(),
+                    "start": clip.start_seconds,
+                    "end": clip.end_seconds,
+                    "volumePercent": clip.volume_percent * (timeline.music_master_volume_percent / 100.0),
+                    "fadeInEnabled": clip.fade_in_enabled,
+                    "fadeInSeconds": clip.fade_in_seconds,
+                    "fadeOutEnabled": clip.fade_out_enabled,
+                    "fadeOutSeconds": clip.fade_out_seconds,
+                    "loopEnabled": clip.loop_enabled,
+                    "duckOverlapStart": duck_overlap.map(|(s, _)| s),
+                    "duckOverlapEnd": duck_overlap.map(|(_, e)| e),
+                    "duckMultiplier": 1.0 - (timeline.music_duck_sensitivity_percent / 100.0).clamp(0.0, 1.0),
+                }));
+            }
+        }
+
         let manifest = json!({
             "width": width,
             "height": height,
             "fps": 30,
+            "crf": crf,
+            "preset": preset,
             "narrationAudioPath": narration_audio_path.to_string_lossy(),
             "narrationOffsetSeconds": timeline.narration_offset_seconds,
+            "narrationVolumePercent": timeline.narration_volume_percent,
+            "narrationTrimStartSeconds": timeline.narration_trim_start_seconds,
+            "narrationTrimEndSeconds": timeline.narration_trim_end_seconds,
+            "narrationDurationSeconds": narration_duration_seconds,
+            "includeNarration": options.include_narration,
+            "music": music,
             "stills": stills,
             "captions": captions,
             "captionDefaultStyle": caption_default_style,
+            "burnCaptions": options.captions_mode != "srt",
+            "writeSrt": options.captions_mode != "burned-in",
             "durationSeconds": duration_seconds,
         });
 
@@ -5989,28 +7123,71 @@ Return JSON only:
         }
     }
 
+    pub fn create_export_job(&self, video_id: &str, destination_path: &str) -> Result<String, String> {
+        let id = Uuid::new_v4().to_string();
+        self.connection.execute(
+            "INSERT INTO export_jobs(id,video_id,status,destination_path,created_at) VALUES(?1,?2,'running',?3,?4)",
+            params![id, video_id, destination_path, Utc::now().to_rfc3339()],
+        ).map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    pub fn complete_export_job(&self, job_id: &str, destination_path: &str) -> Result<(), String> {
+        self.connection.execute(
+            "UPDATE export_jobs SET status='completed', destination_path=?1, completed_at=?2 WHERE id=?3",
+            params![destination_path, Utc::now().to_rfc3339(), job_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn fail_export_job(&self, job_id: &str, error: &str) -> Result<(), String> {
+        self.connection.execute(
+            "UPDATE export_jobs SET status='failed', error=?1, completed_at=?2 WHERE id=?3",
+            params![error, Utc::now().to_rfc3339(), job_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn list_export_jobs(&self, video_id: &str) -> Result<Vec<ExportJob>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,video_id,status,destination_path,error,created_at,completed_at FROM export_jobs WHERE video_id=?1 ORDER BY created_at DESC"
+        ).map_err(|e| e.to_string())?;
+        let jobs = statement.query_map([video_id], |row| Ok(ExportJob {
+            id: row.get(0)?,
+            video_id: row.get(1)?,
+            status: row.get(2)?,
+            destination_path: row.get(3)?,
+            error: row.get(4)?,
+            created_at: row.get(5)?,
+            completed_at: row.get(6)?,
+        })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        Ok(jobs)
+    }
+
     pub fn export_timeline_video_with_progress<F, S>(
         &self,
         video_id: &str,
         engine_dir: &Path,
+        options: &ExportSettings,
         mut on_spawn: S,
         mut progress: F,
-    ) -> Result<PathBuf, String>
+    ) -> Result<(PathBuf, Option<PathBuf>), String>
     where
         F: FnMut(i64, &str, &str),
         S: FnMut(u32),
     {
         #[cfg(test)]
         {
-            let _ = (engine_dir, &mut on_spawn);
+            let _ = (engine_dir, options, &mut on_spawn);
             progress(100, "Export ready", "test");
-            Ok(PathBuf::from("test-output.mp4"))
+            Ok((PathBuf::from("test-output.mp4"), None))
         }
         #[cfg(not(test))]
         {
             let (video_dir, manifest_path) =
-                self.build_timeline_export_manifest(video_id, engine_dir)?;
+                self.build_timeline_export_manifest(video_id, engine_dir, options)?;
             let output_path = video_dir.join("export").join("output.mp4");
+            let srt_path = video_dir.join("export").join("captions.srt");
             let export_engine = engine_dir.join("auto_gen_engine/video_export_engine.py");
             if !export_engine.exists() {
                 return Err(format!(
@@ -6114,7 +7291,9 @@ Return JSON only:
             if !output_path.exists() {
                 return Err("Video export finished but no output file was produced.".into());
             }
-            Ok(output_path)
+            let produced_srt = (options.captions_mode != "burned-in" && srt_path.exists())
+                .then_some(srt_path);
+            Ok((output_path, produced_srt))
         }
     }
 
@@ -6144,8 +7323,11 @@ Return JSON only:
         }
         #[cfg(not(test))]
         {
+            // Bundle export hands each clip to another editor as its own file
+            // at native resolution/quality — the single-file video's
+            // resolution/quality/captions-mode/music-mix settings don't apply.
             let (_video_dir, manifest_path) =
-                self.build_timeline_export_manifest(video_id, engine_dir)?;
+                self.build_timeline_export_manifest(video_id, engine_dir, &ExportSettings::default())?;
             let export_engine = engine_dir.join("auto_gen_engine/video_export_engine.py");
             if !export_engine.exists() {
                 return Err(format!(
@@ -6504,10 +7686,27 @@ fn extension_to_media_type(extension: &str) -> &'static str {
         "m4a" => "audio/mp4",
         "aac" => "audio/aac",
         "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
         _ => "application/octet-stream",
+    }
+}
+
+/// Infers a media-library `kind` ('still'|'clip'|'audio') from a file
+/// extension — used by the top-level "+ Import" entry point, which has no
+/// pre-selected kind and routes the imported file into the matching tab.
+fn media_library_kind_for_extension(extension: &str) -> Option<&'static str> {
+    match extension {
+        "png" | "jpg" | "jpeg" | "webp" => Some("still"),
+        "mp4" | "mov" | "webm" | "mkv" => Some("clip"),
+        "mp3" | "wav" | "m4a" | "aac" | "flac" | "ogg" => Some("audio"),
+        _ => None,
     }
 }
 
@@ -7987,6 +9186,333 @@ mod tests {
                 )
                 .is_err());
         }
+    }
+
+    #[test]
+    fn imports_media_library_assets_and_lists_by_kind() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let image_path = temp.path().join("logo.png");
+        fs::write(&image_path, b"png-bytes").unwrap();
+        let audio_path = temp.path().join("song.mp3");
+        fs::write(&audio_path, b"mp3-bytes").unwrap();
+
+        let still_asset = repo
+            .import_media_library_asset(&video.id, &image_path, Some("still"), temp.path())
+            .unwrap();
+        assert_eq!(still_asset.kind, "still");
+        assert_eq!(still_asset.duration_seconds, None);
+        let audio_asset = repo
+            .import_media_library_asset(&video.id, &audio_path, Some("audio"), temp.path())
+            .unwrap();
+        assert_eq!(audio_asset.kind, "audio");
+        assert_eq!(audio_asset.duration_seconds, Some(1.0));
+
+        let stills = repo.list_media_library_assets(&video.id, Some("still")).unwrap();
+        assert_eq!(stills.len(), 1);
+        assert_eq!(stills[0].id, still_asset.id);
+        let all = repo.list_media_library_assets(&video.id, None).unwrap();
+        assert_eq!(all.len(), 2);
+
+        // The top-level "+ Import" entry point has no pre-selected kind — an
+        // unsupported extension should be rejected outright...
+        let unknown_path = temp.path().join("data.xyz");
+        fs::write(&unknown_path, b"???").unwrap();
+        assert!(repo
+            .import_media_library_asset(&video.id, &unknown_path, None, temp.path())
+            .is_err());
+        // ...while a known extension is routed to the correct kind automatically.
+        let inferred = repo
+            .import_media_library_asset(&video.id, &image_path, None, temp.path())
+            .unwrap();
+        assert_eq!(inferred.kind, "still");
+
+        repo.remove_media_library_asset(&still_asset.id).unwrap();
+        assert_eq!(repo.list_media_library_assets(&video.id, Some("still")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn music_clips_persist_settings_and_reject_overlap() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        repo.connection.execute(
+            "INSERT INTO timelines(video_id,duration_seconds,playhead_seconds,zoom,updated_at) VALUES(?1,10,0,1,'now')",
+            [&video.id],
+        ).unwrap();
+        let audio_path = temp.path().join("song.mp3");
+        fs::write(&audio_path, b"mp3-bytes").unwrap();
+        let asset = repo
+            .import_media_library_asset(&video.id, &audio_path, Some("audio"), temp.path())
+            .unwrap();
+
+        let timeline = repo.add_music_clip(&video.id, &asset.id, 0.0).unwrap();
+        assert_eq!(timeline.music_clips.len(), 1);
+        let clip_id = timeline.music_clips[0].id.clone();
+
+        assert!(repo.add_music_clip(&video.id, &asset.id, 0.5).is_err());
+
+        let updated = repo
+            .set_music_clip_settings(&video.id, &clip_id, 40.0, true, 2.0, true, 1.5, true, true)
+            .unwrap();
+        let clip = updated.music_clips.iter().find(|c| c.id == clip_id).unwrap();
+        assert_eq!(clip.volume_percent, 40.0);
+        assert!(clip.fade_in_enabled);
+        assert!(clip.loop_enabled);
+        assert!(clip.auto_duck);
+
+        let after_master = repo.set_music_master_settings(&video.id, 150.0, 75.0).unwrap();
+        assert_eq!(after_master.music_master_volume_percent, 150.0);
+        assert_eq!(after_master.music_duck_sensitivity_percent, 75.0);
+
+        let after_delete = repo.delete_music_clip(&video.id, &clip_id).unwrap();
+        assert!(after_delete.music_clips.is_empty());
+    }
+
+    #[test]
+    fn color_filter_and_dip_to_white_transition_are_validated_and_applied() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let timeline = repo.build_timeline(&video.id).unwrap();
+        assert!(timeline.clips.iter().all(|c| c.color_filter_preset == "none" && (c.color_filter_intensity - 50.0).abs() < 1e-9));
+        let first_clip_id = timeline.clips[0].id.clone();
+
+        assert!(repo.set_timeline_clip_color_filter(&video.id, &first_clip_id, "bogus", 50.0).is_err());
+        assert!(repo.set_timeline_clip_transition(&video.id, &first_clip_id, "dip-to-white").is_ok());
+        for join_transition in ["cross-fade", "slide-left", "slide-right", "zoom-blur"] {
+            assert!(
+                repo.set_timeline_clip_transition_out(&video.id, &first_clip_id, join_transition).is_ok(),
+                "{join_transition} should be a valid transition_out value",
+            );
+        }
+        assert!(repo.set_timeline_clip_transition_out(&video.id, &first_clip_id, "bogus-transition").is_err());
+
+        let updated = repo.set_timeline_clip_color_filter(&video.id, &first_clip_id, "warm", 150.0).unwrap();
+        let clip = updated.clips.iter().find(|c| c.id == first_clip_id).unwrap();
+        assert_eq!(clip.color_filter_preset, "warm");
+        assert_eq!(clip.color_filter_intensity, 100.0); // clamped
+
+        let all = repo.apply_color_filter_to_all_clips(&video.id, "cinematic", 60.0).unwrap();
+        assert!(all.clips.iter().all(|c| c.color_filter_preset == "cinematic" && (c.color_filter_intensity - 60.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn text_overlay_clip_validates_style_fields() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        repo.connection.execute(
+            "INSERT INTO timelines(video_id,duration_seconds,playhead_seconds,zoom,updated_at) VALUES(?1,10,0,1,'now')",
+            [&video.id],
+        ).unwrap();
+
+        let timeline = repo.add_text_overlay_clip(&video.id, 2.0).unwrap();
+        assert_eq!(timeline.text_clips.len(), 1);
+        let clip_id = timeline.text_clips[0].id.clone();
+
+        assert!(repo.set_text_overlay_style(
+            &video.id, &clip_id, "Hello", "Rubik", 40.0, true, false, "#FFFFFF", "bogus", "#000000", "bottom-center", "fade",
+        ).is_err());
+
+        let updated = repo.set_text_overlay_style(
+            &video.id, &clip_id, "Hello", "Rubik", 40.0, true, false, "#FFFFFF", "solid", "#000000", "bottom-center", "fade",
+        ).unwrap();
+        let clip = updated.text_clips.iter().find(|c| c.id == clip_id).unwrap();
+        assert_eq!(clip.text, "Hello");
+        assert_eq!(clip.background_mode, "solid");
+
+        let after_delete = repo.delete_text_overlay_clip(&video.id, &clip_id).unwrap();
+        assert!(after_delete.text_clips.is_empty());
+    }
+
+    #[test]
+    fn text_overlay_clips_reject_overlap() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        repo.connection.execute(
+            "INSERT INTO timelines(video_id,duration_seconds,playhead_seconds,zoom,updated_at) VALUES(?1,10,0,1,'now')",
+            [&video.id],
+        ).unwrap();
+
+        let timeline = repo.add_text_overlay_clip(&video.id, 0.0).unwrap();
+        let first_id = timeline.text_clips[0].id.clone();
+
+        // A second overlay starting inside the first one's [0,3) span must be rejected.
+        assert!(repo.add_text_overlay_clip(&video.id, 1.0).is_err());
+        // Non-overlapping placement still succeeds.
+        let timeline = repo.add_text_overlay_clip(&video.id, 5.0).unwrap();
+        assert_eq!(timeline.text_clips.len(), 2);
+
+        // Dragging the first clip to overlap the second must also be rejected.
+        assert!(repo.update_text_overlay_clip(&video.id, &first_id, 4.5, 6.0).is_err());
+    }
+
+    #[test]
+    fn logo_show_throughout_resyncs_and_manual_resize_disables_it() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        repo.connection.execute(
+            "INSERT INTO timelines(video_id,duration_seconds,playhead_seconds,zoom,updated_at) VALUES(?1,20,0,1,'now')",
+            [&video.id],
+        ).unwrap();
+        let image_path = temp.path().join("logo.png");
+        fs::write(&image_path, b"png-bytes").unwrap();
+        let asset = repo
+            .import_media_library_asset(&video.id, &image_path, Some("still"), temp.path())
+            .unwrap();
+
+        let timeline = repo.add_logo_clip(&video.id, &asset.id).unwrap();
+        assert_eq!(timeline.logo_clips.len(), 1);
+        let clip = &timeline.logo_clips[0];
+        assert!(clip.show_throughout);
+        assert_eq!(clip.start_seconds, 0.0);
+        assert_eq!(clip.end_seconds, 20.0);
+        let clip_id = clip.id.clone();
+
+        let after_resize = repo.update_logo_clip(&video.id, &clip_id, 2.0, 8.0).unwrap();
+        let resized = after_resize.logo_clips.iter().find(|c| c.id == clip_id).unwrap();
+        assert!(!resized.show_throughout);
+        assert_eq!(resized.start_seconds, 2.0);
+        assert_eq!(resized.end_seconds, 8.0);
+
+        let after_style = repo.set_logo_clip_style(&video.id, &clip_id, "top-left", 20.0, 80.0, true).unwrap();
+        let restyled = after_style.logo_clips.iter().find(|c| c.id == clip_id).unwrap();
+        assert!(restyled.show_throughout);
+        assert_eq!(restyled.start_seconds, 0.0);
+        assert_eq!(restyled.end_seconds, 20.0);
+        assert_eq!(restyled.position, "top-left");
+    }
+
+    #[test]
+    fn remove_all_clip_effects_resets_every_stills_clip() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let timeline = repo.build_timeline(&video.id).unwrap();
+        assert!(!timeline.clips.is_empty());
+        let first_clip_id = timeline.clips[0].id.clone();
+        repo.set_timeline_clip_motion(&video.id, &first_clip_id, "zoom-in").unwrap();
+        repo.set_timeline_clip_motion_intensity(&video.id, &first_clip_id, 0.5).unwrap();
+        repo.set_timeline_clip_transition(&video.id, &first_clip_id, "fade").unwrap();
+        repo.set_timeline_clip_color_filter(&video.id, &first_clip_id, "warm", 80.0).unwrap();
+
+        let reset = repo.remove_all_clip_effects(&video.id).unwrap();
+        assert!(reset.clips.iter().all(|clip| {
+            clip.motion_preset == "none"
+                && clip.transition_in == "cut"
+                && clip.transition_out == "cut"
+                && (clip.motion_intensity - 0.22).abs() < 1e-9
+                && clip.color_filter_preset == "none"
+                && (clip.color_filter_intensity - 50.0).abs() < 1e-9
+        }));
+    }
+
+    #[test]
+    fn export_jobs_track_lifecycle_and_list_newest_first() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+
+        let job1 = repo.create_export_job(&video.id, "/tmp/first.mp4").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let job2 = repo.create_export_job(&video.id, "/tmp/second.mp4").unwrap();
+
+        repo.complete_export_job(&job1, "/tmp/first-final.mp4").unwrap();
+        repo.fail_export_job(&job2, "ffmpeg exploded").unwrap();
+
+        let jobs = repo.list_export_jobs(&video.id).unwrap();
+        assert_eq!(jobs.len(), 2);
+        // Newest first.
+        assert_eq!(jobs[0].id, job2);
+        assert_eq!(jobs[0].status, "failed");
+        assert_eq!(jobs[0].error.as_deref(), Some("ffmpeg exploded"));
+        assert!(jobs[0].completed_at.is_some());
+        assert_eq!(jobs[1].id, job1);
+        assert_eq!(jobs[1].status, "completed");
+        assert_eq!(jobs[1].destination_path, "/tmp/first-final.mp4");
+
+        let other_video = repo.create_video(&channel.id, "Other").unwrap();
+        assert!(repo.list_export_jobs(&other_video.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restores_timeline_from_snapshot_after_mutation() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let before = repo.build_timeline(&video.id).unwrap();
+        assert!(!before.clips.is_empty());
+        let first_clip_id = before.clips[0].id.clone();
+
+        let song_path = temp.path().join("song.mp3");
+        fs::write(&song_path, b"mp3-bytes").unwrap();
+        let asset = repo.import_media_library_asset(&video.id, &song_path, Some("audio"), temp.path()).unwrap();
+        let before = repo.add_music_clip(&video.id, &asset.id, 0.0).unwrap();
+        assert_eq!(before.music_clips.len(), 1);
+
+        let snapshot_json = serde_json::to_string(&before).unwrap();
+
+        // Mutate the timeline: change the first clip's motion, delete the
+        // music clip entirely — both should be undone by the restore below.
+        repo.set_timeline_clip_motion(&video.id, &first_clip_id, "zoom-in").unwrap();
+        let music_clip_id = before.music_clips[0].id.clone();
+        repo.delete_music_clip(&video.id, &music_clip_id).unwrap();
+        let mutated = repo.get_timeline(&video.id).unwrap();
+        assert!(mutated.music_clips.is_empty());
+        assert_eq!(mutated.clips.iter().find(|c| c.id == first_clip_id).unwrap().motion_preset, "zoom-in");
+
+        let restored = repo.restore_timeline_snapshot(&video.id, &snapshot_json).unwrap();
+        assert_eq!(restored.clips.len(), before.clips.len());
+        assert_eq!(restored.clips.iter().find(|c| c.id == first_clip_id).unwrap().motion_preset, "none");
+        assert_eq!(restored.music_clips.len(), 1);
+        assert_eq!(restored.music_clips[0].id, music_clip_id);
+
+        // A snapshot from a different video must be rejected outright.
+        let other_video = repo.create_video(&channel.id, "Other").unwrap();
+        assert!(repo.restore_timeline_snapshot(&other_video.id, &snapshot_json).is_err());
+    }
+
+    #[test]
+    fn removing_media_library_asset_cascades_to_placed_clips() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        repo.connection.execute(
+            "INSERT INTO timelines(video_id,duration_seconds,playhead_seconds,zoom,updated_at) VALUES(?1,10,0,1,'now')",
+            [&video.id],
+        ).unwrap();
+        let audio_path = temp.path().join("song.mp3");
+        fs::write(&audio_path, b"mp3-bytes").unwrap();
+        let asset = repo
+            .import_media_library_asset(&video.id, &audio_path, Some("audio"), temp.path())
+            .unwrap();
+        let timeline = repo.add_music_clip(&video.id, &asset.id, 0.0).unwrap();
+        assert_eq!(timeline.music_clips.len(), 1);
+
+        repo.remove_media_library_asset(&asset.id).unwrap();
+
+        let after = repo.get_timeline(&video.id).unwrap();
+        assert!(after.music_clips.is_empty());
+        assert!(repo.list_media_library_assets(&video.id, None).unwrap().is_empty());
     }
 
     #[test]

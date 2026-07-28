@@ -2,9 +2,9 @@ mod projects;
 
 use base64::Engine;
 use projects::{
-    AnimationJob, CaptionSet, Channel, ExportResult, ImageJob, ImageRender, ImageWorkspace,
-    InputAsset, ProjectRepository, PromptVersion, ResumeState, Timeline, Video, VideoAsset,
-    VideoInputs, VideoProgress, VisualPlan,
+    AnimationJob, CaptionSet, Channel, ExportJob, ExportResult, ExportSettings, ImageJob,
+    ImageRender, ImageWorkspace, InputAsset, MediaLibraryAsset, ProjectRepository, PromptVersion,
+    ResumeState, Timeline, Video, VideoAsset, VideoInputs, VideoProgress, VisualPlan,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -636,11 +636,12 @@ fn pick_download_folder(app: tauri::AppHandle) -> Option<String> {
 }
 
 #[tauri::command]
-fn pick_export_destination(app: tauri::AppHandle, default_name: String) -> Option<String> {
-    app.dialog()
-        .file()
-        .add_filter("MP4 video", &["mp4"])
-        .set_file_name(&default_name)
+fn pick_export_destination(app: tauri::AppHandle, default_name: String, default_dir: Option<String>) -> Option<String> {
+    let mut dialog = app.dialog().file().add_filter("MP4 video", &["mp4"]).set_file_name(&default_name);
+    if let Some(dir) = default_dir.filter(|d| !d.is_empty()) {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog
         .blocking_save_file()
         .and_then(|value| value.as_path().map(|p| p.to_string_lossy().into_owned()))
 }
@@ -651,6 +652,11 @@ fn pick_export_project_destination(app: tauri::AppHandle) -> Option<String> {
         .file()
         .blocking_pick_folder()
         .and_then(|value| value.as_path().map(|p| p.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+fn list_export_jobs(state: State<'_, RepositoryState>, video_id: String) -> Result<Vec<ExportJob>, String> {
+    with_repository(state, |repository| repository.list_export_jobs(&video_id))
 }
 
 #[tauri::command]
@@ -939,6 +945,31 @@ fn set_timeline_clip_motion_intensity(
 }
 
 #[tauri::command]
+fn set_timeline_clip_color_filter(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    preset: String,
+    intensity: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_timeline_clip_color_filter(&video_id, &clip_id, &preset, intensity)
+    })
+}
+
+#[tauri::command]
+fn apply_color_filter_to_all_clips(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    preset: String,
+    intensity: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.apply_color_filter_to_all_clips(&video_id, &preset, intensity)
+    })
+}
+
+#[tauri::command]
 fn apply_motion_to_all_clips(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -1025,6 +1056,17 @@ fn delete_timeline_clip(
 }
 
 #[tauri::command]
+fn duplicate_timeline_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.duplicate_timeline_clip(&video_id, &clip_id)
+    })
+}
+
+#[tauri::command]
 fn delete_timeline_caption_clip(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -1053,6 +1095,335 @@ fn reset_timeline_to_default(
 ) -> Result<Timeline, String> {
     with_repository(state, |repository| {
         repository.reset_timeline_to_default(&video_id)
+    })
+}
+
+#[tauri::command]
+fn restore_timeline_snapshot(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    snapshot_json: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.restore_timeline_snapshot(&video_id, &snapshot_json)
+    })
+}
+
+// ===== Media library (Editor tab: Stills / Clips / Audio tabs) =====
+
+#[tauri::command]
+fn pick_and_import_media_library_asset(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    kind: Option<String>,
+) -> Result<Option<MediaLibraryAsset>, String> {
+    let mut picker = app.dialog().file();
+    picker = match kind.as_deref() {
+        Some("still") => picker.add_filter("Images", &["png", "jpg", "jpeg", "webp"]),
+        Some("clip") => picker.add_filter("Video clips", &["mp4", "mov", "webm", "mkv"]),
+        Some("audio") => picker.add_filter("Audio", &["mp3", "wav", "m4a", "aac", "flac", "ogg"]),
+        _ => picker.add_filter(
+            "Media",
+            &[
+                "png", "jpg", "jpeg", "webp", "mp4", "mov", "webm", "mkv", "mp3", "wav", "m4a",
+                "aac", "flac", "ogg",
+            ],
+        ),
+    };
+    let Some(path) = picker
+        .blocking_pick_file()
+        .and_then(|file| file.as_path().map(ToOwned::to_owned))
+    else {
+        return Ok(None);
+    };
+    let engine_dir = resolve_engine_dir(&app)?;
+    with_repository(state, |repository| {
+        repository.import_media_library_asset(&video_id, &path, kind.as_deref(), &engine_dir)
+    })
+    .map(Some)
+}
+
+#[tauri::command]
+fn list_media_library_assets(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    kind: Option<String>,
+) -> Result<Vec<MediaLibraryAsset>, String> {
+    with_repository(state, |repository| {
+        repository.list_media_library_assets(&video_id, kind.as_deref())
+    })
+}
+
+#[tauri::command]
+fn remove_media_library_asset(
+    state: State<'_, RepositoryState>,
+    asset_id: String,
+) -> Result<(), String> {
+    with_repository(state, |repository| {
+        repository.remove_media_library_asset(&asset_id)
+    })
+}
+
+#[tauri::command]
+fn get_media_library_asset_file_path(
+    state: State<'_, RepositoryState>,
+    asset_id: String,
+) -> Result<String, String> {
+    with_repository(state, |repository| {
+        repository
+            .media_library_asset_file_path(&asset_id)
+            .map(|path| path.to_string_lossy().into_owned())
+    })
+}
+
+#[tauri::command]
+fn list_video_assets(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Vec<VideoAsset>, String> {
+    with_repository(state, |repository| repository.list_video_assets(&video_id))
+}
+
+#[tauri::command]
+fn add_video_asset_clip_to_stills_track(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    video_asset_id: String,
+    start_seconds: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.add_video_asset_clip_to_stills_track(&video_id, &video_asset_id, start_seconds)
+    })
+}
+
+#[tauri::command]
+fn add_library_asset_to_stills_track(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    media_library_asset_id: String,
+    start_seconds: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.add_library_asset_to_stills_track(&video_id, &media_library_asset_id, start_seconds)
+    })
+}
+
+// ===== Music track =====
+
+#[tauri::command]
+fn add_music_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    media_library_asset_id: String,
+    start_seconds: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.add_music_clip(&video_id, &media_library_asset_id, start_seconds)
+    })
+}
+
+#[tauri::command]
+fn update_music_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    start: f64,
+    end: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.update_music_clip(&video_id, &clip_id, start, end)
+    })
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn set_music_clip_settings(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    volume_percent: f64,
+    fade_in_enabled: bool,
+    fade_in_seconds: f64,
+    fade_out_enabled: bool,
+    fade_out_seconds: f64,
+    auto_duck: bool,
+    loop_enabled: bool,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_music_clip_settings(
+            &video_id, &clip_id, volume_percent,
+            fade_in_enabled, fade_in_seconds, fade_out_enabled, fade_out_seconds, auto_duck, loop_enabled,
+        )
+    })
+}
+
+#[tauri::command]
+fn delete_music_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.delete_music_clip(&video_id, &clip_id)
+    })
+}
+
+#[tauri::command]
+fn set_music_master_settings(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    master_volume_percent: f64,
+    duck_sensitivity_percent: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_music_master_settings(&video_id, master_volume_percent, duck_sensitivity_percent)
+    })
+}
+
+#[tauri::command]
+fn set_sequence_locked(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    locked: bool,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| repository.set_sequence_locked(&video_id, locked))
+}
+
+#[tauri::command]
+fn set_narration_settings(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    volume_percent: f64,
+    trim_start_seconds: f64,
+    trim_end_seconds: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_narration_settings(&video_id, volume_percent, trim_start_seconds, trim_end_seconds)
+    })
+}
+
+// ===== Overlays track: text =====
+
+#[tauri::command]
+fn add_text_overlay_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    at_seconds: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.add_text_overlay_clip(&video_id, at_seconds)
+    })
+}
+
+#[tauri::command]
+fn update_text_overlay_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    start: f64,
+    end: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.update_text_overlay_clip(&video_id, &clip_id, start, end)
+    })
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn set_text_overlay_style(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    text: String,
+    font_family: String,
+    font_size_px: f64,
+    bold: bool,
+    italic: bool,
+    color: String,
+    background_mode: String,
+    background_color: String,
+    position: String,
+    animation: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_text_overlay_style(
+            &video_id, &clip_id, &text, &font_family, font_size_px, bold, italic,
+            &color, &background_mode, &background_color, &position, &animation,
+        )
+    })
+}
+
+#[tauri::command]
+fn delete_text_overlay_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.delete_text_overlay_clip(&video_id, &clip_id)
+    })
+}
+
+// ===== Overlays track: logo/watermark =====
+
+#[tauri::command]
+fn add_logo_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    media_library_asset_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.add_logo_clip(&video_id, &media_library_asset_id)
+    })
+}
+
+#[tauri::command]
+fn update_logo_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    start: f64,
+    end: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.update_logo_clip(&video_id, &clip_id, start, end)
+    })
+}
+
+#[tauri::command]
+fn set_logo_clip_style(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    position: String,
+    size_percent: f64,
+    opacity_percent: f64,
+    show_throughout: bool,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_logo_clip_style(&video_id, &clip_id, &position, size_percent, opacity_percent, show_throughout)
+    })
+}
+
+#[tauri::command]
+fn delete_logo_clip(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.delete_logo_clip(&video_id, &clip_id)
+    })
+}
+
+#[tauri::command]
+fn remove_all_clip_effects(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.remove_all_clip_effects(&video_id)
     })
 }
 
@@ -1665,6 +2036,7 @@ async fn export_timeline_video(
     state: State<'_, RepositoryState>,
     video_id: String,
     destination_path: String,
+    options: ExportSettings,
 ) -> Result<Option<String>, String> {
     let (database_path, projects_dir) = {
         let repository = state
@@ -1680,18 +2052,25 @@ async fn export_timeline_video(
             .map_err(|e| format!("Could not locate app resource directory: {e}"))?
             .join("python-engine")
     };
-    let output_path = {
+    let job_id = {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.create_export_job(&video_id, &destination_path)?
+    };
+    let (output_path, srt_path) = {
         let progress_app = app.clone();
         let pid_app = app.clone();
         let cleanup_app = app.clone();
         let event_video_id = video_id.clone();
         let pid_video_id = video_id.clone();
         let cleanup_video_id = video_id.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        let (worker_database_path, worker_projects_dir) = (database_path.clone(), projects_dir.clone());
+        let worker_video_id = video_id.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let repository = ProjectRepository::open(&worker_database_path, &worker_projects_dir)?;
             let result = repository.export_timeline_video_with_progress(
-                &video_id,
+                &worker_video_id,
                 &engine_dir,
+                &options,
                 move |pid| {
                     let jobs = pid_app.state::<ExportJobsState>();
                     jobs.lock()
@@ -1717,10 +2096,29 @@ async fn export_timeline_video(
             result
         })
         .await
-        .map_err(|error| format!("Export worker failed: {error}"))??
+        .map_err(|error| format!("Export worker failed: {error}"))?;
+        match result {
+            Ok(paths) => paths,
+            Err(error) => {
+                let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+                repository.fail_export_job(&job_id, &error)?;
+                return Err(error);
+            }
+        }
     };
     let dest = PathBuf::from(&destination_path);
-    fs::copy(&output_path, &dest).map_err(|e| format!("Could not save exported video: {e}"))?;
+    let copy_result = fs::copy(&output_path, &dest).map_err(|e| format!("Could not save exported video: {e}"));
+    if let Err(error) = &copy_result {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.fail_export_job(&job_id, error)?;
+    }
+    copy_result?;
+    if let Some(srt_path) = srt_path {
+        let srt_dest = dest.with_extension("srt");
+        let _ = fs::copy(&srt_path, &srt_dest);
+    }
+    let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+    repository.complete_export_job(&job_id, &destination_path)?;
     Ok(Some(dest.to_string_lossy().into_owned()))
 }
 
@@ -1814,6 +2212,39 @@ fn cancel_timeline_export(app: tauri::AppHandle, video_id: String) -> Result<boo
     #[cfg(not(windows))]
     {
         Ok(false)
+    }
+}
+
+#[tauri::command]
+fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new("explorer");
+        command.args([format!("/select,{path}")]);
+        command.creation_flags(0x08000000);
+        command.spawn().map_err(|e| format!("Could not open the file manager: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R", &path])
+            .spawn()
+            .map_err(|e| format!("Could not open the file manager: {e}"))?;
+        Ok(())
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let parent = std::path::Path::new(&path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(path);
+        std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| format!("Could not open the file manager: {e}"))?;
+        Ok(())
     }
 }
 
@@ -2099,6 +2530,8 @@ pub fn run() {
             get_asset_file_path,
             pick_download_folder,
             pick_export_destination,
+            list_export_jobs,
+            reveal_in_file_manager,
             copy_render_to_folder,
             export_latest_stills,
             export_project_bundle,
@@ -2122,6 +2555,8 @@ pub fn run() {
             set_timeline_clip_transition,
             set_timeline_clip_transition_out,
             set_timeline_clip_motion_intensity,
+            set_timeline_clip_color_filter,
+            apply_color_filter_to_all_clips,
             apply_motion_to_all_clips,
             apply_transition_in_to_all_clips,
             apply_transition_out_to_all_clips,
@@ -2130,9 +2565,34 @@ pub fn run() {
             extrapolate_stills_to_fill_gaps,
             reset_stills_timing_to_natural,
             delete_timeline_clip,
+            duplicate_timeline_clip,
             delete_timeline_caption_clip,
             clear_timeline_track,
             reset_timeline_to_default,
+            restore_timeline_snapshot,
+            pick_and_import_media_library_asset,
+            list_media_library_assets,
+            remove_media_library_asset,
+            get_media_library_asset_file_path,
+            list_video_assets,
+            add_video_asset_clip_to_stills_track,
+            add_library_asset_to_stills_track,
+            add_music_clip,
+            update_music_clip,
+            set_music_clip_settings,
+            delete_music_clip,
+            set_music_master_settings,
+            set_sequence_locked,
+            set_narration_settings,
+            add_text_overlay_clip,
+            update_text_overlay_clip,
+            set_text_overlay_style,
+            delete_text_overlay_clip,
+            add_logo_clip,
+            update_logo_clip,
+            set_logo_clip_style,
+            delete_logo_clip,
+            remove_all_clip_effects,
             probe_narration_duration,
             detect_render_subject,
             export_timeline_video,

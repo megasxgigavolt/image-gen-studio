@@ -122,6 +122,80 @@ def assign_frame_counts(segments: list[dict], fps: int) -> None:
         cumulative_frame += segment["frames"]
 
 
+# These 4 transitions need both neighboring clips' pixel data blended
+# together, unlike cut/fade/dip-to-white which only ever touch one segment's
+# own frames — see `expand_join_transitions`. Mapped onto ffmpeg's `xfade`
+# filter's built-in transition catalog rather than hand-built filter_complex
+# graphs per type, since xfade already covers all of these reliably.
+JOIN_TRANSITIONS = {"cross-fade", "slide-left", "slide-right", "zoom-blur"}
+_XFADE_TRANSITION_NAMES = {
+    "cross-fade": "fade",
+    "slide-left": "slideleft",
+    "slide-right": "slideright",
+    # xfade has no literal "zoom + motion blur" preset; "zoomin" (the
+    # incoming clip zooms in while cross-dissolving) is the closest built-in
+    # analog and reads as a zoom-blur at typical transition speeds.
+    "zoom-blur": "zoomin",
+}
+
+
+def expand_join_transitions(segments: list[dict], fps: int) -> list[dict]:
+    """Splices a short blended "transition segment" between two adjacent
+    segments wherever the earlier one's `transitionOut` is a join transition.
+
+    A real crossfade/slide/zoom-blur overlaps the outgoing clip's tail with
+    the incoming clip's head — playing 2N frames' worth of source over only
+    N frames of output. Simply carving that overlap out of both clips' own
+    on-screen time would shrink the total exported duration by N frames per
+    transition, drifting picture out of sync with the fixed-length narration
+    track after every single one. Instead, the outgoing clip's own segment
+    is left completely untouched (still its full nominal length) and the
+    *transition segment* renders N extra "virtual" frames of the outgoing
+    clip continuing past its nominal end — safe for a still image, since its
+    Ken-Burns motion formulas are just math with no footage limit — blended
+    against the incoming clip's own first N frames. The incoming clip's own
+    independent segment then starts N frames later (skipping the head that
+    now plays inside the transition instead). Net effect: nominal_a + N +
+    (nominal_b - N) == nominal_a + nominal_b, so total output length (and
+    narration sync) is exactly preserved.
+
+    This only works when the outgoing side is a still image — a "video"
+    (Veo/imported) clip has no footage beyond what it was trimmed to for its
+    own slot, so extending it isn't possible; a join transition into/out of
+    a "video" segment, a "black" gap, or the very edge of the timeline
+    silently renders as a hard cut instead, same as how the true first/last
+    segment's fade already gets ignored."""
+    for segment in segments:
+        segment["_originalFrames"] = segment["frames"]
+
+    expanded: list[dict] = []
+    for index, segment in enumerate(segments):
+        expanded.append(segment)
+        transition_type = segment.get("transitionOut", "cut")
+        next_segment = segments[index + 1] if index + 1 < len(segments) else None
+        if (
+            transition_type not in JOIN_TRANSITIONS
+            or segment["kind"] != "image"
+            or next_segment is None
+            or next_segment["kind"] not in ("image", "video")
+        ):
+            continue
+        duration_a = segment["end"] - segment["start"]
+        duration_b = next_segment["end"] - next_segment["start"]
+        transition_seconds = max(0.2, min(0.75, min(duration_a, duration_b) / 3))
+        transition_frames = max(1, min(round(transition_seconds * fps), next_segment["frames"] - 1))
+        next_segment["frames"] -= transition_frames
+        next_segment["_trimStartFrames"] = next_segment.get("_trimStartFrames", 0) + transition_frames
+        expanded.append({
+            "kind": "transition",
+            "transitionType": transition_type,
+            "frames": transition_frames,
+            "segmentA": segment,
+            "segmentB": next_segment,
+        })
+    return expanded
+
+
 def close_gaps(stills: list[dict], duration_seconds: float) -> list[dict]:
     """Stretches each still to cover through to the next one's start (and the
     first/last still out to the timeline's edges), so no silence gap is left
@@ -147,10 +221,38 @@ MAX_SCALE_REFERENCE_DURATION = 60.0  # only bounds pathological cases; must
 # mid-clip (the old `1 + amount*3` cap froze zoom at exactly 15s elapsed).
 
 
+# Matches TimelineView.tsx's COLOR_FILTER_TARGETS exactly (brightness
+# additive to line up with ffmpeg eq's -1..1 range, contrast/saturation
+# multiplicative around 1) so the canvas preview and this ffmpeg filter agree.
+COLOR_FILTER_TARGETS: dict[str, tuple[float, float, float]] = {
+    "warm": (0.03, 1.05, 1.25),
+    "cool": (-0.02, 1.05, 0.9),
+    "cinematic": (-0.05, 1.15, 0.85),
+    "bright": (0.12, 1.02, 1.08),
+    "muted": (0.02, 0.95, 0.55),
+    "dark": (-0.18, 1.12, 0.9),
+}
+
+
+def build_color_filter_vf(preset: str, intensity_percent: float) -> str:
+    """Returns an ffmpeg `eq=` filter node for a color preset, or "" for
+    'none'/unrecognized presets (nothing to append to the -vf chain)."""
+    target = COLOR_FILTER_TARGETS.get(preset)
+    if not target:
+        return ""
+    brightness_target, contrast_target, saturation_target = target
+    t = max(0.0, min(100.0, intensity_percent)) / 100.0
+    brightness = brightness_target * t
+    contrast = 1 + (contrast_target - 1) * t
+    saturation = 1 + (saturation_target - 1) * t
+    return f"eq=brightness={brightness:.4f}:contrast={contrast:.4f}:saturation={saturation:.4f}"
+
+
 def build_image_filter(
     motion: str, transition_in: str, transition_out: str, intensity: float,
     width: int, height: int, fps: int, duration: float, frames: int,
     subject_x: float = 0.5, subject_y: float = 0.5,
+    color_filter: str = "none", color_filter_intensity: float = 50.0,
 ) -> str:
     """Ken Burns camera-movement presets via ffmpeg's zoompan filter, plus
     optional fade-from/to-black "transitions" at the start and/or end.
@@ -171,14 +273,25 @@ def build_image_filter(
     fade_in_duration = max(0.15, min(duration / 2, duration * 0.08))
     fade_out_duration = max(0.15, min(duration / 2, duration * 0.08))
     fades = []
-    if transition_in == "fade":
-        fades.append(f"fade=t=in:st=0:d={fade_in_duration:.3f}:color=black")
-    if transition_out == "fade":
-        fades.append(f"fade=t=out:st={max(0.0, duration - fade_out_duration):.3f}:d={fade_out_duration:.3f}:color=black")
+    if transition_in in ("fade", "dip-to-white"):
+        in_color = "white" if transition_in == "dip-to-white" else "black"
+        fades.append(f"fade=t=in:st=0:d={fade_in_duration:.3f}:color={in_color}")
+    if transition_out in ("fade", "dip-to-white"):
+        out_color = "white" if transition_out == "dip-to-white" else "black"
+        fades.append(f"fade=t=out:st={max(0.0, duration - fade_out_duration):.3f}:d={fade_out_duration:.3f}:color={out_color}")
     fade = "".join(f",{f}" for f in fades)
+    color_vf = build_color_filter_vf(color_filter, color_filter_intensity)
+    color_node = f",{color_vf}" if color_vf else ""
 
     def anchored_xy(sx: float, sy: float) -> str:
         return f"x='(iw-iw/zoom)*{sx:.5f}':y='(ih-ih/zoom)*{sy:.5f}'"
+
+    # Matches the canvas preview's applyMotion(): when no subject point was
+    # ever saved for this render, subject_x/y arrive as the generic (0.5,
+    # 0.5) default — Ken Burns overrides that specific case with its own
+    # off-center starting point so it still pans instead of zooming in place.
+    kb_start_x = subject_x if (subject_x, subject_y) != (0.5, 0.5) else 0.35
+    kb_start_y = subject_y if (subject_x, subject_y) != (0.5, 0.5) else 0.35
 
     zoompan_presets = {
         "zoom-in": (
@@ -211,6 +324,11 @@ def build_image_filter(
             f"z='{peak:.5f}':"
             f"x='(iw-iw/zoom)*min(1,(on/{fps})/{REFERENCE_DURATION})':y='(ih-ih/zoom)/2'"
         ),
+        "ken-burns": (
+            f"z='min({max_scale:.5f},1+{rate:.6f}*on/{fps})':"
+            f"x='(iw-iw/zoom)*({kb_start_x:.5f}+({0.5 - kb_start_x:.5f})*min(1,(on/{fps})/{REFERENCE_DURATION}))':"
+            f"y='(ih-ih/zoom)*({kb_start_y:.5f}+({0.5 - kb_start_y:.5f})*min(1,(on/{fps})/{REFERENCE_DURATION}))'"
+        ),
     }
     if motion in zoompan_presets:
         # zoompan crops at integer-pixel granularity in its source's coordinate
@@ -228,31 +346,36 @@ def build_image_filter(
         pre_scale = max(width, height) * 8
         return (
             f"scale={pre_scale}:-2,zoompan={zoompan_presets[motion]}:"
-            f"d={frames}:s={width}x{height}:fps={fps}{fade}"
+            f"d={frames}:s={width}x{height}:fps={fps}{color_node}{fade}"
         )
     return (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}{fade}"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}{color_node}{fade}"
     )
 
 
 def build_video_filter(
     transition_in: str, transition_out: str, width: int, height: int, fps: int, duration: float,
+    color_filter: str = "none", color_filter_intensity: float = 50.0,
 ) -> str:
     """Scale/pad a generated animation clip onto the target canvas, same as a
     still's `build_image_filter` but with no Ken-Burns zoompan — Veo output
     already has real motion, it just needs to fit the export frame."""
     fades = []
-    if transition_in == "fade":
+    if transition_in in ("fade", "dip-to-white"):
         fade_in_duration = max(0.15, min(duration / 2, duration * 0.08))
-        fades.append(f"fade=t=in:st=0:d={fade_in_duration:.3f}:color=black")
-    if transition_out == "fade":
+        in_color = "white" if transition_in == "dip-to-white" else "black"
+        fades.append(f"fade=t=in:st=0:d={fade_in_duration:.3f}:color={in_color}")
+    if transition_out in ("fade", "dip-to-white"):
         fade_out_duration = max(0.15, min(duration / 2, duration * 0.08))
-        fades.append(f"fade=t=out:st={max(0.0, duration - fade_out_duration):.3f}:d={fade_out_duration:.3f}:color=black")
+        out_color = "white" if transition_out == "dip-to-white" else "black"
+        fades.append(f"fade=t=out:st={max(0.0, duration - fade_out_duration):.3f}:d={fade_out_duration:.3f}:color={out_color}")
     fade = "".join(f",{f}" for f in fades)
+    color_vf = build_color_filter_vf(color_filter, color_filter_intensity)
+    color_node = f",{color_vf}" if color_vf else ""
     return (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}{fade}"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}{color_node}{fade}"
     )
 
 
@@ -264,9 +387,18 @@ def run_ffmpeg(args: list[str]) -> None:
         raise RuntimeError(f"ffmpeg failed: {result.stderr[-2000:]}")
 
 
-def encode_segment(
-    segment: dict, index: int, width: int, height: int, fps: int, work_dir: Path
-) -> Path:
+def _encode_segment_to_path(
+    segment: dict, out_path: Path, width: int, height: int, fps: int,
+) -> None:
+    """Core per-kind ffmpeg invocation for an image/video/black segment,
+    factored out of `encode_segment` so `_build_transition_segment` can reuse
+    it to render the tail/head windows a join transition blends together.
+    `_originalFrames` (full untrimmed length, used for motion-rate math and
+    as the trim filter's upper bound) defaults to `frames` when absent — the
+    common case, since only segments touched by `expand_join_transitions`
+    ever set it explicitly. `_trimStartFrames` skips that many frames off the
+    segment's own head (needed when a preceding join transition consumed
+    them) via ffmpeg's `trim` filter — cheap for the common case of 0."""
     # `duration` (seconds) only bounds the input source (loop/color generator)
     # with headroom to spare — the segment's actual output length is fixed by
     # `-frames:v`, using the cumulative-frame-accurate count `assign_frame_counts`
@@ -275,17 +407,21 @@ def encode_segment(
     # exactly the per-clip rounding error that used to accumulate into a
     # growing drift across many stills.
     duration = max(0.05, segment["end"] - segment["start"])
-    frames = segment["frames"]
-    out_path = work_dir / f"seg_{index:04d}.ts"
+    output_frames = segment["frames"]
+    original_frames = segment.get("_originalFrames", output_frames)
+    trim_start_frames = segment.get("_trimStartFrames", 0)
     if segment["kind"] == "image":
         vf = build_image_filter(
             segment.get("motion", "none"),
             segment.get("transitionIn", "cut"),
             segment.get("transitionOut", "cut"),
             segment.get("motionIntensity", 0.22),
-            width, height, fps, duration, frames,
+            width, height, fps, duration, original_frames,
             segment.get("subjectX", 0.5), segment.get("subjectY", 0.5),
+            segment.get("colorFilter", "none"), segment.get("colorFilterIntensity", 50.0),
         )
+        if trim_start_frames > 0:
+            vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
         run_ffmpeg([
             "-y", "-loop", "1", "-t", f"{duration + 1:.3f}", "-i", segment["path"],
             # Intermediate segments are re-encoded again in the final concat
@@ -294,13 +430,14 @@ def encode_segment(
             # CRF here keeps this first pass close to lossless — the disk
             # cost is temporary, these files are deleted after the final pass.
             "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
-            "-r", str(fps), "-frames:v", str(frames), str(out_path),
+            "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
         ])
     elif segment["kind"] == "video":
         vf = build_video_filter(
             segment.get("transitionIn", "cut"),
             segment.get("transitionOut", "cut"),
             width, height, fps, duration,
+            segment.get("colorFilter", "none"), segment.get("colorFilterIntensity", 50.0),
         )
         # Safety net for a stale asset (the slot was resized after the last
         # "Adjust animation to duration" click): if the stored clip is
@@ -311,18 +448,80 @@ def encode_segment(
         source_duration = segment.get("sourceDurationSeconds")
         if source_duration is not None and source_duration < duration - 0.05:
             vf = f"tpad=stop_mode=clone:stop_duration={duration - source_duration:.3f},{vf}"
+        if trim_start_frames > 0:
+            vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
         run_ffmpeg([
             "-y", "-i", segment["path"],
             "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
-            "-r", str(fps), "-frames:v", str(frames), str(out_path),
+            "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
         ])
     else:
         run_ffmpeg([
             "-y", "-f", "lavfi", "-t", f"{duration + 1:.3f}",
             "-i", f"color=c=black:s={width}x{height}:r={fps}",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
-            "-frames:v", str(frames), str(out_path),
+            "-frames:v", str(output_frames), str(out_path),
         ])
+
+
+def _build_transition_segment(
+    segment: dict, index: int, width: int, height: int, fps: int, work_dir: Path, out_path: Path,
+) -> None:
+    """Renders a join transition (cross-fade/slide-left/slide-right/
+    zoom-blur) as an `xfade` blend of the outgoing clip's tail window and the
+    incoming clip's head window — each rendered as its own short clip first
+    (reusing `_encode_segment_to_path` with the trim/frame-count tricks that
+    give exactly the tail or head of that clip's own motion timeline), then
+    combined in one more ffmpeg pass. The "tail window" is rendered from a
+    virtually-extended copy of the outgoing clip (see `expand_join_transitions`
+    for why) — its own independent segment elsewhere is untouched."""
+    transition_frames = segment["frames"]
+    segment_a = segment["segmentA"]
+    segment_b = segment["segmentB"]
+    tail_path = work_dir / f"seg_{index:04d}_a.ts"
+    head_path = work_dir / f"seg_{index:04d}_b.ts"
+    nominal_a_frames = segment_a["_originalFrames"]
+    tail_segment = {
+        **segment_a,
+        "end": segment_a["end"] + transition_frames / fps,
+        "frames": transition_frames,
+        "_originalFrames": nominal_a_frames + transition_frames,
+        "_trimStartFrames": nominal_a_frames,
+        "transitionIn": "cut", "transitionOut": "cut",
+    }
+    head_segment = {
+        **segment_b,
+        "frames": transition_frames,
+        "_originalFrames": segment_b["_originalFrames"],
+        "_trimStartFrames": 0,
+        "transitionIn": "cut", "transitionOut": "cut",
+    }
+    _encode_segment_to_path(tail_segment, tail_path, width, height, fps)
+    _encode_segment_to_path(head_segment, head_path, width, height, fps)
+    xfade_name = _XFADE_TRANSITION_NAMES.get(segment["transitionType"], "fade")
+    transition_seconds = transition_frames / fps
+    try:
+        run_ffmpeg([
+            "-y", "-i", str(tail_path), "-i", str(head_path),
+            "-filter_complex",
+            f"[0:v]format=yuv420p,setsar=1[a];[1:v]format=yuv420p,setsar=1[b];"
+            f"[a][b]xfade=transition={xfade_name}:duration={transition_seconds:.3f}:offset=0[outv]",
+            "-map", "[outv]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+            "-r", str(fps), "-frames:v", str(transition_frames), str(out_path),
+        ])
+    finally:
+        tail_path.unlink(missing_ok=True)
+        head_path.unlink(missing_ok=True)
+
+
+def encode_segment(
+    segment: dict, index: int, width: int, height: int, fps: int, work_dir: Path
+) -> Path:
+    out_path = work_dir / f"seg_{index:04d}.ts"
+    if segment["kind"] == "transition":
+        _build_transition_segment(segment, index, width, height, fps, work_dir, out_path)
+    else:
+        _encode_segment_to_path(segment, out_path, width, height, fps)
     return out_path
 
 
@@ -632,6 +831,11 @@ def run(manifest_path: Path, output_path: Path) -> None:
         segments[0]["transitionIn"] = "cut"
     if segments[-1]["kind"] == "image":
         segments[-1]["transitionOut"] = "cut"
+    # Only the single baked video gets blended join transitions — the
+    # asset-bundle export (see below) hands each clip to another editor as
+    # its own separate file, where a cross-fade/slide/zoom-blur has nothing
+    # meaningful to mean.
+    segments = expand_join_transitions(segments, fps)
 
     engine.report_progress(5, "Preparing export", f"{len(segments)} segments to render")
     # Each segment is an independent ffmpeg process (its own frame range,
@@ -663,33 +867,114 @@ def run(manifest_path: Path, output_path: Path) -> None:
         "\n".join(f"file '{path.name}'" for path in segment_paths), encoding="utf-8"
     )
 
+    music = manifest.get("music", [])
+    include_narration = bool(manifest.get("includeNarration", True))
+    narration_volume_percent = float(manifest.get("narrationVolumePercent", 100.0))
+    narration_trim_start = max(0.0, float(manifest.get("narrationTrimStartSeconds", 0.0)))
+    narration_trim_end = max(0.0, float(manifest.get("narrationTrimEndSeconds", 0.0)))
+    burn_captions = bool(manifest.get("burnCaptions", True))
+    write_srt = bool(manifest.get("writeSrt", False))
+    crf = int(manifest.get("crf", 18))
+    preset = str(manifest.get("preset", "fast"))
+
+    if write_srt and captions:
+        write_captions_srt(captions, work_dir / "captions.srt")
+
     ass_path = work_dir / "captions.ass"
-    has_captions = bool(captions)
+    has_captions = bool(captions) and burn_captions
     if has_captions:
         default_style = manifest.get("captionDefaultStyle") or _FALLBACK_CAPTION_STYLE
         write_captions_ass(captions, ass_path, width, height, default_style)
 
     engine.report_progress(72, "Rendering video", "Muxing audio and captions")
-    final_args = [
-        "-y", "-f", "concat", "-safe", "0", "-i", str(segments_list_path),
-        "-i", narration_audio_path,
-    ]
-    # Narration's start offset is applied as an audio delay in the same filter
-    # graph as the caption overlay (rather than a second ffmpeg pass) so
-    # export stays a single encode; `adelay` needs one value per channel,
-    # hence the doubled `|`-joined pair for stereo.
+    final_args = ["-y", "-f", "concat", "-safe", "0", "-i", str(segments_list_path)]
+
+    # Every audio source (narration + each music clip) becomes its own ffmpeg
+    # input and its own labeled filter chain (trim/fade/volume/delay), then
+    # all of them are mixed with `amix` — a timeline with neither narration
+    # nor music included just exports silent (-an). `apad` on the mixed
+    # result guards against the audio ending before the video does (video's
+    # own length is always authoritative, fixed by the segments' exact frame
+    # count — narration/music simply go quiet for whatever's left over).
+    audio_input_args: list[str] = []
+    graph_parts: list[str] = []
+    next_input_index = 1
+    audio_labels: list[str] = []
+
+    if include_narration:
+        audio_input_args += ["-i", narration_audio_path]
+        narration_index = next_input_index
+        next_input_index += 1
+        chain = f"[{narration_index}:a]"
+        if narration_trim_start > 0 or narration_trim_end > 0:
+            narration_duration = float(manifest.get("narrationDurationSeconds", duration_seconds))
+            trim_end = max(narration_trim_start + 0.05, narration_duration - narration_trim_end)
+            chain += f"atrim=start={narration_trim_start:.3f}:end={trim_end:.3f},asetpts=PTS-STARTPTS,"
+        if narration_offset_seconds > 0:
+            delay_ms = round(narration_offset_seconds * 1000)
+            chain += f"adelay={delay_ms}|{delay_ms},"
+        volume_mult = max(0.0, narration_volume_percent) / 100.0
+        chain += f"volume={volume_mult:.4f}[narr]"
+        graph_parts.append(chain)
+        audio_labels.append("[narr]")
+
+    for i, clip in enumerate(music):
+        clip_duration = max(0.05, float(clip["end"]) - float(clip["start"]))
+        if clip.get("loopEnabled"):
+            audio_input_args += ["-stream_loop", "-1", "-i", clip["path"]]
+        else:
+            audio_input_args += ["-i", clip["path"]]
+        clip_index = next_input_index
+        next_input_index += 1
+        chain = f"[{clip_index}:a]atrim=start=0:end={clip_duration:.3f},asetpts=PTS-STARTPTS"
+        fade_in = max(0.0, float(clip.get("fadeInSeconds", 0.0))) if clip.get("fadeInEnabled") else 0.0
+        if fade_in > 0:
+            chain += f",afade=t=in:st=0:d={fade_in:.3f}"
+        fade_out = max(0.0, float(clip.get("fadeOutSeconds", 0.0))) if clip.get("fadeOutEnabled") else 0.0
+        if fade_out > 0:
+            chain += f",afade=t=out:st={max(0.0, clip_duration - fade_out):.3f}:d={fade_out:.3f}"
+        volume_mult = max(0.0, float(clip.get("volumePercent", 100.0))) / 100.0
+        chain += f",volume={volume_mult:.4f}"
+        delay_ms = round(float(clip["start"]) * 1000)
+        if delay_ms > 0:
+            chain += f",adelay={delay_ms}|{delay_ms}"
+        duck_start, duck_end = clip.get("duckOverlapStart"), clip.get("duckOverlapEnd")
+        if duck_start is not None and duck_end is not None:
+            duck_multiplier = max(0.0, float(clip.get("duckMultiplier", 1.0)))
+            chain += (
+                f",volume=enable='between(t\\,{float(duck_start):.3f}\\,{float(duck_end):.3f})'"
+                f":volume={duck_multiplier:.4f}"
+            )
+        label = f"m{i}"
+        graph_parts.append(f"{chain}[{label}]")
+        audio_labels.append(f"[{label}]")
+
+    final_audio_label = None
+    if audio_labels:
+        if len(audio_labels) > 1:
+            graph_parts.append(
+                f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=0[mixed]"
+            )
+            mixed_label = "[mixed]"
+        else:
+            mixed_label = audio_labels[0]
+        graph_parts.append(f"{mixed_label}apad[aout]")
+        final_audio_label = "[aout]"
+
     video_filter = f"ass='{escape_subtitles_path(ass_path)}':fontsdir='{escape_subtitles_path(_BUNDLED_FONTS_DIR)}'" if has_captions else None
-    audio_filter = f"adelay={round(narration_offset_seconds * 1000)}|{round(narration_offset_seconds * 1000)}" if narration_offset_seconds > 0 else None
-    if video_filter or audio_filter:
-        graph = []
-        graph.append(f"[0:v]{video_filter}[v]" if video_filter else "[0:v]copy[v]")
-        graph.append(f"[1:a]{audio_filter}[a]" if audio_filter else "[1:a]anull[a]")
-        final_args += ["-filter_complex", ";".join(graph), "-map", "[v]", "-map", "[a]"]
-    else:
-        final_args += ["-map", "0:v", "-map", "1:a"]
+    graph_parts.insert(0, f"[0:v]{video_filter}[v]" if video_filter else "[0:v]copy[v]")
+
+    final_args += audio_input_args
+    final_args += ["-filter_complex", ";".join(graph_parts), "-map", "[v]"]
+    if final_audio_label:
+        final_args += ["-map", final_audio_label]
+    final_args += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p", "-r", str(fps)]
+    final_args += ["-c:a", "aac", "-b:a", "192k"] if final_audio_label else ["-an"]
+    # Video's own length is exact and authoritative (see assign_frame_counts);
+    # `-t` here is a safety net in case the mixed/padded audio ever overruns
+    # it, not something that should ever actually need to trim the picture.
     final_args += [
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p", "-r", str(fps),
-        "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart",
+        "-t", f"{duration_seconds:.3f}", "-movflags", "+faststart",
         "-progress", "pipe:1", "-nostats", str(output_path),
     ]
     run_final_pass(final_args, duration_seconds)

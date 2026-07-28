@@ -25,6 +25,9 @@ import {
   ZoomOut,
   MoreHorizontal,
   ImageOff,
+  Search,
+  ChevronUp,
+  ChevronDown,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -39,9 +42,9 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { type ChangeEvent, type FormEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { type AppStage, useAppStore } from "./store/app-store";
+import { type AppStage, lastSelectedStill, useAppStore } from "./store/app-store";
 import { log } from "./infrastructure/logger";
 import { resolveAssetUrl, resolveRenderUrl } from "./infrastructure/media-cache";
 import { formatTimeShort } from "./domain/timecode";
@@ -64,7 +67,6 @@ const navItems: { stage: AppStage; label: string; icon: typeof Home; alwaysEnabl
 ];
 const MAX_CACHE_SIZE = 20;
 const imageWorkspaceCache = new Map<string, ImageWorkspaceRecord>();
-const lastSelectedStill = new Map<string, string>(); // videoId → groupId
 
 function setCached(key: string, value: ImageWorkspaceRecord) {
   if (imageWorkspaceCache.size >= MAX_CACHE_SIZE) {
@@ -149,9 +151,14 @@ function ToastDisplay() {
 
 function TitleBar() {
   const win = getCurrentWindow();
+  const titlebarActions = useAppStore((state) => state.titlebarActions);
+  const activeChannelName = useAppStore((state) => state.activeChannelName);
+  const activeVideoTitle = useAppStore((state) => state.activeVideoTitle);
+  const breadcrumb = ["Studio", activeChannelName, activeVideoTitle].filter(Boolean).join(" › ");
   return (
     <div className="titlebar">
-      <span className="titlebar-title" data-tauri-drag-region />
+      <span className="titlebar-title" data-tauri-drag-region>{breadcrumb}</span>
+      {titlebarActions && <div className="titlebar-actions" onPointerDown={(e) => e.stopPropagation()}>{titlebarActions}</div>}
       <div className="titlebar-controls">
         <button className="titlebar-btn minimize" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.minimize()} aria-label="Minimize"><Minus size={13} strokeWidth={2} /></button>
         <button className="titlebar-btn maximize" onPointerDown={(e) => e.stopPropagation()} onClick={() => void win.toggleMaximize()} aria-label="Maximize"><Square size={11} strokeWidth={1.8} /></button>
@@ -824,6 +831,91 @@ function VisualPlanView() {
     void projectsClient.getVisualPlan(activeVideoId).then(setPlan).catch((caught) => setError(String(caught)));
   }, [activeVideoId]);
 
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [matchIndex, setMatchIndex] = useState(0);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const matchRefs = useRef<Map<string, HTMLElement>>(new Map());
+
+  function registerMatchRef(key: string, el: HTMLElement | null) {
+    if (el) matchRefs.current.set(key, el);
+    else matchRefs.current.delete(key);
+  }
+
+  // Every occurrence of the query within every sentence, in chronological
+  // (ordinal) order — this is what Enter cycles through, not just the
+  // sentences that contain a match.
+  const searchMatches = useMemo(() => {
+    const trimmed = searchQuery.trim().toLowerCase();
+    if (!plan || !trimmed) return [] as { key: string; sentenceId: string }[];
+    const sorted = [...plan.sentences].sort((a, b) => a.ordinal - b.ordinal);
+    const results: { key: string; sentenceId: string }[] = [];
+    for (const sentence of sorted) {
+      const lowerText = sentence.text.toLowerCase();
+      let occurrence = 0;
+      let searchFrom = 0;
+      while (true) {
+        const idx = lowerText.indexOf(trimmed, searchFrom);
+        if (idx === -1) break;
+        results.push({ key: `${sentence.id}:${occurrence}`, sentenceId: sentence.id });
+        searchFrom = idx + trimmed.length;
+        occurrence++;
+      }
+    }
+    return results;
+  }, [plan, searchQuery]);
+
+  useEffect(() => {
+    setMatchIndex(0);
+  }, [searchQuery]);
+
+  useEffect(() => {
+    if (!searchOpen) return;
+    requestAnimationFrame(() => searchInputRef.current?.select());
+  }, [searchOpen]);
+
+  useEffect(() => {
+    if (searchMatches.length === 0) return;
+    const active = searchMatches[Math.min(matchIndex, searchMatches.length - 1)];
+    matchRefs.current.get(active.key)?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [matchIndex, searchMatches]);
+
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        setSearchOpen(true);
+        return;
+      }
+      if (event.key === "Escape" && searchOpen) {
+        setSearchOpen(false);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [searchOpen]);
+
+  function closeSearch() {
+    setSearchOpen(false);
+  }
+
+  function navigateMatch(direction: 1 | -1) {
+    if (searchMatches.length === 0) return;
+    setMatchIndex((current) => (current + direction + searchMatches.length) % searchMatches.length);
+  }
+
+  function onSearchKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      navigateMatch(event.shiftKey ? -1 : 1);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeSearch();
+    }
+  }
+
+  const activeMatchKey = searchMatches.length > 0 ? searchMatches[Math.min(matchIndex, searchMatches.length - 1)].key : null;
+
   async function moveSentence(sentenceId: string, targetGroupId: string) {
     if (!activeVideoId) return;
     try { setPlan(await projectsClient.movePlanSentence(activeVideoId, sentenceId, targetGroupId)); }
@@ -860,6 +952,24 @@ function VisualPlanView() {
         <div><h1>Visual plan</h1><p>Drag a sentence into an adjacent still to regroup it. Chronological order remains enforced.</p></div>
         <div className="heading-actions"><button className="secondary" onClick={() => setStage("inputs")}>← Back</button><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
       </div>
+      {searchOpen && (
+        <div className="plan-search-bar">
+          <Search size={14} />
+          <input
+            ref={searchInputRef}
+            type="text"
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            onKeyDown={onSearchKeyDown}
+            placeholder="Search sentences… (Enter for next, Shift+Enter for previous)"
+            autoFocus
+          />
+          <span className="plan-search-count">{searchQuery.trim() ? `${searchMatches.length ? matchIndex + 1 : 0}/${searchMatches.length}` : ""}</span>
+          <button type="button" onClick={() => navigateMatch(-1)} disabled={!searchMatches.length} aria-label="Previous match"><ChevronUp size={15} /></button>
+          <button type="button" onClick={() => navigateMatch(1)} disabled={!searchMatches.length} aria-label="Next match"><ChevronDown size={15} /></button>
+          <button type="button" onClick={closeSearch} aria-label="Close search"><X size={15} /></button>
+        </div>
+      )}
       {error && <div className="inline-error">{error}</div>}
       {!plan && !error && <div className="empty-state">Loading visual plan…</div>}
       {confirmReset && <ConfirmDialog title="Reset visual plan?" message="This restores the original AI-generated groupings. All custom drag-and-drop changes will be lost." confirmLabel="Reset" onConfirm={() => { setConfirmReset(false); void resetPlan(); }} onCancel={() => setConfirmReset(false)} />}
@@ -882,7 +992,14 @@ function VisualPlanView() {
               <div className="timing"><strong>{formatTimeShort(timing.startSeconds)} – {formatTimeShort(timing.endSeconds)}</strong><small>{timing.durationSeconds.toFixed(1)} sec</small></div>
               <div className="sentences">
                 {timing.members.map((sentence) => (
-                  <DraggableSentence key={sentence.id} sentence={sentence} active={draggedSentenceId === sentence.id} />
+                  <DraggableSentence
+                    key={sentence.id}
+                    sentence={sentence}
+                    active={draggedSentenceId === sentence.id}
+                    searchQuery={searchQuery}
+                    activeMatchKey={activeMatchKey}
+                    registerMatchRef={registerMatchRef}
+                  />
                 ))}
               </div>
             </DroppableStill>
@@ -897,7 +1014,52 @@ function VisualPlanView() {
 
 type PlanSentenceRecord = VisualPlanRecord["sentences"][number];
 
-function DraggableSentence({ sentence, active }: { sentence: PlanSentenceRecord; active: boolean }) {
+/** Splits `text` on every occurrence of `query`, wrapping matches in <mark>
+ * so each instance can be independently scrolled to and marked active. */
+function highlightSentenceText(
+  text: string,
+  query: string,
+  sentenceId: string,
+  activeMatchKey: string | null,
+  registerMatchRef: (key: string, el: HTMLElement | null) => void,
+): ReactNode {
+  const trimmed = query.trim();
+  if (!trimmed) return text;
+  const lowerText = text.toLowerCase();
+  const lowerQuery = trimmed.toLowerCase();
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  let occurrence = 0;
+  let searchFrom = 0;
+  while (true) {
+    const idx = lowerText.indexOf(lowerQuery, searchFrom);
+    if (idx === -1) break;
+    if (idx > cursor) parts.push(text.slice(cursor, idx));
+    const key = `${sentenceId}:${occurrence}`;
+    parts.push(
+      <mark
+        key={key}
+        ref={(el) => registerMatchRef(key, el)}
+        className={key === activeMatchKey ? "search-match search-match-active" : "search-match"}
+      >
+        {text.slice(idx, idx + trimmed.length)}
+      </mark>,
+    );
+    cursor = idx + trimmed.length;
+    searchFrom = cursor;
+    occurrence++;
+  }
+  if (cursor < text.length) parts.push(text.slice(cursor));
+  return parts.length > 0 ? parts : text;
+}
+
+function DraggableSentence({ sentence, active, searchQuery, activeMatchKey, registerMatchRef }: {
+  sentence: PlanSentenceRecord;
+  active: boolean;
+  searchQuery: string;
+  activeMatchKey: string | null;
+  registerMatchRef: (key: string, el: HTMLElement | null) => void;
+}) {
   const { attributes, listeners, setNodeRef, transform } = useDraggable({ id: `sentence:${sentence.id}` });
   return <div
     ref={setNodeRef}
@@ -907,7 +1069,7 @@ function DraggableSentence({ sentence, active }: { sentence: PlanSentenceRecord;
     {...attributes}
   >
     <b title="Drag sentence"><GripVertical size={18} /></b>
-    <span>{sentence.text}</span>
+    <span>{highlightSentenceText(sentence.text, searchQuery, sentence.id, activeMatchKey, registerMatchRef)}</span>
     <small>{formatTimeShort(sentence.startSeconds)}</small>
   </div>;
 }

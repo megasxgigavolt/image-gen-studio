@@ -1,8 +1,14 @@
 import { create } from "zustand";
+import type { ReactNode } from "react";
 import { originalDemoPlan } from "../data/demo";
 import type { VisualPlanGroup } from "../domain/visual-plan";
 
 export type AppStage = "home" | "inputs" | "visual-plan" | "images" | "timeline" | "tools";
+
+/** videoId → groupId. Lets one stage (e.g. the Editor's "Go to this still in
+ * Visuals" context menu action) pre-seed which still the Images stage
+ * restores as selected when it next mounts. */
+export const lastSelectedStill = new Map<string, string>();
 export type Theme = "light" | "dark";
 
 type Toast = { id: number; message: string; kind: "success" | "error" | "info" };
@@ -17,6 +23,11 @@ type AppState = {
   activeVideoTitle: string | null;
   lastProductionStage: "inputs" | "visual-plan";
   toast: Toast | null;
+  /** Per-page action content (buttons/menus) rendered in the titlebar — set
+   * by whichever view owns it (e.g. the Editor tab's Export controls) and
+   * cleared on unmount, since the titlebar itself has no page context. */
+  titlebarActions: ReactNode | null;
+  setTitlebarActions: (actions: ReactNode | null) => void;
   setStage: (stage: AppStage) => void;
   toggleTheme: () => void;
   resetVisualPlan: () => void;
@@ -50,6 +61,8 @@ export const useAppStore = create<AppState>((set) => ({
   activeVideoTitle: null,
   lastProductionStage: "inputs",
   toast: null,
+  titlebarActions: null,
+  setTitlebarActions: (actions) => set({ titlebarActions: actions }),
   setStage: (stage) =>
     set((state) => ({
       stage,

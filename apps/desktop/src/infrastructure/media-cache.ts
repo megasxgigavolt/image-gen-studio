@@ -7,6 +7,7 @@ import { projectsClient } from "./projects-client";
 const renderUrlCache = new Map<string, Promise<string>>();
 const assetUrlCache = new Map<string, Promise<string>>();
 const videoAssetUrlCache = new Map<string, Promise<string>>();
+const mediaLibraryAssetUrlCache = new Map<string, Promise<string>>();
 
 export function resolveRenderUrl(renderId: string): Promise<string> {
   let cached = renderUrlCache.get(renderId);
@@ -34,6 +35,18 @@ export function resolveVideoAssetUrl(videoAssetId: string): Promise<string> {
   if (!cached) {
     cached = projectsClient.getVideoAssetFilePath(videoAssetId).then((path) => (path ? convertFileSrc(path) : ""));
     videoAssetUrlCache.set(videoAssetId, cached);
+  }
+  return cached;
+}
+
+// Media library imports are copied into an immutable per-video library
+// folder and never rewritten in place, so a resolved id is safe to cache
+// forever — same reasoning as resolveVideoAssetUrl above.
+export function resolveMediaLibraryAssetUrl(assetId: string): Promise<string> {
+  let cached = mediaLibraryAssetUrlCache.get(assetId);
+  if (!cached) {
+    cached = projectsClient.getMediaLibraryAssetFilePath(assetId).then((path) => (path ? convertFileSrc(path) : ""));
+    mediaLibraryAssetUrlCache.set(assetId, cached);
   }
   return cached;
 }

@@ -192,13 +192,101 @@ export type MotionPreset =
   | "pan-right"
   | "zoom-pulse"
   | "zoom-in-subject"
-  | "zoom-out-subject";
-export type TransitionPreset = "cut" | "fade";
-export type ClipKind = "still" | "animation";
+  | "zoom-out-subject"
+  | "ken-burns";
+export type TransitionPreset = "cut" | "fade" | "dip-to-white" | "cross-fade" | "slide-left" | "slide-right" | "zoom-blur";
+export type ExportResolution = "2160p" | "1080p" | "720p";
+export type ExportQuality = "high" | "balanced" | "compressed";
+export type ExportCaptionsMode = "burned-in" | "srt" | "both";
+export type ExportSettingsRecord = {
+  resolution: ExportResolution;
+  quality: ExportQuality;
+  captionsMode: ExportCaptionsMode;
+  includeNarration: boolean;
+  includeMusic: boolean;
+};
+export type ExportJobRecord = {
+  id: string;
+  videoId: string;
+  status: "running" | "completed" | "failed";
+  destinationPath: string;
+  error: string | null;
+  createdAt: string;
+  completedAt: string | null;
+};
+export type ClipKind = "still" | "animation" | "imported-still" | "imported-clip";
+export type ColorFilterPreset = "none" | "warm" | "cool" | "cinematic" | "bright" | "muted" | "dark";
 export type TimelineClipRecord = {
   id: string; groupId: string; renderId: string | null; ordinal: number; startSeconds: number; endSeconds: number; label: string;
   motionPreset: MotionPreset; transitionIn: TransitionPreset; transitionOut: TransitionPreset; motionIntensity: number;
   clipKind: ClipKind; videoAssetId: string | null;
+  /** Set for clipKind 'imported-still'/'imported-clip' — the media library asset backing this clip. */
+  mediaLibraryAssetId: string | null;
+  colorFilterPreset: ColorFilterPreset;
+  colorFilterIntensity: number;
+};
+
+export type MediaLibraryKind = "still" | "clip" | "audio";
+export type MediaLibraryAssetRecord = {
+  id: string;
+  videoId: string;
+  kind: MediaLibraryKind;
+  originalName: string;
+  relativePath: string;
+  mediaType: string;
+  sizeBytes: number;
+  durationSeconds: number | null;
+  createdAt: string;
+};
+
+export type TimelineMusicClipRecord = {
+  id: string;
+  mediaLibraryAssetId: string;
+  ordinal: number;
+  startSeconds: number;
+  endSeconds: number;
+  label: string;
+  volumePercent: number;
+  fadeInEnabled: boolean;
+  fadeInSeconds: number;
+  fadeOutEnabled: boolean;
+  fadeOutSeconds: number;
+  autoDuck: boolean;
+  loopEnabled: boolean;
+};
+
+export type TextOverlayPosition =
+  | "top-left" | "top-center" | "top-right"
+  | "middle-left" | "center" | "middle-right"
+  | "bottom-left" | "bottom-center" | "bottom-right";
+export type TextBackgroundMode = "none" | "solid" | "blur";
+export type TextOverlayAnimation = "none" | "fade" | "slide";
+export type TimelineTextClipRecord = {
+  id: string;
+  startSeconds: number;
+  endSeconds: number;
+  text: string;
+  fontFamily: string;
+  fontSizePx: number;
+  bold: boolean;
+  italic: boolean;
+  color: string;
+  backgroundMode: TextBackgroundMode;
+  backgroundColor: string;
+  position: TextOverlayPosition;
+  animation: TextOverlayAnimation;
+};
+
+export type LogoPosition = "top-left" | "top-right" | "bottom-left" | "bottom-right" | "center";
+export type TimelineLogoClipRecord = {
+  id: string;
+  mediaLibraryAssetId: string;
+  startSeconds: number;
+  endSeconds: number;
+  position: LogoPosition;
+  sizePercent: number;
+  opacityPercent: number;
+  showThroughout: boolean;
 };
 export type VeoResolution = "720p" | "1080p";
 export type VideoAssetRecord = {
@@ -259,6 +347,17 @@ export type TimelineRecord = {
   captionClips: TimelineCaptionClipRecord[];
   captionStyle: CaptionStyle;
   narrationOffsetSeconds: number;
+  musicClips: TimelineMusicClipRecord[];
+  textClips: TimelineTextClipRecord[];
+  logoClips: TimelineLogoClipRecord[];
+  musicMasterVolumePercent: number;
+  musicDuckSensitivityPercent: number;
+  /** When true (the default), Stills clips can't be reordered by dragging —
+   * only resized/effects-edited — keeping them locked to narration sync. */
+  sequenceLocked: boolean;
+  narrationVolumePercent: number;
+  narrationTrimStartSeconds: number;
+  narrationTrimEndSeconds: number;
 };
 
 type BrowserData = {
@@ -552,8 +651,8 @@ export const projectsClient = {
     if (isTauri()) return invoke("pick_download_folder");
     return null;
   },
-  async pickExportDestination(defaultName: string): Promise<string | null> {
-    if (isTauri()) return invoke("pick_export_destination", { defaultName });
+  async pickExportDestination(defaultName: string, defaultDir?: string | null): Promise<string | null> {
+    if (isTauri()) return invoke("pick_export_destination", { defaultName, defaultDir: defaultDir ?? null });
     return null;
   },
   async copyRenderToFolder(renderId: string, folderPath: string): Promise<string> {
@@ -652,6 +751,14 @@ export const projectsClient = {
     if (isTauri()) return invoke("apply_motion_to_all_clips", { videoId, motionPreset, intensity });
     throw new Error("Timeline requires the native application.");
   },
+  async setTimelineClipColorFilter(videoId: string, clipId: string, preset: ColorFilterPreset, intensity: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_timeline_clip_color_filter", { videoId, clipId, preset, intensity });
+    throw new Error("Timeline requires the native application.");
+  },
+  async applyColorFilterToAllClips(videoId: string, preset: ColorFilterPreset, intensity: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("apply_color_filter_to_all_clips", { videoId, preset, intensity });
+    throw new Error("Timeline requires the native application.");
+  },
   async applyTransitionInToAllClips(videoId: string, transitionIn: TransitionPreset): Promise<TimelineRecord> {
     if (isTauri()) return invoke("apply_transition_in_to_all_clips", { videoId, transitionIn });
     throw new Error("Timeline requires the native application.");
@@ -680,16 +787,129 @@ export const projectsClient = {
     if (isTauri()) return invoke("delete_timeline_clip", { videoId, clipId });
     throw new Error("Timeline requires the native application.");
   },
+  async duplicateTimelineClip(videoId: string, clipId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("duplicate_timeline_clip", { videoId, clipId });
+    throw new Error("Timeline requires the native application.");
+  },
   async deleteTimelineCaptionClip(videoId: string, clipId: string): Promise<TimelineRecord> {
     if (isTauri()) return invoke("delete_timeline_caption_clip", { videoId, clipId });
     throw new Error("Timeline requires the native application.");
   },
-  async clearTimelineTrack(videoId: string, track: "stills" | "captions"): Promise<TimelineRecord> {
+  async clearTimelineTrack(videoId: string, track: "stills" | "captions" | "music" | "overlays"): Promise<TimelineRecord> {
     if (isTauri()) return invoke("clear_timeline_track", { videoId, track });
     throw new Error("Timeline requires the native application.");
   },
   async resetTimelineToDefault(videoId: string): Promise<TimelineRecord> {
     if (isTauri()) return invoke("reset_timeline_to_default", { videoId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async restoreTimelineSnapshot(videoId: string, snapshot: TimelineRecord): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("restore_timeline_snapshot", { videoId, snapshotJson: JSON.stringify(snapshot) });
+    throw new Error("Timeline requires the native application.");
+  },
+  // ===== Media library (Editor tab: Stills / Clips / Audio tabs) =====
+  async pickAndImportMediaLibraryAsset(videoId: string, kind: MediaLibraryKind | null): Promise<MediaLibraryAssetRecord | null> {
+    if (isTauri()) return invoke("pick_and_import_media_library_asset", { videoId, kind });
+    throw new Error("Media library import requires the native application.");
+  },
+  async listMediaLibraryAssets(videoId: string, kind: MediaLibraryKind | null): Promise<MediaLibraryAssetRecord[]> {
+    if (isTauri()) return invoke("list_media_library_assets", { videoId, kind });
+    return [];
+  },
+  async removeMediaLibraryAsset(assetId: string): Promise<void> {
+    if (isTauri()) return invoke("remove_media_library_asset", { assetId });
+  },
+  async getMediaLibraryAssetFilePath(assetId: string): Promise<string> {
+    if (isTauri()) return invoke("get_media_library_asset_file_path", { assetId });
+    return "";
+  },
+  async listVideoAssets(videoId: string): Promise<VideoAssetRecord[]> {
+    if (isTauri()) return invoke("list_video_assets", { videoId });
+    return [];
+  },
+  async addVideoAssetClipToStillsTrack(videoId: string, videoAssetId: string, startSeconds: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("add_video_asset_clip_to_stills_track", { videoId, videoAssetId, startSeconds });
+    throw new Error("Timeline requires the native application.");
+  },
+  async addLibraryAssetToStillsTrack(videoId: string, mediaLibraryAssetId: string, startSeconds: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("add_library_asset_to_stills_track", { videoId, mediaLibraryAssetId, startSeconds });
+    throw new Error("Timeline requires the native application.");
+  },
+  // ===== Music track =====
+  async addMusicClip(videoId: string, mediaLibraryAssetId: string, startSeconds: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("add_music_clip", { videoId, mediaLibraryAssetId, startSeconds });
+    throw new Error("Timeline requires the native application.");
+  },
+  async updateMusicClip(videoId: string, clipId: string, start: number, end: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("update_music_clip", { videoId, clipId, start, end });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setMusicClipSettings(
+    videoId: string, clipId: string, volumePercent: number,
+    fadeInEnabled: boolean, fadeInSeconds: number, fadeOutEnabled: boolean, fadeOutSeconds: number,
+    autoDuck: boolean, loopEnabled: boolean,
+  ): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_music_clip_settings", { videoId, clipId, volumePercent, fadeInEnabled, fadeInSeconds, fadeOutEnabled, fadeOutSeconds, autoDuck, loopEnabled });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setSequenceLocked(videoId: string, locked: boolean): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_sequence_locked", { videoId, locked });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setNarrationSettings(videoId: string, volumePercent: number, trimStartSeconds: number, trimEndSeconds: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_narration_settings", { videoId, volumePercent, trimStartSeconds, trimEndSeconds });
+    throw new Error("Timeline requires the native application.");
+  },
+  async deleteMusicClip(videoId: string, clipId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("delete_music_clip", { videoId, clipId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setMusicMasterSettings(videoId: string, masterVolumePercent: number, duckSensitivityPercent: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_music_master_settings", { videoId, masterVolumePercent, duckSensitivityPercent });
+    throw new Error("Timeline requires the native application.");
+  },
+  // ===== Overlays track: text =====
+  async addTextOverlayClip(videoId: string, atSeconds: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("add_text_overlay_clip", { videoId, atSeconds });
+    throw new Error("Timeline requires the native application.");
+  },
+  async updateTextOverlayClip(videoId: string, clipId: string, start: number, end: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("update_text_overlay_clip", { videoId, clipId, start, end });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setTextOverlayStyle(
+    videoId: string, clipId: string, text: string, fontFamily: string, fontSizePx: number,
+    bold: boolean, italic: boolean, color: string, backgroundMode: TextBackgroundMode, backgroundColor: string,
+    position: TextOverlayPosition, animation: TextOverlayAnimation,
+  ): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_text_overlay_style", {
+      videoId, clipId, text, fontFamily, fontSizePx, bold, italic, color, backgroundMode, backgroundColor, position, animation,
+    });
+    throw new Error("Timeline requires the native application.");
+  },
+  async deleteTextOverlayClip(videoId: string, clipId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("delete_text_overlay_clip", { videoId, clipId });
+    throw new Error("Timeline requires the native application.");
+  },
+  // ===== Overlays track: logo/watermark =====
+  async addLogoClip(videoId: string, mediaLibraryAssetId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("add_logo_clip", { videoId, mediaLibraryAssetId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async updateLogoClip(videoId: string, clipId: string, start: number, end: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("update_logo_clip", { videoId, clipId, start, end });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setLogoClipStyle(videoId: string, clipId: string, position: LogoPosition, sizePercent: number, opacityPercent: number, showThroughout: boolean): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_logo_clip_style", { videoId, clipId, position, sizePercent, opacityPercent, showThroughout });
+    throw new Error("Timeline requires the native application.");
+  },
+  async deleteLogoClip(videoId: string, clipId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("delete_logo_clip", { videoId, clipId });
+    throw new Error("Timeline requires the native application.");
+  },
+  async removeAllClipEffects(videoId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("remove_all_clip_effects", { videoId });
     throw new Error("Timeline requires the native application.");
   },
   async probeNarrationDuration(videoId: string): Promise<number> {
@@ -700,9 +920,16 @@ export const projectsClient = {
     if (isTauri()) return invoke("detect_render_subject", { videoId, renderId });
     throw new Error("Timeline requires the native application.");
   },
-  async exportTimelineVideo(videoId: string, destinationPath: string): Promise<string | null> {
-    if (isTauri()) return invoke("export_timeline_video", { videoId, destinationPath });
+  async exportTimelineVideo(videoId: string, destinationPath: string, options: ExportSettingsRecord): Promise<string | null> {
+    if (isTauri()) return invoke("export_timeline_video", { videoId, destinationPath, options });
     throw new Error("Video export requires the native application.");
+  },
+  async listExportJobs(videoId: string): Promise<ExportJobRecord[]> {
+    if (isTauri()) return invoke("list_export_jobs", { videoId });
+    return [];
+  },
+  async revealInFileManager(path: string): Promise<void> {
+    if (isTauri()) return invoke("reveal_in_file_manager", { path });
   },
   async pickExportProjectDestination(): Promise<string | null> {
     if (isTauri()) return invoke("pick_export_project_destination");

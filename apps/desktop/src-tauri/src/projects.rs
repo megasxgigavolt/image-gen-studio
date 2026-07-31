@@ -2674,7 +2674,7 @@ Return JSON only:
             group.kind, start, end
         );
         let text = request_gemini_text(&auth, &request)?;
-        let cleaned_plan = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+        let cleaned_plan = extract_json_from_text(&text);
         let planned: EducationalPlanResponse = serde_json::from_str(cleaned_plan)
             .map_err(|e| format!("Educational plan was not valid JSON: {e}"))?;
         validate_educational_plan(&planned)?;
@@ -2801,7 +2801,7 @@ Return exactly one plan for every supplied row, in the same order."#,
                 serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
             );
             let text = request_gemini_text(&auth, &request)?;
-            let cleaned_wvp = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+            let cleaned_wvp = extract_json_from_text(&text);
             let response: WholeVideoPlanResponse = serde_json::from_str(cleaned_wvp)
                 .map_err(|e| format!("Whole-video plan was not valid JSON: {e}"))?;
             if response.plans.len() != chunk.len() {
@@ -3523,8 +3523,8 @@ Return JSON only:
         let auth = self.gemini_auth()?;
         let prompt = "Analyze this image as a reusable production style reference. Return only JSON with styleDirective (string describing art style, rendering, color language, recurring subjects, and visual consistency rules) and imageSettings (object with any of: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, lensType, lightDirection, lightQuality, shadowType, contrast, saturation, composition, motion — use only values strongly supported by the image).";
         let text = request_gemini_vision(&auth, prompt, &media_type, &bytes)?;
-        let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
-        serde_json::from_str(cleaned).map_err(|_| "Style analysis was not valid JSON.".to_string())
+        let cleaned = extract_json_from_text(&text);
+        serde_json::from_str(cleaned).map_err(|_| format!("Style analysis was not valid JSON. Raw response: {}", text.chars().take(300).collect::<String>()))
     }
 
     pub fn generate_image_render(
@@ -8096,7 +8096,7 @@ struct WholeVideoPlanResponse {
 
 fn request_openai_educational_plan(api_key: &str, prompt: &str) -> Result<EducationalPlanResponse, String> {
     let text = request_openai_text(api_key, prompt)?;
-    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let cleaned = extract_json_from_text(&text);
     serde_json::from_str(cleaned).map_err(|_| "OpenAI educational plan was not valid JSON.".to_string())
 }
 
@@ -8127,7 +8127,7 @@ fn request_openai_whole_video_plan(api_key: &str, prompt: &str) -> Result<WholeV
     }
     let text = body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
         .ok_or("OpenAI returned no whole-video plan.")?;
-    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let cleaned = extract_json_from_text(text);
     serde_json::from_str(cleaned).map_err(|_| "OpenAI whole-video plan was not valid JSON.".to_string())
 }
 
@@ -8164,7 +8164,7 @@ fn request_openai_style(api_key: &str, mime: &str, bytes: &[u8]) -> Result<Style
     }
     let text = body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
         .ok_or("OpenAI returned no style analysis.")?;
-    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let cleaned = extract_json_from_text(text);
     serde_json::from_str(cleaned).map_err(|_| "OpenAI style analysis was not valid JSON.".to_string())
 }
 
@@ -8215,7 +8215,7 @@ Return only JSON: {"effect": "<exact treatment name from the numbered list above
     }
     let text = body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
         .ok_or("OpenAI returned no motion graphic analysis.")?;
-    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let cleaned = extract_json_from_text(text);
     let plan: MotionGraphicPlan = serde_json::from_str(cleaned).map_err(|_| "OpenAI motion graphic analysis was not valid JSON.".to_string())?;
     if !MOTION_GRAPHIC_EFFECTS.contains(&plan.effect.as_str()) {
         return Err(format!("OpenAI returned an unrecognized motion graphic effect: {}", plan.effect));

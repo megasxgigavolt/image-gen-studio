@@ -2085,16 +2085,44 @@ def run(args: argparse.Namespace) -> None:
 
         # Minimal objects for output consistency, matching the AI-error
         # fallback branch below's shape (write_outputs expects these).
+        # analyses must have one entry per sentence — write_outputs and the
+        # JSON audit payload both zip(sentences, pass1_result.analyses), so
+        # a short/empty analyses list silently drops sentences from the
+        # audit JSON that the Rust side reads back.
         from pydantic import BaseModel
+
+        class FallbackAnalysis(BaseModel):
+            sentence_id: int
+            visual_anchor: str
+            dominant_subject: str = "unknown"
+            environment: str = "unspecified"
+            time_context: str = "unspecified"
+            action: str = "unspecified"
+            emotion: str = "neutral"
+            story_beat: str = "development"
+            visual_density: int = 5
+            narrative_energy: int = 5
+            abstraction_level: int = 50
+            visual_importance: int = 5
+            hard_boundary_before: bool = False
+            hard_boundary_reason: str = "Per-sentence pacing"
 
         class FallbackPass1(BaseModel):
             hook_end_sentence_id: int = 1
-            analyses: list = []
+            analyses: list[FallbackAnalysis] = []
 
         class FallbackPass2(BaseModel):
             transitions: list = []
 
-        pass1_result = FallbackPass1()
+        pass1_result = FallbackPass1(
+            analyses=[
+                FallbackAnalysis(
+                    sentence_id=sentence.sentence_id,
+                    visual_anchor=sentence.text,
+                )
+                for sentence in sentences
+            ],
+        )
         pass2_result = FallbackPass2()
         groups = per_sentence_grouping(sentences)
         validate_groups(groups, sentences)

@@ -281,8 +281,9 @@ export function ClipInspector({
             <p className="tl-source-hint">
               OpenAI inspects this still against 5 documented camera-movement treatments — Ken Burns, Sequential
               Panel Reveal, Speed Pan &amp; Motion Blur, Ominous Push-In, and Candlelight Flicker — and picks the
-              best fit. Run it from the Motion Graphics button in the toolbar above. Metadata only for now —
-              settings here don't yet change the exported video.
+              best fit. Run it from the Motion Graphics button in the toolbar above. The base camera movement is
+              approximated onto Camera Movement below (visible in preview and export) — glow, desaturation, and
+              flicker from the full treatment aren't rendered yet.
             </p>
           )}
           {selectedClip.motionGraphicEffect && (

@@ -2910,25 +2910,37 @@ Return JSON only — no markdown, no explanation:
     /// Prefers whichever provider `plan_bulk_visuals` is already using for
     /// planning (passed in via `openai_key`/`gemini_auth`) rather than
     /// hard-coding a provider, unlike `extract_reference_style`.
+    /// Reads the video's reference image bytes (see `list_assets(video_id,
+    /// "reference")` — guaranteed 0-or-1 row). Shared by
+    /// `character_description_for_video` (vision analysis) and
+    /// `generate_image_render` (passed as actual generation input, not just
+    /// description text — see that function's comment for why both matter).
+    fn reference_image_bytes(&self, video_id: &str) -> Result<Option<(String, Vec<u8>)>, String> {
+        let Some(reference) = self.list_assets(video_id, "reference")?.into_iter().next() else {
+            return Ok(None);
+        };
+        let channel_id: String = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let bytes = fs::read(self.projects_dir.join(&channel_id).join(video_id).join(&reference.relative_path))
+            .map_err(|_| "Reference image file is missing.".to_string())?;
+        Ok(Some((reference.media_type, bytes)))
+    }
+
     fn character_description_for_video(
         &self,
         video_id: &str,
         openai_key: &Option<String>,
         gemini_auth: &Option<GeminiAuth>,
     ) -> Result<String, String> {
-        let reference = self.list_assets(video_id, "reference")?.into_iter().next()
+        let (media_type, bytes) = self.reference_image_bytes(video_id)?
             .ok_or("Character Consistency requires a reference image — upload one in Bulk Gen Config first.")?;
-        let channel_id: String = self.connection.query_row(
-            "SELECT channel_id FROM videos WHERE id=?1", [video_id], |row| row.get(0),
-        ).map_err(|e| e.to_string())?;
-        let bytes = fs::read(self.projects_dir.join(&channel_id).join(video_id).join(&reference.relative_path))
-            .map_err(|_| "Reference image file is missing.".to_string())?;
-        let prompt = "Identify the single main character or protagonist in this reference image (a person, animal, or creature — not a background object or environment). Write a concise, reusable physical description of that character for an illustrator to redraw consistently across dozens of separate scenes: species/type, approximate age, physical proportions and build, coloring/markings, distinguishing features, and any clothing or props. Do not describe the pose, background, camera angle, or art/rendering style — only the character's inherent physical identity, in 3-5 sentences of plain prose. If no clear single character is present, describe the closest candidate subject instead. Return only the description, no preamble, no labels, no markdown.";
+        let prompt = "Identify the single main character or protagonist in this reference image (a person, animal, or creature — not a background object or environment). Write a concise, reusable physical description of that character for an illustrator to redraw consistently across dozens of separate scenes. You MUST explicitly cover: species/type; approximate age; physical proportions and build; exact hair color, length, and style (or fur/feather coloring and pattern if not human) — this is the single most common detail illustrators get inconsistent, so describe it precisely; eye color; skin/fur tone; any distinguishing marks or features; and clothing/props with their exact colors. Do not describe the pose, background, camera angle, or art/rendering style — only the character's inherent physical identity, in 4-6 sentences of plain prose. If no clear single character is present, describe the closest candidate subject instead. Return only the description, no preamble, no labels, no markdown.";
         match openai_key {
-            Some(key) => request_openai_character_description(key, prompt, &reference.media_type, &bytes),
+            Some(key) => request_openai_character_description(key, prompt, &media_type, &bytes),
             None => request_gemini_vision(
                 gemini_auth.as_ref().ok_or("Configure an OpenAI or Gemini API key to use Character Consistency.")?,
-                prompt, &reference.media_type, &bytes,
+                prompt, &media_type, &bytes,
             ),
         }
     }
@@ -2965,6 +2977,14 @@ Return JSON only — no markdown, no explanation:
             }));
         }
         let total = row_data.len();
+        // Persisted per-video so generate_image_render can pass the actual
+        // reference image into every still's generation call too (text
+        // description alone doesn't reliably reproduce exact details like
+        // hair across independent generations — see that function).
+        self.save_app_setting(
+            &format!("character_consistency.{video_id}"),
+            if character_consistency { "true" } else { "false" },
+        )?;
         // Computed once (a real vision API call), not per-chunk like
         // director_note below — then interpolated into every chunk's prompt.
         let character_block = if character_consistency {
@@ -3604,9 +3624,48 @@ Return JSON only:
             .get_app_setting("gemini_model")?
             .unwrap_or_else(|| "gemini-3.1-flash-image".into());
         let prompt = assemble_image_prompt(system_prompt, user_prompt, &settings);
-        let (image_bytes, extension) = request_gemini_image(
-            &auth, &model, &prompt, requested_aspect_ratio(&settings),
-        )?;
+        // When Character Consistency is on (flag set by plan_bulk_visuals),
+        // pass the actual reference image as generation input, not just the
+        // character description baked into user_prompt as text. A text
+        // description alone doesn't reliably reproduce fine visual details
+        // (hair color/style especially) across independent generations —
+        // conditioning on the real image is what actually anchors them.
+        let character_consistency_enabled = self
+            .get_app_setting(&format!("character_consistency.{video_id}"))?
+            .as_deref() == Some("true");
+        let reference_for_generation = if character_consistency_enabled {
+            self.reference_image_bytes(video_id)?
+        } else {
+            None
+        };
+        let (image_bytes, extension) = match reference_for_generation {
+            Some((reference_mime, reference_bytes)) => {
+                // request_gemini_image_with_source is otherwise only used for
+                // in-place edits (edit_render/edit_thumbnail), where the source
+                // image IS the thing being modified and the prompt says to
+                // preserve it. That's the opposite of what we want here — the
+                // attached image is a CHARACTER REFERENCE for an entirely new
+                // scene, not an image to edit — so this framing is mandatory,
+                // not optional, or the model tends to keep the reference's
+                // background/pose instead of generating the new scene.
+                let character_reference_prompt = format!(
+                    "The attached image is a CHARACTER REFERENCE ONLY. Reproduce that character's exact \
+                     appearance (hair, coloring, build, distinguishing features, attire) — but IGNORE the \
+                     reference image's background, pose, camera angle, and composition entirely. Generate \
+                     a completely new scene as described below, featuring that character:\n\n{prompt}"
+                );
+                request_gemini_image_with_source(
+                    &auth, &model, &character_reference_prompt, &reference_bytes, &reference_mime, None,
+                    requested_aspect_ratio(&settings),
+                )?
+            }
+            // character_consistency_enabled but no reference found (e.g. removed
+            // after planning) falls back to text-only rather than blocking
+            // generation entirely.
+            None => request_gemini_image(
+                &auth, &model, &prompt, requested_aspect_ratio(&settings),
+            )?,
+        };
         let channel_id: String = self
             .connection
             .query_row(

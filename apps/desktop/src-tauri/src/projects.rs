@@ -7991,9 +7991,21 @@ Return JSON only:
         let new_right_id = format!("s{}", target_number + 1);
         sentences[target_index].text = left_text;
         sentences[target_index].end_seconds = midpoint;
+        // Shift every existing sentence's OWN id past the split point up by
+        // one, freeing `target_number + 1` for the new right-half and
+        // keeping the sentences table's ids in sync with what `renumber`
+        // below applies to group references — this loop was missing
+        // entirely in the first version, leaving groups pointing at ids
+        // that don't exist in `visual_plan_sentences`.
+        for sentence in sentences.iter_mut() {
+            let n = sentence_number(&sentence.id);
+            if n > target_number {
+                sentence.id = format!("s{}", n + 1);
+            }
+        }
         let right_sentence = PlanSentence {
             id: new_right_id.clone(),
-            ordinal: sentences[target_index].ordinal + 1,
+            ordinal: 0,
             text: right_text,
             start_seconds: midpoint,
             end_seconds: end,
@@ -8062,6 +8074,16 @@ Return JSON only:
         first.text = format!("{} {}", first.text.trim(), second.text.trim());
         first.start_seconds = first.start_seconds.min(second.start_seconds);
         first.end_seconds = first.end_seconds.max(second.end_seconds);
+        // Same fix as split_plan_sentence: shift every remaining sentence's
+        // OWN id past the removed one down by one, keeping the sentences
+        // table in sync with what `renumber` below applies to group
+        // references — this loop was missing entirely in the first version.
+        for sentence in sentences.iter_mut() {
+            let n = sentence_number(&sentence.id);
+            if n > second_number {
+                sentence.id = format!("s{}", n - 1);
+            }
+        }
         for (index, sentence) in sentences.iter_mut().enumerate() {
             sentence.ordinal = index as i64 + 1;
         }
@@ -9500,6 +9522,66 @@ mod tests {
                 original.groups
             );
         }
+    }
+
+    #[test]
+    fn splits_and_merges_plan_sentences_keeping_ids_consistent() {
+        // Regression test: the first version of split_plan_sentence/
+        // merge_plan_sentences renumbered group `sentence_ids` references
+        // but never renumbered the sentences table's OWN ids, leaving
+        // groups pointing at sentence ids that didn't exist — crashed the
+        // Visual Plan view with "Cannot read properties of undefined
+        // (reading 'startSeconds')" as soon as it tried to resolve a
+        // group's members.
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(
+            &video.id,
+            "One short sentence. A second sentence follows. The final sentence closes.",
+            4,
+        )
+        .unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let original = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        assert!(original.sentences.len() >= 3);
+
+        fn assert_groups_reference_real_sentences(plan: &VisualPlan) {
+            for group in &plan.groups {
+                for id in &group.sentence_ids {
+                    assert!(
+                        plan.sentences.iter().any(|s| &s.id == id),
+                        "group {} references missing sentence {id}",
+                        group.id
+                    );
+                }
+            }
+        }
+
+        fn assert_ids_are_gapless(plan: &VisualPlan) {
+            let mut numbers: Vec<i64> = plan.sentences.iter().map(|s| sentence_number(&s.id)).collect();
+            numbers.sort();
+            for pair in numbers.windows(2) {
+                assert_eq!(pair[1], pair[0] + 1, "sentence ids are not gapless: {numbers:?}");
+            }
+        }
+
+        let first = original.sentences[0].clone();
+        let offset = (first.text.len() / 2).max(1);
+        let after_split = repo.split_plan_sentence(&video.id, &first.id, offset).unwrap();
+        assert_eq!(after_split.sentences.len(), original.sentences.len() + 1);
+        assert_groups_reference_real_sentences(&after_split);
+        assert_ids_are_gapless(&after_split);
+
+        let merged = repo
+            .merge_plan_sentences(&video.id, &after_split.sentences[0].id, &after_split.sentences[1].id)
+            .unwrap();
+        assert_eq!(merged.sentences.len(), original.sentences.len());
+        assert_groups_reference_real_sentences(&merged);
+        assert_ids_are_gapless(&merged);
+        assert_eq!(merged.sentences[0].text, first.text);
     }
 
     #[test]

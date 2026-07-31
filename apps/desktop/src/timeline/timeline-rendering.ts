@@ -8,6 +8,7 @@ import {
   Shuffle,
   Sparkles,
   Sun,
+  Film,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
@@ -68,6 +69,7 @@ export const MOTION_OPTIONS: { value: MotionPreset; label: string; icon: typeof 
   { value: "zoom-in-subject", label: "Zoom in on subject", icon: ZoomIn },
   { value: "zoom-out-subject", label: "Zoom out on subject", icon: ZoomOut },
   { value: "ken-burns", label: "Ken Burns", icon: Move },
+  { value: "cuts", label: "Cuts", icon: Film },
   { value: "none", label: "None", icon: Ban },
 ];
 
@@ -133,6 +135,22 @@ export function applyMotion(
     scaleMul = peak;
     panX = Math.min(1, elapsedSeconds / MOTION_REFERENCE_DURATION);
     panY = 0.5;
+  } else if (motion === "cuts") {
+    // Mirrors video_export_engine.py's "cuts" handling exactly: a hard-cut
+    // step function between 3 fixed crops (wide, subject, complementary
+    // corner), not a continuous animation — matches the actual export,
+    // which independently encodes each third as its own segment.
+    const cutAnchors: [number, number, number][] = [
+      [0.5, 0.5, 1.0],
+      [subject?.x ?? 0.5, subject?.y ?? 0.5, Math.min(maxScale, peak + 0.3)],
+      [1 - (subject?.x ?? 0.5), 1 - (subject?.y ?? 0.5), Math.min(maxScale, peak + 0.3)],
+    ];
+    const third = duration / 3;
+    const cutIndex = Math.min(2, Math.floor(elapsedSeconds / Math.max(0.001, third)));
+    const [cx, cy, cscale] = cutAnchors[cutIndex];
+    scaleMul = cscale;
+    panX = cx;
+    panY = cy;
   } else if (motion === "ken-burns") {
     // Classic Ken Burns: zoom in steadily while panning from an off-center
     // starting point toward the frame's center, so the motion reads as a

@@ -35,6 +35,11 @@ import scene_grouping_engine as engine
 FPS_DEFAULT = 30
 MAX_ENCODE_WORKERS = 4
 
+# "cuts" motion preset: a still is split into this many hard-cut static
+# crops instead of one continuous pan/zoom — see build_segments()'s "cuts"
+# branch and build_image_filter's cut_index handling.
+CUTS_SEGMENT_COUNT = 3
+
 # Fallback caption look if a manifest is ever missing captionDefaultStyle
 # (e.g. one written before per-clip caption styling existed) — matches what
 # used to be the single hardcoded ASS style for every export.
@@ -90,6 +95,32 @@ def build_segments(stills: list[dict], duration_seconds: float) -> list[dict]:
                 "transitionIn": still.get("transitionIn", "cut"),
                 "transitionOut": still.get("transitionOut", "cut"),
             })
+        elif still.get("motion") == "cuts":
+            # Hard cuts between CUTS_SEGMENT_COUNT static crops of the same
+            # image, instead of one continuous pan/zoom — evenly split this
+            # still's time range into that many consecutive sub-segments,
+            # each its own independent encode (see build_image_filter's
+            # cut_index handling). assign_frame_counts() needs no changes:
+            # it already computes cumulative-frame-accurate counts per
+            # segment regardless of how many segments one still becomes, as
+            # long as each sub-segment's "end" is set correctly here.
+            count = CUTS_SEGMENT_COUNT
+            span = (end - start) / count
+            for cut_index in range(count):
+                cut_start = start + span * cut_index
+                cut_end = end if cut_index == count - 1 else start + span * (cut_index + 1)
+                segments.append({
+                    "kind": "image", "path": still["imagePath"], "start": cut_start, "end": cut_end,
+                    "motion": "cuts", "cutIndex": cut_index, "cutCount": count,
+                    "subjectX": still.get("subjectX", 0.5), "subjectY": still.get("subjectY", 0.5),
+                    # Only the whole still's own transitionIn/Out apply to
+                    # its first/last sub-segment — the cuts between
+                    # sub-segments are always hard cuts, not user-chosen.
+                    "transitionIn": still.get("transitionIn", "cut") if cut_index == 0 else "cut",
+                    "transitionOut": still.get("transitionOut", "cut") if cut_index == count - 1 else "cut",
+                    "colorFilter": still.get("colorFilter", "none"),
+                    "colorFilterIntensity": still.get("colorFilterIntensity", 50.0),
+                })
         else:
             segments.append({
                 "kind": "image", "path": still["imagePath"], "start": start, "end": end,
@@ -97,6 +128,13 @@ def build_segments(stills: list[dict], duration_seconds: float) -> list[dict]:
                 "motionIntensity": still.get("motionIntensity", 0.22),
                 "transitionIn": still.get("transitionIn", "cut"),
                 "transitionOut": still.get("transitionOut", "cut"),
+                # These were previously dropped here despite the manifest
+                # already carrying them (Rust always sends them per still) —
+                # meant color filters and subject-anchored zoom silently
+                # never reached the real export, only the live preview.
+                "subjectX": still.get("subjectX", 0.5), "subjectY": still.get("subjectY", 0.5),
+                "colorFilter": still.get("colorFilter", "none"),
+                "colorFilterIntensity": still.get("colorFilterIntensity", 50.0),
             })
         cursor = max(cursor, end)
     if cursor < duration_seconds - 1e-6:
@@ -253,6 +291,7 @@ def build_image_filter(
     width: int, height: int, fps: int, duration: float, frames: int,
     subject_x: float = 0.5, subject_y: float = 0.5,
     color_filter: str = "none", color_filter_intensity: float = 50.0,
+    cut_index: int = 0,
 ) -> str:
     """Ken Burns camera-movement presets via ffmpeg's zoompan filter, plus
     optional fade-from/to-black "transitions" at the start and/or end.
@@ -330,6 +369,25 @@ def build_image_filter(
             f"y='(ih-ih/zoom)*({kb_start_y:.5f}+({0.5 - kb_start_y:.5f})*min(1,(on/{fps})/{REFERENCE_DURATION}))'"
         ),
     }
+    if motion == "cuts":
+        # Hard-cut motion preset: each sub-segment holds one FIXED crop for
+        # its whole duration (no z= animation over time) — the "cut" is
+        # produced by concatenating independently-encoded segments (see
+        # build_segments), not by anything in this filter itself. Sequence
+        # reads as wide establishing shot -> push to the detected subject ->
+        # push to the complementary corner, rather than 3 arbitrary crops.
+        cut_anchors = [
+            (0.5, 0.5, 1.0),
+            (subject_x, subject_y, min(max_scale, peak + 0.3)),
+            (1 - subject_x, 1 - subject_y, min(max_scale, peak + 0.3)),
+        ]
+        cx, cy, cscale = cut_anchors[cut_index % len(cut_anchors)]
+        pre_scale = max(width, height) * 8
+        return (
+            f"scale={pre_scale}:-2,zoompan=z='{cscale:.5f}':"
+            f"{anchored_xy(cx, cy)}:"
+            f"d={frames}:s={width}x{height}:fps={fps}{color_node}{fade}"
+        )
     if motion in zoompan_presets:
         # zoompan crops at integer-pixel granularity in its source's coordinate
         # space; a slow zoom (low intensity) moves less than one pixel per
@@ -419,6 +477,7 @@ def _encode_segment_to_path(
             width, height, fps, duration, original_frames,
             segment.get("subjectX", 0.5), segment.get("subjectY", 0.5),
             segment.get("colorFilter", "none"), segment.get("colorFilterIntensity", 50.0),
+            segment.get("cutIndex", 0),
         )
         if trim_start_frames > 0:
             vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"

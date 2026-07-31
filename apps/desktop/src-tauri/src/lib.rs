@@ -504,6 +504,7 @@ async fn plan_bulk_visuals(
     style_directive: String,
     base_settings_json: String,
     creative_instruction: String,
+    character_consistency: bool,
 ) -> Result<projects::BulkPlanResult, String> {
     let (database_path, projects_dir) =
         with_repository(state, |repository| Ok(repository.paths()))?;
@@ -514,6 +515,7 @@ async fn plan_bulk_visuals(
             &style_directive,
             &base_settings_json,
             &creative_instruction,
+            character_consistency,
             |planned, total| {
                 let _ = app.emit(
                     "bulk_plan_progress",

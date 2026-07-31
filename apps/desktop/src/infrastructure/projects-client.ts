@@ -1103,8 +1103,8 @@ export const projectsClient = {
     if (isTauri()) return invoke("suggest_still_prompt", { videoId, groupId, styleDirective, baseSettingsJson });
     throw new Error("Prompt suggestion requires the native application.");
   },
-  async planBulkVisuals(videoId: string, styleDirective: string, baseSettingsJson: string, creativeInstruction: string): Promise<BulkPlanResultRecord> {
-    if (isTauri()) return invoke("plan_bulk_visuals", { videoId, styleDirective, baseSettingsJson, creativeInstruction });
+  async planBulkVisuals(videoId: string, styleDirective: string, baseSettingsJson: string, creativeInstruction: string, characterConsistency: boolean): Promise<BulkPlanResultRecord> {
+    if (isTauri()) return invoke("plan_bulk_visuals", { videoId, styleDirective, baseSettingsJson, creativeInstruction, characterConsistency });
     throw new Error("Bulk planning requires the native application.");
   },
   async analyzeMotionGraphics(videoId: string): Promise<TimelineRecord> {

@@ -49,7 +49,7 @@ export type VideoInputsRecord = {
   videoId: string;
   scriptText: string;
   pacingSeconds: number;
-  pacingPreset: "calm" | "balanced" | "fast" | "custom";
+  pacingPreset: "calm" | "balanced" | "fast" | "custom" | "per-sentence";
   pacingMinSeconds: number;
   pacingMaxSeconds: number;
   audio: InputAssetRecord | null;
@@ -193,7 +193,8 @@ export type MotionPreset =
   | "zoom-pulse"
   | "zoom-in-subject"
   | "zoom-out-subject"
-  | "ken-burns";
+  | "ken-burns"
+  | "cuts";
 export type TransitionPreset = "cut" | "fade" | "dip-to-white" | "cross-fade" | "slide-left" | "slide-right" | "zoom-blur";
 export type ExportResolution = "2160p" | "1080p" | "720p";
 export type ExportQuality = "high" | "balanced" | "compressed";
@@ -1027,7 +1028,7 @@ export const projectsClient = {
     writeBrowserData(data);
     return inputs;
   },
-  async saveVideoPacing(videoId: string, preset: "calm" | "balanced" | "fast" | "custom", minSeconds: number, maxSeconds: number) {
+  async saveVideoPacing(videoId: string, preset: "calm" | "balanced" | "fast" | "custom" | "per-sentence", minSeconds: number, maxSeconds: number) {
     if (isTauri()) return invoke<VideoInputsRecord>("save_video_pacing", { videoId, preset, minSeconds, maxSeconds });
     const data = readBrowserData();
     const existing = await this.getVideoInputs(videoId);
@@ -1226,6 +1227,88 @@ export const projectsClient = {
     if (!original) throw new Error("Original visual plan was not found.");
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, original);
     return JSON.parse(original) as VisualPlanRecord;
+  },
+  async updatePlanSentenceText(videoId: string, sentenceId: string, text: string): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("update_plan_sentence_text", { videoId, sentenceId, text });
+    const plan = await this.getVisualPlan(videoId);
+    const trimmed = text.trim();
+    if (!trimmed) throw new Error("Sentence text is required.");
+    plan.sentences = plan.sentences.map((s) => (s.id === sentenceId ? { ...s, text: trimmed } : s));
+    localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
+    return plan;
+  },
+  async splitPlanSentence(videoId: string, sentenceId: string, splitAfterOffset: number): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("split_plan_sentence", { videoId, sentenceId, splitAfterOffset });
+    const plan = await this.getVisualPlan(videoId);
+    const targetNumber = Number(sentenceId.slice(1));
+    const target = plan.sentences.find((s) => s.id === sentenceId);
+    if (!target) throw new Error("Sentence was not found.");
+    const leftText = target.text.slice(0, splitAfterOffset).trim();
+    const rightText = target.text.slice(splitAfterOffset).trim();
+    if (!leftText || !rightText) throw new Error("Split point must have text on both sides.");
+    const leftWords = Math.max(1, leftText.split(/\s+/).length);
+    const rightWords = Math.max(1, rightText.split(/\s+/).length);
+    const fraction = leftWords / (leftWords + rightWords);
+    const midpoint = target.startSeconds + (target.endSeconds - target.startSeconds) * fraction;
+    const newRightId = `s${targetNumber + 1}`;
+    const renumber = (id: string): string[] => {
+      const n = Number(id.slice(1));
+      if (n === targetNumber) return [`s${n}`, newRightId];
+      if (n > targetNumber) return [`s${n + 1}`];
+      return [id];
+    };
+    plan.sentences = plan.sentences.flatMap((s) => {
+      if (s.id !== sentenceId) {
+        const n = Number(s.id.slice(1));
+        return [{ ...s, id: n > targetNumber ? `s${n + 1}` : s.id }];
+      }
+      return [
+        { ...s, text: leftText, endSeconds: midpoint },
+        { id: newRightId, ordinal: 0, text: rightText, startSeconds: midpoint, endSeconds: target.endSeconds },
+      ];
+    }).sort((a, b) => Number(a.id.slice(1)) - Number(b.id.slice(1)))
+      .map((s, index) => ({ ...s, ordinal: index + 1 }));
+    plan.groups = plan.groups.map((group) => ({ ...group, sentenceIds: group.sentenceIds.flatMap(renumber) }))
+      .filter((group) => group.sentenceIds.length)
+      .map((group, index) => ({ ...group, ordinal: index + 1 }));
+    localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
+    return plan;
+  },
+  async mergePlanSentences(videoId: string, firstSentenceId: string, secondSentenceId: string): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("merge_plan_sentences", { videoId, firstSentenceId, secondSentenceId });
+    const plan = await this.getVisualPlan(videoId);
+    const firstNumber = Number(firstSentenceId.slice(1));
+    const secondNumber = Number(secondSentenceId.slice(1));
+    if (secondNumber !== firstNumber + 1) throw new Error("Only chronologically adjacent sentences can be merged.");
+    const first = plan.sentences.find((s) => s.id === firstSentenceId);
+    const second = plan.sentences.find((s) => s.id === secondSentenceId);
+    if (!first || !second) throw new Error("Sentence was not found.");
+    const renumber = (id: string): string[] => {
+      const n = Number(id.slice(1));
+      if (n === secondNumber) return [];
+      if (n > secondNumber) return [`s${n - 1}`];
+      return [id];
+    };
+    plan.sentences = plan.sentences
+      .filter((s) => s.id !== secondSentenceId)
+      .map((s) => {
+        if (s.id !== firstSentenceId) {
+          const n = Number(s.id.slice(1));
+          return { ...s, id: n > secondNumber ? `s${n - 1}` : s.id };
+        }
+        return {
+          ...s,
+          text: `${first.text.trim()} ${second.text.trim()}`,
+          startSeconds: Math.min(first.startSeconds, second.startSeconds),
+          endSeconds: Math.max(first.endSeconds, second.endSeconds),
+        };
+      })
+      .map((s, index) => ({ ...s, ordinal: index + 1 }));
+    plan.groups = plan.groups.map((group) => ({ ...group, sentenceIds: group.sentenceIds.flatMap(renumber) }))
+      .filter((group) => group.sentenceIds.length)
+      .map((group, index) => ({ ...group, ordinal: index + 1 }));
+    localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
+    return plan;
   },
   async generateCaptions(videoId: string, intervalSeconds: number): Promise<CaptionSetRecord> {
     if (isTauri()) return invoke("generate_captions", { videoId, intervalSeconds });

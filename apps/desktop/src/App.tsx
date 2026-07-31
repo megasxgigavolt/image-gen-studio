@@ -643,7 +643,7 @@ function InputsView() {
   const { setStage, activeVideoId } = useAppStore();
   const [script, setScript] = useState("");
   const [pacing, setPacing] = useState(8);
-  const [pacingPreset, setPacingPreset] = useState<"calm" | "balanced" | "fast" | "custom">("balanced");
+  const [pacingPreset, setPacingPreset] = useState<"calm" | "balanced" | "fast" | "custom" | "per-sentence">("balanced");
   const [pacingMin, setPacingMin] = useState(6);
   const [pacingMax, setPacingMax] = useState(10);
   const [audio, setAudio] = useState<import("./infrastructure/projects-client").InputAssetRecord | null>(null);
@@ -696,11 +696,14 @@ function InputsView() {
     return () => window.clearTimeout(timeout);
   }, [activeVideoId, hydrated, pacing, script]);
 
-  async function choosePacing(preset: "calm" | "balanced" | "fast" | "custom", min = pacingMin, max = pacingMax) {
+  async function choosePacing(preset: "calm" | "balanced" | "fast" | "custom" | "per-sentence", min = pacingMin, max = pacingMax) {
     if (!activeVideoId) return;
     const safeMin = preset === "custom" ? Math.min(min, max) : min;
     const safeMax = preset === "custom" ? Math.max(min, max) : max;
-    const ranges = { calm: [10, 16], balanced: [6, 10], fast: [3, 6], custom: [safeMin, safeMax] } as const;
+    // min/max are unused for grouping when preset is "per-sentence" (the
+    // backend skips duration-window grouping entirely) — persisted anyway
+    // since the column is NOT NULL with a validated 2-30s range.
+    const ranges = { calm: [10, 16], balanced: [6, 10], fast: [3, 6], "per-sentence": [3, 6], custom: [safeMin, safeMax] } as const;
     const [nextMin, nextMax] = ranges[preset];
     setPacingPreset(preset); setPacingMin(nextMin); setPacingMax(nextMax);
     setPacing(Math.round((nextMin + nextMax) / 2)); setStatus("Saving…");
@@ -809,7 +812,7 @@ function InputsView() {
         </article>
         <div className="panel-stack">
           <article className="panel"><div className="panel-heading"><div><h2>Narration audio</h2><p>Used for word-level timing.</p></div><button className="secondary" onClick={() => void importAsset("audio")}><Upload size={15} />{audio ? "Replace" : "Import"}</button></div>{audio ? <div className="file-row"><span>♪</span><div><strong>{audio.originalName}</strong><small>{(audio.sizeBytes / 1024 / 1024).toFixed(1)} MB</small></div><button className="icon-button" onClick={() => void removeAsset(audio.id)}><X size={15} /></button></div> : <div className="asset-empty">WAV, MP3, M4A, AAC, or FLAC</div>}</article>
-          <article className="panel"><div className="pacing-heading"><div><h2>Scene pacing</h2><p>Preferred duration range per still</p></div><strong>{pacingMin}–{pacingMax} sec</strong></div><div className="pacing-options">{([["calm","Calm","10–16s"],["balanced","Balanced","6–10s"],["fast","Fast","3–6s"],["custom","Custom","Choose range"]] as const).map(([value,label,detail]) => <button key={value} className={pacingPreset === value ? "active" : ""} onClick={() => void choosePacing(value)}><strong>{label}</strong><small>{detail}</small></button>)}</div><div className="custom-pacing"><label>Minimum<input type="number" min="2" max="30" value={pacingMin} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMin(Number(event.target.value))} onBlur={(event) => { if (pacingPreset === "custom") void choosePacing("custom", Number(event.target.value), pacingMax); }} /></label><label>Maximum<input type="number" min="2" max="30" value={pacingMax} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMax(Number(event.target.value))} onBlur={(event) => { if (pacingPreset === "custom") void choosePacing("custom", pacingMin, Number(event.target.value)); }} /></label></div></article>
+          <article className="panel"><div className="pacing-heading"><div><h2>Scene pacing</h2><p>Preferred duration range per still</p></div><strong>{pacingPreset === "per-sentence" ? "1 sentence" : `${pacingMin}–${pacingMax} sec`}</strong></div><div className="pacing-options">{([["calm","Calm","10–16s"],["balanced","Balanced","6–10s"],["fast","Fast","3–6s"],["per-sentence","Every sentence","1:1 split"],["custom","Custom","Choose range"]] as const).map(([value,label,detail]) => <button key={value} className={pacingPreset === value ? "active" : ""} onClick={() => void choosePacing(value)}><strong>{label}</strong><small>{detail}</small></button>)}</div>{pacingPreset === "per-sentence" ? <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"8px 0 0"}}>Every sentence becomes its own still — no AI grouping, fastest to generate.</p> : <div className="custom-pacing"><label>Minimum<input type="number" min="2" max="30" value={pacingMin} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMin(Number(event.target.value))} onBlur={(event) => { if (pacingPreset === "custom") void choosePacing("custom", Number(event.target.value), pacingMax); }} /></label><label>Maximum<input type="number" min="2" max="30" value={pacingMax} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMax(Number(event.target.value))} onBlur={(event) => { if (pacingPreset === "custom") void choosePacing("custom", pacingMin, Number(event.target.value)); }} /></label></div>}</article>
           <article className={ready ? "readiness ready" : "readiness"}><strong>{ready ? "Ready for visual planning" : "Source material incomplete"}</strong><span>{ready ? "Script and narration audio are available." : "Add a script and narration audio to continue."}</span></article>
         </div>
       </div>
@@ -825,6 +828,8 @@ function VisualPlanView() {
   const [draggedSentenceId, setDraggedSentenceId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [editingSentenceId, setEditingSentenceId] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
   useEffect(() => {
     if (!activeVideoId) return;
@@ -933,6 +938,12 @@ function VisualPlanView() {
     catch (caught) { setError(String(caught)); }
   }
 
+  async function mergeSentences(firstSentenceId: string, secondSentenceId: string) {
+    if (!activeVideoId) return;
+    try { setPlan(await projectsClient.mergePlanSentences(activeVideoId, firstSentenceId, secondSentenceId)); }
+    catch (caught) { setError(String(caught)); }
+  }
+
   function finishDrag(event: DragEndEvent) {
     const sentenceId = String(event.active.id).replace(/^sentence:/, "");
     const target = event.over ? String(event.over.id) : "";
@@ -943,13 +954,62 @@ function VisualPlanView() {
       void moveSentence(sentenceId, target.replace(/^group:/, ""));
     } else if (target.startsWith("divider:")) {
       void createGroup(sentenceId, Number(target.replace(/^divider:/, "")));
+    } else if (target.startsWith("sentence:")) {
+      // Dropping one sentence onto another merges them — dropped-onto
+      // wins as the "first" half only when it's actually the earlier one,
+      // so chronology is preserved regardless of drag direction.
+      const targetSentenceId = target.replace(/^sentence:/, "");
+      if (targetSentenceId === sentenceId) return;
+      const a = Number(sentenceId.slice(1));
+      const b = Number(targetSentenceId.slice(1));
+      const [firstId, secondId] = a < b ? [sentenceId, targetSentenceId] : [targetSentenceId, sentenceId];
+      void mergeSentences(firstId, secondId);
     }
+  }
+
+  function startEditingSentence(sentence: PlanSentenceRecord) {
+    setEditingSentenceId(sentence.id);
+    setEditText(sentence.text);
+  }
+
+  // Checked on every keystroke, not just on blur — a period typed anywhere
+  // before the last non-whitespace character means "split here, now,"
+  // per the request that this happen immediately rather than on commit.
+  // Trailing sentence-ending periods don't count as a split point.
+  function findMidTextPeriodOffset(text: string): number | null {
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === "." && text.slice(i + 1).trim().length > 0) return i + 1;
+    }
+    return null;
+  }
+
+  function onEditTextChange(sentenceId: string, value: string) {
+    const offset = findMidTextPeriodOffset(value);
+    if (offset !== null && activeVideoId) {
+      setEditingSentenceId(null);
+      setEditText("");
+      projectsClient.splitPlanSentence(activeVideoId, sentenceId, offset)
+        .then(setPlan)
+        .catch((caught) => setError(String(caught)));
+      return;
+    }
+    setEditText(value);
+  }
+
+  async function commitSentenceEdit(sentenceId: string) {
+    if (!activeVideoId) return;
+    const text = editText;
+    setEditingSentenceId(null);
+    const original = plan?.sentences.find((s) => s.id === sentenceId)?.text;
+    if (!text.trim() || text.trim() === original) return;
+    try { setPlan(await projectsClient.updatePlanSentenceText(activeVideoId, sentenceId, text)); }
+    catch (caught) { setError(String(caught)); }
   }
 
   return (
     <section className="view">
       <div className="page-heading">
-        <div><h1>Visual plan</h1><p>Drag a sentence into an adjacent still to regroup it. Chronological order remains enforced.</p></div>
+        <div><h1>Visual plan</h1><p>Drag a sentence into an adjacent still to regroup it, or onto another sentence to merge them. Double-click a sentence to edit it — typing a period splits it immediately. Chronological order remains enforced.</p></div>
         <div className="heading-actions"><button className="secondary" onClick={() => setStage("inputs")}>← Back</button><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
       </div>
       {searchOpen && (
@@ -996,9 +1056,16 @@ function VisualPlanView() {
                     key={sentence.id}
                     sentence={sentence}
                     active={draggedSentenceId === sentence.id}
+                    dropActive={dropTarget === `sentence:${sentence.id}`}
                     searchQuery={searchQuery}
                     activeMatchKey={activeMatchKey}
                     registerMatchRef={registerMatchRef}
+                    editing={editingSentenceId === sentence.id}
+                    editText={editText}
+                    onStartEdit={() => startEditingSentence(sentence)}
+                    onChangeText={(value) => onEditTextChange(sentence.id, value)}
+                    onCommit={() => void commitSentenceEdit(sentence.id)}
+                    onCancel={() => setEditingSentenceId(null)}
                   />
                 ))}
               </div>
@@ -1053,23 +1120,55 @@ function highlightSentenceText(
   return parts.length > 0 ? parts : text;
 }
 
-function DraggableSentence({ sentence, active, searchQuery, activeMatchKey, registerMatchRef }: {
+function DraggableSentence({
+  sentence, active, dropActive, searchQuery, activeMatchKey, registerMatchRef,
+  editing, editText, onStartEdit, onChangeText, onCommit, onCancel,
+}: {
   sentence: PlanSentenceRecord;
   active: boolean;
+  dropActive: boolean;
   searchQuery: string;
   activeMatchKey: string | null;
   registerMatchRef: (key: string, el: HTMLElement | null) => void;
+  editing: boolean;
+  editText: string;
+  onStartEdit: () => void;
+  onChangeText: (value: string) => void;
+  onCommit: () => void;
+  onCancel: () => void;
 }) {
-  const { attributes, listeners, setNodeRef, transform } = useDraggable({ id: `sentence:${sentence.id}` });
+  const { attributes, listeners, setNodeRef: setDragRef, transform } = useDraggable({ id: `sentence:${sentence.id}`, disabled: editing });
+  // Also a drop target for merge — dragging one sentence onto another. Same
+  // dnd-kit id namespace (`sentence:`) as the draggable above so finishDrag
+  // can dispatch on the prefix; sharing one DOM node for both roles is a
+  // standard dnd-kit pattern (compose the two setNodeRef callbacks).
+  const { setNodeRef: setDropRef, isOver } = useDroppable({ id: `sentence:${sentence.id}` });
+  const setNodeRef = (el: HTMLDivElement | null) => { setDragRef(el); setDropRef(el); };
   return <div
     ref={setNodeRef}
-    className={active ? "sentence dragging" : "sentence"}
+    className={[active && "dragging", (dropActive || isOver) && "drag-over", "sentence"].filter(Boolean).join(" ")}
     style={{ transform: CSS.Translate.toString(transform), touchAction: "none" }}
-    {...listeners}
-    {...attributes}
+    {...(editing ? {} : listeners)}
+    {...(editing ? {} : attributes)}
   >
     <b title="Drag sentence"><GripVertical size={18} /></b>
-    <span>{highlightSentenceText(sentence.text, searchQuery, sentence.id, activeMatchKey, registerMatchRef)}</span>
+    {editing ? (
+      <textarea
+        className="sentence-edit"
+        autoFocus
+        value={editText}
+        onChange={(event) => onChangeText(event.target.value)}
+        onBlur={onCommit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); onCommit(); }
+          else if (event.key === "Escape") { event.preventDefault(); onCancel(); }
+        }}
+      />
+    ) : (
+      <span onDoubleClick={onStartEdit} title="Double-click to edit">
+        {highlightSentenceText(sentence.text, searchQuery, sentence.id, activeMatchKey, registerMatchRef)}
+      </span>
+    )}
     <small>{formatTimeShort(sentence.startSeconds)}</small>
   </div>;
 }

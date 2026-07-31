@@ -1651,6 +1651,26 @@ def heuristic_fallback(
     return groups
 
 
+def per_sentence_grouping(sentences: list[TimedSentence]) -> list[VisualGroup]:
+    """One VisualGroup per sentence, no AI calls and no duration merging —
+    the literal "every sentence becomes its own still" pacing mode. Modeled
+    on heuristic_fallback's group-construction shape, just without any of
+    its range-building logic."""
+    return [
+        VisualGroup(
+            group_id=index + 1,
+            start_sentence_id=sentence.sentence_id,
+            end_sentence_id=sentence.sentence_id,
+            scene_type="still",
+            visual_anchor=sentence.text,
+            scene_description=sentence.text,
+            confidence="low",
+            reason="Per-sentence pacing: every sentence is its own still by request.",
+        )
+        for index, sentence in enumerate(sentences)
+    ]
+
+
 def write_outputs(
     output_xlsx: Path,
     output_json: Path,
@@ -2059,98 +2079,119 @@ def run(args: argparse.Namespace) -> None:
         f"{len(sentences)} sentences aligned to Whisper words",
     )
 
-    try:
-        report_progress(58, "Analyzing visual meaning", "AI pass 1 of 2")
-        print("\nAI Pass 1: extracting sentence visual metadata", flush=True)
-        pass1_result = analyze_sentences_pass1(
-            sentences=sentences,
-            ai_model=args.ai_model,
-            cache_path=output_dir / "visual-plan-pass1-cache.json",
-        )
+    if args.per_sentence:
+        print("\nPer-sentence pacing requested — skipping AI grouping entirely.", flush=True)
+        report_progress(70, "Building per-sentence plan", f"{len(sentences)} stills (1 per sentence)")
 
-        report_progress(68, "Scoring scene boundaries", "AI pass 2 of 2")
-        print("AI Pass 2: scoring scene boundaries and proposing groups", flush=True)
-        pass2_result = _batch_score_boundaries_pass2(
-            sentences=sentences,
-            pass1_result=pass1_result,
-            ai_model=args.ai_model,
-            min_duration=args.min_duration,
-            max_duration=args.max_duration,
-        )
-
-        groups = normalize_groups(
-            sentences=sentences,
-            pass2_result=pass2_result,
-        )
-        report_progress(
-            88,
-            "Optimizing scene durations",
-            "Applying pacing limits and repairing coverage",
-        )
-        groups = optimize_durations(
-            groups=groups,
-            sentences=sentences,
-            pass2_result=pass2_result,
-            min_duration=args.min_duration,
-            max_duration=args.max_duration,
-        )
-        validate_groups(groups, sentences)
-
-    except Exception as exc:
-        if not args.fallback_on_ai_error:
-            raise
-
-        print(f"\nWarning: AI segmentation failed: {exc}", flush=True)
-        print("Using emergency duration and paragraph based fallback.", flush=True)
-        report_progress(
-            82,
-            "Using fallback grouping",
-            "AI grouping failed; preserving Whisper timestamps",
-        )
-
-        # Minimal objects for output consistency.
+        # Minimal objects for output consistency, matching the AI-error
+        # fallback branch below's shape (write_outputs expects these).
         from pydantic import BaseModel
 
-        class FallbackAnalysis(BaseModel):
-            sentence_id: int
-            visual_anchor: str
-            dominant_subject: str = "unknown"
-            environment: str = "unspecified"
-            time_context: str = "unspecified"
-            action: str = "unspecified"
-            emotion: str = "neutral"
-            story_beat: str = "development"
-            visual_density: int = 5
-            narrative_energy: int = 5
-            abstraction_level: int = 50
-            visual_importance: int = 5
-            hard_boundary_before: bool = False
-            hard_boundary_reason: str = "Fallback mode"
-
         class FallbackPass1(BaseModel):
-            hook_end_sentence_id: int
-            analyses: list[FallbackAnalysis]
+            hook_end_sentence_id: int = 1
+            analyses: list = []
 
         class FallbackPass2(BaseModel):
             transitions: list = []
 
-        pass1_result = FallbackPass1(
-            hook_end_sentence_id=1,
-            analyses=[
-                FallbackAnalysis(
-                    sentence_id=sentence.sentence_id,
-                    visual_anchor=sentence.text,
-                )
-                for sentence in sentences
-            ],
-        )
+        pass1_result = FallbackPass1()
         pass2_result = FallbackPass2()
-        groups = heuristic_fallback(
-            sentences=sentences,
-            min_duration=args.min_duration,
-            max_duration=args.max_duration,
-        )
+        groups = per_sentence_grouping(sentences)
         validate_groups(groups, sentences)
+
+    else:
+        try:
+            report_progress(58, "Analyzing visual meaning", "AI pass 1 of 2")
+            print("\nAI Pass 1: extracting sentence visual metadata", flush=True)
+            pass1_result = analyze_sentences_pass1(
+                sentences=sentences,
+                ai_model=args.ai_model,
+                cache_path=output_dir / "visual-plan-pass1-cache.json",
+            )
+
+            report_progress(68, "Scoring scene boundaries", "AI pass 2 of 2")
+            print("AI Pass 2: scoring scene boundaries and proposing groups", flush=True)
+            pass2_result = _batch_score_boundaries_pass2(
+                sentences=sentences,
+                pass1_result=pass1_result,
+                ai_model=args.ai_model,
+                min_duration=args.min_duration,
+                max_duration=args.max_duration,
+            )
+
+            groups = normalize_groups(
+                sentences=sentences,
+                pass2_result=pass2_result,
+            )
+            report_progress(
+                88,
+                "Optimizing scene durations",
+                "Applying pacing limits and repairing coverage",
+            )
+            groups = optimize_durations(
+                groups=groups,
+                sentences=sentences,
+                pass2_result=pass2_result,
+                min_duration=args.min_duration,
+                max_duration=args.max_duration,
+            )
+            validate_groups(groups, sentences)
+
+        except Exception as exc:
+            if not args.fallback_on_ai_error:
+                raise
+
+            print(f"\nWarning: AI segmentation failed: {exc}", flush=True)
+            print("Using emergency duration and paragraph based fallback.", flush=True)
+            report_progress(
+                82,
+                "Using fallback grouping",
+                "AI grouping failed; preserving Whisper timestamps",
+            )
+
+            # Minimal objects for output consistency.
+            from pydantic import BaseModel
+
+            class FallbackAnalysis(BaseModel):
+                sentence_id: int
+                visual_anchor: str
+                dominant_subject: str = "unknown"
+                environment: str = "unspecified"
+                time_context: str = "unspecified"
+                action: str = "unspecified"
+                emotion: str = "neutral"
+                story_beat: str = "development"
+                visual_density: int = 5
+                narrative_energy: int = 5
+                abstraction_level: int = 50
+                visual_importance: int = 5
+                hard_boundary_before: bool = False
+                hard_boundary_reason: str = "Fallback mode"
+
+            class FallbackPass1(BaseModel):
+                hook_end_sentence_id: int
+                analyses: list[FallbackAnalysis]
+
+            class FallbackPass2(BaseModel):
+                transitions: list = []
+
+            pass1_result = FallbackPass1(
+                hook_end_sentence_id=1,
+                analyses=[
+                    FallbackAnalysis(
+                        sentence_id=sentence.sentence_id,
+                        visual_anchor=sentence.text,
+                    )
+                    for sentence in sentences
+                ],
+            )
+            pass2_result = FallbackPass2()
+            groups = heuristic_fallback(
+                sentences=sentences,
+                min_duration=args.min_duration,
+                max_duration=args.max_duration,
+            )
+            validate_groups(groups, sentences)
 
     if args.preview:
         preview_groups(groups, sentences)
@@ -2260,6 +2301,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--fallback-on-ai-error",
         action="store_true",
         help="Use a duration and paragraph fallback if an AI call fails",
+    )
+    parser.add_argument(
+        "--per-sentence",
+        action="store_true",
+        help="Skip AI grouping entirely; every sentence becomes its own still",
     )
     return parser
 

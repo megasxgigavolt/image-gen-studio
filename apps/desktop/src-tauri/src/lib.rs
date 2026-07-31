@@ -2334,6 +2334,42 @@ fn reset_visual_plan(
 }
 
 #[tauri::command]
+fn update_plan_sentence_text(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    sentence_id: String,
+    text: String,
+) -> Result<VisualPlan, String> {
+    with_repository(state, |repository| {
+        repository.update_plan_sentence_text(&video_id, &sentence_id, &text)
+    })
+}
+
+#[tauri::command]
+fn split_plan_sentence(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    sentence_id: String,
+    split_after_offset: usize,
+) -> Result<VisualPlan, String> {
+    with_repository(state, |repository| {
+        repository.split_plan_sentence(&video_id, &sentence_id, split_after_offset)
+    })
+}
+
+#[tauri::command]
+fn merge_plan_sentences(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    first_sentence_id: String,
+    second_sentence_id: String,
+) -> Result<VisualPlan, String> {
+    with_repository(state, |repository| {
+        repository.merge_plan_sentences(&video_id, &first_sentence_id, &second_sentence_id)
+    })
+}
+
+#[tauri::command]
 fn pick_thumbnail_image(app: tauri::AppHandle) -> Option<serde_json::Value> {
     let path = app
         .dialog()
@@ -2541,6 +2577,9 @@ pub fn run() {
             move_plan_sentence,
             create_plan_group,
             reset_visual_plan,
+            update_plan_sentence_text,
+            split_plan_sentence,
+            merge_plan_sentences,
             get_app_setting,
             save_app_setting,
             list_prompt_versions,

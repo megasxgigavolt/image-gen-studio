@@ -66,9 +66,9 @@ pub const EDUCATIONAL_VISUAL_PLANNER_VERSION: &str = "3.0.0-bulk-plan-v2";
 /// Shared validation list for `timeline_clips.motion_preset` — kept as one
 /// const so `set_timeline_clip_motion`/`apply_motion_to_all_clips` can't drift
 /// out of sync with each other.
-pub const MOTION_PRESETS: [&str; 9] = [
+pub const MOTION_PRESETS: [&str; 10] = [
     "none", "zoom-in", "zoom-out", "pan-left", "pan-right",
-    "zoom-pulse", "zoom-in-subject", "zoom-out-subject", "ken-burns",
+    "zoom-pulse", "zoom-in-subject", "zoom-out-subject", "ken-burns", "cuts",
 ];
 
 /// Shared validation list for `timeline_clips.transition_in`/`transition_out`
@@ -117,26 +117,25 @@ fn approximate_motion_preset_for_effect(effect: &str, settings_json: Option<&str
         // Zoom + pan from off-center toward center — the one preset that
         // actually combines both motions.
         "Ken Burns" => "ken-burns",
-        // NOTE: "zoom-in-subject"/"zoom-out-subject" are NOT used here even
-        // though they'd read as more semantically apt for some of these —
-        // applyMotion() (timeline-rendering.ts) shares the exact same
-        // scaleMul formula as "zoom-in"/"zoom-out" and only diverges when a
-        // `subject` coordinate is supplied, which nothing currently feeds
-        // into these clips. Using them renders pixel-identical to the plain
-        // variant, which is what caused every effect to visually collapse
-        // into the same "zoom-in" motion — deliberately picking 5 DISTINCT
-        // rendered shapes below instead, even where the semantic fit is a
-        // bit looser, so the 5 AI picks actually look different.
-        // Steep, centered push with NO pan — distinct from Ken Burns's
-        // combined zoom+pan, matching the SOP's "no pan, steeper push" note.
-        "Ominous Push-In" => "zoom-in",
+        // "zoom-in-subject" IS genuinely distinct from plain "zoom-in" —
+        // `useTimelineAssets.ts` auto-calls `detect_render_subject` for any
+        // clip with this preset, caching a real per-image subject point
+        // that both the canvas preview and (after fixing build_segments()'s
+        // dropped-field bug alongside this change) the actual ffmpeg export
+        // now use to anchor the push — a steep, content-aware push toward
+        // the detected subject, no pan, distinct from Ken Burns's combined
+        // zoom+pan toward frame-center.
+        "Ominous Push-In" => "zoom-in-subject",
         // A pulse (in, then back out) reads as "breathing" — the closest
         // available analog to an organic flicker; a flat zoom wouldn't.
         "Candlelight Flicker" => "zoom-pulse",
-        // No available preset represents "snap between sub-panels"; a
-        // directional pan at least conveys "revealing across the frame"
-        // rather than collapsing to the same zoom as everything else.
-        "Sequential Panel Reveal" => "pan-right",
+        // The real thing now: hard cuts between static crops (see the
+        // "cuts" preset in video_export_engine.py's build_segments/
+        // build_image_filter) — wide shot, then pushes to the detected
+        // subject and its complementary corner, rather than one continuous
+        // motion. The actual "add cuts" capability the SOP's panel-reveal
+        // effect could never be represented as before.
+        "Sequential Panel Reveal" => "cuts",
         "Speed Pan & Motion Blur" => {
             // Direction from panXFrom/panXTo if present (SOP: sign encodes
             // direction, positive-to-negative is left-to-right).
@@ -2089,7 +2088,7 @@ impl ProjectRepository {
         if min_seconds < 2 || max_seconds > 30 || min_seconds > max_seconds {
             return Err("Scene pacing must use a valid 2–30 second range.".into());
         }
-        if !["calm", "balanced", "fast", "custom"].contains(&preset) {
+        if !["calm", "balanced", "fast", "custom", "per-sentence"].contains(&preset) {
             return Err("Unknown pacing preset.".into());
         }
         self.get_video_inputs(video_id)?;
@@ -6554,11 +6553,21 @@ Return JSON only:
             command
                 .arg(&grouping_engine)
                 .arg(&audio_path)
-                .arg(&script_path)
-                .arg("--min-duration")
-                .arg(inputs.pacing_min_seconds.to_string())
-                .arg("--max-duration")
-                .arg(inputs.pacing_max_seconds.to_string())
+                .arg(&script_path);
+            if inputs.pacing_preset == "per-sentence" {
+                // Skips AI boundary-scoring/duration-window grouping
+                // entirely — every sentence becomes its own group. Duration
+                // bounds are meaningless here so they're omitted rather than
+                // passed with placeholder values.
+                command.arg("--per-sentence");
+            } else {
+                command
+                    .arg("--min-duration")
+                    .arg(inputs.pacing_min_seconds.to_string())
+                    .arg("--max-duration")
+                    .arg(inputs.pacing_max_seconds.to_string());
+            }
+            command
                 .arg("--output")
                 .arg(&output_path)
                 .arg("--fallback-on-ai-error")
@@ -7841,6 +7850,245 @@ Return JSON only:
             false,
             &current.timing_source,
         )?;
+        self.get_visual_plan(video_id)
+    }
+
+    /// Renumbers every sentence id (`"sN"`) referenced across a group set
+    /// via `renumber`, in place — shared by `split_plan_sentence` and
+    /// `merge_plan_sentences` to keep both the "current" and "original"
+    /// snapshots consistent with a sentence id shift. `renumber` returns
+    /// `None` to drop a reference entirely (used by merge to remove the
+    /// absorbed sentence's id) or `Some(new_ids)` to replace it with one or
+    /// more ids in order (used by split to expand one id into two).
+    fn renumber_group_sentence_ids<F>(groups: &mut Vec<PlanGroup>, mut renumber: F)
+    where
+        F: FnMut(&str) -> Option<Vec<String>>,
+    {
+        for group in groups.iter_mut() {
+            group.sentence_ids = group
+                .sentence_ids
+                .iter()
+                .flat_map(|id| renumber(id).unwrap_or_default())
+                .collect();
+        }
+        groups.retain(|group| !group.sentence_ids.is_empty());
+    }
+
+    /// Writes both the "current" and "original" `visual_plan_groups`
+    /// snapshots plus the full `visual_plan_sentences` set in one pass —
+    /// used by `split_plan_sentence`/`merge_plan_sentences`, which (unlike
+    /// every other plan-editing method) must rewrite sentence text/ids
+    /// themselves, not just group membership. Deliberately bypasses
+    /// `save_plan` (its sentence-write path is gated by the same `original`
+    /// flag that controls which group snapshot gets overwritten, and it
+    /// only ever writes one group snapshot per call) rather than
+    /// complicating that method's contract for every other caller.
+    fn write_renumbered_plan(
+        &self,
+        video_id: &str,
+        sentences: &[PlanSentence],
+        current_groups: &[PlanGroup],
+        original_groups: &[PlanGroup],
+    ) -> Result<(), String> {
+        self.connection.execute(
+            "DELETE FROM visual_plan_sentences WHERE video_id = ?1",
+            [video_id],
+        ).map_err(|e| e.to_string())?;
+        for sentence in sentences {
+            self.connection.execute(
+                "INSERT INTO visual_plan_sentences(id, video_id, ordinal, text, start_seconds, end_seconds) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    format!("{video_id}::{}", sentence.id),
+                    video_id,
+                    sentence.ordinal,
+                    sentence.text,
+                    sentence.start_seconds,
+                    sentence.end_seconds
+                ],
+            ).map_err(|e| e.to_string())?;
+        }
+        for (groups, original) in [(current_groups, false), (original_groups, true)] {
+            self.connection.execute(
+                "DELETE FROM visual_plan_groups WHERE video_id = ?1 AND is_original = ?2",
+                params![video_id, original as i64],
+            ).map_err(|e| e.to_string())?;
+            for group in groups {
+                self.connection.execute(
+                    "INSERT INTO visual_plan_groups(id, video_id, ordinal, label, kind, sentence_ids_json, is_original) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        format!("{video_id}::{}::{}", if original {"original"} else {"current"}, group.id),
+                        video_id,
+                        group.ordinal,
+                        group.label,
+                        group.kind,
+                        serde_json::to_string(&group.sentence_ids).unwrap(),
+                        original as i64
+                    ],
+                ).map_err(|e| e.to_string())?;
+            }
+        }
+        self.connection.execute(
+            "UPDATE visual_plan_meta SET updated_at=?1 WHERE video_id=?2",
+            params![Utc::now().to_rfc3339(), video_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Plain text edit for one sentence (double-click-to-edit in the Visual
+    /// Plan view) — no renumbering needed since it doesn't change how many
+    /// sentences exist. Mid-text-period edits are handled by
+    /// `split_plan_sentence` instead, called by the frontend before this
+    /// one whenever it detects a period was typed.
+    pub fn update_plan_sentence_text(&self, video_id: &str, sentence_id: &str, text: &str) -> Result<VisualPlan, String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err("Sentence text is required.".into());
+        }
+        self.connection.execute(
+            "UPDATE visual_plan_sentences SET text=?1 WHERE video_id=?2 AND id=?3",
+            params![trimmed, video_id, format!("{video_id}::{sentence_id}")],
+        ).map_err(|e| e.to_string())?;
+        self.get_visual_plan(video_id)
+    }
+
+    /// Splits one sentence's text into two at `split_after_offset` (a byte
+    /// offset into the ORIGINAL text — e.g. the position right after a
+    /// period the user just typed), renumbering every later sentence id and
+    /// every group's `sentence_ids_json` (both snapshots) to keep the
+    /// gapless-consecutive-id chronology invariant (`validate_group_
+    /// chronology`) intact. No word-level timestamps exist per sentence
+    /// (confirmed: `visual_plan_sentences` has no per-word column), so
+    /// timing splits proportionally by word count either side of the
+    /// offset — the same approach `split_caption_clip` uses, just word-
+    /// count instead of that feature's true per-word timestamps.
+    pub fn split_plan_sentence(
+        &self,
+        video_id: &str,
+        sentence_id: &str,
+        split_after_offset: usize,
+    ) -> Result<VisualPlan, String> {
+        let plan = self.get_visual_plan(video_id)?;
+        let target_number = sentence_number(sentence_id);
+        let mut sentences = plan.sentences;
+        let target_index = sentences
+            .iter()
+            .position(|s| s.id == sentence_id)
+            .ok_or("Sentence was not found.")?;
+        let offset = split_after_offset.min(sentences[target_index].text.len());
+        let (left_raw, right_raw) = sentences[target_index].text.split_at(offset);
+        let left_text = left_raw.trim().to_string();
+        let right_text = right_raw.trim().to_string();
+        if left_text.is_empty() || right_text.is_empty() {
+            return Err("Split point must have text on both sides.".into());
+        }
+        let left_words = left_text.split_whitespace().count().max(1) as f64;
+        let right_words = right_text.split_whitespace().count().max(1) as f64;
+        let fraction = left_words / (left_words + right_words);
+        let start = sentences[target_index].start_seconds;
+        let end = sentences[target_index].end_seconds;
+        let midpoint = start + (end - start) * fraction;
+
+        let new_right_id = format!("s{}", target_number + 1);
+        sentences[target_index].text = left_text;
+        sentences[target_index].end_seconds = midpoint;
+        let right_sentence = PlanSentence {
+            id: new_right_id.clone(),
+            ordinal: sentences[target_index].ordinal + 1,
+            text: right_text,
+            start_seconds: midpoint,
+            end_seconds: end,
+        };
+        sentences.insert(target_index + 1, right_sentence);
+        for (index, sentence) in sentences.iter_mut().enumerate() {
+            sentence.ordinal = index as i64 + 1;
+        }
+
+        let renumber = |id: &str| -> Option<Vec<String>> {
+            let n = sentence_number(id);
+            if n == target_number {
+                Some(vec![format!("s{n}"), new_right_id.clone()])
+            } else if n > target_number {
+                Some(vec![format!("s{}", n + 1)])
+            } else {
+                Some(vec![id.to_string()])
+            }
+        };
+        let mut current_groups = self.load_groups(video_id, false)?;
+        let mut original_groups = self.load_groups(video_id, true)?;
+        Self::renumber_group_sentence_ids(&mut current_groups, renumber);
+        Self::renumber_group_sentence_ids(&mut original_groups, renumber);
+        for groups in [&mut current_groups, &mut original_groups] {
+            for (index, group) in groups.iter_mut().enumerate() {
+                group.ordinal = index as i64 + 1;
+            }
+        }
+        validate_group_chronology(&current_groups)?;
+        validate_group_chronology(&original_groups)?;
+
+        self.write_renumbered_plan(video_id, &sentences, &current_groups, &original_groups)?;
+        self.get_visual_plan(video_id)
+    }
+
+    /// Merges two chronologically ADJACENT sentences into one (dragging one
+    /// sentence onto another), renumbering everything after the merge point
+    /// down by one id — the merge counterpart to `split_plan_sentence`. Only
+    /// adjacent sentences are accepted (same convention as `move_plan_
+    /// sentence`'s boundary check and `merge_caption_clips`'s adjacency
+    /// requirement) since merging non-adjacent sentences would silently
+    /// reorder narration, violating chronology.
+    pub fn merge_plan_sentences(
+        &self,
+        video_id: &str,
+        first_sentence_id: &str,
+        second_sentence_id: &str,
+    ) -> Result<VisualPlan, String> {
+        let plan = self.get_visual_plan(video_id)?;
+        let first_number = sentence_number(first_sentence_id);
+        let second_number = sentence_number(second_sentence_id);
+        if second_number != first_number + 1 {
+            return Err("Only chronologically adjacent sentences can be merged.".into());
+        }
+        let mut sentences = plan.sentences;
+        let first_index = sentences
+            .iter()
+            .position(|s| s.id == first_sentence_id)
+            .ok_or("Sentence was not found.")?;
+        let second_index = sentences
+            .iter()
+            .position(|s| s.id == second_sentence_id)
+            .ok_or("Sentence was not found.")?;
+        let second = sentences.remove(second_index);
+        let first = &mut sentences[first_index];
+        first.text = format!("{} {}", first.text.trim(), second.text.trim());
+        first.start_seconds = first.start_seconds.min(second.start_seconds);
+        first.end_seconds = first.end_seconds.max(second.end_seconds);
+        for (index, sentence) in sentences.iter_mut().enumerate() {
+            sentence.ordinal = index as i64 + 1;
+        }
+
+        let renumber = |id: &str| -> Option<Vec<String>> {
+            let n = sentence_number(id);
+            if n == second_number {
+                None
+            } else if n > second_number {
+                Some(vec![format!("s{}", n - 1)])
+            } else {
+                Some(vec![id.to_string()])
+            }
+        };
+        let mut current_groups = self.load_groups(video_id, false)?;
+        let mut original_groups = self.load_groups(video_id, true)?;
+        Self::renumber_group_sentence_ids(&mut current_groups, renumber);
+        Self::renumber_group_sentence_ids(&mut original_groups, renumber);
+        for groups in [&mut current_groups, &mut original_groups] {
+            for (index, group) in groups.iter_mut().enumerate() {
+                group.ordinal = index as i64 + 1;
+            }
+        }
+        validate_group_chronology(&current_groups)?;
+        validate_group_chronology(&original_groups)?;
+
+        self.write_renumbered_plan(video_id, &sentences, &current_groups, &original_groups)?;
         self.get_visual_plan(video_id)
     }
 

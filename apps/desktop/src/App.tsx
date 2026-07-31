@@ -972,28 +972,23 @@ function VisualPlanView() {
     setEditText(sentence.text);
   }
 
-  // Checked on every keystroke, not just on blur — a period typed anywhere
-  // before the last non-whitespace character means "split here, now,"
-  // per the request that this happen immediately rather than on commit.
-  // Trailing sentence-ending periods don't count as a split point.
-  function findMidTextPeriodOffset(text: string): number | null {
-    for (let i = 0; i < text.length; i++) {
-      if (text[i] === "." && text.slice(i + 1).trim().length > 0) return i + 1;
-    }
-    return null;
+  function onEditTextChange(value: string) {
+    setEditText(value);
   }
 
-  function onEditTextChange(sentenceId: string, value: string) {
-    const offset = findMidTextPeriodOffset(value);
-    if (offset !== null && activeVideoId) {
-      setEditingSentenceId(null);
-      setEditText("");
-      projectsClient.splitPlanSentence(activeVideoId, sentenceId, offset)
-        .then(setPlan)
-        .catch((caught) => setError(String(caught)));
-      return;
-    }
-    setEditText(value);
+  // Fires only when the just-typed character was actually a period — NOT a
+  // scan of the whole text for "does a period exist anywhere," which used
+  // to misfire on backspace (or any edit) whenever the sentence already had
+  // an unrelated period elsewhere, e.g. its own normal trailing full stop.
+  // `offset` is the cursor position right after that period, already
+  // resolved from the live selection by the caller.
+  function onPeriodTyped(sentenceId: string, offset: number) {
+    if (!activeVideoId) return;
+    setEditingSentenceId(null);
+    setEditText("");
+    projectsClient.splitPlanSentence(activeVideoId, sentenceId, offset)
+      .then(setPlan)
+      .catch((caught) => setError(String(caught)));
   }
 
   async function commitSentenceEdit(sentenceId: string) {
@@ -1063,7 +1058,8 @@ function VisualPlanView() {
                     editing={editingSentenceId === sentence.id}
                     editText={editText}
                     onStartEdit={() => startEditingSentence(sentence)}
-                    onChangeText={(value) => onEditTextChange(sentence.id, value)}
+                    onChangeText={onEditTextChange}
+                    onPeriodTyped={(offset) => onPeriodTyped(sentence.id, offset)}
                     onCommit={() => void commitSentenceEdit(sentence.id)}
                     onCancel={() => setEditingSentenceId(null)}
                   />
@@ -1122,7 +1118,7 @@ function highlightSentenceText(
 
 function DraggableSentence({
   sentence, active, dropActive, searchQuery, activeMatchKey, registerMatchRef,
-  editing, editText, onStartEdit, onChangeText, onCommit, onCancel,
+  editing, editText, onStartEdit, onChangeText, onPeriodTyped, onCommit, onCancel,
 }: {
   sentence: PlanSentenceRecord;
   active: boolean;
@@ -1134,6 +1130,7 @@ function DraggableSentence({
   editText: string;
   onStartEdit: () => void;
   onChangeText: (value: string) => void;
+  onPeriodTyped: (offset: number) => void;
   onCommit: () => void;
   onCancel: () => void;
 }) {
@@ -1175,7 +1172,23 @@ function DraggableSentence({
         className="sentence-edit-inline"
         contentEditable
         suppressContentEditableWarning
-        onInput={(event) => onChangeText(event.currentTarget.textContent ?? "")}
+        onInput={(event) => {
+          const text = event.currentTarget.textContent ?? "";
+          onChangeText(text);
+          // Only treat this as "split here" when a period was just TYPED —
+          // checking the native InputEvent's inputType/data, not re-scanning
+          // the whole text for "does a period exist anywhere" (that used to
+          // misfire on backspace, or any edit, whenever the sentence already
+          // had an unrelated period elsewhere — including its own normal
+          // trailing full stop).
+          const native = event.nativeEvent as InputEvent;
+          if (native.inputType !== "insertText" || native.data !== ".") return;
+          const selection = window.getSelection();
+          const range = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
+          const offset = range && range.endContainer.nodeType === Node.TEXT_NODE ? range.endOffset : null;
+          if (offset === null || text.slice(offset).trim().length === 0) return;
+          onPeriodTyped(offset);
+        }}
         onBlur={onCommit}
         onKeyDown={(event) => {
           if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); }

@@ -2945,7 +2945,14 @@ EXPRESSIVE STORYTELLING LAYER (required, not a style):
 - Keep expression choices faithful to narration and previous planned context. Use the previous context above to continue the story and avoid repeating the same pose, emotion, environment, or subject arrangement across batches.
 
 INTERNAL TARGET DISTRIBUTION (soft targets; do not force inappropriate visuals):
-Character Scene 25-35%; Behavioral Demonstration 10-15%; Close Detail 10-15%; Environmental Scene 5-10%; Object Focus 5-10%; Comparison 10-15%; Process Illustration 5-10%; Timeline 2-5%; Textless Infographic 5-10%; Scientific Diagram 2-8%; Geographic Map 0-5%; Concept Visualization 2-8%; POV Scene 0-5%; Symbolic Representation 2-8%; Documentary Frame 5-15%.
+Character Scene 20-28%; Character Close-Up / Reaction 2-6%; Behavioral Demonstration 8-14%; Close Detail 8-14%; Environmental Scene 5-10%; Object Focus 4-8%; Comparison 8-13%; Before/After or Transformation 6-12%; Size / Scale Comparison 1-4%; Process Illustration 4-8%; Timeline 5-9%; Title / Statement Card 10-18%; Textless Infographic 3-8%; Scientific Diagram 2-6%; Family Tree / Lineage Diagram 0-4%; Geographic Map 0-4%; Concept Visualization 2-8%; POV Scene 0-5%; Symbolic Representation 2-8%; Documentary Frame 3-10%.
+
+NEW VISUAL TYPE DEFINITIONS (use these exact meanings):
+- Character Close-Up / Reaction: a face/character shown close-up conveying a specific emotion or reaction — distinct from a wider Character Scene.
+- Before/After or Transformation: two states of the SAME subject shown to contrast a change over time.
+- Size / Scale Comparison: subjects drawn at relative scale to each other (e.g. two animals sized against one another).
+- Title / Statement Card: a still composed to carry a short on-screen punchline or chapter statement — generous negative space, low visual complexity, uncluttered background so a caption overlay has room. Also covers a posed question or an unrelated relatable analogy scene standing in for an abstract idea.
+- Family Tree / Lineage Diagram: a branching ancestry/relationship diagram — distinct from a generic Scientific Diagram.
 
 ANTI-REPETITION (enforce strictly):
 - Never assign the same visualType to more than 3 consecutive stills.
@@ -3012,11 +3019,12 @@ SELF-CHECK before writing userPrompt: scan your draft for every banned word abov
 ✗ WRONG:   "Softly lit bedroom interior, warm morning light streaming through curtains onto a wooden desk"
 If MANDATORY CREATIVE RULES are present above: positive inclusions are woven into the scene description; negative exclusions appear as [Avoid: ...] at the end of the prompt.
 
-TEXTLESS VISUAL RULE (Textless Infographic, Timeline, Geographic Map, Scientific Diagram, Process Illustration):
+TEXTLESS VISUAL RULE (Textless Infographic, Timeline, Geographic Map, Scientific Diagram, Process Illustration, Title / Statement Card, Family Tree / Lineage Diagram):
 - Use arrows, icons, silhouettes, spatial layout, visual contrast, before/after, symbolic shapes.
 - Do NOT include readable text, labels, words, signs, or fake text in userPrompt.
+- For Title / Statement Card specifically: this rule means compose the SCENE for a downstream caption overlay (generous negative space, a clear focal subject off to one side, an uncluttered background) — it does NOT mean render text into the image.
 
-Allowed visualType values: Character Scene; Behavioral Demonstration; Close Detail; Environmental Scene; Object Focus; Comparison; Process Illustration; Timeline; Textless Infographic; Scientific Diagram; Geographic Map; Concept Visualization; POV Scene; Symbolic Representation; Documentary Frame.
+Allowed visualType values: Character Scene; Character Close-Up / Reaction; Behavioral Demonstration; Close Detail; Environmental Scene; Object Focus; Comparison; Before/After or Transformation; Size / Scale Comparison; Process Illustration; Timeline; Title / Statement Card; Textless Infographic; Scientific Diagram; Family Tree / Lineage Diagram; Geographic Map; Concept Visualization; POV Scene; Symbolic Representation; Documentary Frame.
 
 You MUST return exactly one plan for every row in the current batch. Return JSON only — no explanation, no markdown:
 {{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content — mandatory creative rules embedded; negatives as [Avoid: ...]"}}]}}"#,
@@ -7815,6 +7823,8 @@ fn repair_excessive_consecutive_visual_types(planned: &mut [V2PlanStillResponse]
         "Environmental Scene",
         "Object Focus",
         "Comparison",
+        "Before/After or Transformation",
+        "Title / Statement Card",
         "Process Illustration",
         "Textless Infographic",
         "Concept Visualization",

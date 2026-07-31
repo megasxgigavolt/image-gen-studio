@@ -1270,6 +1270,7 @@ function ImagesView() {
   const [bulkPlan, setBulkPlan] = useState<import("./infrastructure/projects-client").BulkPlanResultRecord | null>(null);
   const [bulkPlanLoading, setBulkPlanLoading] = useState(false);
   const [bulkInstruction, setBulkInstruction] = useState(() => localStorage.getItem("bulk_creative_instruction") ?? "");
+  const [characterConsistency, setCharacterConsistency] = useState(() => localStorage.getItem("bulk_character_consistency") === "true");
   const [bulkOverviewOpen, setBulkOverviewOpen] = useState(false);
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null);
   const [preparingGroupIds, setPreparingGroupIds] = useState<Set<string>>(new Set());
@@ -1640,7 +1641,7 @@ function ImagesView() {
     _planningVideoId = activeVideoId;
     const innerPromise = (async () => {
       await projectsClient.saveAppSetting("system_prompt", systemPrompt);
-      return projectsClient.planBulkVisuals(activeVideoId, systemPrompt, settingsJson, bulkInstruction);
+      return projectsClient.planBulkVisuals(activeVideoId, systemPrompt, settingsJson, bulkInstruction, characterConsistency);
     })();
     _planningPromise = innerPromise;
     try {
@@ -2113,6 +2114,21 @@ function ImagesView() {
             ))}
             <button className="secondary" onClick={() => void importReference()}><Plus size={14} />{references.length ? "Replace image" : "Upload reference image"}</button>
           </div>
+          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Character Consistency</h3><small>Optional</small></div>
+          <label className="toggle-setting" style={{padding:"6px 0"}}>
+            <span>
+              Keep one character consistent across all stills
+              <small>AI derives a character from your reference image and weaves it into every applicable still's prompt.</small>
+            </span>
+            <input
+              type="checkbox"
+              checked={characterConsistency}
+              onChange={(event) => { setCharacterConsistency(event.target.checked); localStorage.setItem("bulk_character_consistency", String(event.target.checked)); }}
+            />
+          </label>
+          {characterConsistency && !references.length && (
+            <p style={{fontSize:"11px",color:"var(--muted)",margin:"2px 0 0"}}>Upload a reference image above — Character Consistency needs one to work from.</p>
+          )}
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still. Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
           <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cat as the main character. Show visible emotions and varied body language. Avoid showing text, labels, or close-ups on faces." rows={4} />

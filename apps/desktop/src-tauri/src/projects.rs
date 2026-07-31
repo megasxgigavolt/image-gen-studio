@@ -2901,7 +2901,39 @@ Return JSON only — no markdown, no explanation:
         serde_json::from_str(cleaned).map_err(|_| "Style extraction was not valid JSON.".to_string())
     }
 
-    pub fn plan_bulk_visuals<F: Fn(usize, usize)>(&self, video_id: &str, style_directive: &str, base_settings_json: &str, creative_instruction: &str, on_progress: F) -> Result<BulkPlanResult, String> {
+    /// Derives a reusable character description from the video's reference
+    /// image (see `list_assets(video_id, "reference")` — guaranteed 0-or-1
+    /// row, `import_asset` deletes any prior reference before inserting a
+    /// new one) for the "Character Consistency" toggle in Bulk Gen Config.
+    /// Returns plain prose (not JSON) — deliberately, to sidestep the
+    /// markdown-fence JSON-parsing footguns fixed elsewhere in this file.
+    /// Prefers whichever provider `plan_bulk_visuals` is already using for
+    /// planning (passed in via `openai_key`/`gemini_auth`) rather than
+    /// hard-coding a provider, unlike `extract_reference_style`.
+    fn character_description_for_video(
+        &self,
+        video_id: &str,
+        openai_key: &Option<String>,
+        gemini_auth: &Option<GeminiAuth>,
+    ) -> Result<String, String> {
+        let reference = self.list_assets(video_id, "reference")?.into_iter().next()
+            .ok_or("Character Consistency requires a reference image — upload one in Bulk Gen Config first.")?;
+        let channel_id: String = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let bytes = fs::read(self.projects_dir.join(&channel_id).join(video_id).join(&reference.relative_path))
+            .map_err(|_| "Reference image file is missing.".to_string())?;
+        let prompt = "Identify the single main character or protagonist in this reference image (a person, animal, or creature — not a background object or environment). Write a concise, reusable physical description of that character for an illustrator to redraw consistently across dozens of separate scenes: species/type, approximate age, physical proportions and build, coloring/markings, distinguishing features, and any clothing or props. Do not describe the pose, background, camera angle, or art/rendering style — only the character's inherent physical identity, in 3-5 sentences of plain prose. If no clear single character is present, describe the closest candidate subject instead. Return only the description, no preamble, no labels, no markdown.";
+        match openai_key {
+            Some(key) => request_openai_character_description(key, prompt, &reference.media_type, &bytes),
+            None => request_gemini_vision(
+                gemini_auth.as_ref().ok_or("Configure an OpenAI or Gemini API key to use Character Consistency.")?,
+                prompt, &reference.media_type, &bytes,
+            ),
+        }
+    }
+
+    pub fn plan_bulk_visuals<F: Fn(usize, usize)>(&self, video_id: &str, style_directive: &str, base_settings_json: &str, creative_instruction: &str, character_consistency: bool, on_progress: F) -> Result<BulkPlanResult, String> {
         let openai_key = self.get_provider_key("openai")?;
         // Gemini Flash hard-caps output at ~8000 tokens; OpenAI gpt-4.1-mini supports 18000
         let chunk_size_for_provider: usize = if openai_key.is_some() { 6 } else { 3 };
@@ -2933,6 +2965,27 @@ Return JSON only — no markdown, no explanation:
             }));
         }
         let total = row_data.len();
+        // Computed once (a real vision API call), not per-chunk like
+        // director_note below — then interpolated into every chunk's prompt.
+        let character_block = if character_consistency {
+            let description = self.character_description_for_video(video_id, &openai_key, &gemini_auth)?;
+            format!(
+                "\n\n════════════════════════════════════════\n\
+                 MANDATORY CHARACTER CONSISTENCY — NON-NEGOTIABLE\n\
+                 ════════════════════════════════════════\n\
+                 Every still that depicts a character, protagonist, or narrator figure MUST depict this\n\
+                 EXACT same character, described from the user's reference image:\n\n\
+                 {}\n\n\
+                 Maintain this character's species/type, physical proportions, coloring, distinguishing\n\
+                 features, and attire consistently across every still — do not redesign or vary their\n\
+                 appearance between stills. If a still's narration does not call for a character, omit\n\
+                 them naturally rather than forcing their presence.\n\
+                 ════════════════════════════════════════\n",
+                description.trim()
+            )
+        } else {
+            String::new()
+        };
         let mut planned: Vec<V2PlanStillResponse> = Vec::with_capacity(total);
         let chunk_size: usize = chunk_size_for_provider;
         let total_batches = total.div_ceil(chunk_size);
@@ -2981,7 +3034,7 @@ Return JSON only — no markdown, no explanation:
                 r#"You are an Educational Visual Director planning an entire video, not isolated stills.
 
 Style directive: {style_directive}
-Base image settings: {base_settings_json}{director_note}
+Base image settings: {base_settings_json}{director_note}{character_block}
 Total stills in video: {total}. This is planning batch {} of {total_batches}.
 Previously planned context (chronological; includes earlier batches and must guide continuity, emotional variety, and non-repetition): {}
 
@@ -8176,6 +8229,34 @@ fn request_openai_style(api_key: &str, mime: &str, bytes: &[u8]) -> Result<Style
         .ok_or("OpenAI returned no style analysis.")?;
     let cleaned = extract_json_from_text(text);
     serde_json::from_str(cleaned).map_err(|_| "OpenAI style analysis was not valid JSON.".to_string())
+}
+
+/// Vision analysis for the Character Consistency toggle in Bulk Gen Config —
+/// unlike `request_openai_style`, the prompt asks for plain prose (not
+/// JSON), so the response is returned as-is with no parsing step.
+fn request_openai_character_description(api_key: &str, prompt: &str, mime: &str, bytes: &[u8]) -> Result<String, String> {
+    let image_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+    let response = reqwest::blocking::Client::new()
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": [{"role":"user","content":[
+                {"type":"input_text","text":prompt},
+                {"type":"input_image","image_url":image_url}
+            ]}],
+            "max_output_tokens": 400
+        }))
+        .send().map_err(|error| format!("Could not reach OpenAI: {error}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response.json()
+        .map_err(|error| format!("OpenAI returned an unreadable response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("OpenAI character analysis failed ({status}): {}", body.pointer("/error/message").and_then(|value| value.as_str()).unwrap_or("unknown error")));
+    }
+    let text = body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
+        .ok_or("OpenAI returned no character analysis.")?;
+    Ok(text.trim().to_string())
 }
 
 /// Vision analysis for the Motion Graphics feature: picks one of the 5

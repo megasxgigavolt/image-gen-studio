@@ -1296,9 +1296,14 @@ export const projectsClient = {
           const n = Number(s.id.slice(1));
           return { ...s, id: n > secondNumber ? `s${n - 1}` : s.id };
         }
+        // Strip the trailing period at the join so the merge is reversible
+        // the same way it was created: typing "." back at that spot
+        // re-triggers the auto-split.
+        const firstTrimmed = first.text.trim();
+        const firstJoined = firstTrimmed.endsWith(".") ? firstTrimmed.slice(0, -1) : firstTrimmed;
         return {
           ...s,
-          text: `${first.text.trim()} ${second.text.trim()}`,
+          text: `${firstJoined} ${second.text.trim()}`,
           startSeconds: Math.min(first.startSeconds, second.startSeconds),
           endSeconds: Math.max(first.endSeconds, second.endSeconds),
         };

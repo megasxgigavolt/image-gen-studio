@@ -603,6 +603,22 @@ const MIGRATION_032: &str = r#"
 ALTER TABLE visual_plan_meta ADD COLUMN original_sentences_json TEXT;
 "#;
 
+/// Snapshot of the exact inputs (script/audio/pacing) used for the plan
+/// currently on `visual_plan_meta`. Without this, "does the existing plan
+/// still match the current inputs" could only be judged by comparing
+/// against whatever `video_inputs` holds *right now* — which is correct
+/// only within a single session (from the moment pacing/script actually
+/// changes) and silently resets to "matches" on every fresh hydration,
+/// since there was nowhere to persist "what was actually used last time."
+/// See `get_video_inputs`'s `plan_matches_current_inputs` computation.
+const MIGRATION_033: &str = r#"
+ALTER TABLE visual_plan_meta ADD COLUMN generation_script_text TEXT;
+ALTER TABLE visual_plan_meta ADD COLUMN generation_audio_id TEXT;
+ALTER TABLE visual_plan_meta ADD COLUMN generation_pacing_preset TEXT;
+ALTER TABLE visual_plan_meta ADD COLUMN generation_pacing_min_seconds INTEGER;
+ALTER TABLE visual_plan_meta ADD COLUMN generation_pacing_max_seconds INTEGER;
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -669,6 +685,11 @@ pub struct VideoInputs {
     pub audio: Option<InputAsset>,
     pub references: Vec<InputAsset>,
     pub updated_at: String,
+    /// None when no plan has ever been generated for this video, or the
+    /// plan predates this field (legacy data, no generation snapshot
+    /// recorded) — the frontend treats that as "assume it matches" rather
+    /// than nagging to regenerate a plan that's probably fine.
+    pub plan_matches_current_inputs: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1679,6 +1700,21 @@ impl ProjectRepository {
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(32, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
+        let has_generation_script_text: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('visual_plan_meta') WHERE name='generation_script_text')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_generation_script_text {
+            self.connection.execute_batch(MIGRATION_033).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(33, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -2059,6 +2095,29 @@ impl ProjectRepository {
             .transpose()?
             .flatten();
         let references = self.list_assets(video_id, "reference")?;
+        let generation_snapshot: Option<(Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>)> = self
+            .connection
+            .query_row(
+                "SELECT generation_script_text, generation_audio_id, generation_pacing_preset, generation_pacing_min_seconds, generation_pacing_max_seconds FROM visual_plan_meta WHERE video_id=?1",
+                [video_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let plan_matches_current_inputs = generation_snapshot.and_then(
+            |(gen_script, gen_audio_id, gen_preset, gen_min, gen_max)| {
+                // gen_script is only absent for rows written before this
+                // snapshot existed (or no plan generated yet) — anything
+                // else missing here would be a real bug, not a legacy case.
+                gen_script.map(|gen_script| {
+                    gen_script == script_text
+                        && gen_audio_id == audio.as_ref().map(|a| a.id.clone())
+                        && gen_preset.as_deref() == Some(pacing_preset.as_str())
+                        && gen_min == Some(pacing_min_seconds)
+                        && gen_max == Some(pacing_max_seconds)
+                })
+            },
+        );
         Ok(VideoInputs {
             video_id: video_id.into(),
             script_text,
@@ -2069,6 +2128,7 @@ impl ProjectRepository {
             audio,
             references,
             updated_at,
+            plan_matches_current_inputs,
         })
     }
 
@@ -6549,6 +6609,7 @@ Return JSON only:
                 "estimated test fixture",
             )?;
             self.save_original_sentences_snapshot(video_id, &sentences)?;
+            self.save_plan_generation_inputs(video_id, &inputs)?;
             self.save_plan(
                 video_id,
                 &sentences,
@@ -6748,6 +6809,7 @@ Return JSON only:
                 "whisper + AI boundary scoring",
             )?;
             self.save_original_sentences_snapshot(video_id, &sentences)?;
+            self.save_plan_generation_inputs(video_id, &inputs)?;
             self.save_plan(
                 video_id,
                 &sentences,
@@ -8200,6 +8262,27 @@ Return JSON only:
         Ok(())
     }
 
+    /// Captures the exact script/audio/pacing used for this generation, so
+    /// a later `get_video_inputs` call can tell whether the existing plan
+    /// still matches current inputs even after a full app restart — see
+    /// MIGRATION_033's doc comment for why this can't just be reconstructed
+    /// from `video_inputs` at read time. Called once, right after
+    /// generation, alongside `save_original_sentences_snapshot`.
+    fn save_plan_generation_inputs(&self, video_id: &str, inputs: &VideoInputs) -> Result<(), String> {
+        self.connection.execute(
+            "UPDATE visual_plan_meta SET generation_script_text=?1, generation_audio_id=?2, generation_pacing_preset=?3, generation_pacing_min_seconds=?4, generation_pacing_max_seconds=?5 WHERE video_id=?6",
+            params![
+                inputs.script_text,
+                inputs.audio.as_ref().map(|a| a.id.clone()),
+                inputs.pacing_preset,
+                inputs.pacing_min_seconds,
+                inputs.pacing_max_seconds,
+                video_id
+            ],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn save_plan(
         &self,
         video_id: &str,
@@ -9610,6 +9693,57 @@ mod tests {
                 original.groups
             );
         }
+    }
+
+    #[test]
+    fn plan_match_flag_survives_a_fresh_read_and_flips_when_pacing_changes() {
+        // Regression test: "does the existing plan match current inputs"
+        // used to live only in frontend state, reconstructed from whatever
+        // video_inputs held *right now* on every hydration — so after a
+        // full app restart it always reported "matches," even right after
+        // switching pacing presets and never regenerating. This asserts
+        // the match flag is derived from what was actually used at
+        // generation time, not from current video_inputs.
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(
+            &video.id,
+            "One short sentence. A second sentence follows. The final sentence closes.",
+            4,
+        )
+        .unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+
+        // No plan generated yet: no opinion either way.
+        assert_eq!(
+            repo.get_video_inputs(&video.id).unwrap().plan_matches_current_inputs,
+            None
+        );
+
+        repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        assert_eq!(
+            repo.get_video_inputs(&video.id).unwrap().plan_matches_current_inputs,
+            Some(true)
+        );
+
+        // Changing pacing after generation must flip the flag — and, since
+        // this is read straight from the database (not frontend state),
+        // this simulates the flag surviving a full app restart.
+        repo.save_video_pacing(&video.id, "per-sentence", 3, 6).unwrap();
+        assert_eq!(
+            repo.get_video_inputs(&video.id).unwrap().plan_matches_current_inputs,
+            Some(false)
+        );
+
+        // Regenerating brings it back in sync.
+        repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        assert_eq!(
+            repo.get_video_inputs(&video.id).unwrap().plan_matches_current_inputs,
+            Some(true)
+        );
     }
 
     #[test]

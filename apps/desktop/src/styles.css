@@ -222,7 +222,7 @@ textarea{text-align:justify!important}
 .video-art span{position:relative;z-index:1}
 .preview>.job-status,.preview>.bulk-live-progress{position:static!important;margin:0!important;border:0!important;border-radius:0!important;box-shadow:none!important;background:var(--surface);border-bottom:1px solid var(--line)!important}
 .preview>header{margin:12px 12px 0!important;border:1px solid var(--line)!important;border-radius:8px!important}
-.stills-heading{display:grid!important;grid-template-columns:1fr auto;align-items:center;min-height:52px!important;padding:0 14px!important;border-bottom:1px solid var(--line);gap:8px;box-sizing:border-box}
+.stills-heading{display:grid!important;grid-template-columns:1fr auto;align-items:center;min-height:38px!important;padding:8px 12px!important;border-bottom:1px solid var(--line);gap:8px;box-sizing:border-box}
 .stills-heading-left{display:flex;align-items:center;gap:9px;min-width:0;overflow:hidden}
 .stills-heading-label{font-weight:700;font-size:14px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .stills-heading-count{background:var(--brand-soft);color:var(--brand);font-weight:800;font-size:12px;padding:3px 11px;border-radius:99px;flex-shrink:0}

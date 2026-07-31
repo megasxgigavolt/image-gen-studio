@@ -1144,6 +1144,23 @@ function DraggableSentence({
   // standard dnd-kit pattern (compose the two setNodeRef callbacks).
   const { setNodeRef: setDropRef, isOver } = useDroppable({ id: `sentence:${sentence.id}` });
   const setNodeRef = (el: HTMLDivElement | null) => { setDragRef(el); setDropRef(el); };
+  const editableRef = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!editing || !editableRef.current) return;
+    const el = editableRef.current;
+    el.textContent = editText;
+    el.focus();
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    // Only re-sync when entering edit mode, not on every editText change —
+    // contentEditable owns its own DOM content while focused; re-writing
+    // textContent from React state on every keystroke would reset the caret.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editing]);
   return <div
     ref={setNodeRef}
     className={[active && "dragging", (dropActive || isOver) && "drag-over", "sentence"].filter(Boolean).join(" ")}
@@ -1153,14 +1170,15 @@ function DraggableSentence({
   >
     <b title="Drag sentence"><GripVertical size={18} /></b>
     {editing ? (
-      <textarea
-        className="sentence-edit"
-        autoFocus
-        value={editText}
-        onChange={(event) => onChangeText(event.target.value)}
+      <span
+        ref={editableRef}
+        className="sentence-edit-inline"
+        contentEditable
+        suppressContentEditableWarning
+        onInput={(event) => onChangeText(event.currentTarget.textContent ?? "")}
         onBlur={onCommit}
         onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); onCommit(); }
+          if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); }
           else if (event.key === "Escape") { event.preventDefault(); onCancel(); }
         }}
       />

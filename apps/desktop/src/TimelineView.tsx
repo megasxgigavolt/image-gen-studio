@@ -24,6 +24,7 @@ import {
   type ColorFilterPreset,
   type ExportSettingsRecord,
   type ImageRenderRecord,
+  type MotionGraphicEffect,
   type MotionPreset,
   type TimelineCaptionClipRecord,
   type TimelineClipRecord,
@@ -46,6 +47,7 @@ import { EditorToolbar, ZOOM_MAX, ZOOM_MIN } from "./timeline/EditorToolbar";
 import { TimelinePreview } from "./timeline/TimelinePreview";
 import { TimelineTracks } from "./timeline/TimelineTracks";
 import { ClipInspector } from "./timeline/ClipInspector";
+import { getMotionGraphicEffectDef, parseMotionGraphicSettings } from "./timeline/motion-graphics";
 import { CaptionsInspector } from "./timeline/CaptionsInspector";
 import { DEFAULT_CAPTION_STYLE, findClipAtTime } from "./timeline/timeline-rendering";
 import { isTypingTarget, resolveShortcutAction } from "./timeline/shortcut-resolver";
@@ -105,6 +107,8 @@ export function TimelineView() {
   const [selectedClipVideoAsset, setSelectedClipVideoAsset] = useState<VideoAssetRecord | null>(null);
   const [retiming, setRetiming] = useState(false);
   const [extrapolating, setExtrapolating] = useState(false);
+  const [analyzingMotionGraphics, setAnalyzingMotionGraphics] = useState(false);
+  const [motionGraphicsProgress, setMotionGraphicsProgress] = useState<{ done: number; total: number } | null>(null);
   const [uploadingAnimation, setUploadingAnimation] = useState(false);
   const [selectedCaptionClip, setSelectedCaptionClip] = useState<TimelineCaptionClipRecord | null>(null);
   const [captionText, setCaptionText] = useState("");
@@ -266,6 +270,12 @@ export function TimelineView() {
   useEffect(() => {
     setCaptionText(selectedCaptionClip?.text ?? "");
   }, [selectedCaptionClip?.id, selectedCaptionClip?.text]);
+  useEffect(() => {
+    const unlisten = listen<{ done: number; total: number }>("motion_graphics_progress", (event) => {
+      setMotionGraphicsProgress({ done: event.payload.done, total: event.payload.total });
+    });
+    return () => { void unlisten.then((fn) => fn()); };
+  }, []);
   // Native <audio> volume tops out at 1.0 — values above 100% aren't
   // achievable without a Web Audio gain node, so this only ever attenuates.
   useEffect(() => {
@@ -468,6 +478,7 @@ export function TimelineView() {
     await refresh(projectsClient.setTimelineClipTransition(activeVideoId, clipId, "cut"));
     await refresh(projectsClient.setTimelineClipTransitionOut(activeVideoId, clipId, "cut"));
     await refresh(projectsClient.setTimelineClipColorFilter(activeVideoId, clipId, "none", 50));
+    await refresh(projectsClient.setTimelineClipMotionGraphic(activeVideoId, clipId, null, null, null));
   }
 
   async function swapRender(renderId: string) {
@@ -495,6 +506,22 @@ export function TimelineView() {
   async function setColorFilter(preset: ColorFilterPreset, intensity: number) {
     if (!activeVideoId || !selectedClip) return;
     await refresh(projectsClient.setTimelineClipColorFilter(activeVideoId, selectedClip.id, preset, intensity));
+  }
+
+  async function setMotionGraphicEffect(effect: MotionGraphicEffect) {
+    if (!activeVideoId || !selectedClip) return;
+    const def = getMotionGraphicEffectDef(effect);
+    const settingsJson = def ? JSON.stringify(def.defaults) : null;
+    await refresh(projectsClient.setTimelineClipMotionGraphic(activeVideoId, selectedClip.id, effect, settingsJson, "Manually selected"));
+  }
+
+  async function setMotionGraphicSetting(key: string, value: number | string) {
+    if (!activeVideoId || !selectedClip || !selectedClip.motionGraphicEffect) return;
+    const current = parseMotionGraphicSettings(selectedClip.motionGraphicSettings);
+    const nextSettings = { ...current, [key]: value };
+    await refresh(projectsClient.setTimelineClipMotionGraphic(
+      activeVideoId, selectedClip.id, selectedClip.motionGraphicEffect, JSON.stringify(nextSettings), selectedClip.motionGraphicReason,
+    ));
   }
 
   async function applyColorFilterToAll() {
@@ -552,8 +579,24 @@ export function TimelineView() {
     await refresh(projectsClient.applyTransitionInToAllClips(activeVideoId, "cut"));
     await refresh(projectsClient.applyTransitionOutToAllClips(activeVideoId, "cut"));
     await refresh(projectsClient.applyColorFilterToAllClips(activeVideoId, "none", 50));
+    await refresh(projectsClient.clearMotionGraphicsForAllClips(activeVideoId));
     await refresh(projectsClient.resetStillsTimingToNatural(activeVideoId));
-    addToast("Removed camera movement, transitions, color filters, and any gap-filling stretch from every still.", "success");
+    addToast("Removed camera movement, transitions, color filters, motion graphics, and any gap-filling stretch from every still.", "success");
+  }
+
+  async function analyzeMotionGraphics() {
+    if (!activeVideoId || analyzingMotionGraphics) return;
+    setAnalyzingMotionGraphics(true);
+    setMotionGraphicsProgress(null);
+    try {
+      await refresh(projectsClient.analyzeMotionGraphics(activeVideoId));
+      addToast("Motion graphics assigned to every still.", "success");
+    } catch (caught) {
+      addToast(String(caught), "error");
+    } finally {
+      setAnalyzingMotionGraphics(false);
+      setMotionGraphicsProgress(null);
+    }
   }
 
   async function resetTimelineToDefault() {
@@ -1463,6 +1506,8 @@ export function TimelineView() {
                 onRemoveTransitionFromAll={() => void removeTransitionFromAll()}
                 onSetColorFilter={(preset, intensity) => void setColorFilter(preset, intensity)}
                 onApplyColorFilterToAll={() => void applyColorFilterToAll()}
+                onSetMotionGraphicEffect={(effect) => void setMotionGraphicEffect(effect)}
+                onSetMotionGraphicSetting={(key, value) => void setMotionGraphicSetting(key, value)}
                 onResetEffects={() => void resetEffects()}
               />
             ) : (
@@ -1508,6 +1553,9 @@ export function TimelineView() {
             onExtrapolateStills={() => setConfirmExtrapolateStills(true)}
             extrapolating={extrapolating}
             onRemoveAllEffects={() => setConfirmRemoveAllEffects(true)}
+            onAnalyzeMotionGraphics={() => void analyzeMotionGraphics()}
+            analyzingMotionGraphics={analyzingMotionGraphics}
+            motionGraphicsProgressLabel={motionGraphicsProgress ? `Analyzing ${motionGraphicsProgress.done}/${motionGraphicsProgress.total}…` : null}
           />
           <EditorToolbar
             canUndo={canUndo}

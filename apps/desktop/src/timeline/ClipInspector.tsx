@@ -1,15 +1,17 @@
-import { Clapperboard, Clock, Move, Redo2, Scissors, Shuffle, Sparkles, Trash2, Undo2, Upload } from "lucide-react";
+import { Clapperboard, Clock, Film, Move, Redo2, Scissors, Shuffle, Sparkles, Trash2, Undo2, Upload } from "lucide-react";
 import { formatTime } from "../domain/timecode";
 import { pickVeoDuration } from "../domain/animation";
 import type {
   ColorFilterPreset,
   ImageRenderRecord,
+  MotionGraphicEffect,
   TimelineClipRecord,
   TransitionPreset,
   VeoResolution,
   VideoAssetRecord,
 } from "../infrastructure/projects-client";
 import { MOTION_OPTIONS, TRANSITION_IN_OPTIONS, TRANSITION_OPTIONS } from "./timeline-rendering";
+import { getMotionGraphicEffectDef, MOTION_GRAPHIC_EFFECTS, parseMotionGraphicSettings } from "./motion-graphics";
 
 const COLOR_FILTER_PRESETS: ColorFilterPreset[] = ["none", "warm", "cool", "cinematic", "bright", "muted", "dark"];
 
@@ -54,6 +56,8 @@ export function ClipInspector({
   onRemoveTransitionFromAll,
   onSetColorFilter,
   onApplyColorFilterToAll,
+  onSetMotionGraphicEffect,
+  onSetMotionGraphicSetting,
   onResetEffects,
 }: {
   selectedClip: TimelineClipRecord;
@@ -92,6 +96,8 @@ export function ClipInspector({
   onRemoveTransitionFromAll: () => void;
   onSetColorFilter: (preset: ColorFilterPreset, intensity: number) => void;
   onApplyColorFilterToAll: () => void;
+  onSetMotionGraphicEffect: (effect: MotionGraphicEffect) => void;
+  onSetMotionGraphicSetting: (key: string, value: number | string) => void;
   onResetEffects: () => void;
 }) {
   const durationMismatch = selectedClip.clipKind === "animation" && selectedClipVideoAsset
@@ -266,6 +272,71 @@ export function ClipInspector({
             <span className="tl-intensity-value">{Math.round(globalIntensity * 100)}%</span>
           </div>
           <button className="secondary full" style={{ marginTop: "6px" }} onClick={onAlternateZoom}><Shuffle size={14} />Alternate zoom in/out (all stills)</button>
+        </div>
+      )}
+      {selectedClip.clipKind !== "animation" && (
+        <div className="tl-inspector-group">
+          <span className="tl-inspector-label"><Film size={12} />Motion Graphics</span>
+          {!selectedClip.motionGraphicEffect && (
+            <p className="tl-source-hint">
+              OpenAI inspects this still against 5 documented camera-movement treatments — Ken Burns, Sequential
+              Panel Reveal, Speed Pan &amp; Motion Blur, Ominous Push-In, and Candlelight Flicker — and picks the
+              best fit. Run it from the Motion Graphics button in the toolbar above. Metadata only for now —
+              settings here don't yet change the exported video.
+            </p>
+          )}
+          {selectedClip.motionGraphicEffect && (
+            <>
+              {selectedClip.motionGraphicReason && (
+                <p className="tl-source-hint tl-prompt-readout">{selectedClip.motionGraphicReason}</p>
+              )}
+              <div className="tl-preset-grid two">
+                {MOTION_GRAPHIC_EFFECTS.map((def) => (
+                  <button
+                    key={def.id}
+                    className={selectedClip.motionGraphicEffect === def.id ? "tl-preset-btn active" : "tl-preset-btn"}
+                    onClick={() => onSetMotionGraphicEffect(def.id)}
+                    title={def.summary}
+                  >
+                    <span>{def.label}</span>
+                  </button>
+                ))}
+              </div>
+              {(() => {
+                const def = getMotionGraphicEffectDef(selectedClip.motionGraphicEffect);
+                if (!def) return null;
+                const settings = parseMotionGraphicSettings(selectedClip.motionGraphicSettings);
+                return (
+                  <>
+                    {def.fields.map((field) => (
+                      <div key={field.key} className="tl-inspector-label-row" style={{ marginTop: "8px" }}>
+                        <span className="tl-inspector-label">{field.label}</span>
+                        {field.type === "range" ? (
+                          <div className="tl-intensity-control">
+                            <input
+                              type="range" className="tl-slider"
+                              min={field.min} max={field.max} step={field.step}
+                              value={Number(settings[field.key] ?? field.min)}
+                              onChange={(event) => onSetMotionGraphicSetting(field.key, Number(event.target.value))}
+                            />
+                            <span className="tl-intensity-value">{settings[field.key] ?? field.min}</span>
+                          </div>
+                        ) : (
+                          <select
+                            value={String(settings[field.key] ?? field.options[0])}
+                            onChange={(event) => onSetMotionGraphicSetting(field.key, event.target.value)}
+                          >
+                            {field.options.map((option) => <option key={option} value={option}>{option}</option>)}
+                          </select>
+                        )}
+                      </div>
+                    ))}
+                    <p className="tl-source-hint" style={{ marginTop: "8px" }}>{def.bestFor}</p>
+                  </>
+                );
+              })()}
+            </>
+          )}
         </div>
       )}
       <div className="tl-inspector-group">

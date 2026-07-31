@@ -224,7 +224,20 @@ export type TimelineClipRecord = {
   mediaLibraryAssetId: string | null;
   colorFilterPreset: ColorFilterPreset;
   colorFilterIntensity: number;
+  /** AI-recommended (or manually overridden) treatment name, or null if this clip hasn't been analyzed yet. */
+  motionGraphicEffect: MotionGraphicEffect | null;
+  /** JSON-stringified tunable settings for motionGraphicEffect — shape depends on which effect is assigned. */
+  motionGraphicSettings: string | null;
+  /** Short AI-written justification for the assigned effect. */
+  motionGraphicReason: string | null;
 };
+
+export type MotionGraphicEffect =
+  | "Ken Burns"
+  | "Sequential Panel Reveal"
+  | "Speed Pan & Motion Blur"
+  | "Ominous Push-In"
+  | "Candlelight Flicker";
 
 export type MediaLibraryKind = "still" | "clip" | "audio";
 export type MediaLibraryAssetRecord = {
@@ -755,6 +768,14 @@ export const projectsClient = {
     if (isTauri()) return invoke("set_timeline_clip_color_filter", { videoId, clipId, preset, intensity });
     throw new Error("Timeline requires the native application.");
   },
+  async setTimelineClipMotionGraphic(videoId: string, clipId: string, effect: MotionGraphicEffect | null, settingsJson: string | null, reason: string | null): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_timeline_clip_motion_graphic", { videoId, clipId, effect, settingsJson, reason });
+    throw new Error("Timeline requires the native application.");
+  },
+  async clearMotionGraphicsForAllClips(videoId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("clear_motion_graphics_for_all_clips", { videoId });
+    throw new Error("Timeline requires the native application.");
+  },
   async applyColorFilterToAllClips(videoId: string, preset: ColorFilterPreset, intensity: number): Promise<TimelineRecord> {
     if (isTauri()) return invoke("apply_color_filter_to_all_clips", { videoId, preset, intensity });
     throw new Error("Timeline requires the native application.");
@@ -1085,6 +1106,10 @@ export const projectsClient = {
   async planBulkVisuals(videoId: string, styleDirective: string, baseSettingsJson: string, creativeInstruction: string): Promise<BulkPlanResultRecord> {
     if (isTauri()) return invoke("plan_bulk_visuals", { videoId, styleDirective, baseSettingsJson, creativeInstruction });
     throw new Error("Bulk planning requires the native application.");
+  },
+  async analyzeMotionGraphics(videoId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("analyze_motion_graphics", { videoId });
+    throw new Error("Motion graphics analysis requires the native application.");
   },
   async approveBulkPlan(videoId: string, styleDirective: string, stills: BulkPlannedStillRecord[]): Promise<number> {
     if (isTauri()) return invoke("approve_bulk_plan", { videoId, styleDirective, stills });

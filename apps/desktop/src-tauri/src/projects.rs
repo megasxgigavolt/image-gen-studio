@@ -3065,7 +3065,7 @@ Return JSON only — no markdown, no explanation:
     ) -> Result<String, String> {
         let (media_type, bytes) = self.reference_image_bytes(video_id)?
             .ok_or("Character Consistency requires a reference image — upload one in Bulk Gen Config first.")?;
-        let prompt = "Identify the single main character or protagonist in this reference image (a person, animal, or creature — not a background object or environment). Write a concise, reusable physical description of that character for an illustrator to redraw consistently across dozens of separate scenes. You MUST explicitly cover: species/type; approximate age; physical proportions and build; exact hair color, length, and style (or fur/feather coloring and pattern if not human) — this is the single most common detail illustrators get inconsistent, so describe it precisely; eye color; skin/fur tone; any distinguishing marks or features; and clothing/props with their exact colors. Do not describe the pose, background, camera angle, or art/rendering style — only the character's inherent physical identity, in 4-6 sentences of plain prose. If no clear single character is present, describe the closest candidate subject instead. Return only the description, no preamble, no labels, no markdown.";
+        let prompt = "Identify the single main character or protagonist in this reference image (a person, animal, or creature — not a background object or environment). Write a concise, reusable physical description of that character for an illustrator to redraw consistently across dozens of separate scenes. You MUST explicitly cover: species/type; approximate age; physical proportions and build; exact hair color, length, and style (or fur/feather coloring and pattern if not human) — this is the single most common detail illustrators get inconsistent, so describe it precisely; eye color; skin/fur tone; and any distinguishing marks or features. Deliberately do NOT describe clothing, outfit, or props — those must change scene-to-scene to match each still's own context, not stay fixed like the physical identity. Do not describe the pose, background, camera angle, or art/rendering style either — only the character's inherent physical identity, in 4-6 sentences of plain prose. If no clear single character is present, describe the closest candidate subject instead. Return only the description, no preamble, no labels, no markdown.";
         match openai_key {
             Some(key) => request_openai_character_description(key, prompt, &media_type, &bytes),
             None => request_gemini_vision(
@@ -3126,10 +3126,13 @@ Return JSON only — no markdown, no explanation:
                  Every still that depicts a character, protagonist, or narrator figure MUST depict this\n\
                  EXACT same character, described from the user's reference image:\n\n\
                  {}\n\n\
-                 Maintain this character's species/type, physical proportions, coloring, distinguishing\n\
-                 features, and attire consistently across every still — do not redesign or vary their\n\
-                 appearance between stills. If a still's narration does not call for a character, omit\n\
-                 them naturally rather than forcing their presence.\n\
+                 Maintain this character's species/type, physical proportions, coloring, and distinguishing\n\
+                 features consistently across every still — do not redesign or vary their physical identity\n\
+                 between stills. Clothing/attire is the one exception: do NOT keep it fixed — design each\n\
+                 still's outfit to fit that still's own narration, setting, weather, and activity (e.g. a coat\n\
+                 in a cold-weather scene, workout clothes in an exercise scene), the same way you would for any\n\
+                 other subject. If a still's narration does not call for a character, omit them naturally\n\
+                 rather than forcing their presence.\n\
                  ════════════════════════════════════════\n",
                 description.trim()
             )
@@ -3738,6 +3741,56 @@ Return JSON only:
         serde_json::from_str(cleaned).map_err(|_| format!("Style analysis was not valid JSON. Raw response: {}", text.chars().take(300).collect::<String>()))
     }
 
+    /// Quick pre-generation check that this still's planned prompt/settings
+    /// still match the visual intent of its own narration. Plans are
+    /// produced in AI batches under token/context pressure (see
+    /// `plan_bulk_visuals`) and prompts/settings can also be hand-edited
+    /// afterward — both are common ways they drift out of alignment with
+    /// what the sentence(s) are actually about. Best-effort: any failure
+    /// here (bad JSON, network error) returns None and generation proceeds
+    /// with the original prompt/settings rather than blocking on a
+    /// validator that couldn't do its job.
+    fn validate_visual_intent(
+        &self,
+        auth: &GeminiAuth,
+        narration: &str,
+        user_prompt: &str,
+        settings_json: &str,
+    ) -> Option<(String, String)> {
+        if narration.trim().is_empty() {
+            return None;
+        }
+        let check_prompt = format!(
+            "You are a quality-control step in an automated video illustration pipeline, checking a \
+             single still right before it is generated.\n\n\
+             Narration this still represents: \"{narration}\"\n\n\
+             Planned image prompt (what will be drawn): \"{user_prompt}\"\n\
+             Planned image settings: {settings_json}\n\n\
+             Judge only one thing: does the planned prompt actually depict the visual intent of THIS \
+             narration — the concept, subject, or moment it describes — rather than something generic or \
+             mismatched? Also check whether the settings (mood, lighting, weatherAtmosphere, etc.) \
+             contradict the narration's own implied tone or setting (e.g. a cheerful mood for a somber \
+             line, indoor lighting for an explicitly outdoor scene).\n\n\
+             Return ONLY JSON: {{\"aligned\": boolean, \"correctedUserPrompt\": string or null, \
+             \"correctedSettings\": object or null}}.\n\
+             If aligned is true, correctedUserPrompt and correctedSettings MUST both be null.\n\
+             If aligned is false, correctedUserPrompt MUST be a rewritten prompt that fixes ONLY the \
+             mismatch (keep everything that already works), and correctedSettings MUST be the COMPLETE \
+             settings object with every original key present, changing only the fields that were \
+             actually wrong."
+        );
+        let raw = request_gemini_text(auth, &check_prompt).ok()?;
+        let cleaned = extract_json_from_text(&raw);
+        let parsed: serde_json::Value = serde_json::from_str(cleaned).ok()?;
+        if parsed.get("aligned").and_then(|v| v.as_bool()).unwrap_or(true) {
+            return None;
+        }
+        let corrected_prompt = parsed.get("correctedUserPrompt").and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())?.to_string();
+        let corrected_settings = parsed.get("correctedSettings").filter(|v| v.is_object())?.to_string();
+        Some((corrected_prompt, corrected_settings))
+    }
+
     pub fn generate_image_render(
         &self,
         video_id: &str,
@@ -3755,13 +3808,34 @@ Return JSON only:
         if !prompt_exists {
             return Err("The selected prompt version does not belong to this still.".into());
         }
-        let settings: serde_json::Value = serde_json::from_str(settings_json)
-            .map_err(|_| "Image settings must be valid JSON.".to_string())?;
         let auth = self.gemini_auth()?;
         let model = self
             .get_app_setting("gemini_model")?
             .unwrap_or_else(|| "gemini-3.1-flash-image".into());
-        let prompt = assemble_image_prompt(system_prompt, user_prompt, &settings);
+        let narration = self.get_visual_plan(video_id).ok()
+            .and_then(|plan| {
+                let group = plan.groups.iter().find(|g| g.id == group_id)?;
+                Some(group.sentence_ids.iter()
+                    .filter_map(|id| plan.sentences.iter().find(|s| &s.id == id))
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "))
+            })
+            .unwrap_or_default();
+        let (prompt_version_id, effective_user_prompt, effective_settings_json) =
+            match self.validate_visual_intent(&auth, &narration, user_prompt, settings_json) {
+                Some((corrected_prompt, corrected_settings)) => {
+                    let version = self.create_prompt_version(
+                        video_id, group_id, &corrected_settings, system_prompt, &corrected_prompt,
+                    )?;
+                    (version.id, corrected_prompt, corrected_settings)
+                }
+                None => (prompt_version_id.to_string(), user_prompt.to_string(), settings_json.to_string()),
+            };
+        let prompt_version_id = prompt_version_id.as_str();
+        let settings: serde_json::Value = serde_json::from_str(&effective_settings_json)
+            .map_err(|_| "Image settings must be valid JSON.".to_string())?;
+        let prompt = assemble_image_prompt(system_prompt, &effective_user_prompt, &settings);
         // When Character Consistency is on (flag set by plan_bulk_visuals),
         // pass the actual reference image as generation input, not just the
         // character description baked into user_prompt as text. A text
@@ -3788,9 +3862,12 @@ Return JSON only:
                 // background/pose instead of generating the new scene.
                 let character_reference_prompt = format!(
                     "The attached image is a CHARACTER REFERENCE ONLY. Reproduce that character's exact \
-                     appearance (hair, coloring, build, distinguishing features, attire) — but IGNORE the \
-                     reference image's background, pose, camera angle, and composition entirely. Generate \
-                     a completely new scene as described below, featuring that character:\n\n{prompt}"
+                     physical appearance (hair, coloring, build, distinguishing features) — but IGNORE the \
+                     reference image's background, pose, camera angle, composition, and clothing entirely. \
+                     Dress the character in whatever outfit fits the new scene described below (do not copy \
+                     the reference image's outfit unless that scene independently calls for the same \
+                     clothing). Generate a completely new scene as described below, featuring that \
+                     character:\n\n{prompt}"
                 );
                 request_gemini_image_with_source(
                     &auth, &model, &character_reference_prompt, &reference_bytes, &reference_mime, None,

@@ -696,8 +696,19 @@ function InputsView() {
         pacingMin: inputs.pacingMinSeconds,
         pacingMax: inputs.pacingMaxSeconds,
       });
+      // planMatchesCurrentInputs is persisted server-side (what was
+      // actually used the last time this plan was generated), unlike this
+      // reconstructed `signature` which only reflects current video_inputs
+      // and can't tell "pacing changed since generation" on its own after
+      // a fresh reload — see MIGRATION_033's doc comment. false means a
+      // mismatch: force the comparison below to fail so the button shows
+      // "Generate" instead of "View". null (no snapshot recorded, e.g. a
+      // legacy plan) falls back to assuming it matches, same as before.
       void projectsClient.getVisualPlan(activeVideoId)
-        .then(() => { setHasPlan(true); setGeneratedInputSignature(signature); })
+        .then(() => {
+          setHasPlan(true);
+          setGeneratedInputSignature(inputs.planMatchesCurrentInputs === false ? null : signature);
+        })
         .catch(() => { setHasPlan(false); setGeneratedInputSignature(null); });
     }).catch((caught) => setError(String(caught)));
   }, [activeVideoId]);

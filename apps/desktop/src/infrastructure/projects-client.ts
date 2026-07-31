@@ -55,6 +55,9 @@ export type VideoInputsRecord = {
   audio: InputAssetRecord | null;
   references: InputAssetRecord[];
   updatedAt: string;
+  // None (null) when no plan exists yet, or a legacy plan predates this
+  // field and never recorded what generated it.
+  planMatchesCurrentInputs: boolean | null;
 };
 
 export type PlanSentenceRecord = { id: string; ordinal: number; text: string; startSeconds: number; endSeconds: number };
@@ -547,7 +550,7 @@ export const projectsClient = {
     if (isTauri()) return invoke("get_video_inputs", { videoId });
     const data = readBrowserData();
     return data.inputs?.[videoId] ?? {
-      videoId, scriptText: "", pacingSeconds: 8, pacingPreset: "balanced", pacingMinSeconds: 6, pacingMaxSeconds: 10, audio: null, references: [], updatedAt: now(),
+      videoId, scriptText: "", pacingSeconds: 8, pacingPreset: "balanced", pacingMinSeconds: 6, pacingMaxSeconds: 10, audio: null, references: [], updatedAt: now(), planMatchesCurrentInputs: null,
     };
   },
   async getImageWorkspace(videoId: string): Promise<ImageWorkspaceRecord> {
@@ -1021,7 +1024,7 @@ export const projectsClient = {
     if (isTauri()) return invoke<VideoInputsRecord>("save_video_inputs", { videoId, scriptText, pacingSeconds });
     const data = readBrowserData();
     const existing = data.inputs?.[videoId] ?? {
-      videoId, scriptText: "", pacingSeconds: 8, pacingPreset: "balanced" as const, pacingMinSeconds: 6, pacingMaxSeconds: 10, audio: null, references: [], updatedAt: now(),
+      videoId, scriptText: "", pacingSeconds: 8, pacingPreset: "balanced" as const, pacingMinSeconds: 6, pacingMaxSeconds: 10, audio: null, references: [], updatedAt: now(), planMatchesCurrentInputs: null,
     };
     const inputs = { ...existing, scriptText, pacingSeconds, updatedAt: now() };
     (data.inputs ??= {})[videoId] = inputs;

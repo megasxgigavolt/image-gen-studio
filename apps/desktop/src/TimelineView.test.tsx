@@ -22,6 +22,7 @@ const EMPTY_INPUTS: VideoInputsRecord = {
   audio: null,
   references: [],
   updatedAt: new Date().toISOString(),
+  planMatchesCurrentInputs: null,
 };
 
 const EMPTY_TIMELINE: TimelineRecord = {

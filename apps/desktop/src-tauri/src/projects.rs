@@ -114,12 +114,29 @@ pub const MOTION_GRAPHIC_EFFECTS: [&str; 5] = [
 /// are lost in this approximation.
 fn approximate_motion_preset_for_effect(effect: &str, settings_json: Option<&str>) -> &'static str {
     match effect {
+        // Zoom + pan from off-center toward center — the one preset that
+        // actually combines both motions.
         "Ken Burns" => "ken-burns",
-        "Ominous Push-In" => "zoom-in-subject",
-        // Both are slow near-static pushes per the SOP (§5.5's "very subtle
-        // push-in — this effect should feel almost still"; §5.2 holds on the
-        // full grid before zooming) — flicker/panel-reveal have no equivalent.
-        "Candlelight Flicker" | "Sequential Panel Reveal" => "zoom-in",
+        // NOTE: "zoom-in-subject"/"zoom-out-subject" are NOT used here even
+        // though they'd read as more semantically apt for some of these —
+        // applyMotion() (timeline-rendering.ts) shares the exact same
+        // scaleMul formula as "zoom-in"/"zoom-out" and only diverges when a
+        // `subject` coordinate is supplied, which nothing currently feeds
+        // into these clips. Using them renders pixel-identical to the plain
+        // variant, which is what caused every effect to visually collapse
+        // into the same "zoom-in" motion — deliberately picking 5 DISTINCT
+        // rendered shapes below instead, even where the semantic fit is a
+        // bit looser, so the 5 AI picks actually look different.
+        // Steep, centered push with NO pan — distinct from Ken Burns's
+        // combined zoom+pan, matching the SOP's "no pan, steeper push" note.
+        "Ominous Push-In" => "zoom-in",
+        // A pulse (in, then back out) reads as "breathing" — the closest
+        // available analog to an organic flicker; a flat zoom wouldn't.
+        "Candlelight Flicker" => "zoom-pulse",
+        // No available preset represents "snap between sub-panels"; a
+        // directional pan at least conveys "revealing across the frame"
+        // rather than collapsing to the same zoom as everything else.
+        "Sequential Panel Reveal" => "pan-right",
         "Speed Pan & Motion Blur" => {
             // Direction from panXFrom/panXTo if present (SOP: sign encodes
             // direction, positive-to-negative is left-to-right).

@@ -8334,7 +8334,10 @@ fn request_openai_motion_graphic(api_key: &str, mime: &str, base64_data: &str) -
 
 If nothing clearly matches, default to Ken Burns.
 
-Return only JSON: {"effect": "<exact treatment name from the numbered list above>", "settings": {<only that treatment's fields, as numbers/strings per the types above>}, "reason": "<one short sentence on why this fits the image>"}"#;
+The "effect" field in your JSON response MUST be EXACTLY one of these 5 strings, character-for-character, with nothing else appended — do NOT include the description/dash/"Best for" text that follows each name in the numbered list above, ONLY the bare name itself:
+"Ken Burns" | "Sequential Panel Reveal" | "Speed Pan & Motion Blur" | "Ominous Push-In" | "Candlelight Flicker"
+
+Return only JSON: {"effect": "Ken Burns", "settings": {<only that treatment's fields, as numbers/strings per the types above>}, "reason": "<one short sentence on why this fits the image>"} — using whichever of the 5 exact strings above actually fits, not necessarily "Ken Burns"."#;
     let response = reqwest::blocking::Client::new()
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(api_key)
@@ -8356,9 +8359,17 @@ Return only JSON: {"effect": "<exact treatment name from the numbered list above
     let text = body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
         .ok_or("OpenAI returned no motion graphic analysis.")?;
     let cleaned = extract_json_from_text(text);
-    let plan: MotionGraphicPlan = serde_json::from_str(cleaned).map_err(|_| "OpenAI motion graphic analysis was not valid JSON.".to_string())?;
+    let mut plan: MotionGraphicPlan = serde_json::from_str(cleaned).map_err(|_| "OpenAI motion graphic analysis was not valid JSON.".to_string())?;
     if !MOTION_GRAPHIC_EFFECTS.contains(&plan.effect.as_str()) {
-        return Err(format!("OpenAI returned an unrecognized motion graphic effect: {}", plan.effect));
+        // The model sometimes echoes the numbered list's description/dash
+        // suffix along with the name (e.g. "Ken Burns — classic push-in +
+        // diagonal pan") despite the prompt's exact-string instruction —
+        // normalize by matching on prefix instead of hard-failing the whole
+        // analysis for this still over a cosmetic deviation.
+        match MOTION_GRAPHIC_EFFECTS.iter().find(|&&name| plan.effect.starts_with(name)) {
+            Some(&name) => plan.effect = name.to_string(),
+            None => return Err(format!("OpenAI returned an unrecognized motion graphic effect: {}", plan.effect)),
+        }
     }
     Ok(plan)
 }

@@ -8071,7 +8071,14 @@ Return JSON only:
             .ok_or("Sentence was not found.")?;
         let second = sentences.remove(second_index);
         let first = &mut sentences[first_index];
-        first.text = format!("{} {}", first.text.trim(), second.text.trim());
+        // Strip the first half's trailing period at the join so the merge
+        // is reversible the same way it was created: typing "." back at
+        // that exact spot re-triggers the auto-split. Only a plain "."
+        // is stripped (not "?"/"!") — those change the sentence's meaning
+        // if dropped and aren't what the split trigger looks for anyway.
+        let first_trimmed = first.text.trim();
+        let first_joined = first_trimmed.strip_suffix('.').unwrap_or(first_trimmed);
+        first.text = format!("{} {}", first_joined, second.text.trim());
         first.start_seconds = first.start_seconds.min(second.start_seconds);
         first.end_seconds = first.end_seconds.max(second.end_seconds);
         // Same fix as split_plan_sentence: shift every remaining sentence's
@@ -9582,6 +9589,43 @@ mod tests {
         assert_groups_reference_real_sentences(&merged);
         assert_ids_are_gapless(&merged);
         assert_eq!(merged.sentences[0].text, first.text);
+    }
+
+    #[test]
+    fn merging_sentences_strips_the_join_period_so_it_can_be_resplit() {
+        // The left half of a real split always ends with a plain "." (it's
+        // where the user's cursor was) — merging back should drop exactly
+        // that period so typing "." at the same spot re-triggers a split,
+        // round-tripping cleanly, while the merged sentence's OWN final
+        // punctuation (from the absorbed second half) must survive intact.
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(
+            &video.id,
+            "One short sentence. A second sentence follows. The final sentence closes.",
+            4,
+        )
+        .unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let original = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        assert!(original.sentences.len() >= 2);
+        assert!(original.sentences[0].text.ends_with('.'));
+
+        let merged = repo
+            .merge_plan_sentences(&video.id, &original.sentences[0].id, &original.sentences[1].id)
+            .unwrap();
+        let joined = &merged.sentences[0].text;
+        assert!(
+            !joined.contains(". "),
+            "join point should have no period left in it: {joined:?}"
+        );
+        assert!(
+            joined.ends_with('.'),
+            "the merged sentence's own trailing punctuation (from the second half) must survive: {joined:?}"
+        );
     }
 
     #[test]

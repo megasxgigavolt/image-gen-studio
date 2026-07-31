@@ -35,6 +35,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   DndContext,
   PointerSensor,
+  pointerWithin,
   useDraggable,
   useDroppable,
   useSensor,
@@ -1007,7 +1008,7 @@ function VisualPlanView() {
   return (
     <section className="view">
       <div className="page-heading">
-        <div><h1>Visual plan</h1><p>Drag a sentence into an adjacent still to regroup it, or onto another sentence to merge them. Double-click a sentence to edit it — typing a period splits it immediately. Chronological order remains enforced.</p></div>
+        <div><h1>Visual plan</h1><p>Drag a sentence to regroup it, or onto another sentence's handle to merge. Double-click to edit. Chronological order remains enforced.</p></div>
         <div className="heading-actions"><button className="secondary" onClick={() => setStage("inputs")}>← Back</button><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
       </div>
       {searchOpen && (
@@ -1034,6 +1035,14 @@ function VisualPlanView() {
       {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{formatTimeShort(plan.sentences.at(-1)?.endSeconds ?? 0)} total · Average {((plan.sentences.at(-1)?.endSeconds ?? 0) / plan.groups.length).toFixed(1)} sec · {plan.timingSource}</span></div>
       <div className="plan-scroll"><DndContext
         sensors={sensors}
+        // pointerWithin (not the default rectIntersection) so a small
+        // nested target — the merge drop zone on a sentence's own grip
+        // handle — reliably wins over the large still it sits inside, by
+        // checking where the pointer actually is rather than which
+        // rectangle it overlaps most. This is what makes "drop into this
+        // still" (anywhere in the still) and "merge with this sentence"
+        // (only its handle) unambiguous instead of racing each other.
+        collisionDetection={pointerWithin}
         onDragStart={(event) => setDraggedSentenceId(String(event.active.id).replace(/^sentence:/, ""))}
         onDragOver={(event) => setDropTarget(event.over ? String(event.over.id) : null)}
         onDragCancel={() => { setDraggedSentenceId(null); setDropTarget(null); }}
@@ -1138,12 +1147,16 @@ function DraggableSentence({
   onCancel: () => void;
 }) {
   const { attributes, listeners, setNodeRef: setDragRef, transform } = useDraggable({ id: `sentence:${sentence.id}`, disabled: editing });
-  // Also a drop target for merge — dragging one sentence onto another. Same
-  // dnd-kit id namespace (`sentence:`) as the draggable above so finishDrag
-  // can dispatch on the prefix; sharing one DOM node for both roles is a
-  // standard dnd-kit pattern (compose the two setNodeRef callbacks).
-  const { setNodeRef: setDropRef, isOver } = useDroppable({ id: `sentence:${sentence.id}` });
-  const setNodeRef = (el: HTMLDivElement | null) => { setDragRef(el); setDropRef(el); };
+  // The merge drop target is deliberately just the grip handle, NOT the
+  // whole row — the row's own group still uses the whole area for "move
+  // into this still" (DroppableStill). Sharing one hit area for both made
+  // it a coin flip whether dropping a sentence near another one moved it
+  // into that still or merged it with that specific sentence. A small,
+  // separate handle-only target (paired with pointerWithin collision
+  // detection on the DndContext) makes the two gestures physically
+  // distinct: drop anywhere in a still to move there, drop precisely on
+  // another sentence's handle to merge with it.
+  const { setNodeRef: setMergeDropRef, isOver: isMergeOver } = useDroppable({ id: `sentence:${sentence.id}` });
   const editableRef = useRef<HTMLSpanElement>(null);
   useEffect(() => {
     if (!editing || !editableRef.current) return;
@@ -1161,14 +1174,19 @@ function DraggableSentence({
     // textContent from React state on every keystroke would reset the caret.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editing]);
+  const mergeTargetActive = dropActive || isMergeOver;
   return <div
-    ref={setNodeRef}
-    className={[active && "dragging", (dropActive || isOver) && "drag-over", "sentence"].filter(Boolean).join(" ")}
+    ref={setDragRef}
+    className={[active && "dragging", "sentence"].filter(Boolean).join(" ")}
     style={{ transform: CSS.Translate.toString(transform), touchAction: "none" }}
     {...(editing ? {} : listeners)}
     {...(editing ? {} : attributes)}
   >
-    <b title="Drag sentence"><GripVertical size={18} /></b>
+    <b
+      ref={setMergeDropRef}
+      className={mergeTargetActive ? "merge-handle drag-over" : "merge-handle"}
+      title="Drag another sentence here to merge it with this one"
+    ><GripVertical size={18} /></b>
     {editing ? (
       <span
         ref={editableRef}

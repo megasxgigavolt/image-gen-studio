@@ -592,6 +592,17 @@ ALTER TABLE timeline_clips ADD COLUMN motion_graphic_settings_json TEXT;
 ALTER TABLE timeline_clips ADD COLUMN motion_graphic_reason TEXT;
 "#;
 
+/// `visual_plan_sentences` (unlike `visual_plan_groups`) has never had an
+/// original/current duplication — "Reset original" could only restore
+/// grouping boundaries, never sentence text/splits/merges, since there was
+/// nowhere to restore them FROM. Storing a full JSON snapshot on
+/// `visual_plan_meta` (captured once at generation time) rather than
+/// duplicating `visual_plan_sentences` rows avoids touching that table's
+/// existing id scheme/primary key at all — see `reset_visual_plan`.
+const MIGRATION_032: &str = r#"
+ALTER TABLE visual_plan_meta ADD COLUMN original_sentences_json TEXT;
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -1651,6 +1662,21 @@ impl ProjectRepository {
         }
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(31, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_original_sentences_json: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('visual_plan_meta') WHERE name='original_sentences_json')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_original_sentences_json {
+            self.connection.execute_batch(MIGRATION_032).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(32, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -6522,6 +6548,7 @@ Return JSON only:
                 true,
                 "estimated test fixture",
             )?;
+            self.save_original_sentences_snapshot(video_id, &sentences)?;
             self.save_plan(
                 video_id,
                 &sentences,
@@ -6720,6 +6747,7 @@ Return JSON only:
                 true,
                 "whisper + AI boundary scoring",
             )?;
+            self.save_original_sentences_snapshot(video_id, &sentences)?;
             self.save_plan(
                 video_id,
                 &sentences,
@@ -7792,11 +7820,32 @@ Return JSON only:
         self.get_visual_plan(video_id)
     }
 
+    /// Restores the plan to exactly how it looked right after generation —
+    /// grouping boundaries AND sentence text/splits/merges. Sentences have
+    /// no is_original duplication like groups do (see MIGRATION_032's doc
+    /// comment), so the snapshot lives as JSON on `visual_plan_meta`,
+    /// captured once by `save_original_sentences_snapshot` right after
+    /// generation. Plans generated before that existed have no snapshot
+    /// (`original_sentences_json` is NULL) — falls back to the old
+    /// groups-only reset for those rather than erroring.
     pub fn reset_visual_plan(&self, video_id: &str) -> Result<VisualPlan, String> {
-        let original = self.load_groups(video_id, true)?;
-        let sentences = self.get_visual_plan(video_id)?.sentences;
-        let timing_source = self.get_visual_plan(video_id)?.timing_source;
-        self.save_plan(video_id, &sentences, &original, false, &timing_source)?;
+        let original_groups = self.load_groups(video_id, true)?;
+        let plan = self.get_visual_plan(video_id)?;
+        let snapshot_json: Option<String> = self.connection.query_row(
+            "SELECT original_sentences_json FROM visual_plan_meta WHERE video_id=?1",
+            [video_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let original_sentences: Vec<PlanSentence> = match snapshot_json {
+            Some(json) => serde_json::from_str(&json).map_err(|e| e.to_string())?,
+            None => plan.sentences,
+        };
+        // save_plan's sentence-write and is_original=1 group-write are both
+        // gated by the same `original: bool` — writing original_groups back
+        // over themselves here is a harmless no-op, it's what unlocks
+        // restoring sentences without a separate write path.
+        self.save_plan(video_id, &original_sentences, &original_groups, true, &plan.timing_source)?;
+        self.save_plan(video_id, &original_sentences, &original_groups, false, &plan.timing_source)?;
         self.get_visual_plan(video_id)
     }
 
@@ -8127,6 +8176,22 @@ Return JSON only:
 
         self.write_renumbered_plan(video_id, &sentences, &current_groups, &original_groups)?;
         self.get_visual_plan(video_id)
+    }
+
+    /// Captures the just-generated sentence list as a JSON snapshot on
+    /// `visual_plan_meta`, so `reset_visual_plan` has something to restore
+    /// sentence text/splits/merges FROM — called once, right after
+    /// generation, never touched by `split_plan_sentence`/`merge_plan_
+    /// sentences`/`update_plan_sentence_text`. Requires the `visual_plan_
+    /// meta` row to already exist (call after `save_plan`, which upserts
+    /// it) since this is a plain UPDATE, not an upsert.
+    fn save_original_sentences_snapshot(&self, video_id: &str, sentences: &[PlanSentence]) -> Result<(), String> {
+        let json = serde_json::to_string(sentences).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "UPDATE visual_plan_meta SET original_sentences_json=?1 WHERE video_id=?2",
+            params![json, video_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn save_plan(
@@ -9636,6 +9701,46 @@ mod tests {
             joined.ends_with('.'),
             "the merged sentence's own trailing punctuation (from the second half) must survive: {joined:?}"
         );
+    }
+
+    #[test]
+    fn reset_visual_plan_is_a_true_factory_reset_of_sentences_too() {
+        // Before this, reset_visual_plan only restored GROUP boundaries —
+        // sentence text/splits/merges were permanent, with no way back.
+        // Requested explicitly: "reset original" should restore everything
+        // to exactly how it was right after generation.
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(
+            &video.id,
+            "One short sentence. A second sentence follows. The final sentence closes.",
+            4,
+        )
+        .unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let original = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+
+        // Mutate sentences three different ways: edit text, merge two, and
+        // (on what's left) split one — all should be undone by reset.
+        repo.update_plan_sentence_text(&video.id, &original.sentences[2].id, "A rewritten third sentence.")
+            .unwrap();
+        let after_merge = repo
+            .merge_plan_sentences(&video.id, &original.sentences[0].id, &original.sentences[1].id)
+            .unwrap();
+        repo.split_plan_sentence(&video.id, &after_merge.sentences[0].id, 5).unwrap();
+
+        // Merge (3->2 sentences) then split (2->3) nets back to the same
+        // COUNT by coincidence — text is the reliable signal that the plan
+        // actually diverged from its generated state.
+        let mutated = repo.get_visual_plan(&video.id).unwrap();
+        assert_ne!(mutated.sentences[0].text, original.sentences[0].text);
+
+        let reset = repo.reset_visual_plan(&video.id).unwrap();
+        assert_eq!(reset.sentences, original.sentences);
+        assert_eq!(reset.groups, original.groups);
     }
 
     #[test]

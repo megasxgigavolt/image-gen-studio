@@ -1,4 +1,4 @@
-import { Hexagon, LoaderCircle, MoreHorizontal, Move, Music, SlidersHorizontal, Trash2, Type } from "lucide-react";
+import { Clapperboard, Hexagon, LoaderCircle, MoreHorizontal, Move, Music, SlidersHorizontal, Trash2, Type } from "lucide-react";
 
 export type ToolKind = "text" | "captions" | "music" | "filters" | "logo";
 
@@ -13,12 +13,18 @@ export function Toolbar({
   onExtrapolateStills,
   extrapolating,
   onRemoveAllEffects,
+  onAnalyzeMotionGraphics,
+  analyzingMotionGraphics,
+  motionGraphicsProgressLabel,
 }: {
   activeTool: ToolKind | null;
   onSelectTool: (tool: ToolKind | null) => void;
   onExtrapolateStills: () => void;
   extrapolating: boolean;
   onRemoveAllEffects: () => void;
+  onAnalyzeMotionGraphics: () => void;
+  analyzingMotionGraphics: boolean;
+  motionGraphicsProgressLabel: string | null;
 }) {
   function toggle(tool: ToolKind) {
     onSelectTool(activeTool === tool ? null : tool);
@@ -49,6 +55,10 @@ export function Toolbar({
       <div className="tl-tool-toolbar-group">
         <button className="tl-tool-btn" disabled={extrapolating} title="Stretch every still to close gaps between them, so transitions become visible" onClick={onExtrapolateStills}>
           {extrapolating ? <LoaderCircle className="spin" size={16} /> : <Move size={16} />}<span>Fill gaps</span>
+        </button>
+        <button className="tl-tool-btn" disabled={analyzingMotionGraphics} title="Use OpenAI to pick a camera-movement treatment for every still, per the Motion Graphics SOP" onClick={onAnalyzeMotionGraphics}>
+          {analyzingMotionGraphics ? <LoaderCircle className="spin" size={16} /> : <Clapperboard size={16} />}
+          <span>{analyzingMotionGraphics && motionGraphicsProgressLabel ? motionGraphicsProgressLabel : "Motion Graphics"}</span>
         </button>
         <button className="tl-tool-btn danger" title="Remove camera movement, transitions, and gap-filling stretch from every still" onClick={onRemoveAllEffects}>
           <Trash2 size={16} /><span>Remove all effects</span>

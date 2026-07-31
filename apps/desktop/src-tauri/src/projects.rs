@@ -90,6 +90,22 @@ pub const VALID_TRANSITIONS: [&str; 7] = [
 /// `eq` filter) — kept numerically identical there so preview and export agree.
 pub const COLOR_FILTER_PRESETS: [&str; 7] = ["none", "warm", "cool", "cinematic", "bright", "muted", "dark"];
 
+/// Shared validation list for `timeline_clips.motion_graphic_effect` — the
+/// 5 treatments documented in `SOPs/Motion_Graphics_SOP_v1.md`. Metadata
+/// only: this is an AI-assigned recommendation + its tunable settings for a
+/// future rendering pass, not wired into `video_export_engine.py` today.
+/// Distinct from (and not to be confused with) `MOTION_PRESETS`'s simpler
+/// `"ken-burns"` value above, which the ffmpeg export pipeline already
+/// renders — that preset predates and is unrelated to this SOP's richer
+/// "Ken Burns" treatment.
+pub const MOTION_GRAPHIC_EFFECTS: [&str; 5] = [
+    "Ken Burns",
+    "Sequential Panel Reveal",
+    "Speed Pan & Motion Blur",
+    "Ominous Push-In",
+    "Candlelight Flicker",
+];
+
 const MIGRATION_001: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -526,6 +542,12 @@ CREATE TABLE IF NOT EXISTS export_jobs (
 CREATE INDEX IF NOT EXISTS idx_export_jobs_video ON export_jobs(video_id, created_at DESC);
 "#;
 
+const MIGRATION_031: &str = r#"
+ALTER TABLE timeline_clips ADD COLUMN motion_graphic_effect TEXT;
+ALTER TABLE timeline_clips ADD COLUMN motion_graphic_settings_json TEXT;
+ALTER TABLE timeline_clips ADD COLUMN motion_graphic_reason TEXT;
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -678,6 +700,14 @@ pub struct ProviderKeyStatus {
 pub struct StyleExtraction {
     pub style_directive: String,
     pub image_settings: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MotionGraphicPlan {
+    pub effect: String,
+    pub settings: serde_json::Value,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -859,6 +889,15 @@ pub struct TimelineClip {
     pub media_library_asset_id: Option<String>,
     pub color_filter_preset: String,
     pub color_filter_intensity: f64,
+    /// AI-recommended treatment name from `MOTION_GRAPHIC_EFFECTS`, or `None`
+    /// if this clip hasn't been analyzed yet. Metadata only — see the const's
+    /// doc comment.
+    pub motion_graphic_effect: Option<String>,
+    /// JSON-serialized tunable settings for `motion_graphic_effect` (field
+    /// shape depends on which effect is assigned).
+    pub motion_graphic_settings_json: Option<String>,
+    /// Short AI-written justification for the assigned effect.
+    pub motion_graphic_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1553,6 +1592,21 @@ impl ProjectRepository {
         self.connection.execute_batch(MIGRATION_030).map_err(|error| error.to_string())?;
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(30, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_motion_graphic_effect: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timeline_clips') WHERE name='motion_graphic_effect')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_motion_graphic_effect {
+            self.connection.execute_batch(MIGRATION_031).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(31, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -3099,6 +3153,39 @@ You MUST return exactly one plan for every row in the current batch. Return JSON
         })
     }
 
+    /// Runs OpenAI vision analysis (see `request_openai_motion_graphic`)
+    /// against every timeline clip that has a rendered image, assigning each
+    /// one a `MOTION_GRAPHIC_EFFECTS` treatment + settings. Metadata only —
+    /// see `MOTION_GRAPHIC_EFFECTS`'s doc comment. Clips are processed and
+    /// persisted one at a time (not chunked — one vision call per still, no
+    /// text-token-budget concern like `plan_bulk_visuals` has) so progress
+    /// is visible and partial results survive a later failure. OpenAI-only,
+    /// no Gemini fallback, since this feature is scoped to OpenAI vision.
+    pub fn analyze_motion_graphics<F: Fn(usize, usize)>(&self, video_id: &str, on_progress: F) -> Result<Timeline, String> {
+        let api_key = self.get_provider_key("openai")?
+            .ok_or("An OpenAI API key is required for Motion Graphics analysis. Add one in Settings.")?;
+        let timeline = self.get_timeline(video_id)?;
+        let clips: Vec<&TimelineClip> = timeline.clips.iter().filter(|clip| clip.render_id.is_some()).collect();
+        let total = clips.len();
+        if total == 0 {
+            return Err("No stills with a rendered image were found on this timeline.".into());
+        }
+        for (index, clip) in clips.into_iter().enumerate() {
+            let render_id = clip.render_id.as_ref().expect("filtered to Some above");
+            let (mime, base64_data) = self.read_render_file(render_id)?;
+            let plan = request_openai_motion_graphic(&api_key, &mime, &base64_data)?;
+            self.set_timeline_clip_motion_graphic(
+                video_id,
+                &clip.id,
+                Some(plan.effect.as_str()),
+                Some(&serde_json::to_string(&plan.settings).unwrap_or_default()),
+                Some(plan.reason.as_str()),
+            )?;
+            on_progress(index + 1, total);
+        }
+        self.get_timeline(video_id)
+    }
+
     pub fn suggest_still_prompt(&self, video_id: &str, group_id: &str, style_directive: &str, base_settings_json: &str) -> Result<BulkPlannedStill, String> {
         let auth = self.gemini_auth()?;
         let visual_plan = self.get_visual_plan(video_id)?;
@@ -4027,7 +4114,7 @@ Return JSON only:
         let caption_style = serde_json::from_str(&caption_style_raw).unwrap_or_else(|_| json!({}));
         self.backfill_missing_clip_renders(video_id)?;
         let mut statement = self.connection.prepare(
-            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
+            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
         ).map_err(|e| e.to_string())?;
         let clips = statement
             .query_map([video_id], |row| {
@@ -4048,6 +4135,9 @@ Return JSON only:
                     media_library_asset_id: row.get(13)?,
                     color_filter_preset: row.get(14)?,
                     color_filter_intensity: row.get(15)?,
+                    motion_graphic_effect: row.get(16)?,
+                    motion_graphic_settings_json: row.get(17)?,
+                    motion_graphic_reason: row.get(18)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -4648,6 +4738,34 @@ Return JSON only:
         self.get_timeline(video_id)
     }
 
+    /// Sets (or clears, when `effect` is `None`) a clip's AI-assigned or
+    /// manually-overridden motion graphic treatment. `settings_json` and
+    /// `reason` are cleared together with `effect` since they only make
+    /// sense alongside an assigned effect.
+    pub fn set_timeline_clip_motion_graphic(&self, video_id: &str, clip_id: &str, effect: Option<&str>, settings_json: Option<&str>, reason: Option<&str>) -> Result<Timeline, String> {
+        if let Some(chosen) = effect {
+            if !MOTION_GRAPHIC_EFFECTS.contains(&chosen) {
+                return Err("Unknown motion graphic effect.".into());
+            }
+        }
+        self.connection.execute(
+            "UPDATE timeline_clips SET motion_graphic_effect=?1, motion_graphic_settings_json=?2, motion_graphic_reason=?3 WHERE id=?4 AND video_id=?5",
+            params![effect, settings_json, reason, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    /// Clears the AI-assigned/overridden motion graphic on every clip in the
+    /// video — the bulk counterpart to `set_timeline_clip_motion_graphic`,
+    /// used by the Timeline toolbar's "Remove all effects" action.
+    pub fn clear_motion_graphics_for_all_clips(&self, video_id: &str) -> Result<Timeline, String> {
+        self.connection.execute(
+            "UPDATE timeline_clips SET motion_graphic_effect=NULL, motion_graphic_settings_json=NULL, motion_graphic_reason=NULL WHERE video_id=?1",
+            [video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
     pub fn apply_color_filter_to_all_clips(&self, video_id: &str, preset: &str, intensity: f64) -> Result<Timeline, String> {
         if !COLOR_FILTER_PRESETS.contains(&preset) {
             return Err("Unknown color filter preset.".into());
@@ -4811,12 +4929,14 @@ Return JSON only:
             group_id, render_id, label, motion_preset, transition_in, transition_out, motion_intensity,
             clip_kind, video_asset_id, media_library_asset_id, start_seconds, end_seconds,
             color_filter_preset, color_filter_intensity,
-        ): (String, Option<String>, String, String, String, String, f64, String, Option<String>, Option<String>, f64, f64, String, f64) = self.connection.query_row(
-            "SELECT group_id,render_id,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,start_seconds,end_seconds,color_filter_preset,color_filter_intensity FROM timeline_clips WHERE id=?1 AND video_id=?2",
+            motion_graphic_effect, motion_graphic_settings_json, motion_graphic_reason,
+        ): (String, Option<String>, String, String, String, String, f64, String, Option<String>, Option<String>, f64, f64, String, f64, Option<String>, Option<String>, Option<String>) = self.connection.query_row(
+            "SELECT group_id,render_id,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,start_seconds,end_seconds,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason FROM timeline_clips WHERE id=?1 AND video_id=?2",
             params![clip_id, video_id],
             |row| Ok((
                 row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?,
                 row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?,
+                row.get(14)?, row.get(15)?, row.get(16)?,
             )),
         ).map_err(|_| "Clip was not found.".to_string())?;
         let duration = (end_seconds - start_seconds).max(0.5);
@@ -4829,8 +4949,8 @@ Return JSON only:
             "SELECT COALESCE(MAX(ordinal),0)+1 FROM timeline_clips WHERE video_id=?1", [video_id], |row| row.get(0),
         ).map_err(|e| e.to_string())?;
         self.connection.execute(
-            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-            params![Uuid::new_v4().to_string(), video_id, group_id, render_id, next_ordinal, new_start, new_end, label, motion_preset, transition_in, transition_out, motion_intensity, clip_kind, video_asset_id, media_library_asset_id, color_filter_preset, color_filter_intensity],
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            params![Uuid::new_v4().to_string(), video_id, group_id, render_id, next_ordinal, new_start, new_end, label, motion_preset, transition_in, transition_out, motion_intensity, clip_kind, video_asset_id, media_library_asset_id, color_filter_preset, color_filter_intensity, motion_graphic_effect, motion_graphic_settings_json, motion_graphic_reason],
         ).map_err(|e| e.to_string())?;
         self.recompute_timeline_duration(video_id)?;
         self.get_timeline(video_id)
@@ -5265,7 +5385,7 @@ Return JSON only:
     /// `clear_timeline_track` (which deletes clips outright).
     pub fn remove_all_clip_effects(&self, video_id: &str) -> Result<Timeline, String> {
         self.connection.execute(
-            "UPDATE timeline_clips SET motion_preset='none', transition_in='cut', transition_out='cut', motion_intensity=0.22, color_filter_preset='none', color_filter_intensity=50 WHERE video_id=?1",
+            "UPDATE timeline_clips SET motion_preset='none', transition_in='cut', transition_out='cut', motion_intensity=0.22, color_filter_preset='none', color_filter_intensity=50, motion_graphic_effect=NULL, motion_graphic_settings_json=NULL, motion_graphic_reason=NULL WHERE video_id=?1",
             [video_id],
         ).map_err(|e| e.to_string())?;
         self.get_timeline(video_id)
@@ -8046,6 +8166,61 @@ fn request_openai_style(api_key: &str, mime: &str, bytes: &[u8]) -> Result<Style
         .ok_or("OpenAI returned no style analysis.")?;
     let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
     serde_json::from_str(cleaned).map_err(|_| "OpenAI style analysis was not valid JSON.".to_string())
+}
+
+/// Vision analysis for the Motion Graphics feature: picks one of the 5
+/// treatments documented in `SOPs/Motion_Graphics_SOP_v1.md` §5/§6 for a
+/// given still and returns its tunable settings. `base64_data` is already
+/// base64-encoded (as returned by `read_render_file`) — passed straight
+/// through rather than decoded-then-reencoded.
+fn request_openai_motion_graphic(api_key: &str, mime: &str, base64_data: &str) -> Result<MotionGraphicPlan, String> {
+    let image_url = format!("data:{mime};base64,{base64_data}");
+    let prompt = r#"You are selecting a camera-movement treatment for a still image that will become a short video clip. Choose exactly ONE of these 5 treatments and return its tunable settings.
+
+1. Ken Burns — classic push-in + diagonal pan. Best for: dialogue/two-subject scenes, any shot with clear foreground/background separation. Default/safest choice when nothing else clearly fits.
+   settings: scaleFrom (number, ~1.0-1.2), scaleTo (number, ~1.2-1.5, > scaleFrom), panX (number, percent, e.g. -4 to 4), panY (number, percent, e.g. -3 to 3)
+
+2. Sequential Panel Reveal — snap-zooms between sub-panels of a single grid/contact-sheet image. Best for: recap grids, multi-panel montages — ONLY pick this if the image is itself a grid of multiple distinct smaller scenes.
+   settings: holdStartFrames (number, ~10-30, how long the full grid shows before the first zoom), cropPadding (number, ~1.05-1.2)
+
+3. Speed Pan & Motion Blur — fast horizontal drift with directional blur and ghost trails. Best for: riders/runners/marching subjects, anything with an implied direction of travel. The pan direction must match the subject's facing/travel direction.
+   settings: scaleFrom (number, ~1.1-1.2), scaleTo (number, ~1.2-1.4), panXFrom (number, percent), panXTo (number, percent — sign encodes direction: positive-to-negative is left-to-right)
+
+4. Ominous Push-In — slow push-in with desaturation and a warm/red pulsing glow. Best for: single dramatic/mysterious portraits, masked or obscured figures, tense character studies.
+   settings: scaleFrom (number, ~1.1-1.2), scaleTo (number, ~1.35-1.45), transformOriginX (percent, 0-100, horizontal position of the subject's face), transformOriginY (percent, 0-100, vertical position of the subject's face), glowColor (CSS rgba string tuned to the image's palette, e.g. "rgba(196,84,79,0.55)")
+
+5. Candlelight Flicker — near-static framing with an organic warm-light flicker anchored at a fixed point. Best for: interiors with a visible candle/torch/fire light source. Do NOT pick this unless a flame or clearly motivated warm point-light source is actually visible in the image.
+   settings: glowX (fraction, 0-1, horizontal position of the light source), glowY (fraction, 0-1, vertical position of the light source), scaleFrom (number, ~1.03-1.08), scaleTo (number, ~1.1-1.2), transformOriginX (percent, 0-100), transformOriginY (percent, 0-100), flickerAmplitude (number, ~0.1-0.2)
+
+If nothing clearly matches, default to Ken Burns.
+
+Return only JSON: {"effect": "<exact treatment name from the numbered list above>", "settings": {<only that treatment's fields, as numbers/strings per the types above>}, "reason": "<one short sentence on why this fits the image>"}"#;
+    let response = reqwest::blocking::Client::new()
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": "gpt-4.1-mini",
+            "input": [{"role":"user","content":[
+                {"type":"input_text","text":prompt},
+                {"type":"input_image","image_url":image_url}
+            ]}],
+            "max_output_tokens": 700
+        }))
+        .send().map_err(|error| format!("Could not reach OpenAI: {error}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response.json()
+        .map_err(|error| format!("OpenAI returned an unreadable response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("OpenAI motion graphic analysis failed ({status}): {}", body.pointer("/error/message").and_then(|value| value.as_str()).unwrap_or("unknown error")));
+    }
+    let text = body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
+        .ok_or("OpenAI returned no motion graphic analysis.")?;
+    let cleaned = text.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let plan: MotionGraphicPlan = serde_json::from_str(cleaned).map_err(|_| "OpenAI motion graphic analysis was not valid JSON.".to_string())?;
+    if !MOTION_GRAPHIC_EFFECTS.contains(&plan.effect.as_str()) {
+        return Err(format!("OpenAI returned an unrecognized motion graphic effect: {}", plan.effect));
+    }
+    Ok(plan)
 }
 
 fn gemini_generatecontent_url(auth: &GeminiAuth, model: &str) -> String {

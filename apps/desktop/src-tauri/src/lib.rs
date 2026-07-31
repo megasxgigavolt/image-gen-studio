@@ -527,6 +527,47 @@ async fn plan_bulk_visuals(
 }
 
 #[tauri::command]
+async fn analyze_motion_graphics(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Timeline, String> {
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.analyze_motion_graphics(&video_id, |done, total| {
+            let _ = app.emit(
+                "motion_graphics_progress",
+                serde_json::json!({ "done": done, "total": total }),
+            );
+        })
+    })
+    .await
+    .map_err(|e| format!("Motion graphics analysis stopped unexpectedly: {e}"))?
+}
+
+#[tauri::command]
+fn set_timeline_clip_motion_graphic(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    effect: Option<String>,
+    settings_json: Option<String>,
+    reason: Option<String>,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_timeline_clip_motion_graphic(
+            &video_id,
+            &clip_id,
+            effect.as_deref(),
+            settings_json.as_deref(),
+            reason.as_deref(),
+        )
+    })
+}
+
+#[tauri::command]
 async fn approve_bulk_plan(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -954,6 +995,16 @@ fn set_timeline_clip_color_filter(
 ) -> Result<Timeline, String> {
     with_repository(state, |repository| {
         repository.set_timeline_clip_color_filter(&video_id, &clip_id, &preset, intensity)
+    })
+}
+
+#[tauri::command]
+fn clear_motion_graphics_for_all_clips(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.clear_motion_graphics_for_all_clips(&video_id)
     })
 }
 
@@ -2521,6 +2572,7 @@ pub fn run() {
             extract_image_settings_from_directive,
             suggest_still_prompt,
             plan_bulk_visuals,
+            analyze_motion_graphics,
             approve_bulk_plan,
             apply_creative_instructions_to_all,
             apply_style_directive_to_all,
@@ -2556,6 +2608,8 @@ pub fn run() {
             set_timeline_clip_transition_out,
             set_timeline_clip_motion_intensity,
             set_timeline_clip_color_filter,
+            set_timeline_clip_motion_graphic,
+            clear_motion_graphics_for_all_clips,
             apply_color_filter_to_all_clips,
             apply_motion_to_all_clips,
             apply_transition_in_to_all_clips,

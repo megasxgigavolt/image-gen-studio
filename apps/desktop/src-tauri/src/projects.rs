@@ -106,6 +106,34 @@ pub const MOTION_GRAPHIC_EFFECTS: [&str; 5] = [
     "Candlelight Flicker",
 ];
 
+/// Maps a MOTION_GRAPHIC_EFFECTS name onto the nearest existing
+/// `MOTION_PRESETS` value, so an assigned motion graphic is at least
+/// approximated in the canvas preview and ffmpeg export today, ahead of a
+/// real Remotion/ffmpeg port of the SOP's full effects. Only base camera
+/// movement carries over — glow, desaturation, ghost-trails, and flicker
+/// are lost in this approximation.
+fn approximate_motion_preset_for_effect(effect: &str, settings_json: Option<&str>) -> &'static str {
+    match effect {
+        "Ken Burns" => "ken-burns",
+        "Ominous Push-In" => "zoom-in-subject",
+        // Both are slow near-static pushes per the SOP (§5.5's "very subtle
+        // push-in — this effect should feel almost still"; §5.2 holds on the
+        // full grid before zooming) — flicker/panel-reveal have no equivalent.
+        "Candlelight Flicker" | "Sequential Panel Reveal" => "zoom-in",
+        "Speed Pan & Motion Blur" => {
+            // Direction from panXFrom/panXTo if present (SOP: sign encodes
+            // direction, positive-to-negative is left-to-right).
+            let settings: serde_json::Value = settings_json
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_else(|| json!({}));
+            let from = settings.get("panXFrom").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let to = settings.get("panXTo").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if from > to { "pan-right" } else { "pan-left" }
+        }
+        _ => "zoom-in",
+    }
+}
+
 const MIGRATION_001: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -4854,16 +4882,28 @@ Return JSON only:
     /// manually-overridden motion graphic treatment. `settings_json` and
     /// `reason` are cleared together with `effect` since they only make
     /// sense alongside an assigned effect.
+    /// Sets the AI-assigned/overridden motion graphic AND, when assigning
+    /// (not clearing), approximates it onto the existing `motion_preset`
+    /// field so it's actually visible in the canvas preview and rendered on
+    /// export via the ffmpeg pipeline (`video_export_engine.py`) — the SOP's
+    /// 5 richer effects (glow/desaturation/ghost-trails/flicker) still
+    /// aren't rendered, only their base camera movement is approximated.
     pub fn set_timeline_clip_motion_graphic(&self, video_id: &str, clip_id: &str, effect: Option<&str>, settings_json: Option<&str>, reason: Option<&str>) -> Result<Timeline, String> {
         if let Some(chosen) = effect {
             if !MOTION_GRAPHIC_EFFECTS.contains(&chosen) {
                 return Err("Unknown motion graphic effect.".into());
             }
         }
-        self.connection.execute(
-            "UPDATE timeline_clips SET motion_graphic_effect=?1, motion_graphic_settings_json=?2, motion_graphic_reason=?3 WHERE id=?4 AND video_id=?5",
-            params![effect, settings_json, reason, clip_id, video_id],
-        ).map_err(|e| e.to_string())?;
+        match effect.map(|chosen| approximate_motion_preset_for_effect(chosen, settings_json)) {
+            Some(preset) => self.connection.execute(
+                "UPDATE timeline_clips SET motion_graphic_effect=?1, motion_graphic_settings_json=?2, motion_graphic_reason=?3, motion_preset=?4 WHERE id=?5 AND video_id=?6",
+                params![effect, settings_json, reason, preset, clip_id, video_id],
+            ),
+            None => self.connection.execute(
+                "UPDATE timeline_clips SET motion_graphic_effect=?1, motion_graphic_settings_json=?2, motion_graphic_reason=?3 WHERE id=?4 AND video_id=?5",
+                params![effect, settings_json, reason, clip_id, video_id],
+            ),
+        }.map_err(|e| e.to_string())?;
         self.get_timeline(video_id)
     }
 

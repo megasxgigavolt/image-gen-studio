@@ -1237,14 +1237,14 @@ export const projectsClient = {
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
     return plan;
   },
-  async splitPlanSentence(videoId: string, sentenceId: string, splitAfterOffset: number): Promise<VisualPlanRecord> {
-    if (isTauri()) return invoke("split_plan_sentence", { videoId, sentenceId, splitAfterOffset });
+  async splitPlanSentence(videoId: string, sentenceId: string, leftText: string, rightText: string): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("split_plan_sentence", { videoId, sentenceId, leftText, rightText });
     const plan = await this.getVisualPlan(videoId);
     const targetNumber = Number(sentenceId.slice(1));
     const target = plan.sentences.find((s) => s.id === sentenceId);
     if (!target) throw new Error("Sentence was not found.");
-    const leftText = target.text.slice(0, splitAfterOffset).trim();
-    const rightText = target.text.slice(splitAfterOffset).trim();
+    leftText = leftText.trim();
+    rightText = rightText.trim();
     if (!leftText || !rightText) throw new Error("Split point must have text on both sides.");
     const leftWords = Math.max(1, leftText.split(/\s+/).length);
     const rightWords = Math.max(1, rightText.split(/\s+/).length);

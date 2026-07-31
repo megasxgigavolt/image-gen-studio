@@ -2350,10 +2350,11 @@ fn split_plan_sentence(
     state: State<'_, RepositoryState>,
     video_id: String,
     sentence_id: String,
-    split_after_offset: usize,
+    left_text: String,
+    right_text: String,
 ) -> Result<VisualPlan, String> {
     with_repository(state, |repository| {
-        repository.split_plan_sentence(&video_id, &sentence_id, split_after_offset)
+        repository.split_plan_sentence(&video_id, &sentence_id, &left_text, &right_text)
     })
 }
 

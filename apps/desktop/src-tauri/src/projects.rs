@@ -8000,21 +8000,29 @@ Return JSON only:
         self.get_visual_plan(video_id)
     }
 
-    /// Splits one sentence's text into two at `split_after_offset` (a byte
-    /// offset into the ORIGINAL text — e.g. the position right after a
-    /// period the user just typed), renumbering every later sentence id and
-    /// every group's `sentence_ids_json` (both snapshots) to keep the
-    /// gapless-consecutive-id chronology invariant (`validate_group_
-    /// chronology`) intact. No word-level timestamps exist per sentence
-    /// (confirmed: `visual_plan_sentences` has no per-word column), so
-    /// timing splits proportionally by word count either side of the
-    /// offset — the same approach `split_caption_clip` uses, just word-
-    /// count instead of that feature's true per-word timestamps.
+    /// Splits one sentence's text into two, given the two halves' text
+    /// directly (NOT a byte offset into whatever text happens to be stored
+    /// server-side) — the frontend sends the actual live-edited left/right
+    /// text, since the DOM being edited can already differ from what's in
+    /// the database (the just-typed period, plus any other unsaved edits
+    /// made earlier in the same editing session before the split
+    /// triggered). An offset computed against the live DOM text but applied
+    /// against stale server-side text silently splits at the wrong point —
+    /// this is what `split_caption_clip` already does it this way for the
+    /// same reason. Renumbers every later sentence id and every group's
+    /// `sentence_ids_json` (both snapshots) to keep the gapless-consecutive-
+    /// id chronology invariant (`validate_group_chronology`) intact. No
+    /// word-level timestamps exist per sentence (confirmed: `visual_plan_
+    /// sentences` has no per-word column), so timing splits proportionally
+    /// by word count either side — the same approach `split_caption_clip`
+    /// uses, just word-count instead of that feature's true per-word
+    /// timestamps.
     pub fn split_plan_sentence(
         &self,
         video_id: &str,
         sentence_id: &str,
-        split_after_offset: usize,
+        left_text: &str,
+        right_text: &str,
     ) -> Result<VisualPlan, String> {
         let plan = self.get_visual_plan(video_id)?;
         let target_number = sentence_number(sentence_id);
@@ -8023,10 +8031,8 @@ Return JSON only:
             .iter()
             .position(|s| s.id == sentence_id)
             .ok_or("Sentence was not found.")?;
-        let offset = split_after_offset.min(sentences[target_index].text.len());
-        let (left_raw, right_raw) = sentences[target_index].text.split_at(offset);
-        let left_text = left_raw.trim().to_string();
-        let right_text = right_raw.trim().to_string();
+        let left_text = left_text.trim().to_string();
+        let right_text = right_text.trim().to_string();
         if left_text.is_empty() || right_text.is_empty() {
             return Err("Split point must have text on both sides.".into());
         }
@@ -9642,7 +9648,8 @@ mod tests {
 
         let first = original.sentences[0].clone();
         let offset = (first.text.len() / 2).max(1);
-        let after_split = repo.split_plan_sentence(&video.id, &first.id, offset).unwrap();
+        let (left_text, right_text) = first.text.split_at(offset);
+        let after_split = repo.split_plan_sentence(&video.id, &first.id, left_text, right_text).unwrap();
         assert_eq!(after_split.sentences.len(), original.sentences.len() + 1);
         assert_groups_reference_real_sentences(&after_split);
         assert_ids_are_gapless(&after_split);
@@ -9720,7 +9727,9 @@ mod tests {
         let after_merge = repo
             .merge_plan_sentences(&video.id, &original.sentences[0].id, &original.sentences[1].id)
             .unwrap();
-        repo.split_plan_sentence(&video.id, &after_merge.sentences[0].id, 5).unwrap();
+        let merged_text = &after_merge.sentences[0].text;
+        let (left_text, right_text) = merged_text.split_at(5.min(merged_text.len()));
+        repo.split_plan_sentence(&video.id, &after_merge.sentences[0].id, left_text, right_text).unwrap();
 
         // Merge (3->2 sentences) then split (2->3) nets back to the same
         // COUNT by coincidence — text is the reliable signal that the plan

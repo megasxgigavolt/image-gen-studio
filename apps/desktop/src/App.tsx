@@ -980,13 +980,16 @@ function VisualPlanView() {
   // scan of the whole text for "does a period exist anywhere," which used
   // to misfire on backspace (or any edit) whenever the sentence already had
   // an unrelated period elsewhere, e.g. its own normal trailing full stop.
-  // `offset` is the cursor position right after that period, already
-  // resolved from the live selection by the caller.
-  function onPeriodTyped(sentenceId: string, offset: number) {
+  // Takes the actual left/right text the caller already sliced from the
+  // LIVE DOM content (not an offset re-applied against whatever's in the
+  // database — those can differ by the just-typed period alone, or more if
+  // earlier edits in the same session were never persisted, which silently
+  // split at the wrong point).
+  function onPeriodTyped(sentenceId: string, leftText: string, rightText: string) {
     if (!activeVideoId) return;
     setEditingSentenceId(null);
     setEditText("");
-    projectsClient.splitPlanSentence(activeVideoId, sentenceId, offset)
+    projectsClient.splitPlanSentence(activeVideoId, sentenceId, leftText, rightText)
       .then(setPlan)
       .catch((caught) => setError(String(caught)));
   }
@@ -1059,7 +1062,7 @@ function VisualPlanView() {
                     editText={editText}
                     onStartEdit={() => startEditingSentence(sentence)}
                     onChangeText={onEditTextChange}
-                    onPeriodTyped={(offset) => onPeriodTyped(sentence.id, offset)}
+                    onPeriodTyped={(leftText, rightText) => onPeriodTyped(sentence.id, leftText, rightText)}
                     onCommit={() => void commitSentenceEdit(sentence.id)}
                     onCancel={() => setEditingSentenceId(null)}
                   />
@@ -1130,7 +1133,7 @@ function DraggableSentence({
   editText: string;
   onStartEdit: () => void;
   onChangeText: (value: string) => void;
-  onPeriodTyped: (offset: number) => void;
+  onPeriodTyped: (leftText: string, rightText: string) => void;
   onCommit: () => void;
   onCancel: () => void;
 }) {
@@ -1187,7 +1190,10 @@ function DraggableSentence({
           const range = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
           const offset = range && range.endContainer.nodeType === Node.TEXT_NODE ? range.endOffset : null;
           if (offset === null || text.slice(offset).trim().length === 0) return;
-          onPeriodTyped(offset);
+          // Sliced from this live DOM text (which already includes the
+          // period just typed, plus anything else edited this session) —
+          // never re-applied as an offset against server-side text later.
+          onPeriodTyped(text.slice(0, offset), text.slice(offset));
         }}
         onBlur={onCommit}
         onKeyDown={(event) => {

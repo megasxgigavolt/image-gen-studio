@@ -661,10 +661,18 @@ function InputsView() {
   });
   const scriptFileRef = useRef<HTMLInputElement>(null);
   const audioFileRef = useRef<HTMLInputElement>(null);
+  // Pacing is part of this signature so that changing it after a plan
+  // already exists flips "View visual plan →" back to "Generate visual
+  // plan →" — the same existing mechanism that already prompts a
+  // regeneration when the script or audio changes — rather than silently
+  // leaving the stale plan in place with no indication pacing didn't apply.
   const inputSignature = useMemo(() => JSON.stringify({
     script,
     audioId: audio?.id ?? null,
-  }), [audio?.id, script]);
+    pacingPreset,
+    pacingMin,
+    pacingMax,
+  }), [audio?.id, script, pacingPreset, pacingMin, pacingMax]);
 
   useEffect(() => {
     if (!activeVideoId) return;
@@ -677,9 +685,16 @@ function InputsView() {
       setAudio(inputs.audio);
       setStatus("Saved locally");
       setHydrated(true);
+      // Must mirror inputSignature's shape exactly — this is the baseline
+      // it's compared against, computed here from the just-loaded inputs
+      // rather than from component state (which hasn't re-rendered with
+      // the setPacing* calls above yet at this point in the callback).
       const signature = JSON.stringify({
         script: inputs.scriptText,
         audioId: inputs.audio?.id ?? null,
+        pacingPreset: inputs.pacingPreset,
+        pacingMin: inputs.pacingMinSeconds,
+        pacingMax: inputs.pacingMaxSeconds,
       });
       void projectsClient.getVisualPlan(activeVideoId)
         .then(() => { setHasPlan(true); setGeneratedInputSignature(signature); })

@@ -536,9 +536,17 @@ async fn analyze_motion_graphics(
 ) -> Result<Timeline, String> {
     let (database_path, projects_dir) =
         with_repository(state, |repository| Ok(repository.paths()))?;
+    let engine_dir = if cfg!(debug_assertions) {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../services/python-engine")
+    } else {
+        app.path()
+            .resource_dir()
+            .map_err(|e| format!("Could not locate app resource directory: {e}"))?
+            .join("python-engine")
+    };
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
-        repository.analyze_motion_graphics(&video_id, |done, total| {
+        repository.analyze_motion_graphics(&video_id, &engine_dir, |done, total| {
             let _ = app.emit(
                 "motion_graphics_progress",
                 serde_json::json!({ "done": done, "total": total }),
@@ -1485,8 +1493,13 @@ fn spawn_job_workers(
     projects_dir: std::path::PathBuf,
     job_id: String,
 ) {
-    // Vertex image quotas are commonly burst-limited. A single paced worker avoids
-    // parallel 429 storms while still allowing the batch to continue after failures.
+    // Back to a single worker: two concurrent workers both hitting Gemini's image-gen
+    // endpoint turned out to cause real 429s (Gemini's image quota is tightly
+    // rate-limited per-project), not just a theoretical risk — in practice this showed
+    // up as both slower overall throughput (two workers backing off 30-240s at once)
+    // and stills stuck failing after 5 attempts because their retries kept colliding
+    // with the other worker's requests. One worker paced by the 1s gap below avoids
+    // that self-inflicted contention entirely.
     for _ in 0..1 {
         let database_path = database_path.clone();
         let projects_dir = projects_dir.clone();
@@ -1495,11 +1508,25 @@ fn spawn_job_workers(
             let Ok(repository) = ProjectRepository::open(&database_path, &projects_dir) else {
                 return;
             };
+            // One automatic extra pass over anything that ends up 'failed' during this
+            // run, once the normal queue empties — a still that hit a real rate-limit
+            // 429 earlier may well succeed once retried after the rest of the batch has
+            // gone by. Capped at one sweep (not unlimited) so a genuinely broken setup
+            // (bad key, no quota at all) can't loop forever instead of ever settling.
+            let mut auto_retry_sweeps_remaining = 1;
             loop {
-                let Ok(Some((item_id, video_id, group_id, prompt))) =
-                    repository.claim_job_item(&job_id)
-                else {
-                    break;
+                let (item_id, video_id, group_id, prompt) = match repository.claim_job_item(&job_id) {
+                    Ok(Some(item)) => item,
+                    Ok(None) => {
+                        if auto_retry_sweeps_remaining > 0 {
+                            auto_retry_sweeps_remaining -= 1;
+                            if matches!(repository.requeue_failed_job_items(&job_id), Ok(count) if count > 0) {
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    Err(_) => break,
                 };
                 let mut last_error = String::new();
                 let mut render_id = None;
@@ -1529,12 +1556,19 @@ fn spawn_job_workers(
                                     || last_error
                                         .to_ascii_lowercase()
                                         .contains("resource exhausted");
+                                // A per-minute rate-limit window can't reliably clear in
+                                // 5s (confirmed: real 429s still happened with that short a
+                                // wait) — but it also doesn't need the original 240s. This
+                                // ladder guarantees at least one wait past a full 60s
+                                // window by the 3rd attempt: 15s/30s/60s/75s (180s worst
+                                // case across all 4 waits, vs. 75s too short / 450s too
+                                // long).
                                 let delay = if rate_limited {
-                                    30 * 2_u64.pow(attempt)
+                                    15 * 2_u64.pow(attempt)
                                 } else {
                                     3 * 2_u64.pow(attempt)
                                 };
-                                let mut remaining = delay.min(240);
+                                let mut remaining = delay.min(75);
                                 while remaining > 0 {
                                     if matches!(
                                         repository.image_job_status(&job_id).ok().as_deref(),
@@ -1557,15 +1591,17 @@ fn spawn_job_workers(
                 }
                 let result = render_id.ok_or(last_error);
                 let _ = repository.finish_job_item(&job_id, &item_id, result);
-                for _ in 0..8 {
-                    if matches!(
-                        repository.image_job_status(&job_id).ok().as_deref(),
-                        Some("stopped") | Some("failed")
-                    ) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_secs(1));
+                // Brief politeness gap between items on this worker — this used to be a
+                // flat 8s, which was pure idle time on every single item regardless of
+                // whether anything was actually rate-limited (that case is already
+                // handled reactively above with real backoff).
+                if matches!(
+                    repository.image_job_status(&job_id).ok().as_deref(),
+                    Some("stopped") | Some("failed")
+                ) {
+                    break;
                 }
+                thread::sleep(Duration::from_secs(1));
             }
         });
     }

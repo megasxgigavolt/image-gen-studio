@@ -1,0 +1,21 @@
+{
+  "name": "@auto-gen-studio/motion-engine",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Parameterized Remotion render engine for Auto Gen Studio's AI-selected motion-graphic treatments. Invoked per-clip by the Python export engine (see services/python-engine/auto_gen_engine/video_export_engine.py) with a props JSON produced from a timeline clip's motion_graphic_effect + motion_graphic_settings_json.",
+  "scripts": {
+    "render": "remotion render src/index.ts MotionClip",
+    "studio": "remotion studio"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.286",
+    "@remotion/transitions": "4.0.286",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "remotion": "4.0.286"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.1",
+    "typescript": "5.5.4"
+  }
+}

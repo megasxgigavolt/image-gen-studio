@@ -18,15 +18,17 @@ export type MotionGraphicEffectDef = {
   defaults: Record<string, number | string>;
 };
 
-/** Registry of the 5 treatments documented in SOPs/Motion_Graphics_SOP_v1.md.
- * Metadata only — see the Rust MOTION_GRAPHIC_EFFECTS const's doc comment;
- * these settings aren't wired into video export rendering yet. */
+/** Registry of the 7 treatments documented in SOPs/Motion_Graphics_SOP_v1.md.
+ * Rendered for real at export time by services/motion-engine's `MotionClip`
+ * composition (see video_export_engine.py's `_render_motion_graphic`) — see
+ * the Rust MOTION_GRAPHIC_EFFECTS const's doc comment for how the settings
+ * saved here flow all the way through to the exported video. */
 export const MOTION_GRAPHIC_EFFECTS: MotionGraphicEffectDef[] = [
   {
     id: "Ken Burns",
     label: "Ken Burns",
     summary: "Classic documentary push-in combined with a diagonal pan.",
-    bestFor: "Dialogue scenes, two-subject compositions, any shot with clear foreground/background separation. The safe default when nothing else clearly fits.",
+    bestFor: "Dialogue scenes, two-subject compositions, any shot with clear foreground/background separation and calm/expository narration.",
     fields: [
       { key: "scaleFrom", label: "Scale from", type: "range", min: 1.0, max: 1.3, step: 0.01 },
       { key: "scaleTo", label: "Scale to", type: "range", min: 1.1, max: 1.6, step: 0.01 },
@@ -88,6 +90,38 @@ export const MOTION_GRAPHIC_EFFECTS: MotionGraphicEffectDef[] = [
       { key: "flickerAmplitude", label: "Flicker amplitude", type: "range", min: 0.05, max: 0.3, step: 0.01 },
     ],
     defaults: { glowX: 0.935, glowY: 0.1, scaleFrom: 1.05, scaleTo: 1.16, transformOriginX: 62, transformOriginY: 55, flickerAmplitude: 0.15 },
+  },
+  {
+    id: "Focus Pull",
+    label: "Focus Pull",
+    summary: "A blurred wide view racks into sharp focus on the subject — depth-of-field push, no cutout needed.",
+    bestFor: "A moment of realization, a detail the narration calls out, introducing a specific character/object within a busier scene.",
+    fields: [
+      { key: "transformOriginX", label: "Subject position X (%)", type: "range", min: 0, max: 100, step: 1 },
+      { key: "transformOriginY", label: "Subject position Y (%)", type: "range", min: 0, max: 100, step: 1 },
+      { key: "startBlurPx", label: "Start blur (px)", type: "range", min: 4, max: 24, step: 1 },
+      { key: "endBlurPx", label: "End blur (px)", type: "range", min: 0, max: 6, step: 0.5 },
+      { key: "maskRadius", label: "Sharp-circle radius", type: "range", min: 0.15, max: 0.5, step: 0.01 },
+      { key: "scaleFrom", label: "Scale from", type: "range", min: 1.0, max: 1.1, step: 0.01 },
+      { key: "scaleTo", label: "Scale to", type: "range", min: 1.05, max: 1.2, step: 0.01 },
+    ],
+    defaults: { transformOriginX: 50, transformOriginY: 50, startBlurPx: 14, endBlurPx: 0, maskRadius: 0.3, scaleFrom: 1.05, scaleTo: 1.14 },
+  },
+  {
+    id: "Iris Reveal",
+    label: "Iris Reveal",
+    summary: "A circular wipe opens over the subject, revealing the frame from a point outward.",
+    bestFor: "An unveiling/presentation beat, a dramatic entrance, a reveal the narration is building toward — not a neutral default choice.",
+    fields: [
+      { key: "revealX", label: "Reveal X (0-1)", type: "range", min: 0, max: 1, step: 0.01 },
+      { key: "revealY", label: "Reveal Y (0-1)", type: "range", min: 0, max: 1, step: 0.01 },
+      { key: "startRadius", label: "Start radius", type: "range", min: 0, max: 0.1, step: 0.005 },
+      { key: "endRadius", label: "End radius", type: "range", min: 0.5, max: 1.0, step: 0.01 },
+      { key: "holdBeforeFrames", label: "Hold before (frames)", type: "range", min: 0, max: 30, step: 1 },
+      { key: "scaleFrom", label: "Scale from", type: "range", min: 1.0, max: 1.1, step: 0.01 },
+      { key: "scaleTo", label: "Scale to", type: "range", min: 1.02, max: 1.2, step: 0.01 },
+    ],
+    defaults: { revealX: 0.5, revealY: 0.5, startRadius: 0.02, endRadius: 0.9, holdBeforeFrames: 8, scaleFrom: 1.02, scaleTo: 1.08 },
   },
 ];
 

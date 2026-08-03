@@ -135,6 +135,13 @@ def build_segments(stills: list[dict], duration_seconds: float) -> list[dict]:
                 "subjectX": still.get("subjectX", 0.5), "subjectY": still.get("subjectY", 0.5),
                 "colorFilter": still.get("colorFilter", "none"),
                 "colorFilterIntensity": still.get("colorFilterIntensity", 50.0),
+                # An AI-assigned (or manually overridden) SOP motion-graphic
+                # treatment takes priority over the plain `motion` zoompan
+                # preset above when present — see _encode_segment_to_path's
+                # "image" branch. `motion` above still travels through as the
+                # fallback for stills that were never assigned one.
+                "motionGraphicEffect": still.get("motionGraphicEffect"),
+                "motionGraphicSettings": still.get("motionGraphicSettings"),
             })
         cursor = max(cursor, end)
     if cursor < duration_seconds - 1e-6:
@@ -445,6 +452,88 @@ def run_ffmpeg(args: list[str]) -> None:
         raise RuntimeError(f"ffmpeg failed: {result.stderr[-2000:]}")
 
 
+# services/motion-engine — the parameterized Remotion project that actually
+# renders the 7 SOP motion-graphic treatments (Ken Burns, Sequential Panel
+# Reveal, Speed Pan & Motion Blur, Ominous Push-In, Candlelight Flicker,
+# Focus Pull, Iris Reveal). Sibling of python-engine under services/.
+MOTION_ENGINE_DIR = Path(__file__).resolve().parents[2] / "motion-engine"
+
+
+def _resolve_node_bin(name: str) -> str:
+    """`shutil.which` (unlike a bare `subprocess.run(["npm", ...])`) correctly
+    follows PATHEXT on Windows, where npm/npx are `.cmd` shims rather than
+    `.exe` files — `subprocess.run` without `shell=True` can't find those by
+    bare name and fails with WinError 2."""
+    resolved = shutil.which(name)
+    if not resolved:
+        raise RuntimeError(
+            f"'{name}' was not found on PATH. Rendering AI-assigned motion-graphic "
+            "treatments requires Node.js — install it from nodejs.org and try again."
+        )
+    return resolved
+
+
+def _ensure_motion_engine_ready() -> None:
+    """One-time `npm install` for services/motion-engine, mirroring this
+    module's own `_check_deps()`-style self-installing philosophy — a fresh
+    checkout/install shouldn't need a manual setup step before AI motion
+    graphics can render for the first time."""
+    if (MOTION_ENGINE_DIR / "node_modules").exists():
+        return
+    result = subprocess.run(
+        [_resolve_node_bin("npm"), "install"], cwd=str(MOTION_ENGINE_DIR),
+        capture_output=True, text=True, **_subprocess_kwargs(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not install the motion-graphics render engine: {result.stderr[-2000:]}"
+        )
+
+
+def _render_motion_graphic(
+    image_path: str, effect: str, settings: dict,
+    frames: int, fps: int, width: int, height: int, out_path: Path,
+) -> None:
+    """Renders one clip's AI-assigned (or manually overridden) SOP treatment
+    via services/motion-engine's generalized `MotionClip` composition,
+    writing a plain MP4 to `out_path` — the caller (`_encode_segment_to_path`)
+    still applies this segment's own color filter / transition fades and the
+    exact output frame count on top of this in a second, ordinary ffmpeg
+    pass, same as every other segment kind. `--public-dir` points Remotion's
+    headless Chromium at the still's own folder so `staticFile(imagePath)`
+    inside the composition can load it — Chromium refuses to load `file://`
+    URLs outside a folder it's been told is servable."""
+    _ensure_motion_engine_ready()
+    image_file = Path(image_path)
+    props = {
+        "imagePath": image_file.name,
+        "effect": effect,
+        "settings": settings,
+        "durationInFrames": max(1, frames),
+        "fps": fps,
+        "width": width,
+        "height": height,
+    }
+    props_path = out_path.with_suffix(".props.json")
+    props_path.write_text(json.dumps(props), encoding="utf-8")
+    try:
+        result = subprocess.run(
+            [
+                _resolve_node_bin("npx"), "remotion", "render", "src/index.ts", "MotionClip", str(out_path),
+                f"--props={props_path}",
+                f"--public-dir={image_file.parent}",
+                "--log=error",
+            ],
+            cwd=str(MOTION_ENGINE_DIR), capture_output=True, text=True, **_subprocess_kwargs(),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Motion-graphics render failed for {effect!r}: {result.stderr[-2000:]}"
+            )
+    finally:
+        props_path.unlink(missing_ok=True)
+
+
 def _encode_segment_to_path(
     segment: dict, out_path: Path, width: int, height: int, fps: int,
 ) -> None:
@@ -468,7 +557,47 @@ def _encode_segment_to_path(
     output_frames = segment["frames"]
     original_frames = segment.get("_originalFrames", output_frames)
     trim_start_frames = segment.get("_trimStartFrames", 0)
-    if segment["kind"] == "image":
+    if segment["kind"] == "image" and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings"):
+        # AI-assigned (or manually overridden) SOP treatment: render the real
+        # effect via services/motion-engine instead of approximating it with
+        # a zoompan preset, then apply this segment's own color filter and
+        # transition fades on top in an ordinary second ffmpeg pass — same
+        # post-processing every other segment kind already gets.
+        raw_path = out_path.with_suffix(".raw.mp4")
+        _render_motion_graphic(
+            segment["path"], segment["motionGraphicEffect"], segment["motionGraphicSettings"],
+            original_frames, fps, width, height, raw_path,
+        )
+        vf_parts = []
+        color_vf = build_color_filter_vf(
+            segment.get("colorFilter", "none"), segment.get("colorFilterIntensity", 50.0)
+        )
+        if color_vf:
+            vf_parts.append(color_vf)
+        fade_in_duration = max(0.15, min(duration / 2, duration * 0.08))
+        fade_out_duration = max(0.15, min(duration / 2, duration * 0.08))
+        transition_in = segment.get("transitionIn", "cut")
+        transition_out = segment.get("transitionOut", "cut")
+        if transition_in in ("fade", "dip-to-white"):
+            in_color = "white" if transition_in == "dip-to-white" else "black"
+            vf_parts.append(f"fade=t=in:st=0:d={fade_in_duration:.3f}:color={in_color}")
+        if transition_out in ("fade", "dip-to-white"):
+            out_color = "white" if transition_out == "dip-to-white" else "black"
+            vf_parts.append(
+                f"fade=t=out:st={max(0.0, duration - fade_out_duration):.3f}:d={fade_out_duration:.3f}:color={out_color}"
+            )
+        if trim_start_frames > 0:
+            vf_parts.insert(0, f"trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS")
+        vf = ",".join(vf_parts) if vf_parts else "null"
+        try:
+            run_ffmpeg([
+                "-y", "-i", str(raw_path),
+                "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+                "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
+            ])
+        finally:
+            raw_path.unlink(missing_ok=True)
+    elif segment["kind"] == "image":
         vf = build_image_filter(
             segment.get("motion", "none"),
             segment.get("transitionIn", "cut"),

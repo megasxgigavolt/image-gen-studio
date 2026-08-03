@@ -9,6 +9,7 @@
 dist/
 build/
 *.spec
+out/
 
 # Runtime / user data
 generation_state.json

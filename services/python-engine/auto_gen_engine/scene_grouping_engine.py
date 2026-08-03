@@ -55,6 +55,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, Sequence
 
+from ai_client import get_openai_client, parse_structured
+
 try:
     from dotenv import load_dotenv
 
@@ -504,71 +506,6 @@ def align_script_to_words(
         )
 
     return repaired
-
-
-def get_openai_client():
-    try:
-        from openai import OpenAI
-    except ImportError as error:
-        raise RuntimeError(
-            "OpenAI is not installed. Run: pip install openai"
-        ) from error
-
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise RuntimeError(
-            "OPENAI_API_KEY is not configured. Add it in Auto Gen Studio settings."
-        )
-
-    return OpenAI(timeout=120.0, max_retries=1)
-
-
-def parse_structured(
-    client,
-    model: str,
-    system_prompt: str,
-    user_payload: dict,
-    response_model,
-):
-    """
-    Prefer the current Responses API parser. Fall back to the older structured
-    Chat Completions parser for compatible openai package versions.
-    """
-    input_messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": json.dumps(user_payload, ensure_ascii=False),
-        },
-    ]
-
-    responses_api = getattr(client, "responses", None)
-    if responses_api is not None and hasattr(responses_api, "parse"):
-        response = responses_api.parse(
-            model=model,
-            input=input_messages,
-            text_format=response_model,
-        )
-        parsed = getattr(response, "output_parsed", None)
-        if parsed is None:
-            raise RuntimeError("OpenAI returned no parsed structured output.")
-        return parsed
-
-    beta = getattr(client, "beta", None)
-    if beta is not None:
-        response = beta.chat.completions.parse(
-            model=model,
-            messages=input_messages,
-            response_format=response_model,
-        )
-        parsed = response.choices[0].message.parsed
-        if parsed is None:
-            raise RuntimeError("OpenAI returned no parsed structured output.")
-        return parsed
-
-    raise RuntimeError(
-        "The installed openai package does not support structured parsing. "
-        "Upgrade it with: pip install --upgrade openai"
-    )
 
 
 def analyze_sentences_pass1(

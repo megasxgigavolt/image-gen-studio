@@ -241,7 +241,9 @@ export type MotionGraphicEffect =
   | "Sequential Panel Reveal"
   | "Speed Pan & Motion Blur"
   | "Ominous Push-In"
-  | "Candlelight Flicker";
+  | "Candlelight Flicker"
+  | "Focus Pull"
+  | "Iris Reveal";
 
 export type MediaLibraryKind = "still" | "clip" | "audio";
 export type MediaLibraryAssetRecord = {

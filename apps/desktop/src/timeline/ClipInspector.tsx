@@ -279,11 +279,12 @@ export function ClipInspector({
           <span className="tl-inspector-label"><Film size={12} />Motion Graphics</span>
           {!selectedClip.motionGraphicEffect && (
             <p className="tl-source-hint">
-              OpenAI inspects this still against 5 documented camera-movement treatments — Ken Burns, Sequential
-              Panel Reveal, Speed Pan &amp; Motion Blur, Ominous Push-In, and Candlelight Flicker — and picks the
-              best fit. Run it from the Motion Graphics button in the toolbar above. The base camera movement is
-              approximated onto Camera Movement below (visible in preview and export) — glow, desaturation, and
-              flicker from the full treatment aren't rendered yet.
+              OpenAI inspects every still on the timeline together with its narration against 7 documented
+              camera-movement treatments — Ken Burns, Sequential Panel Reveal, Speed Pan &amp; Motion Blur,
+              Ominous Push-In, Candlelight Flicker, Focus Pull, and Iris Reveal — and picks the best fit for each,
+              balancing the mix across the whole video. Run it from the Motion Graphics button in the toolbar
+              above. The assigned treatment renders for real at export time (glow, desaturation, blur, and
+              flicker included); Camera Movement below only shows a rough approximation for the live preview.
             </p>
           )}
           {selectedClip.motionGraphicEffect && (

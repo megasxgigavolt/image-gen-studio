@@ -91,27 +91,33 @@ pub const VALID_TRANSITIONS: [&str; 7] = [
 pub const COLOR_FILTER_PRESETS: [&str; 7] = ["none", "warm", "cool", "cinematic", "bright", "muted", "dark"];
 
 /// Shared validation list for `timeline_clips.motion_graphic_effect` — the
-/// 5 treatments documented in `SOPs/Motion_Graphics_SOP_v1.md`. Metadata
-/// only: this is an AI-assigned recommendation + its tunable settings for a
-/// future rendering pass, not wired into `video_export_engine.py` today.
-/// Distinct from (and not to be confused with) `MOTION_PRESETS`'s simpler
-/// `"ken-burns"` value above, which the ffmpeg export pipeline already
-/// renders — that preset predates and is unrelated to this SOP's richer
-/// "Ken Burns" treatment.
-pub const MOTION_GRAPHIC_EFFECTS: [&str; 5] = [
+/// 7 treatments documented in `SOPs/Motion_Graphics_SOP_v1.md` and rendered
+/// for real by `services/motion-engine`'s `MotionClip` composition at export
+/// time (see `video_export_engine.py`'s `_render_motion_graphic`). Distinct
+/// from (and not to be confused with) `MOTION_PRESETS`'s simpler `"ken-burns"`
+/// value above, which the ffmpeg zoompan pipeline renders for clips that were
+/// never assigned one of these 7 — `approximate_motion_preset_for_effect`
+/// below still maps this richer set onto that simpler one, but only for the
+/// live canvas preview now, not for the real export.
+pub const MOTION_GRAPHIC_EFFECTS: [&str; 7] = [
     "Ken Burns",
     "Sequential Panel Reveal",
     "Speed Pan & Motion Blur",
     "Ominous Push-In",
     "Candlelight Flicker",
+    "Focus Pull",
+    "Iris Reveal",
 ];
 
 /// Maps a MOTION_GRAPHIC_EFFECTS name onto the nearest existing
-/// `MOTION_PRESETS` value, so an assigned motion graphic is at least
-/// approximated in the canvas preview and ffmpeg export today, ahead of a
-/// real Remotion/ffmpeg port of the SOP's full effects. Only base camera
-/// movement carries over — glow, desaturation, ghost-trails, and flicker
-/// are lost in this approximation.
+/// `MOTION_PRESETS` value for the canvas's instant-scrub live preview only
+/// (`timeline-rendering.ts`'s `applyMotion`) — the real export no longer uses
+/// this approximation for a clip that has a `motion_graphic_effect` assigned;
+/// it renders the actual treatment via `services/motion-engine` instead (see
+/// `video_export_engine.py`'s `_render_motion_graphic`). This function stays
+/// only because re-running a full Remotion/Chromium render on every timeline
+/// scrub would make the editor unusably slow — the preview trades exactness
+/// for speed, the export doesn't have to.
 fn approximate_motion_preset_for_effect(effect: &str, settings_json: Option<&str>) -> &'static str {
     match effect {
         // Zoom + pan from off-center toward center — the one preset that
@@ -125,7 +131,7 @@ fn approximate_motion_preset_for_effect(effect: &str, settings_json: Option<&str
         // now use to anchor the push — a steep, content-aware push toward
         // the detected subject, no pan, distinct from Ken Burns's combined
         // zoom+pan toward frame-center.
-        "Ominous Push-In" => "zoom-in-subject",
+        "Ominous Push-In" | "Focus Pull" | "Iris Reveal" => "zoom-in-subject",
         // A pulse (in, then back out) reads as "breathing" — the closest
         // available analog to an organic flicker; a flat zoom wouldn't.
         "Candlelight Flicker" => "zoom-pulse",
@@ -148,6 +154,16 @@ fn approximate_motion_preset_for_effect(effect: &str, settings_json: Option<&str
         }
         _ => "zoom-in",
     }
+}
+
+/// Parses a `TimelineClip`'s raw `motion_graphic_settings_json` string
+/// column into a `serde_json::Value` for embedding directly in the export
+/// manifest — `video_export_engine.py` needs a real JSON object under
+/// `motionGraphicSettings`, not a JSON-encoded string.
+fn motion_graphic_settings_value(clip: &TimelineClip) -> Option<serde_json::Value> {
+    clip.motion_graphic_settings_json
+        .as_ref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
 }
 
 const MIGRATION_001: &str = r#"
@@ -776,14 +792,6 @@ pub struct ProviderKeyStatus {
 pub struct StyleExtraction {
     pub style_directive: String,
     pub image_settings: serde_json::Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MotionGraphicPlan {
-    pub effect: String,
-    pub settings: serde_json::Value,
-    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2659,6 +2667,13 @@ impl ProjectRepository {
         ).map_err(|_| "Render not found.".to_string())?;
         let src = self.render_absolute_path(&render)?;
         let dest_dir = std::path::Path::new(dest_folder);
+        // The remembered download folder (saved app-wide after the first pick — see
+        // downloadStill in App.tsx) can go stale if the user later moves, renames, or
+        // deletes it outside the app. Recreate it rather than failing with a raw "path
+        // not found" error — that's what a "download" action should do when its target
+        // folder is simply gone, the same way browsers do.
+        fs::create_dir_all(dest_dir)
+            .map_err(|e| format!("Could not create download folder {}: {e}", dest_dir.display()))?;
         let dest = dest_dir.join(&render.file_name);
         fs::copy(&src, &dest).map_err(|e| e.to_string())?;
         Ok(render.file_name)
@@ -2991,11 +3006,26 @@ Return exactly one plan for every supplied row, in the same order."#,
     }
 
     pub fn extract_image_settings_from_directive(&self, directive: &str) -> Result<StyleExtraction, String> {
-        // Prefer OpenAI; fall back to Gemini if no OpenAI key is configured
+        // Prefer OpenAI (which internally falls back across OpenAI model tiers on
+        // failure — see request_openai_directive_extract). Gemini is the last resort:
+        // used when no OpenAI key is configured at all, OR when every OpenAI model
+        // tier failed (e.g. an org-wide $0-balance billing gate, which blocks every
+        // OpenAI model identically — no amount of OpenAI-side retrying gets past that).
         if let Some(key) = self.get_provider_key("openai")? {
-            return request_openai_directive_extract(&key, directive);
+            match request_openai_directive_extract(&key, directive) {
+                Ok(result) => return Ok(result),
+                Err(openai_error) => match self.gemini_auth() {
+                    Ok(auth) => return self.extract_image_settings_via_gemini(&auth, directive)
+                        .map_err(|gemini_error| format!("{openai_error} (Gemini fallback also failed: {gemini_error})")),
+                    Err(_) => return Err(openai_error),
+                },
+            }
         }
         let auth = self.gemini_auth()?;
+        self.extract_image_settings_via_gemini(&auth, directive)
+    }
+
+    fn extract_image_settings_via_gemini(&self, auth: &GeminiAuth, directive: &str) -> Result<StyleExtraction, String> {
         let prompt = format!(
             r#"You are a visual production assistant. Your job is to clean up a Style Directive so it contains ONLY global visual style rules — nothing about specific subjects, characters, objects, or scene content.
 
@@ -3026,7 +3056,7 @@ Only populate imageSettings if the directive specifies a concrete per-shot value
 Return JSON only — no markdown, no explanation:
 {{"styleDirective":"<global style rules only>","imageSettings":{{"<field>":"<value>"}}}}"#
         );
-        let text = request_gemini_text(&auth, &prompt)?;
+        let text = request_gemini_text(auth, &prompt)?;
         let cleaned = extract_json_from_text(&text);
         serde_json::from_str(cleaned).map_err(|_| "Style extraction was not valid JSON.".to_string())
     }
@@ -3067,7 +3097,21 @@ Return JSON only — no markdown, no explanation:
             .ok_or("Character Consistency requires a reference image — upload one in Bulk Gen Config first.")?;
         let prompt = "Identify the single main character or protagonist in this reference image (a person, animal, or creature — not a background object or environment). Write a concise, reusable physical description of that character for an illustrator to redraw consistently across dozens of separate scenes. You MUST explicitly cover: species/type; approximate age; physical proportions and build; exact hair color, length, and style (or fur/feather coloring and pattern if not human) — this is the single most common detail illustrators get inconsistent, so describe it precisely; eye color; skin/fur tone; and any distinguishing marks or features. Deliberately do NOT describe clothing, outfit, or props — those must change scene-to-scene to match each still's own context, not stay fixed like the physical identity. Do not describe the pose, background, camera angle, or art/rendering style either — only the character's inherent physical identity, in 4-6 sentences of plain prose. If no clear single character is present, describe the closest candidate subject instead. Return only the description, no preamble, no labels, no markdown.";
         match openai_key {
-            Some(key) => request_openai_character_description(key, prompt, &media_type, &bytes),
+            // Try a second OpenAI model tier before reaching for Gemini (stays on the
+            // high-quota free tier); Gemini is the true last resort, for when an
+            // org-wide $0-balance billing gate blocks every OpenAI model identically.
+            Some(key) => match request_openai_character_description(key, prompt, &media_type, &bytes, "gpt-4.1-mini") {
+                Ok(result) => Ok(result),
+                Err(primary_error) => match request_openai_character_description(key, prompt, &media_type, &bytes, OPENAI_PRIMARY_HIGH_QUOTA_MODEL) {
+                    Ok(result) => Ok(result),
+                    Err(secondary_error) => match gemini_auth.as_ref() {
+                        Some(auth) => request_gemini_vision(auth, prompt, &media_type, &bytes).map_err(|gemini_error| {
+                            format!("{primary_error} (fallback model also failed: {secondary_error}; Gemini fallback also failed: {gemini_error})")
+                        }),
+                        None => Err(format!("{primary_error} (fallback model also failed: {secondary_error})")),
+                    },
+                },
+            },
             None => request_gemini_vision(
                 gemini_auth.as_ref().ok_or("Configure an OpenAI or Gemini API key to use Character Consistency.")?,
                 prompt, &media_type, &bytes,
@@ -3077,9 +3121,24 @@ Return JSON only — no markdown, no explanation:
 
     pub fn plan_bulk_visuals<F: Fn(usize, usize)>(&self, video_id: &str, style_directive: &str, base_settings_json: &str, creative_instruction: &str, character_consistency: bool, on_progress: F) -> Result<BulkPlanResult, String> {
         let openai_key = self.get_provider_key("openai")?;
-        // Gemini Flash hard-caps output at ~8000 tokens; OpenAI gpt-4.1-mini supports 18000
-        let chunk_size_for_provider: usize = if openai_key.is_some() { 6 } else { 3 };
-        let gemini_auth = if openai_key.is_none() { Some(self.gemini_auth()?) } else { None };
+        // When OpenAI is configured, still resolve Gemini as a best-effort last resort
+        // (`.ok()` swallows "no Gemini key configured" so the OpenAI-only happy path is
+        // unaffected) — request_openai_v2_plan already falls back across OpenAI model
+        // tiers, but an org-wide $0-balance billing gate blocks every OpenAI model
+        // identically, so Gemini is the only thing that can still get a batch through.
+        let gemini_auth = if openai_key.is_none() {
+            Some(self.gemini_auth()?)
+        } else {
+            self.gemini_auth().ok()
+        };
+        // Gemini Flash hard-caps output at ~8000 tokens; OpenAI's mini tier supports
+        // 18000. Only size batches for the larger cap when Gemini can never end up
+        // serving one — i.e. pure OpenAI with no Gemini fallback configured at all.
+        // The moment Gemini could be asked to handle a batch (as primary, or as the
+        // fallback above), size for its smaller cap: a batch sized for OpenAI (6
+        // stills) silently overflows Gemini's output limit and comes back as
+        // unparseable/truncated non-JSON text instead of a clean error.
+        let chunk_size_for_provider: usize = if openai_key.is_some() && gemini_auth.is_none() { 6 } else { 3 };
         let visual_plan = self.get_visual_plan(video_id)?;
         if visual_plan.groups.is_empty() {
             return Err("No stills found. Generate a visual plan first.".into());
@@ -3157,6 +3216,8 @@ Return JSON only — no markdown, no explanation:
                 "mood": s.image_settings.get("mood").and_then(|v| v.as_str()),
                 "cameraAngle": s.image_settings.get("cameraAngle").and_then(|v| v.as_str()),
                 "lighting": s.image_settings.get("lighting").and_then(|v| v.as_str()),
+                "colorTemperature": s.image_settings.get("colorTemperature").and_then(|v| v.as_str()),
+                "weatherAtmosphere": s.image_settings.get("weatherAtmosphere").and_then(|v| v.as_str()),
                 "sceneAndEmotionPreview": s.user_prompt.chars().take(320).collect::<String>(),
             })).collect();
             let director_note = if creative_instruction.trim().is_empty() {
@@ -3219,11 +3280,18 @@ ANTI-REPETITION (enforce strictly):
 - Vary subject framing, environment structure, and subject count across stills.
 - For animal/nature/documentary videos: mix types — character scene, close detail, object focus, environment only, comparison, diagram — do not show only character portraits.
 
+NARRATIVE POINT CONTINUITY (decide this FIRST, before applying SETTINGS DIVERSITY below):
+- A "point" is one idea, claim, scene, or beat in the narration — usually spanning several consecutive stills before the narration moves on to its next distinct idea.
+- For each still, judge whether its narration is still elaborating the SAME point as the still immediately before it, or whether the narration has moved on to a NEW point.
+- SAME point as previous still → keep `lighting`, `colorTemperature`, `weatherAtmosphere`, and the implied location/background/environment CONSISTENT with the previous still (do not re-roll them just to satisfy the diversity targets below — those targets are measured across points, not within one). Still make the still visually distinct by varying framing/technical settings instead: cameraAngle, composition, lensType, depthOfField, focusType, contrast, motion, shadowType, saturation. Think "same scene, different shot" — like real B-roll of one continuous moment, not a slideshow of unrelated images.
+- NEW point vs. the previous still → this is a fresh scene: freely re-choose background, lighting, colorTemperature, and weatherAtmosphere per the SETTINGS DIVERSITY rules below.
+- The "no single value in more than 30%" and "full daily cycle" targets below apply across point transitions over the whole video, not still-to-still — do not break same-point continuity just to hit them early.
+
 SETTINGS DIVERSITY — the AI defaults to warm/golden/indoor; actively counter this bias:
 - No single value for `lighting`, `colorTemperature`, or `weatherAtmosphere` may appear in more than 30% of stills across the video.
 - Time-of-day implied by lighting must span the full daily cycle across the video: include daytime, late-afternoon, dusk/blue-hour, night, overcast, and dawn — do not cluster everything in golden-hour daytime.
 - `colorTemperature` must spread across Warm, Neutral, AND Cool stills — all three bands must appear.
-- Consecutive stills must NOT share both the same `lighting` AND the same `colorTemperature` — vary at least one of these every still.
+- Consecutive stills that start a NEW point must NOT share both the same `lighting` AND the same `colorTemperature` as the point that preceded them — vary at least one. Consecutive stills continuing the SAME point are exempt from this (see NARRATIVE POINT CONTINUITY above) — keep them matching on purpose.
 - Location default: if the narration does not explicitly place the subject indoors, choose an EXTERIOR or NATURE setting. Resist defaulting to "home", "office", "classroom", or "bedroom" unless the narration forces it.
 
 IMAGE SETTINGS RULES — provide ALL of the following keys; never leave any as "Undefined":
@@ -3252,7 +3320,7 @@ Field value guidance:
 - colorCastTint: None | Warm Orange Tint | Cool Blue Tint | Teal and Orange | Green Tint | Sepia | Cross Processed
 - surfaceEffects: None | Lens Flare | Chromatic Aberration | Anamorphic Flare | Dust and Scratches | Wet Glass | Fog Layer
 
-Rule: at least 6 of the 20 non-aspect settings must differ between consecutive stills.
+Rule: at least 6 of the 20 non-aspect settings must differ between consecutive stills. Within the SAME narrative point, satisfy this through framing/technical fields (cameraAngle, composition, lensType, depthOfField, focusType, contrast, motion, shadowType, saturation, etc.) — NOT by changing lighting, colorTemperature, weatherAtmosphere, or the implied background, which should stay put until the point changes.
 
 USER PROMPT — ABSOLUTE RULES (the most common AI planning mistake is bleeding image-settings language into userPrompt; read carefully):
 The final image is built from THREE completely independent layers — each owns exclusive territory and must NOT overlap:
@@ -3286,36 +3354,51 @@ TEXTLESS VISUAL RULE (Textless Infographic, Timeline, Geographic Map, Scientific
 
 Allowed visualType values: Character Scene; Character Close-Up / Reaction; Behavioral Demonstration; Close Detail; Environmental Scene; Object Focus; Comparison; Before/After or Transformation; Size / Scale Comparison; Process Illustration; Timeline; Title / Statement Card; Textless Infographic; Scientific Diagram; Family Tree / Lineage Diagram; Geographic Map; Concept Visualization; POV Scene; Symbolic Representation; Documentary Frame.
 
-You MUST return exactly one plan for every row in the current batch. Return JSON only — no explanation, no markdown:
+You MUST return exactly one plan for every row in the current batch.
+OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object and NOTHING else. Do not write any introduction, restatement of the task, narration of your planning process, explanation, commentary, or markdown fences before, between, or after it. Do not describe what you are about to plan — just plan it, silently, and output only the resulting JSON. The very first character of your response must be {{ and the very last character must be }}.
 {{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content — mandatory creative rules embedded; negatives as [Avoid: ...]"}}]}}"#,
                 chunk_index + 1,
                 serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
                 serde_json::to_string_pretty(chunk).unwrap_or_default(),
             );
             let response = match &openai_key {
-                Some(key) => request_openai_v2_plan(key, &prompt)?,
+                Some(key) => match request_openai_v2_plan(key, &prompt) {
+                    Ok(response) => response,
+                    Err(openai_error) => match gemini_auth.as_ref() {
+                        Some(auth) => request_gemini_v2_plan(auth, &prompt).map_err(|gemini_error| {
+                            format!("{openai_error} (Gemini fallback also failed: {gemini_error})")
+                        })?,
+                        None => return Err(openai_error),
+                    },
+                },
                 None => request_gemini_v2_plan(gemini_auth.as_ref().unwrap(), &prompt)?,
             };
-            let valid_count = {
-                let mut count = 0;
-                for (i, plan) in response.plans.iter().enumerate() {
-                    if i >= chunk.len() { break; }
-                    if plan.visual_plan_row_id == chunk[i]["visualPlanRowId"].as_str().unwrap_or_default() {
-                        count += 1;
-                    } else {
-                        break;
-                    }
-                }
-                count
-            };
+            // Match plans back to rows by id rather than strict positional order: models
+            // occasionally reorder or duplicate entries in the array, and a single
+            // out-of-place plan used to zero out an otherwise-usable batch.
+            let mut plans_by_id: std::collections::HashMap<String, V2PlanStillResponse> = response.plans
+                .into_iter()
+                .map(|plan| (plan.visual_plan_row_id.clone(), plan))
+                .collect();
+            let valid_count = chunk.iter()
+                .take_while(|row| {
+                    row["visualPlanRowId"].as_str()
+                        .map(|id| plans_by_id.contains_key(id))
+                        .unwrap_or(false)
+                })
+                .count();
             if valid_count == 0 {
                 return Err(format!(
                     "No usable plans returned for stills {}-{} (batch {}). Please retry.",
                     next_to_plan + 1, chunk_end, chunk_index + 1
                 ));
             }
-            for (offset, mut plan) in response.plans.into_iter().take(valid_count).enumerate() {
-                let row = &chunk[offset];
+            for row in chunk.iter().take(valid_count) {
+                let id = row["visualPlanRowId"].as_str().unwrap_or_default();
+                let mut plan = match plans_by_id.remove(id) {
+                    Some(plan) => plan,
+                    None => break,
+                };
                 if row["settingsLocked"].as_bool().unwrap_or(false) {
                     if let Some(obj) = row["existingSettings"].as_object() {
                         plan.image_settings = serde_json::Value::Object(obj.clone());
@@ -3367,37 +3450,207 @@ You MUST return exactly one plan for every row in the current batch. Return JSON
         })
     }
 
-    /// Runs OpenAI vision analysis (see `request_openai_motion_graphic`)
-    /// against every timeline clip that has a rendered image, assigning each
-    /// one a `MOTION_GRAPHIC_EFFECTS` treatment + settings. Metadata only —
-    /// see `MOTION_GRAPHIC_EFFECTS`'s doc comment. Clips are processed and
-    /// persisted one at a time (not chunked — one vision call per still, no
-    /// text-token-budget concern like `plan_bulk_visuals` has) so progress
-    /// is visible and partial results survive a later failure. OpenAI-only,
-    /// no Gemini fallback, since this feature is scoped to OpenAI vision.
-    pub fn analyze_motion_graphics<F: Fn(usize, usize)>(&self, video_id: &str, on_progress: F) -> Result<Timeline, String> {
-        let api_key = self.get_provider_key("openai")?
-            .ok_or("An OpenAI API key is required for Motion Graphics analysis. Add one in Settings.")?;
+    /// Assigns every timeline clip that has a rendered image one of the 7
+    /// `MOTION_GRAPHIC_EFFECTS` treatments + tunable settings, by batching
+    /// them (image + the clip's own narration text together) through
+    /// `services/python-engine/auto_gen_engine/motion_graphics_engine.py` —
+    /// see that module's docstring for why this replaced the old per-clip,
+    /// image-only, single-OpenAI-call-in-Rust implementation (it converged
+    /// heavily on "Ken Burns" with no way to see either the narration or
+    /// what neighboring clips had already been assigned). The Python engine
+    /// batches clips together and carries a running tally of effects used so
+    /// far across the whole video into every batch, actively balancing the
+    /// mix instead of picking each clip in a vacuum.
+    pub fn analyze_motion_graphics<F: Fn(usize, usize)>(
+        &self, video_id: &str, engine_dir: &Path, on_progress: F,
+    ) -> Result<Timeline, String> {
+        let api_key = self.get_provider_key("openai")?;
+        // OpenAI is preferred (see the Python engine's module docstring); Gemini
+        // credentials are forwarded too so the engine can fall back to it if OpenAI
+        // itself fails (rate limit, exhausted billing credits) or isn't configured at
+        // all — same OpenAI-primary/Gemini-last-resort pattern used throughout this
+        // file. Reuses gemini_auth() (the exact function every other successful Gemini
+        // call in this app already goes through) rather than re-deriving credentials
+        // independently, so whichever of its two auth paths — a plain API key, or a
+        // Vertex service account — is actually configured just works here too. The
+        // Vertex access token is short-lived (~1hr), but that's fine: this analysis
+        // run completes well within that window.
+        // The Err case is intentionally not fatal by itself (OpenAI alone is a valid
+        // setup) — but the reason gemini_auth() failed is forwarded to the Python
+        // engine too (GEMINI_AUTH_ERROR below) rather than silently discarded, so a
+        // real, fixable Gemini-side problem doesn't look identical to "no Gemini
+        // configured at all" if OpenAI's own call also fails.
+        let mut gemini_auth_error: Option<String> = None;
+        let (gemini_api_key, gemini_vertex): (Option<String>, Option<(String, String)>) =
+            match self.gemini_auth() {
+                Ok(GeminiAuth::ApiKey(key)) => (Some(key), None),
+                Ok(GeminiAuth::Vertex { access_token, project_id }) => (None, Some((access_token, project_id))),
+                Err(error) => {
+                    gemini_auth_error = Some(error);
+                    (None, None)
+                }
+            };
+        if api_key.is_none() && gemini_api_key.is_none() && gemini_vertex.is_none() {
+            return Err(gemini_auth_error.map(|error| format!(
+                "An OpenAI or Gemini API key is required for Motion Graphics analysis. Add one in Settings. (Gemini: {error})"
+            )).unwrap_or_else(|| "An OpenAI or Gemini API key is required for Motion Graphics analysis. Add one in Settings.".into()));
+        }
         let timeline = self.get_timeline(video_id)?;
         let clips: Vec<&TimelineClip> = timeline.clips.iter().filter(|clip| clip.render_id.is_some()).collect();
         let total = clips.len();
         if total == 0 {
             return Err("No stills with a rendered image were found on this timeline.".into());
         }
-        for (index, clip) in clips.into_iter().enumerate() {
-            let render_id = clip.render_id.as_ref().expect("filtered to Some above");
-            let (mime, base64_data) = self.read_render_file(render_id)?;
-            let plan = request_openai_motion_graphic(&api_key, &mime, &base64_data)?;
-            self.set_timeline_clip_motion_graphic(
-                video_id,
-                &clip.id,
-                Some(plan.effect.as_str()),
-                Some(&serde_json::to_string(&plan.settings).unwrap_or_default()),
-                Some(plan.reason.as_str()),
-            )?;
-            on_progress(index + 1, total);
+
+        #[cfg(test)]
+        {
+            let _ = engine_dir;
+            let _ = &api_key;
+            let _ = &gemini_api_key;
+            let _ = &gemini_vertex;
+            let _ = &gemini_auth_error;
+            // No Python/network in tests — deterministically cycle through
+            // the catalog so callers can still exercise the resulting
+            // Timeline shape.
+            for (index, clip) in clips.iter().enumerate() {
+                let effect = MOTION_GRAPHIC_EFFECTS[index % MOTION_GRAPHIC_EFFECTS.len()];
+                self.set_timeline_clip_motion_graphic(
+                    video_id, &clip.id, Some(effect), Some("{}"), Some("test fixture"),
+                )?;
+                on_progress(index + 1, total);
+            }
+            return self.get_timeline(video_id);
         }
-        self.get_timeline(video_id)
+        #[cfg(not(test))]
+        {
+            let visual_plan = self.get_visual_plan(video_id)?;
+            let narration_for_group = |group_id: &str| -> String {
+                let Some(group) = visual_plan.groups.iter().find(|g| &g.id == group_id) else {
+                    return String::new();
+                };
+                group.sentence_ids.iter()
+                    .filter_map(|sentence_id| visual_plan.sentences.iter().find(|s| &s.id == sentence_id))
+                    .map(|sentence| sentence.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+
+            let channel_id: String = self.connection
+                .query_row("SELECT channel_id FROM videos WHERE id=?1", [video_id], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+            let work_dir = self.projects_dir.join(channel_id).join(video_id).join("motion-graphics");
+            fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
+            let manifest_path = work_dir.join("manifest.json");
+            let results_path = work_dir.join("results.json");
+
+            let clip_manifest: Vec<serde_json::Value> = clips.iter().map(|clip| {
+                let render_id = clip.render_id.as_ref().expect("filtered to Some above");
+                let (mime, base64_data) = self.read_render_file(render_id)?;
+                Ok::<_, String>(json!({
+                    "clipId": clip.id,
+                    "mime": mime,
+                    "base64Data": base64_data,
+                    "narration": narration_for_group(&clip.group_id),
+                    "startSeconds": clip.start_seconds,
+                    "endSeconds": clip.end_seconds,
+                }))
+            }).collect::<Result<_, _>>()?;
+            fs::write(&manifest_path, serde_json::to_vec(&json!({ "clips": clip_manifest })).unwrap_or_default())
+                .map_err(|e| e.to_string())?;
+
+            let engine_script = engine_dir.join("auto_gen_engine/motion_graphics_engine.py");
+            if !engine_script.exists() {
+                return Err(format!(
+                    "Internal motion-graphics engine was not found at {}.",
+                    engine_script.display()
+                ));
+            }
+            let mut command = Command::new(find_python());
+            command
+                .arg(&engine_script)
+                .arg(&manifest_path)
+                .arg("--output")
+                .arg(&results_path)
+                .current_dir(engine_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(key) = &api_key {
+                command.env("OPENAI_API_KEY", key);
+            }
+            if let Some(key) = &gemini_api_key {
+                command.env("GEMINI_API_KEY", key);
+            }
+            if let Some((access_token, project_id)) = &gemini_vertex {
+                command
+                    .env("GEMINI_VERTEX_ACCESS_TOKEN", access_token)
+                    .env("GEMINI_VERTEX_PROJECT_ID", project_id);
+            }
+            if let Some(error) = &gemini_auth_error {
+                command.env("GEMINI_AUTH_ERROR", error);
+            }
+            #[cfg(windows)]
+            command.creation_flags(0x08000000);
+            let mut child = command
+                .spawn()
+                .map_err(|e| format!("Could not start the Python motion-graphics engine: {e}"))?;
+            let stdout = child.stdout.take().ok_or("Could not capture motion-graphics engine output.")?;
+            let stderr = child.stderr.take().ok_or("Could not capture motion-graphics engine errors.")?;
+            let stderr_thread = std::thread::spawn(move || {
+                let mut reader = BufReader::new(stderr);
+                let mut bytes = Vec::new();
+                let mut output = Vec::new();
+                loop {
+                    bytes.clear();
+                    match reader.read_until(b'\n', &mut bytes) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => output.push(String::from_utf8_lossy(&bytes).trim().to_string()),
+                    }
+                }
+                output.join("\n")
+            });
+            let mut stdout_reader = BufReader::new(stdout);
+            let mut line_bytes = Vec::new();
+            loop {
+                line_bytes.clear();
+                let count = stdout_reader
+                    .read_until(b'\n', &mut line_bytes)
+                    .map_err(|e| format!("Could not read engine progress: {e}"))?;
+                if count == 0 {
+                    break;
+                }
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
+                if let Some(payload) = line.strip_prefix("AUTOGEN_PROGRESS ") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                        let percent = value["percent"].as_i64().unwrap_or(0).clamp(0, 100);
+                        let done = ((percent as f64 / 100.0) * total as f64).round() as usize;
+                        on_progress(done.min(total), total);
+                    }
+                }
+            }
+            let status = child.wait().map_err(|e| format!("Could not wait for motion-graphics engine: {e}"))?;
+            let raw_stderr = stderr_thread.join().unwrap_or_default();
+            if !status.success() {
+                return Err(format!("Motion graphics analysis failed. {raw_stderr}"));
+            }
+
+            let results: serde_json::Value = serde_json::from_slice(
+                &fs::read(&results_path).map_err(|e| format!("Could not read motion-graphics results: {e}"))?,
+            ).map_err(|e| format!("Motion-graphics results were invalid: {e}"))?;
+            let analyses = results["analyses"].as_array().ok_or("Motion-graphics results contained no analyses.")?;
+            for (index, analysis) in analyses.iter().enumerate() {
+                let clip_id = analysis["clipId"].as_str().ok_or("Motion-graphics result missing clipId.")?;
+                let effect = analysis["effect"].as_str().ok_or("Motion-graphics result missing effect.")?;
+                let settings = analysis.get("settings").cloned().unwrap_or_else(|| json!({}));
+                let reason = analysis["reason"].as_str().unwrap_or_default();
+                self.set_timeline_clip_motion_graphic(
+                    video_id, clip_id, Some(effect),
+                    Some(&serde_json::to_string(&settings).unwrap_or_default()),
+                    Some(reason),
+                )?;
+                on_progress(index + 1, total);
+            }
+            self.get_timeline(video_id)
+        }
     }
 
     pub fn suggest_still_prompt(&self, video_id: &str, group_id: &str, style_directive: &str, base_settings_json: &str) -> Result<BulkPlannedStill, String> {
@@ -3610,14 +3863,46 @@ Return JSON only, in exactly this shape: {{"prompt": "the motion prompt text"}}"
 
         let total = entries.len();
         let openai_key = self.get_provider_key("openai")?;
-        let gemini_auth = if openai_key.is_none() { Some(self.gemini_auth()?) } else { None };
-        let chunk_size: usize = if openai_key.is_some() { 6 } else { 3 };
+        // When OpenAI is configured, still resolve Gemini as a best-effort last resort
+        // (`.ok()` swallows "no Gemini key configured" so the OpenAI-only happy path is
+        // unaffected) — call_openai below already falls back across OpenAI model tiers,
+        // but an org-wide $0-balance billing gate blocks every OpenAI model identically,
+        // so Gemini is the only thing that can still get a batch through.
+        let gemini_auth = if openai_key.is_none() {
+            Some(self.gemini_auth()?)
+        } else {
+            self.gemini_auth().ok()
+        };
+        // Only size batches for OpenAI's larger cap when Gemini can never end up serving
+        // one (pure OpenAI, no fallback configured) — see plan_bulk_visuals for why a
+        // Gemini fallback needs the smaller, safer batch size.
+        let chunk_size: usize = if openai_key.is_some() && gemini_auth.is_none() { 6 } else { 3 };
         let now = Utc::now().to_rfc3339();
         let mut applied = 0usize;
 
         let http = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(180))
             .build().map_err(|e| format!("HTTP client error: {e}"))?;
+        let call_openai = |key: &str, prompt: &str, model: &str| -> Result<String, String> {
+            // Use Chat Completions with json_object mode — the Responses API
+            // can emit unescaped quotes in freeform output.
+            let resp = http.post("https://api.openai.com/v1/chat/completions")
+                .bearer_auth(key)
+                .json(&json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 8000,
+                    "response_format": {"type": "json_object"}
+                }))
+                .send()
+                .map_err(|e| format!("OpenAI request failed: {e}"))?;
+            if !resp.status().is_success() {
+                let body: serde_json::Value = resp.json().unwrap_or_default();
+                return Err(format!("OpenAI error: {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown")));
+            }
+            let body: serde_json::Value = resp.json().map_err(|e| format!("OpenAI JSON parse: {e}"))?;
+            Ok(body.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or_default().to_string())
+        };
 
         for chunk in entries.chunks(chunk_size) {
             // Use a numeric index (n) for matching — LLMs can corrupt long UUID strings.
@@ -3652,26 +3937,22 @@ Return JSON only:
             );
 
             let response_text = match &openai_key {
-                Some(key) => {
-                    // Use Chat Completions with json_object mode — the Responses API
-                    // can emit unescaped quotes in freeform output.
-                    let resp = http.post("https://api.openai.com/v1/chat/completions")
-                        .bearer_auth(key)
-                        .json(&json!({
-                            "model": "gpt-4.1-mini",
-                            "messages": [{"role": "user", "content": prompt}],
-                            "max_tokens": 8000,
-                            "response_format": {"type": "json_object"}
-                        }))
-                        .send()
-                        .map_err(|e| format!("OpenAI request failed: {e}"))?;
-                    if !resp.status().is_success() {
-                        let body: serde_json::Value = resp.json().unwrap_or_default();
-                        return Err(format!("OpenAI error: {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown")));
-                    }
-                    let body: serde_json::Value = resp.json().map_err(|e| format!("OpenAI JSON parse: {e}"))?;
-                    body.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or_default().to_string()
-                }
+                Some(key) => match call_openai(key, &prompt, "gpt-4.1-mini") {
+                    Ok(text) => text,
+                    // First fall back to a sibling OpenAI model (stays on the same
+                    // high-quota free tier); only reach for Gemini if that also fails —
+                    // e.g. an org-wide $0-balance billing gate blocks every OpenAI
+                    // model identically, so Gemini is the only thing left that works.
+                    Err(primary_error) => match call_openai(key, &prompt, OPENAI_PRIMARY_HIGH_QUOTA_MODEL) {
+                        Ok(text) => text,
+                        Err(secondary_error) => match gemini_auth.as_ref() {
+                            Some(auth) => request_gemini_text(auth, &prompt).map_err(|gemini_error| {
+                                format!("{primary_error} (fallback model also failed: {secondary_error}; Gemini fallback also failed: {gemini_error})")
+                            })?,
+                            None => return Err(format!("{primary_error} (fallback model also failed: {secondary_error})")),
+                        },
+                    },
+                },
                 None => request_gemini_text(gemini_auth.as_ref().unwrap(), &prompt)?,
             };
 
@@ -3791,6 +4072,83 @@ Return JSON only:
         Some((corrected_prompt, corrected_settings))
     }
 
+    // Post-generation QC gate: looks at the actual rendered pixels (not just the text
+    // prompt, unlike validate_visual_intent above) and flags only clear, obvious misses —
+    // wrong subject/setting, missing the described action, a garbled render. Deliberately
+    // strict about what counts as non-compliant so this triggers a regeneration sparingly,
+    // not on every stylistic nitpick.
+    fn check_generated_image_compliance(
+        &self,
+        auth: &GeminiAuth,
+        narration: &str,
+        user_prompt: &str,
+        previous_still_context: Option<&str>,
+        image_bytes: &[u8],
+        mime: &str,
+    ) -> Option<String> {
+        if narration.trim().is_empty() {
+            return None;
+        }
+        let continuity_note = match previous_still_context {
+            Some(context) => format!(
+                "For reference only, here is the immediately preceding still's narration and scene \
+                 (context, not a requirement to match): {context}\n\
+                 If this still's narration is clearly still the same point/moment as the preceding one, \
+                 a similar background/setting is CORRECT, not a defect — do not flag it as repetitive. \
+                 If the narration has moved on to a new point, a different background/setting is expected.\n\n"
+            ),
+            None => String::new(),
+        };
+        let check_prompt = format!(
+            "You are a final quality-control reviewer for one still in an automated video illustration \
+             pipeline. You are shown the actual generated image.\n\n\
+             Narration this still represents: \"{narration}\"\n\
+             Intended scene description: \"{user_prompt}\"\n\n\
+             {continuity_note}\
+             Judge only clear, obvious problems: does the image depict something recognizably DIFFERENT \
+             from the intended scene (wrong subject, wrong setting, missing the described action or \
+             object entirely, badly malformed or garbled rendering)? Do NOT flag minor stylistic \
+             differences, imperfect anatomy, or subjective composition choices — only flag a still that \
+             a viewer would call clearly wrong for this narration.\n\n\
+             Return ONLY JSON: {{\"compliant\": boolean, \"reason\": string}}. reason should be a short \
+             one-sentence explanation, only populated when compliant is false."
+        );
+        let raw = request_gemini_vision(auth, &check_prompt, mime, image_bytes).ok()?;
+        let cleaned = extract_json_from_text(&raw);
+        let parsed: serde_json::Value = serde_json::from_str(cleaned).ok()?;
+        if parsed.get("compliant").and_then(|v| v.as_bool()).unwrap_or(true) {
+            return None;
+        }
+        Some(
+            parsed.get("reason").and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("Did not match the intended scene.")
+                .to_string(),
+        )
+    }
+
+    // Best-effort context about the still immediately before this one (by ordinal), used
+    // only to help check_generated_image_compliance judge whether a similar background is
+    // intentional continuity or an actual repetition defect. Absence of context (new video,
+    // first still, lookup failure) just means the compliance check skips that nuance.
+    fn previous_still_context(&self, video_id: &str, group_id: &str) -> Option<String> {
+        let plan = self.get_visual_plan(video_id).ok()?;
+        let current = plan.groups.iter().find(|g| g.id == group_id)?;
+        let previous = plan.groups.iter()
+            .filter(|g| g.ordinal < current.ordinal)
+            .max_by_key(|g| g.ordinal)?;
+        let previous_narration = previous.sentence_ids.iter()
+            .filter_map(|id| plan.sentences.iter().find(|s| &s.id == id))
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let previous_prompt = self.list_prompt_versions(video_id, &previous.id).ok()?.into_iter().next()?;
+        Some(json!({
+            "narration": previous_narration,
+            "scene": previous_prompt.user_prompt,
+        }).to_string())
+    }
+
     pub fn generate_image_render(
         &self,
         video_id: &str,
@@ -3812,18 +4170,32 @@ Return JSON only:
         let model = self
             .get_app_setting("gemini_model")?
             .unwrap_or_else(|| "gemini-3.1-flash-image".into());
-        let narration = self.get_visual_plan(video_id).ok()
+        let (narration, ordinal) = self.get_visual_plan(video_id).ok()
             .and_then(|plan| {
                 let group = plan.groups.iter().find(|g| g.id == group_id)?;
-                Some(group.sentence_ids.iter()
+                let narration = group.sentence_ids.iter()
                     .filter_map(|id| plan.sentences.iter().find(|s| &s.id == id))
                     .map(|s| s.text.as_str())
                     .collect::<Vec<_>>()
-                    .join(" "))
+                    .join(" ");
+                Some((narration, group.ordinal))
             })
-            .unwrap_or_default();
+            .unwrap_or((String::new(), 0));
+        // Sampled, like the post-generation compliance check below (offset so they land
+        // on different stills, spreading QC coverage instead of stacking it): every
+        // still used to pay for both an always-on pre-generation Gemini call here AND
+        // the post-generation one below, on top of the actual generation call itself —
+        // 2-3 Gemini calls per still is what was driving repeated real 429s and pushing
+        // per-still time up to minutes once the account's rate limit was actually
+        // exercised. Most stills now cost exactly one Gemini call (the generation
+        // itself); only every 3rd gets the extra pre-check.
+        let intent_check = if ordinal % 3 == 1 {
+            self.validate_visual_intent(&auth, &narration, user_prompt, settings_json)
+        } else {
+            None
+        };
         let (prompt_version_id, effective_user_prompt, effective_settings_json) =
-            match self.validate_visual_intent(&auth, &narration, user_prompt, settings_json) {
+            match intent_check {
                 Some((corrected_prompt, corrected_settings)) => {
                     let version = self.create_prompt_version(
                         video_id, group_id, &corrected_settings, system_prompt, &corrected_prompt,
@@ -3850,37 +4222,64 @@ Return JSON only:
         } else {
             None
         };
-        let (image_bytes, extension) = match reference_for_generation {
-            Some((reference_mime, reference_bytes)) => {
-                // request_gemini_image_with_source is otherwise only used for
-                // in-place edits (edit_render/edit_thumbnail), where the source
-                // image IS the thing being modified and the prompt says to
-                // preserve it. That's the opposite of what we want here — the
-                // attached image is a CHARACTER REFERENCE for an entirely new
-                // scene, not an image to edit — so this framing is mandatory,
-                // not optional, or the model tends to keep the reference's
-                // background/pose instead of generating the new scene.
-                let character_reference_prompt = format!(
-                    "The attached image is a CHARACTER REFERENCE ONLY. Reproduce that character's exact \
-                     physical appearance (hair, coloring, build, distinguishing features) — but IGNORE the \
-                     reference image's background, pose, camera angle, composition, and clothing entirely. \
-                     Dress the character in whatever outfit fits the new scene described below (do not copy \
-                     the reference image's outfit unless that scene independently calls for the same \
-                     clothing). Generate a completely new scene as described below, featuring that \
-                     character:\n\n{prompt}"
-                );
-                request_gemini_image_with_source(
-                    &auth, &model, &character_reference_prompt, &reference_bytes, &reference_mime, None,
-                    requested_aspect_ratio(&settings),
-                )?
+        let render_once = || -> Result<(Vec<u8>, &'static str), String> {
+            match reference_for_generation.as_ref() {
+                Some((reference_mime, reference_bytes)) => {
+                    // request_gemini_image_with_source is otherwise only used for
+                    // in-place edits (edit_render/edit_thumbnail), where the source
+                    // image IS the thing being modified and the prompt says to
+                    // preserve it. That's the opposite of what we want here — the
+                    // attached image is a CHARACTER REFERENCE for an entirely new
+                    // scene, not an image to edit — so this framing is mandatory,
+                    // not optional, or the model tends to keep the reference's
+                    // background/pose instead of generating the new scene.
+                    let character_reference_prompt = format!(
+                        "The attached image is a CHARACTER REFERENCE ONLY. Reproduce that character's exact \
+                         physical appearance (hair, coloring, build, distinguishing features) — but IGNORE the \
+                         reference image's background, pose, camera angle, composition, and clothing entirely. \
+                         Dress the character in whatever outfit fits the new scene described below (do not copy \
+                         the reference image's outfit unless that scene independently calls for the same \
+                         clothing). Generate a completely new scene as described below, featuring that \
+                         character:\n\n{prompt}"
+                    );
+                    request_gemini_image_with_source(
+                        &auth, &model, &character_reference_prompt, reference_bytes, reference_mime, None,
+                        requested_aspect_ratio(&settings),
+                    )
+                }
+                // character_consistency_enabled but no reference found (e.g. removed
+                // after planning) falls back to text-only rather than blocking
+                // generation entirely.
+                None => request_gemini_image(
+                    &auth, &model, &prompt, requested_aspect_ratio(&settings),
+                ),
             }
-            // character_consistency_enabled but no reference found (e.g. removed
-            // after planning) falls back to text-only rather than blocking
-            // generation entirely.
-            None => request_gemini_image(
-                &auth, &model, &prompt, requested_aspect_ratio(&settings),
-            )?,
         };
+        let (mut image_bytes, mut extension) = render_once()?;
+        // Sparing post-generation QC gate: adds a full extra vision call per still it
+        // runs on, so it only samples roughly 1 in 3 stills (by ordinal) rather than
+        // every one — checking every single image nearly doubled per-image latency
+        // across a whole bulk job for comparatively little extra coverage. When it does
+        // run, it only ever escalates to ONE regeneration attempt (never loops further),
+        // and only for a confident, obvious mismatch — see
+        // check_generated_image_compliance's doc comment for what qualifies.
+        let mut regeneration_reason: Option<String> = None;
+        if ordinal % 3 == 0 {
+            if let Some(reason) = self.check_generated_image_compliance(
+                &auth,
+                &narration,
+                &effective_user_prompt,
+                self.previous_still_context(video_id, group_id).as_deref(),
+                &image_bytes,
+                extension_to_media_type(extension),
+            ) {
+                if let Ok((retry_bytes, retry_extension)) = render_once() {
+                    image_bytes = retry_bytes;
+                    extension = retry_extension;
+                }
+                regeneration_reason = Some(reason);
+            }
+        }
         let channel_id: String = self
             .connection
             .query_row(
@@ -3929,6 +4328,8 @@ Return JSON only:
                 "renderId": render.id,
                 "promptVersionId": prompt_version_id,
                 "version": render.version,
+                "regenerated": regeneration_reason.is_some(),
+                "regenerationReason": regeneration_reason,
             })
             .to_string(),
         )?;
@@ -6055,17 +6456,51 @@ Return JSON only:
         if !["queued", "running", "paused", "stopped", "failed"].contains(&status) {
             return Err("Unsupported image job transition.".into());
         }
-        self.connection.execute(
-            "UPDATE image_jobs SET status=?1,updated_at=?2 WHERE id=?3 AND status NOT IN ('completed','failed')",
-            params![status, Utc::now().to_rfc3339(), job_id],
-        ).map_err(|e| e.to_string())?;
+        let now = Utc::now().to_rfc3339();
+        if status == "queued" {
+            // "queued" is also how a job that finished with some items failed gets
+            // retried (see control_image_job's "resume" action) — the one transition
+            // allowed to escape a terminal state, since otherwise a failed still had no
+            // way to be retried short of re-approving the whole plan from scratch.
+            // "completed" stays excluded: it only happens with zero failed items, so
+            // there's nothing to retry.
+            self.connection.execute(
+                "UPDATE image_jobs SET status=?1,updated_at=?2 WHERE id=?3 AND status != 'completed'",
+                params![status, now, job_id],
+            ).map_err(|e| e.to_string())?;
+            self.requeue_failed_job_items(job_id)?;
+        } else {
+            self.connection.execute(
+                "UPDATE image_jobs SET status=?1,updated_at=?2 WHERE id=?3 AND status NOT IN ('completed','failed')",
+                params![status, now, job_id],
+            ).map_err(|e| e.to_string())?;
+        }
         if matches!(status, "stopped" | "failed") {
             self.connection.execute(
                 "UPDATE image_job_items SET status='stopped',updated_at=?1 WHERE job_id=?2 AND status IN ('queued','running')",
-                params![Utc::now().to_rfc3339(), job_id],
+                params![now, job_id],
             ).map_err(|e| e.to_string())?;
         }
         self.get_image_job(job_id)
+    }
+
+    // Resets any 'failed' items for this job back to 'queued' (clearing attempts/
+    // last_error) and recomputes failed_items. Returns how many were requeued. Shared by
+    // the manual "resume"/retry action above and spawn_job_workers' own single automatic
+    // sweep once a job's queue empties — a still that failed early in a run may well
+    // succeed once retried after the rest of the batch has gone by and any rate-limit
+    // window has had time to clear.
+    pub fn requeue_failed_job_items(&self, job_id: &str) -> Result<usize, String> {
+        let now = Utc::now().to_rfc3339();
+        let requeued = self.connection.execute(
+            "UPDATE image_job_items SET status='queued',attempts=0,last_error=NULL,updated_at=?1 WHERE job_id=?2 AND status='failed'",
+            params![now, job_id],
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "UPDATE image_jobs SET failed_items=(SELECT COUNT(*) FROM image_job_items WHERE job_id=?1 AND status='failed'),updated_at=?2 WHERE id=?1",
+            params![job_id, now],
+        ).map_err(|e| e.to_string())?;
+        Ok(requeued)
     }
 
     pub fn recover_image_jobs(&self) -> Result<(), String> {
@@ -7274,6 +7709,8 @@ Return JSON only:
                     "subjectY": 0.5,
                     "colorFilter": clip.color_filter_preset,
                     "colorFilterIntensity": clip.color_filter_intensity,
+                    "motionGraphicEffect": clip.motion_graphic_effect,
+                    "motionGraphicSettings": motion_graphic_settings_value(&clip),
                 }));
                 continue;
             }
@@ -7293,6 +7730,8 @@ Return JSON only:
                 "subjectY": render.subject_y.unwrap_or(0.5),
                 "colorFilter": clip.color_filter_preset,
                 "colorFilterIntensity": clip.color_filter_intensity,
+                "motionGraphicEffect": clip.motion_graphic_effect,
+                "motionGraphicSettings": motion_graphic_settings_value(&clip),
             }));
         }
         if stills.is_empty() {
@@ -8665,7 +9104,25 @@ fn repair_excessive_consecutive_visual_types(planned: &mut [V2PlanStillResponse]
     }
 }
 
+// gpt-5.4-mini and gpt-4.1-mini both sit in OpenAI's much larger "millions of tokens/day"
+// free-usage tier (shared-traffic program), unlike plain gpt-4.1/gpt-5.4/etc., which only
+// get a far smaller daily allowance before billing (or a hard 429) kicks in. Using these as
+// the primary/fallback pair keeps the app's heaviest AI calls inside the generous free tier
+// instead of quietly depending on paid credits.
+const OPENAI_PRIMARY_HIGH_QUOTA_MODEL: &str = "gpt-5.4-mini";
+const OPENAI_SECONDARY_HIGH_QUOTA_MODEL: &str = "gpt-4.1-mini";
+
 fn request_openai_v2_plan(api_key: &str, prompt: &str) -> Result<V2PlanChunkResponse, String> {
+    match request_openai_v2_plan_with_model(api_key, prompt, OPENAI_PRIMARY_HIGH_QUOTA_MODEL) {
+        Ok(response) => Ok(response),
+        // Fall back to a sibling OpenAI model (not Gemini) — stays on the same
+        // high-quota free tier rather than depending on a second provider's key.
+        Err(primary_error) => request_openai_v2_plan_with_model(api_key, prompt, OPENAI_SECONDARY_HIGH_QUOTA_MODEL)
+            .map_err(|fallback_error| format!("{primary_error} (fallback model also failed: {fallback_error})")),
+    }
+}
+
+fn request_openai_v2_plan_with_model(api_key: &str, prompt: &str, model: &str) -> Result<V2PlanChunkResponse, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build().map_err(|e| format!("Could not initialize OpenAI client: {e}"))?;
@@ -8678,7 +9135,7 @@ fn request_openai_v2_plan(api_key: &str, prompt: &str) -> Result<V2PlanChunkResp
         let response = match client.post("https://api.openai.com/v1/chat/completions")
             .bearer_auth(api_key)
             .json(&json!({
-                "model": "gpt-4.1-mini",
+                "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 16000,
                 "response_format": {"type": "json_object"}
@@ -8696,17 +9153,17 @@ fn request_openai_v2_plan(api_key: &str, prompt: &str) -> Result<V2PlanChunkResp
         };
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
             if attempt < 3 { continue; }
-            return Err(format!("OpenAI bulk planning failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("server error")));
+            return Err(format!("OpenAI bulk planning failed ({status}, model {model}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("server error")));
         }
         if !status.is_success() {
-            return Err(format!("OpenAI bulk planning failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
+            return Err(format!("OpenAI bulk planning failed ({status}, model {model}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
         }
         let text = body.pointer("/choices/0/message/content").and_then(|v| v.as_str())
             .ok_or("OpenAI returned no bulk plan.")?;
         return normalize_bulk_plan_response(extract_json_from_text(text))
             .map_err(|e| e.replace("Gemini", "OpenAI"));
     }
-    Err("OpenAI bulk planning failed after retries.".to_string())
+    Err(format!("OpenAI bulk planning failed after retries (model {model})."))
 }
 
 fn request_openai_directive_extract(api_key: &str, directive: &str) -> Result<StyleExtraction, String> {
@@ -8740,12 +9197,22 @@ Only populate imageSettings if the directive specifies a concrete per-shot value
 Return JSON only — no markdown, no explanation:
 {{"styleDirective":"<global style rules only — no subjects, no scene content>","imageSettings":{{"<field>":"<value>"}}}}"#
     );
+    match request_openai_directive_extract_with_model(api_key, &prompt, "gpt-4.1-mini") {
+        Ok(result) => Ok(result),
+        // Fall back to a sibling OpenAI model (not Gemini) — stays on the same
+        // high-quota free tier rather than depending on a second provider's key.
+        Err(primary_error) => request_openai_directive_extract_with_model(api_key, &prompt, OPENAI_PRIMARY_HIGH_QUOTA_MODEL)
+            .map_err(|fallback_error| format!("{primary_error} (fallback model also failed: {fallback_error})")),
+    }
+}
+
+fn request_openai_directive_extract_with_model(api_key: &str, prompt: &str, model: &str) -> Result<StyleExtraction, String> {
     // Use Chat Completions with json_object mode to guarantee valid JSON output
     let client = reqwest::blocking::Client::new();
     let response = client.post("https://api.openai.com/v1/chat/completions")
         .bearer_auth(api_key)
         .json(&json!({
-            "model": "gpt-4.1-mini",
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 1200,
             "response_format": {"type": "json_object"}
@@ -8756,7 +9223,7 @@ Return JSON only — no markdown, no explanation:
     let body: serde_json::Value = response.json()
         .map_err(|e| format!("OpenAI returned unreadable response: {e}"))?;
     if !status.is_success() {
-        return Err(format!("OpenAI style extraction failed ({status}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
+        return Err(format!("OpenAI style extraction failed ({status}, model {model}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
     }
     let text = body.pointer("/choices/0/message/content").and_then(|v| v.as_str())
         .ok_or("OpenAI returned no style extraction.")?;
@@ -8858,13 +9325,13 @@ fn request_openai_style(api_key: &str, mime: &str, bytes: &[u8]) -> Result<Style
 /// Vision analysis for the Character Consistency toggle in Bulk Gen Config —
 /// unlike `request_openai_style`, the prompt asks for plain prose (not
 /// JSON), so the response is returned as-is with no parsing step.
-fn request_openai_character_description(api_key: &str, prompt: &str, mime: &str, bytes: &[u8]) -> Result<String, String> {
+fn request_openai_character_description(api_key: &str, prompt: &str, mime: &str, bytes: &[u8], model: &str) -> Result<String, String> {
     let image_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
     let response = reqwest::blocking::Client::new()
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(api_key)
         .json(&json!({
-            "model": "gpt-4.1-mini",
+            "model": model,
             "input": [{"role":"user","content":[
                 {"type":"input_text","text":prompt},
                 {"type":"input_image","image_url":image_url}
@@ -8876,7 +9343,7 @@ fn request_openai_character_description(api_key: &str, prompt: &str, mime: &str,
     let body: serde_json::Value = response.json()
         .map_err(|error| format!("OpenAI returned an unreadable response: {error}"))?;
     if !status.is_success() {
-        return Err(format!("OpenAI character analysis failed ({status}): {}", body.pointer("/error/message").and_then(|value| value.as_str()).unwrap_or("unknown error")));
+        return Err(format!("OpenAI character analysis failed ({status}, model {model}): {}", body.pointer("/error/message").and_then(|value| value.as_str()).unwrap_or("unknown error")));
     }
     let text = body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
         .ok_or("OpenAI returned no character analysis.")?;
@@ -8888,67 +9355,6 @@ fn request_openai_character_description(api_key: &str, prompt: &str, mime: &str,
 /// given still and returns its tunable settings. `base64_data` is already
 /// base64-encoded (as returned by `read_render_file`) — passed straight
 /// through rather than decoded-then-reencoded.
-fn request_openai_motion_graphic(api_key: &str, mime: &str, base64_data: &str) -> Result<MotionGraphicPlan, String> {
-    let image_url = format!("data:{mime};base64,{base64_data}");
-    let prompt = r#"You are selecting a camera-movement treatment for a still image that will become a short video clip. Choose exactly ONE of these 5 treatments and return its tunable settings.
-
-1. Ken Burns — classic push-in + diagonal pan. Best for: dialogue/two-subject scenes, any shot with clear foreground/background separation. Default/safest choice when nothing else clearly fits.
-   settings: scaleFrom (number, ~1.0-1.2), scaleTo (number, ~1.2-1.5, > scaleFrom), panX (number, percent, e.g. -4 to 4), panY (number, percent, e.g. -3 to 3)
-
-2. Sequential Panel Reveal — snap-zooms between sub-panels of a single grid/contact-sheet image. Best for: recap grids, multi-panel montages — ONLY pick this if the image is itself a grid of multiple distinct smaller scenes.
-   settings: holdStartFrames (number, ~10-30, how long the full grid shows before the first zoom), cropPadding (number, ~1.05-1.2)
-
-3. Speed Pan & Motion Blur — fast horizontal drift with directional blur and ghost trails. Best for: riders/runners/marching subjects, anything with an implied direction of travel. The pan direction must match the subject's facing/travel direction.
-   settings: scaleFrom (number, ~1.1-1.2), scaleTo (number, ~1.2-1.4), panXFrom (number, percent), panXTo (number, percent — sign encodes direction: positive-to-negative is left-to-right)
-
-4. Ominous Push-In — slow push-in with desaturation and a warm/red pulsing glow. Best for: single dramatic/mysterious portraits, masked or obscured figures, tense character studies.
-   settings: scaleFrom (number, ~1.1-1.2), scaleTo (number, ~1.35-1.45), transformOriginX (percent, 0-100, horizontal position of the subject's face), transformOriginY (percent, 0-100, vertical position of the subject's face), glowColor (CSS rgba string tuned to the image's palette, e.g. "rgba(196,84,79,0.55)")
-
-5. Candlelight Flicker — near-static framing with an organic warm-light flicker anchored at a fixed point. Best for: interiors with a visible candle/torch/fire light source. Do NOT pick this unless a flame or clearly motivated warm point-light source is actually visible in the image.
-   settings: glowX (fraction, 0-1, horizontal position of the light source), glowY (fraction, 0-1, vertical position of the light source), scaleFrom (number, ~1.03-1.08), scaleTo (number, ~1.1-1.2), transformOriginX (percent, 0-100), transformOriginY (percent, 0-100), flickerAmplitude (number, ~0.1-0.2)
-
-If nothing clearly matches, default to Ken Burns.
-
-The "effect" field in your JSON response MUST be EXACTLY one of these 5 strings, character-for-character, with nothing else appended — do NOT include the description/dash/"Best for" text that follows each name in the numbered list above, ONLY the bare name itself:
-"Ken Burns" | "Sequential Panel Reveal" | "Speed Pan & Motion Blur" | "Ominous Push-In" | "Candlelight Flicker"
-
-Return only JSON: {"effect": "Ken Burns", "settings": {<only that treatment's fields, as numbers/strings per the types above>}, "reason": "<one short sentence on why this fits the image>"} — using whichever of the 5 exact strings above actually fits, not necessarily "Ken Burns"."#;
-    let response = reqwest::blocking::Client::new()
-        .post("https://api.openai.com/v1/responses")
-        .bearer_auth(api_key)
-        .json(&json!({
-            "model": "gpt-4.1-mini",
-            "input": [{"role":"user","content":[
-                {"type":"input_text","text":prompt},
-                {"type":"input_image","image_url":image_url}
-            ]}],
-            "max_output_tokens": 700
-        }))
-        .send().map_err(|error| format!("Could not reach OpenAI: {error}"))?;
-    let status = response.status();
-    let body: serde_json::Value = response.json()
-        .map_err(|error| format!("OpenAI returned an unreadable response: {error}"))?;
-    if !status.is_success() {
-        return Err(format!("OpenAI motion graphic analysis failed ({status}): {}", body.pointer("/error/message").and_then(|value| value.as_str()).unwrap_or("unknown error")));
-    }
-    let text = body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
-        .ok_or("OpenAI returned no motion graphic analysis.")?;
-    let cleaned = extract_json_from_text(text);
-    let mut plan: MotionGraphicPlan = serde_json::from_str(cleaned).map_err(|_| "OpenAI motion graphic analysis was not valid JSON.".to_string())?;
-    if !MOTION_GRAPHIC_EFFECTS.contains(&plan.effect.as_str()) {
-        // The model sometimes echoes the numbered list's description/dash
-        // suffix along with the name (e.g. "Ken Burns — classic push-in +
-        // diagonal pan") despite the prompt's exact-string instruction —
-        // normalize by matching on prefix instead of hard-failing the whole
-        // analysis for this still over a cosmetic deviation.
-        match MOTION_GRAPHIC_EFFECTS.iter().find(|&&name| plan.effect.starts_with(name)) {
-            Some(&name) => plan.effect = name.to_string(),
-            None => return Err(format!("OpenAI returned an unrecognized motion graphic effect: {}", plan.effect)),
-        }
-    }
-    Ok(plan)
-}
-
 fn gemini_generatecontent_url(auth: &GeminiAuth, model: &str) -> String {
     match auth {
         GeminiAuth::ApiKey(_) => format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"),
@@ -8956,12 +9362,19 @@ fn gemini_generatecontent_url(auth: &GeminiAuth, model: &str) -> String {
     }
 }
 
-// Returns the model to use for text/vision tasks. The project may only have
-// access to the image model (gemini-3.1-flash-image), which also handles text.
+// Returns the model to use for text/vision tasks (structured JSON output, style
+// analysis, etc — never actual image generation, see generate_image_render for that).
+// The Vertex case used to point at the image-generation model (gemini-3.1-flash-image)
+// on the assumption the project might not have a real text model enabled — confirmed
+// by directly probing this app's actual configured Vertex project that "gemini-2.0-flash"
+// 404s there, but "gemini-2.5-flash" works. The image model was also the wrong choice
+// anyway: it tends to narrate/describe rather than reliably return structured JSON for
+// anything non-trivial (see request_gemini_v2_plan's prompt-hardening comment for a
+// case this caused).
 fn gemini_text_model(auth: &GeminiAuth) -> &'static str {
     match auth {
         GeminiAuth::ApiKey(_) => "gemini-2.0-flash",
-        GeminiAuth::Vertex { .. } => "gemini-3.1-flash-image",
+        GeminiAuth::Vertex { .. } => "gemini-2.5-flash",
     }
 }
 
@@ -9035,7 +9448,12 @@ fn extract_json_from_text(raw: &str) -> &str {
 }
 
 fn request_gemini_text(auth: &GeminiAuth, prompt: &str) -> Result<String, String> {
-    let client = reqwest::blocking::Client::new();
+    // See request_gemini_image's comment: Client::new() has no default timeout, which
+    // would let an unresponsive server hang this call (and the whole worker) forever.
+    let client = match reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(60)).build() {
+        Ok(client) => client,
+        Err(e) => return Err(format!("Could not initialize Gemini client: {e}")),
+    };
     for attempt in 0u32..3 {
         let response = gemini_client_request(&client, auth, gemini_text_model(auth))
             .json(&json!({
@@ -9061,7 +9479,12 @@ fn request_gemini_text(auth: &GeminiAuth, prompt: &str) -> Result<String, String
 }
 
 fn request_gemini_vision(auth: &GeminiAuth, prompt: &str, mime: &str, bytes: &[u8]) -> Result<String, String> {
-    let client = reqwest::blocking::Client::new();
+    // See request_gemini_image's comment: Client::new() has no default timeout, which
+    // would let an unresponsive server hang this call (and the whole worker) forever.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("Could not initialize Gemini client: {e}"))?;
     let image_data = base64::engine::general_purpose::STANDARD.encode(bytes);
     let response = gemini_client_request(&client, auth, gemini_text_model(auth))
         .json(&json!({
@@ -9146,11 +9569,18 @@ fn request_gemini_v2_plan(auth: &GeminiAuth, prompt: &str) -> Result<V2PlanChunk
         match normalize_bulk_plan_response(cleaned) {
             Ok(r) => return Ok(r),
             Err(e) => {
-                // EOF = truncated response; retry and the model will usually complete it
-                if e.contains("EOF") && attempt < 3 {
+                // Retry on any parse failure, not just EOF truncation — Gemini
+                // occasionally narrates its planning process in prose instead of
+                // emitting JSON at all for this large a prompt, which is usually a
+                // one-off sampling fluke rather than a hard failure; a fresh attempt
+                // often succeeds.
+                if attempt < 3 {
                     continue;
                 }
-                return Err(e);
+                // Include a raw-text preview — "not valid JSON" alone doesn't say whether
+                // Gemini refused, got confused, or was cut off, all of which look
+                // identical from the parse error text alone.
+                return Err(format!("{e} Raw response: {}", text.chars().take(300).collect::<String>()));
             }
         }
     }
@@ -9335,7 +9765,15 @@ fn request_gemini_image(
     {
         return Err("Gemini model name is invalid.".into());
     }
-    let client = reqwest::blocking::Client::new();
+    // Client::new() has NO default request timeout — if Gemini's server accepts the
+    // connection but never responds, this call would otherwise block forever with no
+    // way for the retry loop or Stop button to ever intervene. This is the actual image
+    // generation call in the bulk-gen pipeline, so a real hang here reads exactly like
+    // "stuck retrying" with zero CPU/network activity that never resolves.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("Could not initialize Gemini client: {e}"))?;
     let (request, aspect_ratio, image_size) = match auth {
         GeminiAuth::ApiKey(api_key) => (client
             .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"))
@@ -9428,7 +9866,12 @@ fn request_gemini_image_with_source(
     {
         return Err("Gemini model name is invalid.".into());
     }
-    let client = reqwest::blocking::Client::new();
+    // See request_gemini_image's comment: Client::new() has no default timeout, which
+    // would let an unresponsive server hang this call (and the whole worker) forever.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("Could not initialize Gemini client: {e}"))?;
     let (request, aspect_ratio, image_size) = match auth {
         GeminiAuth::ApiKey(api_key) => (client
             .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"))

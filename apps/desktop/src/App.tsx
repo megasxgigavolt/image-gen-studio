@@ -1408,6 +1408,9 @@ function SettingSelect({ label, value, options, onChange }: { label: string; val
 // Module-level: survives ImagesView mount/unmount so navigation doesn't kill an in-flight plan
 let _planningVideoId: string | null = null;
 let _planningPromise: Promise<import("./infrastructure/projects-client").BulkPlanResultRecord> | null = null;
+// Bumped whenever the user abandons an in-flight plan (Stop) so its eventual
+// resolution/rejection is ignored instead of clobbering a later run's state.
+let _planningGeneration = 0;
 
 // Bulk plan progress events forwarded outside component lifecycle
 void listen<{ planned: number; total: number }>("bulk_plan_progress", (event) => {
@@ -1523,7 +1526,7 @@ function ImagesView() {
         const inputs = await projectsClient.getVideoInputs(activeVideoId);
         setReferences(inputs.references);
         const latestJob = await projectsClient.getLatestImageJob(activeVideoId);
-        setJob(latestJob && ["queued", "running", "paused", "stopped"].includes(latestJob.status) ? latestJob : null);
+        setJob(latestJob && ["queued", "running", "paused", "stopped", "failed"].includes(latestJob.status) ? latestJob : null);
         const latest = loaded.groups[0]?.promptVersions[0];
         setSystemPrompt(loaded.settings.find((s) => s.key === "system_prompt")?.value ?? latest?.systemPrompt ?? "");
         setUserPrompt(latest?.userPrompt ?? "");
@@ -1557,7 +1560,7 @@ function ImagesView() {
     if (!activeVideoId || !job || !["queued", "running"].includes(job.status)) return;
     const timer = window.setInterval(async () => {
       const latest = await projectsClient.getLatestImageJob(activeVideoId);
-      setJob(latest && ["queued", "running", "paused", "stopped"].includes(latest.status) ? latest : null);
+      setJob(latest && ["queued", "running", "paused", "stopped", "failed"].includes(latest.status) ? latest : null);
       const refreshed = await projectsClient.getImageWorkspace(activeVideoId);
       setWorkspace(refreshed);
       const selected = refreshed.groups.find((item) => item.group.id === selectedGroupId);
@@ -1801,12 +1804,13 @@ function ImagesView() {
   // Reattach to an in-flight plan if the user navigated away and came back
   useEffect(() => {
     if (_planningPromise && _planningVideoId === activeVideoId) {
+      const generation = _planningGeneration;
       setBulkPlanLoading(true);
       setBulkProgress({ current: 0, total: 0, label: "Planning stills with AI…" });
       void _planningPromise
-        .then((plan) => { setBulkPlan(plan); setBulkOverviewOpen(true); })
-        .catch((err: unknown) => { setError(String(err)); setBulkOpen(true); })
-        .finally(() => { setBulkPlanLoading(false); setBulkProgress(null); });
+        .then((plan) => { if (generation !== _planningGeneration) return; setBulkPlan(plan); setBulkOverviewOpen(true); })
+        .catch((err: unknown) => { if (generation !== _planningGeneration) return; setError(String(err)); setBulkOpen(true); })
+        .finally(() => { if (generation !== _planningGeneration) return; setBulkPlanLoading(false); setBulkProgress(null); });
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeVideoId]);
@@ -1819,6 +1823,7 @@ function ImagesView() {
     setBulkProgress({ current: 0, total: 0, label: `Planning ${total} stills with AI…` });
     setError(null);
     _planningVideoId = activeVideoId;
+    const generation = ++_planningGeneration;
     const innerPromise = (async () => {
       await projectsClient.saveAppSetting("system_prompt", systemPrompt);
       return projectsClient.planBulkVisuals(activeVideoId, systemPrompt, settingsJson, bulkInstruction, characterConsistency);
@@ -1826,17 +1831,35 @@ function ImagesView() {
     _planningPromise = innerPromise;
     try {
       const plan = await innerPromise;
+      if (generation !== _planningGeneration) return;
       setBulkPlan(plan);
       setBulkOverviewOpen(true);
     } catch (caught) {
+      if (generation !== _planningGeneration) return;
       setError(String(caught));
       setBulkOpen(true);
     } finally {
-      setBulkPlanLoading(false);
-      setBulkProgress(null);
-      _planningPromise = null;
-      _planningVideoId = null;
+      if (generation === _planningGeneration) {
+        setBulkPlanLoading(false);
+        setBulkProgress(null);
+      }
+      if (_planningVideoId === activeVideoId) {
+        _planningPromise = null;
+        _planningVideoId = null;
+      }
     }
+  }
+
+  // The AI batch planner has no backend cancellation — this is a "soft stop" that
+  // abandons the in-flight call (its eventual result is discarded, see
+  // _planningGeneration) and immediately frees the UI so the user isn't stuck
+  // waiting on a run they already asked to stop.
+  function stopBulkPlan() {
+    _planningGeneration += 1;
+    _planningPromise = null;
+    _planningVideoId = null;
+    setBulkPlanLoading(false);
+    setBulkProgress(null);
   }
 
   async function approveBulkPlan() {
@@ -2147,11 +2170,12 @@ function ImagesView() {
               <div>
                 {["queued", "running"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("pause")}>Pause</button>}
                 {job.status === "paused" && <button className="secondary" onClick={() => void controlJob("resume")}>Resume</button>}
+                {job.status === "failed" && job.failedItems > 0 && <button className="secondary" onClick={() => void controlJob("resume")}>Retry {job.failedItems} failed still{job.failedItems === 1 ? "" : "s"}</button>}
                 {["queued", "running", "paused"].includes(job.status) && <button className="secondary" onClick={() => setConfirmingStop(true)}>Stop</button>}
               </div>
             </div>
           )}
-          {bulkProgress && <div className="bulk-live-progress"><div><strong>{bulkProgress.label}</strong>{bulkProgress.total > 0 && <span>{bulkProgress.current} / {bulkProgress.total}</span>}</div>{bulkProgress.total > 0 ? <progress value={bulkProgress.current} max={bulkProgress.total} /> : <progress />}{bulkProgress.total > 0 && <div className="prompt-progress-actions">{promptPrepStatus === "running" && <button className="secondary" onClick={() => controlPromptPreparation("pause")}>Pause</button>}{promptPrepStatus === "paused" && <button className="secondary" onClick={() => controlPromptPreparation("resume")}>Resume</button>}<button className="secondary" onClick={() => controlPromptPreparation("stop")}>Stop</button></div>}</div>}
+          {bulkProgress && <div className="bulk-live-progress"><div><strong>{bulkProgress.label}</strong>{bulkProgress.total > 0 && <span>{bulkProgress.current} / {bulkProgress.total}</span>}</div>{bulkProgress.total > 0 ? <progress value={bulkProgress.current} max={bulkProgress.total} /> : <progress />}{bulkProgress.total > 0 && <div className="prompt-progress-actions">{promptPrepStatus === "running" && <button className="secondary" onClick={() => controlPromptPreparation("pause")}>Pause</button>}{promptPrepStatus === "paused" && <button className="secondary" onClick={() => controlPromptPreparation("resume")}>Resume</button>}<button className="secondary" onClick={() => (bulkPlanLoading ? stopBulkPlan() : controlPromptPreparation("stop"))}>Stop</button></div>}</div>}
           <header>
             <div><span className="timestamp-heading">{selectedTiming ? `${formatTimeShort(selectedTiming.start)} – ${formatTimeShort(selectedTiming.end)}` : previewLabel}</span><strong className="production-copy narration-preview">{selectedSentences.map((sentence) => sentence.text).join(" ")}</strong></div>
           </header>

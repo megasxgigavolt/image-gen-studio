@@ -3,8 +3,8 @@ mod projects;
 use base64::Engine;
 use projects::{
     AnimationJob, CaptionSet, Channel, ExportJob, ExportResult, ExportSettings, ImageJob,
-    ImageRender, ImageWorkspace, InputAsset, MediaLibraryAsset, ProjectRepository, PromptVersion,
-    ResumeState, Timeline, Video, VideoAsset, VideoInputs, VideoProgress, VisualPlan,
+    ImageRender, ImageWorkspace, InputAsset, MediaLibraryAsset, ProjectRepository, ProviderKeyStatus,
+    PromptVersion, ResumeState, Timeline, Video, VideoAsset, VideoInputs, VideoProgress, VisualPlan,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -226,6 +226,31 @@ fn save_app_setting(
     with_repository(state, |repository| {
         repository.save_app_setting(&key, &value)
     })
+}
+
+#[tauri::command]
+fn get_provider_key_status(
+    state: State<'_, RepositoryState>,
+    provider: String,
+) -> Result<ProviderKeyStatus, String> {
+    with_repository(state, |repository| repository.get_provider_key_status(&provider))
+}
+
+#[tauri::command]
+fn save_provider_key(
+    state: State<'_, RepositoryState>,
+    provider: String,
+    api_key: String,
+) -> Result<(), String> {
+    with_repository(state, |repository| repository.save_provider_key(&provider, &api_key))
+}
+
+#[tauri::command]
+fn test_provider_key(
+    state: State<'_, RepositoryState>,
+    provider: String,
+) -> Result<(), String> {
+    with_repository(state, |repository| repository.test_provider_key(&provider))
 }
 
 #[tauri::command]
@@ -1684,13 +1709,23 @@ fn spawn_animation_job_workers(
                     ) {
                         break;
                     }
-                    match repository.generate_animation_clip(
-                        &item.video_id,
-                        &item.clip_id,
-                        &item.resolution,
-                        &item.prompt,
-                        &engine_dir,
-                    ) {
+                    let generated = match &item.clip_id {
+                        Some(clip_id) => repository.generate_animation_clip(
+                            &item.video_id,
+                            clip_id,
+                            &item.resolution,
+                            &item.prompt,
+                            &engine_dir,
+                        ),
+                        None => repository.generate_animation_for_still(
+                            &item.video_id,
+                            &item.group_id,
+                            &item.resolution,
+                            &item.prompt,
+                            &engine_dir,
+                        ),
+                    };
+                    match generated {
                         Ok(asset) => {
                             video_asset_id = Some(asset.id);
                             break;
@@ -1755,6 +1790,17 @@ fn resolve_engine_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, Stri
     }
 }
 
+/// Preferences' "Open app data folder" — this app has no separate log file
+/// (logging is console-only), so this opens the local app-data directory
+/// (database + project files) rather than pretending a logs folder exists.
+#[tauri::command]
+fn get_app_data_dir(app: tauri::AppHandle) -> Result<String, String> {
+    app.path()
+        .app_local_data_dir()
+        .map(|dir| dir.to_string_lossy().to_string())
+        .map_err(|e| format!("Could not locate the app data directory: {e}"))
+}
+
 #[tauri::command]
 fn create_animation_job(
     app: tauri::AppHandle,
@@ -1773,6 +1819,31 @@ fn create_animation_job(
     Ok(job)
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnimationBulkJobItemInput {
+    group_id: String,
+    prompt: String,
+}
+
+#[tauri::command]
+fn create_animation_bulk_job(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    resolution: String,
+    items: Vec<AnimationBulkJobItemInput>,
+) -> Result<AnimationJob, String> {
+    let engine_dir = resolve_engine_dir(&app)?;
+    let pairs: Vec<(String, String)> = items.into_iter().map(|item| (item.group_id, item.prompt)).collect();
+    let (job, paths) = with_repository(state, |repository| {
+        let job = repository.create_animation_bulk_job(&video_id, &resolution, &pairs)?;
+        Ok((job, repository.paths()))
+    })?;
+    spawn_animation_job_workers(paths.0, paths.1, engine_dir, job.id.clone());
+    Ok(job)
+}
+
 #[tauri::command]
 fn suggest_animation_prompt(
     state: State<'_, RepositoryState>,
@@ -1780,6 +1851,19 @@ fn suggest_animation_prompt(
     group_id: String,
 ) -> Result<String, String> {
     with_repository(state, |repository| repository.suggest_animation_prompt(&video_id, &group_id))
+}
+
+#[tauri::command]
+fn explain_motion_graphic_choice(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_id: String,
+    effect_label: String,
+    effect_summary: String,
+) -> Result<String, String> {
+    with_repository(state, |repository| {
+        repository.explain_motion_graphic_choice(&video_id, &group_id, &effect_label, &effect_summary)
+    })
 }
 
 #[tauri::command]
@@ -2630,6 +2714,12 @@ pub fn run() {
             control_image_job,
             create_animation_job,
             suggest_animation_prompt,
+            explain_motion_graphic_choice,
+            create_animation_bulk_job,
+            get_provider_key_status,
+            save_provider_key,
+            test_provider_key,
+            get_app_data_dir,
             get_latest_animation_job,
             control_animation_job,
             retime_animation_clip,

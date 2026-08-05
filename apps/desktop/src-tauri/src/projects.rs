@@ -569,8 +569,8 @@ CREATE TABLE IF NOT EXISTS timeline_logo_clips (
     start_seconds REAL NOT NULL,
     end_seconds REAL NOT NULL,
     position TEXT NOT NULL DEFAULT 'bottom-right' CHECK(position IN ('top-left','top-right','bottom-left','bottom-right','center')),
-    size_percent REAL NOT NULL DEFAULT 15,
-    opacity_percent REAL NOT NULL DEFAULT 100,
+    size_percent REAL NOT NULL DEFAULT 10,
+    opacity_percent REAL NOT NULL DEFAULT 80,
     show_throughout INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_timeline_logo_clips_video ON timeline_logo_clips(video_id, start_seconds);
@@ -586,7 +586,7 @@ ALTER TABLE timeline_music_clips ADD COLUMN loop_enabled INTEGER NOT NULL DEFAUL
 
 const MIGRATION_029: &str = r#"
 ALTER TABLE timeline_clips ADD COLUMN color_filter_preset TEXT NOT NULL DEFAULT 'none';
-ALTER TABLE timeline_clips ADD COLUMN color_filter_intensity REAL NOT NULL DEFAULT 50;
+ALTER TABLE timeline_clips ADD COLUMN color_filter_intensity REAL NOT NULL DEFAULT 100;
 "#;
 
 const MIGRATION_030: &str = r#"
@@ -633,6 +633,41 @@ ALTER TABLE visual_plan_meta ADD COLUMN generation_audio_id TEXT;
 ALTER TABLE visual_plan_meta ADD COLUMN generation_pacing_preset TEXT;
 ALTER TABLE visual_plan_meta ADD COLUMN generation_pacing_min_seconds INTEGER;
 ALTER TABLE visual_plan_meta ADD COLUMN generation_pacing_max_seconds INTEGER;
+"#;
+
+/// Frees `animation_job_items.clip_id` from its original NOT NULL
+/// constraint, so the Animate pipeline stage can enqueue animation jobs for
+/// stills that aren't on the Editor timeline yet (no clip row exists to
+/// reference). SQLite has no `ALTER COLUMN`, so this is the standard
+/// rebuild-and-swap: create the new shape, copy every row across by
+/// explicit column name (not `SELECT *`, so column reordering across the
+/// original CREATE TABLE + later `ADD COLUMN`s can't silently misalign
+/// values), drop the old table, rename in.
+const MIGRATION_034: &str = r#"
+CREATE TABLE animation_job_items_new (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES animation_jobs(id),
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    group_id TEXT NOT NULL,
+    clip_id TEXT REFERENCES timeline_clips(id),
+    source_render_id TEXT NOT NULL REFERENCES image_renders(id),
+    resolution TEXT NOT NULL,
+    requested_duration_seconds REAL NOT NULL,
+    veo_duration_seconds INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','stopped')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    veo_operation_name TEXT,
+    video_asset_id TEXT REFERENCES video_assets(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    prompt TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO animation_job_items_new (id,job_id,video_id,group_id,clip_id,source_render_id,resolution,requested_duration_seconds,veo_duration_seconds,status,attempts,last_error,veo_operation_name,video_asset_id,created_at,updated_at,prompt)
+SELECT id,job_id,video_id,group_id,clip_id,source_render_id,resolution,requested_duration_seconds,veo_duration_seconds,status,attempts,last_error,veo_operation_name,video_asset_id,created_at,updated_at,prompt FROM animation_job_items;
+DROP TABLE animation_job_items;
+ALTER TABLE animation_job_items_new RENAME TO animation_job_items;
+CREATE INDEX IF NOT EXISTS idx_animation_job_items_job ON animation_job_items(job_id, status, created_at);
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1011,7 +1046,10 @@ pub struct VideoAsset {
 pub struct AnimationJobItem {
     pub id: String,
     pub video_id: String,
-    pub clip_id: String,
+    /// `None` for items created by the Animate pipeline stage (no timeline
+    /// clip exists yet) — `Some` for the Editor's per-clip "Animate this
+    /// clip" flow, which retimes/duration-fits against a real clip.
+    pub clip_id: Option<String>,
     pub group_id: String,
     pub source_render_id: String,
     pub resolution: String,
@@ -1721,6 +1759,21 @@ impl ProjectRepository {
         }
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(33, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let clip_id_not_null: i64 = self
+            .connection
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('animation_job_items') WHERE name='clip_id'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if clip_id_not_null != 0 {
+            self.connection.execute_batch(MIGRATION_034).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(34, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -3776,6 +3829,76 @@ Return JSON only, in exactly this shape: {{"prompt": "the motion prompt text"}}"
             return Err("Gemini returned an empty prompt suggestion.".into());
         }
         Ok(suggestion.to_string())
+    }
+
+    /// Explains why (or whether) a Motion Graphics preset fits a specific
+    /// still, for the live per-clip description in the Editor's clip panel.
+    /// Text-only and OpenAI-primary/Gemini-fallback (same provider
+    /// preference as `analyze_motion_graphics`'s bulk run), unlike that bulk
+    /// run this never touches the Python engine or the image bytes
+    /// themselves — it reasons from the still's own stored scene
+    /// description and narration, which keeps it fast enough to re-run on
+    /// every clip selection/preset change.
+    pub fn explain_motion_graphic_choice(
+        &self, video_id: &str, group_id: &str, effect_label: &str, effect_summary: &str,
+    ) -> Result<String, String> {
+        let api_key = self.get_provider_key("openai")?;
+        let mut gemini_auth_error: Option<String> = None;
+        let gemini_auth = match self.gemini_auth() {
+            Ok(auth) => Some(auth),
+            Err(error) => { gemini_auth_error = Some(error); None }
+        };
+        if api_key.is_none() && gemini_auth.is_none() {
+            return Err(gemini_auth_error.map(|error| format!(
+                "An OpenAI or Gemini API key is required. Add one in Settings. (Gemini: {error})"
+            )).unwrap_or_else(|| "An OpenAI or Gemini API key is required. Add one in Settings.".into()));
+        }
+        let visual_plan = self.get_visual_plan(video_id)?;
+        let group = visual_plan.groups.iter().find(|g| g.id == group_id)
+            .ok_or("Still not found in visual plan.")?;
+        let narration = group.sentence_ids.iter()
+            .filter_map(|id| visual_plan.sentences.iter().find(|s| &s.id == id))
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let still_description = self.list_prompt_versions(video_id, group_id)?
+            .into_iter().next().map(|p| p.user_prompt);
+        let prompt = format!(
+            r#"You are a motion-graphics director explaining a treatment choice for one still image in an explainer video.
+
+Narration spoken while this still is on screen:
+{narration}
+
+What the still image depicts:
+{}
+
+The treatment being considered — "{effect_label}": {effect_summary}
+
+In 1-2 sentences (under 45 words), explain why this treatment fits this specific still and narration — or, if it's a poor fit, say so plainly and briefly explain why. Be concrete about this still, not generic. Do not mention "Veo," camera brand names, resolution, or duration.
+
+Return JSON only, in exactly this shape: {{"description": "the explanation text"}}"#,
+            still_description.as_deref().unwrap_or("(no description available)"),
+        );
+        let raw = match &api_key {
+            Some(key) => match request_openai_text(key, &prompt) {
+                Ok(text) => text,
+                Err(openai_error) => match &gemini_auth {
+                    Some(auth) => request_gemini_text(auth, &prompt)
+                        .map_err(|gemini_error| format!("{openai_error} (Gemini fallback also failed: {gemini_error})"))?,
+                    None => return Err(openai_error),
+                },
+            },
+            None => request_gemini_text(gemini_auth.as_ref().expect("checked above"), &prompt)?,
+        };
+        let cleaned = extract_json_from_text(&raw);
+        let parsed: serde_json::Value = serde_json::from_str(cleaned)
+            .map_err(|e| format!("Response was not valid JSON: {e}"))?;
+        let description = parsed.get("description")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or("No description returned.")?;
+        Ok(description.to_string())
     }
 
     pub fn approve_bulk_plan(&self, video_id: &str, style_directive: &str, stills: &[BulkPlannedStill]) -> Result<usize, String> {
@@ -6072,7 +6195,8 @@ Return JSON only:
             "SELECT duration_seconds FROM timelines WHERE video_id=?1", [video_id], |row| row.get(0),
         ).map_err(|e| e.to_string())?;
         self.connection.execute(
-            "INSERT INTO timeline_logo_clips(id,video_id,media_library_asset_id,start_seconds,end_seconds) VALUES(?1,?2,?3,0,?4)",
+            "INSERT INTO timeline_logo_clips(id,video_id,media_library_asset_id,start_seconds,end_seconds,position,size_percent,opacity_percent,show_throughout) \
+             VALUES(?1,?2,?3,0,?4,'bottom-right',10,80,1)",
             params![Uuid::new_v4().to_string(), video_id, media_library_asset_id, duration_seconds.max(1.0)],
         ).map_err(|e| e.to_string())?;
         self.get_timeline(video_id)
@@ -6096,7 +6220,7 @@ Return JSON only:
         if !["top-left", "top-right", "bottom-left", "bottom-right", "center"].contains(&position) {
             return Err("Unsupported logo position.".into());
         }
-        let clamped_size = size_percent.clamp(1.0, 100.0);
+        let clamped_size = size_percent.clamp(5.0, 30.0);
         let clamped_opacity = opacity_percent.clamp(0.0, 100.0);
         if show_throughout {
             let duration_seconds: f64 = self.connection.query_row(
@@ -6125,7 +6249,7 @@ Return JSON only:
     /// `clear_timeline_track` (which deletes clips outright).
     pub fn remove_all_clip_effects(&self, video_id: &str) -> Result<Timeline, String> {
         self.connection.execute(
-            "UPDATE timeline_clips SET motion_preset='none', transition_in='cut', transition_out='cut', motion_intensity=0.22, color_filter_preset='none', color_filter_intensity=50, motion_graphic_effect=NULL, motion_graphic_settings_json=NULL, motion_graphic_reason=NULL WHERE video_id=?1",
+            "UPDATE timeline_clips SET motion_preset='none', transition_in='cut', transition_out='cut', motion_intensity=0.22, color_filter_preset='none', color_filter_intensity=100, motion_graphic_effect=NULL, motion_graphic_settings_json=NULL, motion_graphic_reason=NULL WHERE video_id=?1",
             [video_id],
         ).map_err(|e| e.to_string())?;
         self.get_timeline(video_id)
@@ -6365,6 +6489,23 @@ Return JSON only:
             provider: provider.to_string(),
             configured,
         })
+    }
+
+    /// Preferences' "Test" button — a minimal real call to confirm a saved
+    /// key actually works, not just that something is stored under it.
+    pub fn test_provider_key(&self, provider: &str) -> Result<(), String> {
+        match provider {
+            "openai" => {
+                let key = self.get_provider_key("openai")?.filter(|value| !value.trim().is_empty())
+                    .ok_or("No OpenAI API key is saved.")?;
+                request_openai_text(&key, "Reply with the single word: OK").map(|_| ())
+            }
+            "gemini" => {
+                let auth = self.gemini_auth()?;
+                request_gemini_text(&auth, r#"Reply with exactly this JSON: {"ok": true}"#).map(|_| ())
+            }
+            _ => Err(format!("Unknown provider: {provider}")),
+        }
     }
 
     pub fn create_image_job(&self, video_id: &str) -> Result<ImageJob, String> {
@@ -6608,6 +6749,43 @@ Return JSON only:
             "INSERT INTO animation_job_items(id,job_id,video_id,group_id,clip_id,source_render_id,resolution,requested_duration_seconds,veo_duration_seconds,prompt,status,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'queued',?11,?11)",
             params![Uuid::new_v4().to_string(), id, video_id, group_id, clip_id, source_render_id, resolution, requested_duration_seconds, veo_duration_seconds, prompt.trim(), now],
         ).map_err(|e| e.to_string())?;
+        self.get_animation_job(&id)
+    }
+
+    /// Bulk counterpart of `create_animation_job` for the Animate pipeline
+    /// stage's "Animate All Stills" — one job with N items, each targeting a
+    /// still directly (`clip_id` NULL) rather than a placed timeline clip.
+    /// `items` is expected to already be filtered to stills that have a
+    /// generated image (the frontend has that list on hand); a still
+    /// missing one fails the whole call rather than silently shrinking the
+    /// job, since that would leave the reported item count for a still the
+    /// user asked to animate quietly wrong.
+    pub fn create_animation_bulk_job(
+        &self, video_id: &str, resolution: &str, items: &[(String, String)],
+    ) -> Result<AnimationJob, String> {
+        if !matches!(resolution, "720p" | "1080p") {
+            return Err("Resolution must be 720p or 1080p.".into());
+        }
+        if items.is_empty() {
+            return Err("No stills to animate.".into());
+        }
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO animation_jobs(id,video_id,status,total_items,created_at,updated_at) VALUES(?1,?2,'queued',?3,?4,?4)",
+            params![id, video_id, items.len() as i64, now],
+        ).map_err(|e| e.to_string())?;
+        let requested_duration_seconds: f64 = *VEO_ALLOWED_DURATIONS.last().expect("non-empty") as f64;
+        let veo_duration_seconds = pick_veo_duration(requested_duration_seconds);
+        for (group_id, prompt) in items {
+            let source_render_id = self.list_image_renders(video_id, group_id)?
+                .into_iter().next().map(|render| render.id)
+                .ok_or_else(|| format!("Still {group_id} has no generated image yet."))?;
+            self.connection.execute(
+                "INSERT INTO animation_job_items(id,job_id,video_id,group_id,clip_id,source_render_id,resolution,requested_duration_seconds,veo_duration_seconds,prompt,status,created_at,updated_at) VALUES(?1,?2,?3,?4,NULL,?5,?6,?7,?8,?9,'queued',?10,?10)",
+                params![Uuid::new_v4().to_string(), id, video_id, group_id, source_render_id, resolution, requested_duration_seconds, veo_duration_seconds, prompt.trim(), now],
+            ).map_err(|e| e.to_string())?;
+        }
         self.get_animation_job(&id)
     }
 
@@ -6869,6 +7047,101 @@ Return JSON only:
                 "reason": "animation-generated",
                 "groupId": group_id,
                 "clipId": clip_id,
+                "videoAssetId": id,
+                "version": version,
+            })
+            .to_string(),
+        )?;
+
+        self.get_video_asset(&id)
+    }
+
+    /// Generates a Veo animation for a still directly — no timeline clip
+    /// required, unlike `generate_animation_clip`. Used by the Animate
+    /// pipeline stage, which runs before stills are ever placed on the
+    /// Editor timeline. Always requests Veo's longest supported duration
+    /// (8s) since there's no timeline slot to size against yet — the
+    /// Editor's existing "Adjust animation to duration" retime already
+    /// handles shrinking a cached animation to fit wherever it ends up.
+    pub fn generate_animation_for_still(
+        &self,
+        video_id: &str,
+        group_id: &str,
+        resolution: &str,
+        prompt: &str,
+        engine_dir: &Path,
+    ) -> Result<VideoAsset, String> {
+        if !matches!(resolution, "720p" | "1080p") {
+            return Err("Resolution must be 720p or 1080p.".into());
+        }
+        let source_render_id = self.list_image_renders(video_id, group_id)?
+            .into_iter().next().map(|render| render.id)
+            .ok_or("Generate an image for this still before animating it.")?;
+        let render = self.get_render_by_id(&source_render_id)?;
+        let source_path = self.render_absolute_path(&render)?;
+        let source_bytes = fs::read(&source_path).map_err(|_| "Source still file is missing.".to_string())?;
+        let mime_type = extension_to_media_type(
+            source_path.extension().and_then(|value| value.to_str()).unwrap_or("png"),
+        );
+
+        let requested_duration_seconds: f64 = *VEO_ALLOWED_DURATIONS.last().expect("non-empty") as f64;
+        let veo_duration_seconds = pick_veo_duration(requested_duration_seconds);
+
+        let auth = self.gemini_auth()?;
+        let model = self.get_app_setting("veo_model")?.filter(|value| !value.trim().is_empty()).unwrap_or_else(|| "veo-3.1-lite-generate-preview".to_string());
+
+        let operation_name = request_veo_generate(
+            &auth, &model, prompt, &source_bytes, mime_type, resolution, veo_duration_seconds,
+        )?;
+
+        let started = std::time::Instant::now();
+        let poll_timeout = std::time::Duration::from_secs(600);
+        let video_bytes = loop {
+            if started.elapsed() > poll_timeout {
+                return Err("Animation generation timed out.".into());
+            }
+            match poll_veo_operation(&auth, &model, &operation_name)? {
+                Some(bytes) => break bytes,
+                None => std::thread::sleep(std::time::Duration::from_secs(10)),
+            }
+        };
+
+        let channel_id: String = self
+            .connection
+            .query_row(
+                "SELECT channel_id FROM videos WHERE id = ?1 AND trashed_at IS NULL",
+                [video_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Video was not found.".to_string())?;
+        let animation_dir = self.projects_dir.join(&channel_id).join(video_id).join("animations").join(group_id);
+        fs::create_dir_all(&animation_dir).map_err(|e| e.to_string())?;
+        let version: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM video_assets WHERE video_id = ?1 AND group_id = ?2",
+                params![video_id, group_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let file_name = format!("animation-v{}.mp4", version);
+        let relative_path = format!("animations/{}/{}", group_id, file_name);
+        let out_path = animation_dir.join(&file_name);
+        fs::write(&out_path, &video_bytes).map_err(|e| e.to_string())?;
+        let actual_duration_seconds = Self::probe_audio_duration(engine_dir, &out_path)?;
+
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO video_assets(id,video_id,group_id,source_render_id,version,parent_video_asset_id,kind,file_name,relative_path,resolution,requested_duration_seconds,veo_duration_seconds,actual_duration_seconds,veo_model,veo_operation_name,prompt,created_at) VALUES(?1,?2,?3,?4,?5,NULL,'generation',?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            params![id, video_id, group_id, source_render_id, version, file_name, relative_path, resolution, requested_duration_seconds, veo_duration_seconds, actual_duration_seconds, model, operation_name, prompt.trim(), now],
+        ).map_err(|e| e.to_string())?;
+
+        self.create_snapshot(
+            video_id,
+            &json!({
+                "reason": "animation-generated-for-still",
+                "groupId": group_id,
                 "videoAssetId": id,
                 "version": version,
             })
@@ -10811,7 +11084,7 @@ mod tests {
         repo.import_asset(&video.id, &audio, "audio").unwrap();
         repo.generate_visual_plan(&video.id, temp.path()).unwrap();
         let timeline = repo.build_timeline(&video.id).unwrap();
-        assert!(timeline.clips.iter().all(|c| c.color_filter_preset == "none" && (c.color_filter_intensity - 50.0).abs() < 1e-9));
+        assert!(timeline.clips.iter().all(|c| c.color_filter_preset == "none" && (c.color_filter_intensity - 100.0).abs() < 1e-9));
         let first_clip_id = timeline.clips[0].id.clone();
 
         assert!(repo.set_timeline_clip_color_filter(&video.id, &first_clip_id, "bogus", 50.0).is_err());
@@ -10947,7 +11220,7 @@ mod tests {
                 && clip.transition_out == "cut"
                 && (clip.motion_intensity - 0.22).abs() < 1e-9
                 && clip.color_filter_preset == "none"
-                && (clip.color_filter_intensity - 50.0).abs() < 1e-9
+                && (clip.color_filter_intensity - 100.0).abs() < 1e-9
         }));
     }
 
@@ -11154,6 +11427,35 @@ mod tests {
 
         // The relaxed retime root-lookup treats an upload as a valid re-derivation root.
         assert!(repo.retime_animation_clip(&video.id, "clip1", temp.path()).is_ok());
+    }
+
+    #[test]
+    fn bulk_animation_job_items_target_stills_directly_with_no_clip() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let prompt = repo.create_prompt_version(&video.id, "g1", "{}", "system", "scene").unwrap();
+        let render_dir = temp.path().join("Projects").join(&channel.id).join(&video.id).join("renders").join("g1");
+        fs::create_dir_all(&render_dir).unwrap();
+        fs::write(render_dir.join("render-v1.png"), b"source").unwrap();
+        let render = repo
+            .insert_image_render("render1", &video.id, "g1", 1, &prompt.id, "render-v1.png", "renders/g1/render-v1.png", None, None, "generation")
+            .unwrap();
+        let _ = render;
+
+        assert!(repo.create_animation_bulk_job(&video.id, "4K", &[("g1".into(), "gentle drift".into())]).is_err());
+        assert!(repo.create_animation_bulk_job(&video.id, "720p", &[]).is_err());
+        // A group with no generated render is rejected rather than silently dropped.
+        assert!(repo.create_animation_bulk_job(&video.id, "720p", &[("g-missing".into(), "prompt".into())]).is_err());
+
+        let job = repo.create_animation_bulk_job(&video.id, "720p", &[("g1".into(), "gentle drift".into())]).unwrap();
+        assert_eq!(job.total_items, 1);
+        assert_eq!(job.status, "queued");
+        assert_eq!(job.items.len(), 1);
+        assert_eq!(job.items[0].clip_id, None);
+        assert_eq!(job.items[0].group_id, "g1");
+        assert_eq!(job.items[0].prompt, "gentle drift");
+        assert_eq!(job.items[0].status, "queued");
     }
 
     #[test]

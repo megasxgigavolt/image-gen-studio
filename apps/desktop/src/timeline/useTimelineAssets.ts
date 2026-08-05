@@ -1,25 +1,34 @@
 import { useEffect, useRef, useState } from "react";
 import { resolveRenderUrl, resolveVideoAssetUrl } from "../infrastructure/media-cache";
 import { projectsClient, type ImageWorkspaceRecord, type TimelineRecord } from "../infrastructure/projects-client";
+import type { AspectRatio } from "./Toolbar";
+
+function canvasSizeForAspectRatio(aspectRatio: AspectRatio): { width: number; height: number } {
+  return aspectRatio === "9:16" ? { width: 540, height: 960 } : { width: 960, height: 540 };
+}
 
 /** Resolves and caches every asset URL/element the preview canvas needs to
  * draw a frame — still-image render URLs, generated-clip video URLs,
  * detected zoom-subject points, and the actual `<img>`/`<video>` elements
  * (loaded once, reused across every draw call). Also owns the preview
- * canvas's aspect ratio, which is only known once the first image loads. */
+ * canvas's pixel size, driven by the project's aspect-ratio setting rather
+ * than any individual still's natural size — stills that don't match get
+ * cover-cropped at draw time (see drawStillClipContent), same as export. */
 export function useTimelineAssets(
   activeVideoId: string | null,
   timeline: TimelineRecord | null,
   workspace: ImageWorkspaceRecord | null,
-  /** Invoked once a lazily-loaded image finishes decoding (or its natural
-   * aspect ratio changes canvasSize) — lets the caller re-draw the current
-   * frame without this hook needing to know anything about the RAF loop. */
+  aspectRatio: AspectRatio,
+  /** Invoked once a lazily-loaded image finishes decoding — lets the caller
+   * re-draw the current frame without this hook needing to know anything
+   * about the RAF loop. */
   onAssetReady?: () => void,
 ) {
   const [renderUrls, setRenderUrls] = useState<Record<string, string>>({});
   const [videoAssetUrls, setVideoAssetUrls] = useState<Record<string, string>>({});
   const [subjectByRender, setSubjectByRender] = useState<Record<string, { x: number; y: number }>>({});
-  const [canvasSize, setCanvasSize] = useState({ width: 960, height: 540 });
+  // A pure derivation of the aspect-ratio setting, not independent state.
+  const canvasSize = canvasSizeForAspectRatio(aspectRatio);
 
   const imageElsRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const videoElsRef = useRef<Map<string, HTMLVideoElement>>(new Map());
@@ -76,16 +85,6 @@ export function useTimelineAssets(
     if (!img) {
       img = new Image();
       img.onload = () => {
-        if (img && img.naturalWidth && img.naturalHeight) {
-          const ratio = img.naturalWidth / img.naturalHeight;
-          setCanvasSize((current) => {
-            const currentRatio = current.width / current.height;
-            if (Math.abs(currentRatio - ratio) < 0.02) return current;
-            return ratio >= 1
-              ? { width: 960, height: Math.round(960 / ratio) }
-              : { width: Math.round(540 * ratio), height: 540 };
-          });
-        }
         onAssetReadyRef.current?.();
       };
       img.src = url;

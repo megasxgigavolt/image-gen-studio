@@ -1,4 +1,6 @@
 import {
+  AlertTriangle,
+  CheckCircle2,
   Film,
   FolderOpen,
   Home,
@@ -28,6 +30,7 @@ import {
   Search,
   ChevronUp,
   ChevronDown,
+  Scissors,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -60,11 +63,14 @@ import {
   type ImageRenderRecord,
 } from "./infrastructure/projects-client";
 import { TimelineView } from "./TimelineView";
+import { AnimateView } from "./AnimateView";
+import { PreferencesModal } from "./PreferencesModal";
 
-const navItems: { stage: AppStage; label: string; icon: typeof Home; alwaysEnabled?: boolean }[] = [
-  { stage: "inputs", label: "Production", icon: Upload },
-  { stage: "images", label: "Images", icon: Image },
-  { stage: "timeline", label: "Editor", icon: Film },
+const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
+  { stage: "inputs", label: "Inputs", icon: Upload },
+  { stage: "images", label: "Visuals", icon: Image },
+  { stage: "animate", label: "Animate", icon: Film },
+  { stage: "timeline", label: "Editor", icon: Scissors },
 ];
 const MAX_CACHE_SIZE = 20;
 const imageWorkspaceCache = new Map<string, ImageWorkspaceRecord>();
@@ -88,12 +94,14 @@ export function ConfirmDialog({
   title,
   message,
   confirmLabel = "Confirm",
+  danger = false,
   onConfirm,
   onCancel,
 }: {
   title: string;
   message: string;
   confirmLabel?: string;
+  danger?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -127,7 +135,7 @@ export function ConfirmDialog({
         <p style={{ color: "var(--muted)", fontSize: "13px", lineHeight: 1.55, marginTop: "8px" }}>{message}</p>
         <div className="footer-actions">
           <button className="secondary" onClick={onCancel}>Cancel</button>
-          <button className="primary" onClick={onConfirm}>{confirmLabel}</button>
+          <button className={danger ? "primary danger" : "primary"} onClick={onConfirm}>{confirmLabel}</button>
         </div>
       </div>
     </div>
@@ -173,6 +181,7 @@ function Sidebar() {
   const { stage, setStage, activeVideoId, lastProductionStage, clearActiveProject } = useAppStore();
   const [appVersion, setAppVersion] = useState("");
   const [confirmHome, setConfirmHome] = useState(false);
+  const [preferencesOpen, setPreferencesOpen] = useState(false);
 
   useEffect(() => {
     void projectsClient.getApplicationVersion().then(setAppVersion);
@@ -186,37 +195,46 @@ function Sidebar() {
     }
   }
 
+  // Position of the current stage within the pipeline — items before it are
+  // "completed" (dim dot), the matching one is "active" (bright dot), items
+  // after it haven't been visited yet this session (dark dot).
+  const currentIndex = navItems.findIndex(({ stage: itemStage }) =>
+    itemStage === "inputs" ? ["inputs", "visual-plan"].includes(stage) : stage === itemStage,
+  );
+
   return (
     <aside className="sidebar">
-      <button className="brand" onClick={handleBrandClick}>
+      <button className="brand" onClick={handleBrandClick} title="Auto Gen Studio">
         <span className="brand-mark"><span /></span>
-        <span>Auto Gen <strong>Studio</strong></span>
       </button>
       <nav>
-        {navItems.map(({ stage: itemStage, label, icon: Icon, alwaysEnabled }) => {
+        {navItems.map(({ stage: itemStage, label, icon: Icon }, index) => {
           const isActive = itemStage === "inputs"
             ? ["inputs", "visual-plan"].includes(stage)
             : stage === itemStage;
-          const isDisabled = !alwaysEnabled && !activeVideoId;
+          const isDisabled = !activeVideoId;
+          const dotState = isActive ? "active" : currentIndex >= 0 && index < currentIndex ? "completed" : "pending";
           return (
             <button
               className={isActive ? "nav-item active" : "nav-item"}
               key={itemStage}
               onClick={() => setStage(itemStage === "inputs" ? lastProductionStage : itemStage)}
               disabled={isDisabled}
-              title={isDisabled ? "Open a video first" : undefined}
+              title={isDisabled ? "Open a video first" : label}
               aria-current={isActive ? "page" : undefined}
             >
+              <span className={`nav-item-dot ${dotState}`} aria-hidden="true" />
               <Icon size={18} />
               <span>{label}</span>
             </button>
           );
         })}
       </nav>
-      <button className="nav-item settings" disabled title="Coming soon">
+      <button className="nav-item settings" onClick={() => setPreferencesOpen(true)}>
         <Settings size={18} /><span>Preferences</span>
       </button>
       {appVersion && <small className="app-version-line">v{appVersion}</small>}
+      {preferencesOpen && createPortal(<PreferencesModal onClose={() => setPreferencesOpen(false)} />, document.body)}
       {confirmHome && createPortal(
         <ConfirmDialog
           title="Leave this project?"
@@ -256,7 +274,7 @@ function Header() {
         {activeVideoTitle && <strong>{activeVideoTitle}</strong>}
       </div>
       <div className="top-actions">
-        <span className="saved">Saved locally</span>
+        {stage !== "timeline" && <span className="saved">Saved locally</span>}
         <button className="icon-button" onClick={handleToggleTheme} aria-label="Toggle theme">
           {theme === "light" ? <Moon size={17} /> : <Sun size={17} />}
         </button>
@@ -305,6 +323,7 @@ function stageLabel(stage: AppStage): string {
   if (stage === "timeline") return "Editor";
   if (stage === "visual-plan") return "Plan";
   if (stage === "images") return "Visuals";
+  if (stage === "animate") return "Animate";
   if (stage === "inputs") return "Inputs";
   return stage;
 }
@@ -313,6 +332,7 @@ const PIPELINE_STAGES: { stage: AppStage; label: string }[] = [
   { stage: "inputs", label: "Inputs" },
   { stage: "visual-plan", label: "Plan" },
   { stage: "images", label: "Visuals" },
+  { stage: "animate", label: "Animate" },
   { stage: "timeline", label: "Editor" },
 ];
 
@@ -342,6 +362,7 @@ function HomeView() {
   const [resume, setResume] = useState<ResumeRecord | null>(null);
   const [dialog, setDialog] = useState<"channel" | "video" | null>(null);
   const [name, setName] = useState("");
+  const [channelAbout, setChannelAbout] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [renamingChannelId, setRenamingChannelId] = useState<string | null>(null);
@@ -351,6 +372,7 @@ function HomeView() {
   const [channelMenu, setChannelMenu] = useState<{ id: string; rect: DOMRect } | null>(null);
   const [videoMenu, setVideoMenu] = useState<{ id: string; rect: DOMRect } | null>(null);
   const [appVersion, setAppVersion] = useState("");
+  const [preferencesOpen, setPreferencesOpen] = useState(false);
   const clickTimers = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -427,13 +449,14 @@ function HomeView() {
     if (!name.trim()) return;
     try {
       if (dialog === "channel") {
-        const channel = await projectsClient.createChannel(name.trim());
+        const channel = await projectsClient.createChannel(name.trim(), channelAbout.trim() || undefined);
         setSelectedChannelId(channel.id);
       } else if (dialog === "video" && selectedChannelId) {
         await projectsClient.createVideo(selectedChannelId, name.trim());
       }
       setDialog(null);
       setName("");
+      setChannelAbout("");
       await loadWorkspace();
     } catch (caught) {
       setError(String(caught));
@@ -561,10 +584,11 @@ function HomeView() {
             ))}
           </div>
         )}
-        <button className="nav-item settings" disabled title="Coming soon">
+        <button className="nav-item settings" onClick={() => setPreferencesOpen(true)}>
           <Settings size={18} /><span>Preferences</span>
         </button>
         {appVersion && <small className="app-version-line">v{appVersion}</small>}
+        {preferencesOpen && <PreferencesModal onClose={() => setPreferencesOpen(false)} />}
       </aside>
       <section className="launcher-videos">
         {resume && showResumeBanner && resume.channelId === selectedChannelId && (
@@ -626,13 +650,24 @@ function HomeView() {
         )}
       </section>
       {(dialog === "channel" || dialog === "video") && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => { setDialog(null); setName(""); }}>
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => { setDialog(null); setName(""); setChannelAbout(""); }}>
           <form className="modal" onSubmit={(event) => void submitCreate(event)} onMouseDown={(event) => event.stopPropagation()}>
             <p className="eyebrow">{dialog === "channel" ? "New workspace" : "New production"}</p>
             <h2>{dialog === "channel" ? "Create channel" : "Create video"}</h2>
-            <label>{dialog === "channel" ? "Channel name" : "Video title"}<input autoFocus value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(e) => { if (e.key === "Escape") { setDialog(null); setName(""); } }} /></label>
+            <label>{dialog === "channel" ? "Channel name" : "Video title"}<input autoFocus value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(e) => { if (e.key === "Escape") { setDialog(null); setName(""); setChannelAbout(""); } }} /></label>
             {!name.trim() && <p style={{ fontSize: "11px", color: "var(--muted)", marginTop: "4px" }}>Name cannot be empty.</p>}
-            <div className="footer-actions"><button type="button" className="secondary" onClick={() => { setDialog(null); setName(""); }}>Cancel</button><button className="primary" type="submit" disabled={!name.trim()}>Create</button></div>
+            {dialog === "channel" && (
+              <label style={{ marginTop: "10px" }}>
+                <span style={{ display: "flex", justifyContent: "space-between" }}>About this channel<small style={{ color: "var(--muted)", fontWeight: 500 }}>Optional</small></span>
+                <textarea
+                  rows={3}
+                  value={channelAbout}
+                  onChange={(event) => setChannelAbout(event.target.value)}
+                  placeholder="Describe your subject, angle, and audience."
+                />
+              </label>
+            )}
+            <div className="footer-actions"><button type="button" className="secondary" onClick={() => { setDialog(null); setName(""); setChannelAbout(""); }}>Cancel</button><button className="primary" type="submit" disabled={!name.trim()}>Create</button></div>
           </form>
         </div>
       )}
@@ -648,7 +683,7 @@ function InputsView() {
   const [pacingMin, setPacingMin] = useState(6);
   const [pacingMax, setPacingMax] = useState(10);
   const [audio, setAudio] = useState<import("./infrastructure/projects-client").InputAssetRecord | null>(null);
-  const [status, setStatus] = useState("Loading source material…");
+  const [, setStatus] = useState("Loading source material…");
   const [error, setError] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const [hasPlan, setHasPlan] = useState(false);
@@ -828,7 +863,17 @@ function InputsView() {
       <input ref={scriptFileRef} className="visually-hidden" type="file" accept=".txt,text/plain" onChange={(event) => void importBrowserScript(event)} />
       <input ref={audioFileRef} className="visually-hidden" type="file" accept=".wav,.mp3,.m4a,.aac,.flac,audio/*" onChange={(event) => void importBrowserAudio(event)} />
       {generating && <GenerationProgress progress={generationProgress} />}
-      <div className="page-heading"><div><h1>Source material</h1><p>Add narration and references that will guide the visual plan.</p></div><span className="save-state">{status}</span></div>
+      <div className="page-heading">
+        <div><h1>Inputs</h1><p>Add narration and references that will guide the visual plan.</p></div>
+        {ready ? (
+          <span className="readiness-badge ready"><CheckCircle2 size={13} />Ready for planning</span>
+        ) : (
+          <span className="readiness-badge">
+            <AlertTriangle size={13} />
+            {!script.trim() && !audio ? "Script and voiceover required" : !script.trim() ? "Script required" : "Voiceover required"}
+          </span>
+        )}
+      </div>
       {!activeVideoId && <div className="inline-error">Open or create a video before adding source material.</div>}
       {error && <div className="inline-error">{error}</div>}
       <div className="inputs-grid">
@@ -840,10 +885,9 @@ function InputsView() {
         <div className="panel-stack">
           <article className="panel"><div className="panel-heading"><div><h2>Narration audio</h2><p>Used for word-level timing.</p></div><button className="secondary" onClick={() => void importAsset("audio")}><Upload size={15} />{audio ? "Replace" : "Import"}</button></div>{audio ? <div className="file-row"><span>♪</span><div><strong>{audio.originalName}</strong><small>{(audio.sizeBytes / 1024 / 1024).toFixed(1)} MB</small></div><button className="icon-button" onClick={() => void removeAsset(audio.id)}><X size={15} /></button></div> : <div className="asset-empty">WAV, MP3, M4A, AAC, or FLAC</div>}</article>
           <article className="panel"><div className="pacing-heading"><div><h2>Scene pacing</h2><p>Preferred duration range per still</p></div><strong>{pacingPreset === "per-sentence" ? "1 sentence" : `${pacingMin}–${pacingMax} sec`}</strong></div><div className="pacing-options">{([["calm","Calm","10–16s"],["balanced","Balanced","6–10s"],["fast","Fast","3–6s"],["per-sentence","Every sentence","1:1 split"],["custom","Custom","Choose range"]] as const).map(([value,label,detail]) => <button key={value} className={pacingPreset === value ? "active" : ""} onClick={() => void choosePacing(value)}><strong>{label}</strong><small>{detail}</small></button>)}</div>{pacingPreset === "per-sentence" ? <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"8px 0 0"}}>Every sentence becomes its own still — no AI grouping, fastest to generate.</p> : <div className="custom-pacing"><label>Minimum<input type="number" min="2" max="30" value={pacingMin} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMin(Number(event.target.value))} onBlur={(event) => { if (pacingPreset === "custom") void choosePacing("custom", Number(event.target.value), pacingMax); }} /></label><label>Maximum<input type="number" min="2" max="30" value={pacingMax} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMax(Number(event.target.value))} onBlur={(event) => { if (pacingPreset === "custom") void choosePacing("custom", pacingMin, Number(event.target.value)); }} /></label></div>}</article>
-          <article className={ready ? "readiness ready" : "readiness"}><strong>{ready ? "Ready for visual planning" : "Source material incomplete"}</strong><span>{ready ? "Script and narration audio are available." : "Add a script and narration audio to continue."}</span></article>
         </div>
       </div>
-      <div className="footer-actions"><button className="secondary" onClick={() => setStage("home")}>Back</button>{hasPlan && inputSignature === generatedInputSignature ? <button className="primary" onClick={() => setStage("visual-plan")}>View visual plan →</button> : <button className="primary" disabled={!ready || !activeVideoId || generating} onClick={() => void generatePlan()}>{generating ? <><LoaderCircle className="spin" size={16} />Generating…</> : "Generate visual plan →"}</button>}</div>
+      <div className="footer-actions">{hasPlan && inputSignature === generatedInputSignature ? <button className="primary" onClick={() => setStage("visual-plan")}>View visual plan →</button> : <button className="primary" disabled={!ready || !activeVideoId || generating} onClick={() => void generatePlan()}>{generating ? <><LoaderCircle className="spin" size={16} />Generating…</> : "Generate visual plan →"}</button>}</div>
     </section>
   );
 }
@@ -1058,7 +1102,7 @@ function VisualPlanView() {
       {error && <div className="inline-error">{error}</div>}
       {!plan && !error && <div className="empty-state">Loading visual plan…</div>}
       {confirmReset && <ConfirmDialog title="Reset visual plan?" message="This restores everything to exactly how it was right after generation — groupings, and any sentence edits, splits, or merges. Everything you've changed since then will be lost." confirmLabel="Reset" onConfirm={() => { setConfirmReset(false); void resetPlan(); }} onCancel={() => setConfirmReset(false)} />}
-      {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{formatTimeShort(plan.sentences.at(-1)?.endSeconds ?? 0)} total · Average {((plan.sentences.at(-1)?.endSeconds ?? 0) / plan.groups.length).toFixed(1)} sec · {plan.timingSource}</span></div>
+      {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{formatTimeShort(plan.sentences.at(-1)?.endSeconds ?? 0)} total · Average {((plan.sentences.at(-1)?.endSeconds ?? 0) / plan.groups.length).toFixed(1)} sec</span></div>
       <div className="plan-scroll"><DndContext
         sensors={sensors}
         // pointerWithin (not the default rectIntersection) so a small
@@ -1780,19 +1824,6 @@ function ImagesView() {
     finally { setAiLoading(false); }
   }
 
-  async function extractImageSettingsFromDirective() {
-    if (!systemPrompt.trim()) return;
-    setAiLoading(true);
-    setError(null);
-    try {
-      const result = await projectsClient.extractImageSettingsFromDirective(systemPrompt);
-      setSystemPrompt(result.styleDirective);
-      setImageSettings((current) => mergeExtractedSettings(current, result.imageSettings));
-      setTab("settings");
-    } catch (caught) { setError(String(caught)); }
-    finally { setAiLoading(false); }
-  }
-
   // Keep progress events alive while component is mounted
   useEffect(() => {
     const unlisten = listen<{ planned: number; total: number }>("bulk_plan_progress", (event) => {
@@ -2101,14 +2132,14 @@ function ImagesView() {
   return (
     <section className="view images-view">
       {loading && <LoadingOverlay label="Working on your images" />}
-      {confirmReset && <ConfirmDialog title="Reset all images?" message="This clears all prompts, image versions, planner results, and still statuses for this video. This cannot be undone." confirmLabel="Reset everything" onConfirm={() => { setConfirmReset(false); void doResetImages(); }} onCancel={() => setConfirmReset(false)} />}
+      {confirmReset && <ConfirmDialog title="Reset all images?" message="This clears all prompts, image versions, planner results, and still statuses for this video. This cannot be undone." confirmLabel="Reset everything" danger onConfirm={() => { setConfirmReset(false); void doResetImages(); }} onCancel={() => setConfirmReset(false)} />}
       {confirmingStop && <ConfirmDialog title="Stop bulk generation?" message="This will permanently stop the current job. Any stills already generated are kept, but remaining stills will not be generated and the job cannot be resumed." confirmLabel="Stop generation" onConfirm={() => { setConfirmingStop(false); void controlJob("cancel"); }} onCancel={() => setConfirmingStop(false)} />}
       <div className="page-heading">
         <div>
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <div className="heading-actions"><button className="secondary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading}><WandSparkles size={17} />Bulk Gen Config</button><button className="primary" onClick={() => setStage("timeline")} disabled={!workspace?.groups.length}><Film size={17} />Continue to timeline →</button></div>
+        <div className="heading-actions"><button className="secondary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading}><WandSparkles size={17} />Bulk Generation</button><button className="primary" onClick={() => setStage("animate")} disabled={!workspace?.groups.length}><Film size={17} />Continue to Animate →</button></div>
       </div>
       {error && <div className="error-toast" role="alert"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
       <div className="image-workspace">
@@ -2119,8 +2150,8 @@ function ImagesView() {
               <span className="stills-heading-count">{stillCount}</span>
             </div>
             <div className="stills-heading-actions">
-              <button className="icon-button" title="Download all" aria-label="Download all" onClick={() => void exportStills()}><Download size={15} /></button>
-              <button className="icon-button danger-action" title="Reset images" aria-label="Reset images" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={15} /></button>
+              <button className="icon-button" title="Download all images" aria-label="Download all images" onClick={() => void exportStills()}><Download size={15} /></button>
+              <button className="icon-button danger-action" title="Reset all images" aria-label="Reset all images" onClick={() => setConfirmReset(true)} disabled={loading}><Trash2 size={15} /></button>
             </div>
           </div>
           <div className="still-list">
@@ -2190,7 +2221,15 @@ function ImagesView() {
             ) : <div className={`image-frame empty-frame ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}`}><div className="image-empty"><Image size={34} /><strong>No image generated yet</strong><span>{imageSettings.aspectRatio === "9:16" ? "YouTube Short · 9:16" : "YouTube Video · 16:9"}</span></div></div>}
           </div>
           <footer>
-            <div className="version-nav"><button disabled={imageRenders.findIndex((r) => r.id === selectedRenderId) >= imageRenders.length - 1} onClick={() => moveVersion(1)}><ChevronLeft size={16} />Older</button><strong>{selectedRenderId ? `Version ${imageRenders.find((r) => r.id === selectedRenderId)?.version} / ${imageRenders.length}` : "No versions"}</strong><button disabled={imageRenders.findIndex((r) => r.id === selectedRenderId) <= 0} onClick={() => moveVersion(-1)}>Newer<ChevronRight size={16} /></button></div>
+            <div className="version-nav"><button disabled={imageRenders.findIndex((r) => r.id === selectedRenderId) >= imageRenders.length - 1} onClick={() => moveVersion(1)}><ChevronLeft size={16} />Older</button><strong>{(() => {
+              // 1-based position within imageRenders (index 0 = newest), so the
+              // newest version always reads as "N / N" — never greater than the
+              // total, unlike the old raw `render.version` counter, which could
+              // outrun the array length once older versions were pruned.
+              const total = imageRenders.length;
+              const index = imageRenders.findIndex((r) => r.id === selectedRenderId);
+              return index >= 0 ? `Version ${total - index} / ${total}` : "No versions";
+            })()}</strong><button disabled={imageRenders.findIndex((r) => r.id === selectedRenderId) <= 0} onClick={() => moveVersion(-1)}>Newer<ChevronRight size={16} /></button></div>
           </footer>
         </div>
         <aside className="prompt-panel">
@@ -2202,7 +2241,7 @@ function ImagesView() {
           }}>
             <button role="tab" aria-selected={tab === "prompt"} className={tab === "prompt" ? "active" : ""} onClick={() => setTab("prompt")}>Prompt</button>
             <button role="tab" aria-selected={tab === "settings"} className={tab === "settings" ? "active" : ""} onClick={() => setTab("settings")}>Settings</button>
-            <button role="tab" aria-selected={tab === "edit"} className={tab === "edit" ? "active" : ""} onClick={() => setTab("edit")}>Edit / Inpaint</button>
+            <button role="tab" aria-selected={tab === "edit"} className={tab === "edit" ? "active" : ""} onClick={() => setTab("edit")}>Edit</button>
           </div>
           {tab === "prompt" ? (
             <div className="prompt-fields">
@@ -2265,8 +2304,8 @@ function ImagesView() {
           ) : (
             <div className="edit-panel">
               <h3>Edit existing image</h3>
-              <p>The actual selected image is sent back to Gemini. Paint a mask for localized changes.</p>
-              <button className="primary full" onClick={() => { clearMask(); setEditOpen(true); }} disabled={!selectedRenderId}>Edit / Inpaint</button>
+              <p>Paint over the area you want changed, then describe the edit in the field below. The rest of the image will be preserved.</p>
+              <button className="primary full" onClick={() => { clearMask(); setEditOpen(true); }} disabled={!selectedRenderId}>Edit</button>
             </div>
           )}
         </aside>
@@ -2279,7 +2318,7 @@ function ImagesView() {
       </div>}
       {editOpen && selectedRenderId && renderUrls[selectedRenderId] && <div className="modal-backdrop image-lightbox">
         <div className="edit-modal">
-          <div className="lightbox-toolbar"><strong>Edit / Inpaint</strong><button className={eraseMask && !editPanMode ? "active" : ""} onClick={() => { setEraseMask((current) => !current); setEditPanMode(false); }}>{eraseMask ? "Paint mask" : "Erase mask"}</button><button className={editPanMode ? "active" : ""} onClick={() => setEditPanMode((current) => !current)}>Pan</button><button onClick={() => setEditZoom((value) => Math.max(.5, value - .25))}><ZoomOut size={16} /></button><button onClick={() => { setEditZoom(1); setEditPan({ x: 0, y: 0 }); }}>Fit</button><button onClick={() => setEditZoom((value) => Math.min(4, value + .25))}><ZoomIn size={16} /></button><button onClick={clearMask}>Clear mask</button><button onClick={() => setEditOpen(false)}><X size={17} /></button></div>
+          <div className="lightbox-toolbar"><strong>Edit</strong><button className={eraseMask && !editPanMode ? "active" : ""} onClick={() => { setEraseMask((current) => !current); setEditPanMode(false); }}>{eraseMask ? "Paint mask" : "Erase mask"}</button><button className={editPanMode ? "active" : ""} onClick={() => setEditPanMode((current) => !current)}>Pan</button><button onClick={() => setEditZoom((value) => Math.max(.5, value - .25))}><ZoomOut size={16} /></button><button onClick={() => { setEditZoom(1); setEditPan({ x: 0, y: 0 }); }}>Fit</button><button onClick={() => setEditZoom((value) => Math.min(4, value + .25))}><ZoomIn size={16} /></button><button onClick={clearMask}>Clear mask</button><button onClick={() => setEditOpen(false)}><X size={17} /></button></div>
           <div className="edit-body">
             <div className={editPanMode ? "mask-stage panning" : "mask-stage"} onPointerDown={(event) => { if (editPanMode) panStartRef.current = { x: event.clientX, y: event.clientY, originX: editPan.x, originY: editPan.y }; }} onPointerMove={(event) => { const start = panStartRef.current; if (editPanMode && start) setEditPan({ x: start.originX + event.clientX - start.x, y: start.originY + event.clientY - start.y }); }} onPointerUp={() => { panStartRef.current = null; }}>
               <div className={`mask-transform ${imageSettings.aspectRatio === "9:16" ? "portrait" : ""}`} style={{ transform: `translate(${editPan.x}px, ${editPan.y}px) scale(${editZoom})` }}>
@@ -2288,7 +2327,7 @@ function ImagesView() {
               </div>
             </div>
             <aside>
-              <p>Paint only the area you want changed. Gemini receives the source image, mask image, and instruction together. Its API does not expose a dedicated mask parameter, so preservation is enforced through visual context and strict edit rules.</p>
+              <p>Paint only the area you want changed. The rest of the image is preserved through visual context and strict edit rules applied alongside your mask and instruction.</p>
               <label>Brush size<input type="range" min="8" max="140" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} /></label>
               <button className="secondary full clear-mask-action" type="button" onClick={clearMask}>Clear painted mask</button>
               <label>Edit instruction<textarea value={editInstruction} onChange={(event) => setEditInstruction(event.target.value)} placeholder="Describe the exact localized change." /></label>
@@ -2301,11 +2340,10 @@ function ImagesView() {
       </div>}
       {bulkOpen && <div className="modal-backdrop" role="presentation" onMouseDown={() => setBulkOpen(false)}>
         <div className="modal bulk-modal" onMouseDown={(e) => e.stopPropagation()}>
-          <h2>Bulk Gen Config</h2>
+          <h2>Bulk Generation Settings</h2>
           <div className="panel-section-heading" style={{marginTop:"4px"}}><h3>Style Directive</h3><small>Global visual style</small></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Describe overall cinematography and visual language. Avoid scene-specific details — the AI will handle those per still.</p>
           <textarea className="bulk-directive" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="e.g. Cinematic documentary style, shallow depth of field, warm color grade, soft natural lighting…" rows={4} />
-          <button className="secondary full" style={{marginTop:"6px"}} onClick={() => void extractImageSettingsFromDirective()} disabled={aiLoading || !systemPrompt.trim()}>{aiLoading ? <><LoaderCircle className="spin" size={13} />Analyzing…</> : <><Sparkles size={14} />Readjust to global settings only</>}</button>
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Reference Image</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Upload a reference to extract visual style and populate the directive automatically.</p>
           <div className="reference-list bulk-ref-list">
@@ -2337,7 +2375,7 @@ function ImagesView() {
           <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still. Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
           <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cat as the main character. Show visible emotions and varied body language. Avoid showing text, labels, or close-ups on faces." rows={4} />
           <button className="primary full" style={{marginTop:"10px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length || bulkProgress !== null || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>
-            {bulkPlanLoading ? "Planning…" : <><WandSparkles size={16} />Plan Video</>}
+            {bulkPlanLoading ? "Planning…" : <><WandSparkles size={16} />Generate All Stills</>}
           </button>
           {Boolean(job && ["queued", "running", "paused"].includes(job.status)) && <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Stop the active job to re-plan.</p>}
           <button className="secondary full" style={{marginTop:"8px"}} onClick={() => setBulkOpen(false)}>Cancel</button>
@@ -2446,7 +2484,7 @@ export function App() {
     <div className={stage === "home" ? "app-shell app-shell-home" : "app-shell"}>
       <TitleBar />
       {stage !== "home" && <Sidebar />}
-      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "timeline" && <TimelineView />}</main>
+      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "animate" && <AnimateView />}{stage === "timeline" && <TimelineView />}</main>
       <ToastDisplay />
     </div>
   );

@@ -413,9 +413,15 @@ def build_image_filter(
             f"scale={pre_scale}:-2,zoompan={zoompan_presets[motion]}:"
             f"d={frames}:s={width}x{height}:fps={fps}{color_node}{fade}"
         )
+    # Cover-crop (not letterbox): scales up until the frame fully covers the
+    # target canvas, then crops the overflow, centered. Matches the editor
+    # preview's cover-fill (see TimelineView's drawStillClipContent) and the
+    # zoompan-based motion presets above, which are already crop-based by
+    # construction — this keeps the "none"-motion path consistent with them
+    # instead of the only one leaving black pillar/letterbox bars.
     return (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}{color_node}{fade}"
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},setsar=1,fps={fps}{color_node}{fade}"
     )
 
 
@@ -439,8 +445,8 @@ def build_video_filter(
     color_vf = build_color_filter_vf(color_filter, color_filter_intensity)
     color_node = f",{color_vf}" if color_vf else ""
     return (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}{color_node}{fade}"
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},setsar=1,fps={fps}{color_node}{fade}"
     )
 
 

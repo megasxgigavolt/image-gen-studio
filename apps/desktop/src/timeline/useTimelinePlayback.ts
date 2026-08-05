@@ -113,7 +113,8 @@ export function useTimelinePlayback(params: {
         }
         if (video.paused) void video.play().catch(() => {});
         if (video.readyState >= 2 && video.videoWidth && video.videoHeight) {
-          const scale = Math.min(canvas.width / video.videoWidth, canvas.height / video.videoHeight);
+          // Cover-fill, matching drawStillClipContent's crop behavior.
+          const scale = Math.max(canvas.width / video.videoWidth, canvas.height / video.videoHeight);
           const w = video.videoWidth * scale;
           const h = video.videoHeight * scale;
           ctx.filter = buildColorFilterCss(clip.colorFilterPreset, clip.colorFilterIntensity);

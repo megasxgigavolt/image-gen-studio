@@ -1,13 +1,11 @@
 import { Clapperboard, Clock, Film, Move, Redo2, Scissors, Shuffle, Sparkles, Trash2, Undo2, Upload } from "lucide-react";
 import { formatTime } from "../domain/timecode";
-import { pickVeoDuration } from "../domain/animation";
 import type {
   ColorFilterPreset,
   ImageRenderRecord,
   MotionGraphicEffect,
   TimelineClipRecord,
   TransitionPreset,
-  VeoResolution,
   VideoAssetRecord,
 } from "../infrastructure/projects-client";
 import { MOTION_OPTIONS, TRANSITION_IN_OPTIONS, TRANSITION_OPTIONS } from "./timeline-rendering";
@@ -26,15 +24,6 @@ export function ClipInspector({
   onDurationDraftChange,
   onCommitDuration,
   selectedClipVideoAsset,
-  animateMode,
-  onAnimateModeChange,
-  animationResolution,
-  onAnimationResolutionChange,
-  animationPrompt,
-  onAnimationPromptChange,
-  suggestingPrompt,
-  onSuggestPrompt,
-  onGenerateAnimation,
   onUploadAnimation,
   uploadingAnimation,
   onUndoAnimation,
@@ -58,6 +47,8 @@ export function ClipInspector({
   onApplyColorFilterToAll,
   onSetMotionGraphicEffect,
   onSetMotionGraphicSetting,
+  motionGraphicDescription,
+  loadingMotionGraphicDescription,
   onResetEffects,
 }: {
   selectedClip: TimelineClipRecord;
@@ -66,15 +57,6 @@ export function ClipInspector({
   onDurationDraftChange: (value: string) => void;
   onCommitDuration: () => void;
   selectedClipVideoAsset: VideoAssetRecord | null;
-  animateMode: "choose" | "generate";
-  onAnimateModeChange: (mode: "choose" | "generate") => void;
-  animationResolution: VeoResolution;
-  onAnimationResolutionChange: (resolution: VeoResolution) => void;
-  animationPrompt: string;
-  onAnimationPromptChange: (value: string) => void;
-  suggestingPrompt: boolean;
-  onSuggestPrompt: () => void;
-  onGenerateAnimation: () => void;
   onUploadAnimation: () => void;
   uploadingAnimation: boolean;
   onUndoAnimation: () => void;
@@ -98,6 +80,8 @@ export function ClipInspector({
   onApplyColorFilterToAll: () => void;
   onSetMotionGraphicEffect: (effect: MotionGraphicEffect) => void;
   onSetMotionGraphicSetting: (key: string, value: number | string) => void;
+  motionGraphicDescription: string | null;
+  loadingMotionGraphicDescription: boolean;
   onResetEffects: () => void;
 }) {
   const durationMismatch = selectedClip.clipKind === "animation" && selectedClipVideoAsset
@@ -145,59 +129,17 @@ export function ClipInspector({
         </div>
       )}
       <div className="tl-inspector-group">
-        <span className="tl-inspector-label"><Clapperboard size={12} />Animate this clip</span>
+        <span className="tl-inspector-label"><Clapperboard size={12} />Animation</span>
         {provenanceLabel && <p className="tl-source-hint tl-provenance-label">{provenanceLabel}</p>}
 
-        {selectedClip.clipKind === "still" && !selectedClip.videoAssetId && animateMode === "choose" && (
+        {selectedClip.clipKind === "still" && !selectedClip.videoAssetId && (
           <>
-            <button className="primary tl-generate-btn" onClick={() => onAnimateModeChange("generate")}>
-              <Clapperboard size={14} />Generate
-            </button>
             <p className="tl-source-hint">
-              Generates motion with Veo from a prompt, automatically stretched or trimmed to exactly fill
-              this {formatTime(selectedClip.endSeconds - selectedClip.startSeconds)} slot.
+              Generate motion for this still from the <strong>Animate</strong> pipeline stage before placing it here,
+              or upload your own clip to use instead.
             </p>
             <button className="tl-upload-secondary" disabled={uploadingAnimation} onClick={onUploadAnimation}>
               <Upload size={12} />{uploadingAnimation ? "Uploading…" : "Or upload your own clip instead"}
-            </button>
-          </>
-        )}
-
-        {selectedClip.clipKind === "still" && !selectedClip.videoAssetId && animateMode === "generate" && (
-          <>
-            <button className="tl-apply-all-btn" style={{ alignSelf: "flex-start" }} onClick={() => onAnimateModeChange("choose")}>← Back</button>
-            <span className="tl-inspector-label">Resolution</span>
-            <div className="tl-preset-grid two">
-              {(["720p", "1080p"] as VeoResolution[]).map((option) => (
-                <button
-                  key={option}
-                  className={animationResolution === option ? "tl-preset-btn active" : "tl-preset-btn"}
-                  onClick={() => onAnimationResolutionChange(option)}
-                >
-                  <span>{option}</span>
-                </button>
-              ))}
-            </div>
-            <div className="tl-inspector-label-row">
-              <span className="tl-inspector-label">Animation prompt</span>
-              <button className="tl-apply-all-btn" disabled={suggestingPrompt} onClick={onSuggestPrompt}>
-                {suggestingPrompt ? "Suggesting…" : "Suggest prompt"}
-              </button>
-            </div>
-            <textarea
-              className="tl-prompt-textarea"
-              placeholder="Describe the motion to add (camera drift, wind, gestures…) — leave blank to let Veo decide, or click Suggest prompt for an AI variation based on this still's narration."
-              value={animationPrompt}
-              onChange={(event) => onAnimationPromptChange(event.target.value)}
-              rows={4}
-            />
-            <p className="tl-source-hint">
-              Veo only generates 4s, 6s, or 8s clips — this will generate as{" "}
-              {pickVeoDuration(selectedClip.endSeconds - selectedClip.startSeconds)}s. Use "Adjust animation to
-              duration" afterward to stretch it to exactly fill this {formatTime(selectedClip.endSeconds - selectedClip.startSeconds)} slot.
-            </p>
-            <button className="primary full" onClick={onGenerateAnimation}>
-              <Clapperboard size={14} />Generate Animation
             </button>
           </>
         )}
@@ -239,11 +181,17 @@ export function ClipInspector({
           </>
         )}
       </div>
-      {selectedClip.clipKind !== "animation" && (
-        <div className="tl-inspector-group">
+      {selectedClip.clipKind !== "animation" && (() => {
+        const cameraActive = selectedClip.motionPreset !== "none";
+        const motionGraphicActive = Boolean(selectedClip.motionGraphicEffect);
+        const cameraInactive = motionGraphicActive;
+        const motionGraphicInactive = cameraActive;
+        return (
+      <>
+      <div className={cameraInactive ? "tl-inspector-group tl-inspector-group-dimmed" : "tl-inspector-group"}>
           <div className="tl-inspector-label-row">
             <span className="tl-inspector-label"><Move size={12} />Camera movement</span>
-            <button className="tl-apply-all-btn" onClick={onApplyMotionToAll}>Apply to all</button>
+            {cameraInactive ? <span className="tl-inactive-pill">Inactive — Motion Graphics is applied</span> : <button className="tl-apply-all-btn" onClick={onApplyMotionToAll}>Apply to all</button>}
           </div>
           <div className="tl-preset-grid two">
             {MOTION_OPTIONS.map((option) => (
@@ -272,25 +220,28 @@ export function ClipInspector({
             <span className="tl-intensity-value">{Math.round(globalIntensity * 100)}%</span>
           </div>
           <button className="secondary full" style={{ marginTop: "6px" }} onClick={onAlternateZoom}><Shuffle size={14} />Alternate zoom in/out (all stills)</button>
-        </div>
-      )}
-      {selectedClip.clipKind !== "animation" && (
-        <div className="tl-inspector-group">
-          <span className="tl-inspector-label"><Film size={12} />Motion Graphics</span>
+      </div>
+      <div className={motionGraphicInactive ? "tl-inspector-group tl-inspector-group-dimmed" : "tl-inspector-group"}>
+          <div className="tl-inspector-label-row">
+            <span className="tl-inspector-label"><Film size={12} />Motion Graphics</span>
+            {motionGraphicInactive && <span className="tl-inactive-pill">Inactive — Camera movement is applied</span>}
+          </div>
           {!selectedClip.motionGraphicEffect && (
             <p className="tl-source-hint">
               OpenAI inspects every still on the timeline together with its narration against 7 documented
               camera-movement treatments — Ken Burns, Sequential Panel Reveal, Speed Pan &amp; Motion Blur,
               Ominous Push-In, Candlelight Flicker, Focus Pull, and Iris Reveal — and picks the best fit for each,
-              balancing the mix across the whole video. Run it from the Motion Graphics button in the toolbar
-              above. The assigned treatment renders for real at export time (glow, desaturation, blur, and
-              flicker included); Camera Movement below only shows a rough approximation for the live preview.
+              balancing the mix across the whole video. Run Auto motion from the toolbar above to assign every
+              still at once, or pick a treatment for just this still below. The assigned treatment renders for
+              real at export time (glow, desaturation, blur, and flicker included); Camera Movement above only
+              shows a rough approximation for the live preview.
             </p>
           )}
-          {selectedClip.motionGraphicEffect && (
-            <>
-              {selectedClip.motionGraphicReason && (
-                <p className="tl-source-hint tl-prompt-readout">{selectedClip.motionGraphicReason}</p>
+          {selectedClip.motionGraphicEffect && loadingMotionGraphicDescription && (
+                <div className="tl-skeleton-line" aria-hidden="true" />
+              )}
+          {selectedClip.motionGraphicEffect && !loadingMotionGraphicDescription && motionGraphicDescription && (
+                <p className="tl-source-hint tl-prompt-readout">{motionGraphicDescription}</p>
               )}
               <div className="tl-preset-grid two">
                 {MOTION_GRAPHIC_EFFECTS.map((def) => (
@@ -304,7 +255,7 @@ export function ClipInspector({
                   </button>
                 ))}
               </div>
-              {(() => {
+          {selectedClip.motionGraphicEffect && (() => {
                 const def = getMotionGraphicEffectDef(selectedClip.motionGraphicEffect);
                 if (!def) return null;
                 const settings = parseMotionGraphicSettings(selectedClip.motionGraphicSettings);
@@ -337,10 +288,10 @@ export function ClipInspector({
                   </>
                 );
               })()}
-            </>
-          )}
-        </div>
-      )}
+      </div>
+      </>
+        );
+      })()}
       <div className="tl-inspector-group">
         <div className="tl-inspector-label-row">
           <span className="tl-inspector-label"><Sparkles size={12} />Transition in</span>

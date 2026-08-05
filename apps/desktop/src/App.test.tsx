@@ -19,10 +19,10 @@ describe("application workflow navigation", () => {
   it("opens the create-channel dialog and prevents premature downstream navigation", async () => {
     render(<App />);
 
-    const production = screen.getByRole("button", { name: /^production$/i });
-    const images = screen.getByRole("button", { name: /^images$/i });
-    expect(production).toBeDisabled();
-    expect(images).toBeDisabled();
+    const inputs = screen.getByRole("button", { name: /^inputs$/i });
+    const visuals = screen.getByRole("button", { name: /^visuals$/i });
+    expect(inputs).toBeDisabled();
+    expect(visuals).toBeDisabled();
 
     await waitFor(() => expect(screen.getByRole("button", { name: /^\+ add channel$/i })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: /^\+ add channel$/i }));

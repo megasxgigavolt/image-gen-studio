@@ -40,6 +40,8 @@ export function ExportDrawer({
   exportProgress,
   settings,
   onSettingsChange,
+  fileName,
+  onFileNameChange,
   result,
   onStart,
   onCancel,
@@ -56,6 +58,8 @@ export function ExportDrawer({
   exportProgress: { percent: number; stage: string; detail: string };
   settings: ExportSettingsRecord;
   onSettingsChange: (patch: Partial<ExportSettingsRecord>) => void;
+  fileName: string;
+  onFileNameChange: (name: string) => void;
   result: ExportResult | null;
   onStart: () => void;
   onCancel: () => void;
@@ -123,6 +127,16 @@ export function ExportDrawer({
           </ul>
           {!exporting ? (
             <>
+              <div className="tl-inspector-group">
+                <span className="tl-inspector-label">File name</span>
+                <input
+                  type="text"
+                  className="tl-text-input"
+                  value={fileName}
+                  onChange={(event) => onFileNameChange(event.target.value)}
+                  placeholder="Video 1"
+                />
+              </div>
               <div className="tl-inspector-group">
                 <span className="tl-inspector-label">Resolution</span>
                 <div className="tl-preset-grid three">

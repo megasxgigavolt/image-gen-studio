@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { originalDemoPlan } from "../data/demo";
 import type { VisualPlanGroup } from "../domain/visual-plan";
 
-export type AppStage = "home" | "inputs" | "visual-plan" | "images" | "timeline" | "tools";
+export type AppStage = "home" | "inputs" | "visual-plan" | "images" | "animate" | "timeline" | "tools";
 
 /** videoId → groupId. Lets one stage (e.g. the Editor's "Go to this still in
  * Visuals" context menu action) pre-seed which still the Images stage

@@ -324,7 +324,7 @@ export type AnimationJobRecord = {
   createdAt: string;
   updatedAt: string;
   items: {
-    id: string; videoId: string; clipId: string; groupId: string; sourceRenderId: string; resolution: VeoResolution;
+    id: string; videoId: string; clipId: string | null; groupId: string; sourceRenderId: string; resolution: VeoResolution;
     requestedDurationSeconds: number; veoDurationSeconds: number; prompt: string; status: string; attempts: number;
     lastError: string | null; videoAssetId: string | null;
   }[];
@@ -580,6 +580,10 @@ export const projectsClient = {
   async getProviderKeyStatus(provider: "openai" | "gemini"): Promise<ProviderKeyStatusRecord> {
     if (isTauri()) return invoke("get_provider_key_status", { provider });
     return { provider, configured: localStorage.getItem(`${STORAGE_KEY}.key-status.${provider}`) === "configured" };
+  },
+  async testProviderKey(provider: "openai" | "gemini"): Promise<void> {
+    if (isTauri()) return invoke("test_provider_key", { provider });
+    throw new Error("Testing a provider key requires the native application.");
   },
   async createPromptVersion(
     videoId: string,
@@ -958,6 +962,10 @@ export const projectsClient = {
   async revealInFileManager(path: string): Promise<void> {
     if (isTauri()) return invoke("reveal_in_file_manager", { path });
   },
+  async getAppDataDir(): Promise<string> {
+    if (isTauri()) return invoke("get_app_data_dir");
+    return "";
+  },
   async pickExportProjectDestination(): Promise<string | null> {
     if (isTauri()) return invoke("pick_export_project_destination");
     return null;
@@ -986,9 +994,19 @@ export const projectsClient = {
     if (isTauri()) return invoke("create_animation_job", { videoId, clipId, resolution, prompt });
     throw new Error("Animation generation requires the native application.");
   },
+  /** Animate stage counterpart of createAnimationJob — targets stills
+   * directly (no timeline clip needed yet). */
+  async createAnimationBulkJob(videoId: string, resolution: VeoResolution, items: { groupId: string; prompt: string }[]): Promise<AnimationJobRecord> {
+    if (isTauri()) return invoke("create_animation_bulk_job", { videoId, resolution, items });
+    throw new Error("Animation generation requires the native application.");
+  },
   async suggestAnimationPrompt(videoId: string, groupId: string): Promise<string> {
     if (isTauri()) return invoke("suggest_animation_prompt", { videoId, groupId });
     throw new Error("Prompt suggestions require the native application.");
+  },
+  async explainMotionGraphicChoice(videoId: string, groupId: string, effectLabel: string, effectSummary: string): Promise<string> {
+    if (isTauri()) return invoke("explain_motion_graphic_choice", { videoId, groupId, effectLabel, effectSummary });
+    throw new Error("This requires the native application.");
   },
   async getLatestAnimationJob(videoId: string): Promise<AnimationJobRecord | null> {
     if (isTauri()) return invoke("get_latest_animation_job", { videoId });

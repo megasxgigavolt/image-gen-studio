@@ -19,7 +19,6 @@ import { formatTime, secondsToPixels } from "./domain/timecode";
 import { setCachedData } from "./infrastructure/media-cache";
 import {
   projectsClient,
-  type AnimationJobRecord,
   type CaptionStyle,
   type ColorFilterPreset,
   type ExportSettingsRecord,
@@ -31,12 +30,11 @@ import {
   type TimelineMusicClipRecord,
   type TimelineTextClipRecord,
   type TransitionPreset,
-  type VeoResolution,
   type VideoAssetRecord,
 } from "./infrastructure/projects-client";
 import { MediaLibraryPanel, MEDIA_DRAG_MIME, type MediaDragPayload } from "./timeline/MediaLibraryPanel";
 import { ContextMenu, type ContextMenuItem } from "./timeline/ContextMenu";
-import { Toolbar, type ToolKind } from "./timeline/Toolbar";
+import { Toolbar, type AspectRatio, type ToolKind } from "./timeline/Toolbar";
 import { ExportDrawer } from "./timeline/ExportDrawer";
 import { ExportHistoryModal } from "./timeline/ExportHistoryModal";
 import { MusicTool } from "./timeline/tools/MusicTool";
@@ -62,14 +60,24 @@ const BASE_PIXELS_PER_SECOND = 40;
 const FRAME_STEP_SECONDS = 1 / 30;
 const CLIP_JUMP_EPSILON = 0.05;
 
+// A year is far more than this app's autosave cadence could ever produce
+// legitimately — anything beyond it means the timestamp is corrupt, not that
+// the save is actually that old (this is what used to render as absurdities
+// like "Saved 388h ago" once elapsed time crossed a day with no cap).
+const MAX_PLAUSIBLE_SAVE_AGE_SECONDS = 60 * 60 * 24 * 365;
+
 function formatSavedRelativeTime(isoTimestamp: string): string {
-  const elapsedSeconds = Math.max(0, Math.round((Date.now() - new Date(isoTimestamp).getTime()) / 1000));
-  if (elapsedSeconds < 10) return "Saved just now";
-  if (elapsedSeconds < 60) return `Saved ${elapsedSeconds}s ago`;
+  const savedAt = new Date(isoTimestamp).getTime();
+  const elapsedSeconds = Math.round((Date.now() - savedAt) / 1000);
+  if (!Number.isFinite(elapsedSeconds) || elapsedSeconds < 0 || elapsedSeconds > MAX_PLAUSIBLE_SAVE_AGE_SECONDS) {
+    return "Saved just now";
+  }
+  if (elapsedSeconds < 60) return "Saved just now";
   const minutes = Math.round(elapsedSeconds / 60);
-  if (minutes < 60) return `Saved ${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  return `Saved ${hours}h ago`;
+  if (minutes < 60) return `Saved ${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  const hours = Math.round(elapsedSeconds / 3600);
+  if (hours < 24) return `Saved ${hours} hour${hours === 1 ? "" : "s"} ago`;
+  return `Saved ${new Date(savedAt).toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
 }
 
 export function TimelineView() {
@@ -86,6 +94,25 @@ export function TimelineView() {
   const [exportSettings, setExportSettings] = useState<ExportSettingsRecord>({
     resolution: "1080p", quality: "high", captionsMode: "burned-in", includeNarration: true, includeMusic: true,
   });
+  // Preferences' Export Defaults pre-fill the panel once per mount — after
+  // that the user's own picks in this session take priority, so this must
+  // not re-run on every settings change.
+  useEffect(() => {
+    void (async () => {
+      const [resolution, quality, captionsMode] = await Promise.all([
+        projectsClient.getAppSetting("export_default_resolution"),
+        projectsClient.getAppSetting("export_default_quality"),
+        projectsClient.getAppSetting("export_default_captions"),
+      ]);
+      setExportSettings((current) => ({
+        ...current,
+        resolution: (resolution as ExportSettingsRecord["resolution"]) || current.resolution,
+        quality: (quality as ExportSettingsRecord["quality"]) || current.quality,
+        captionsMode: (captionsMode as ExportSettingsRecord["captionsMode"]) || current.captionsMode,
+      }));
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [exportResult, setExportResult] = useState<{ kind: "success"; path: string } | { kind: "failure"; error: string } | null>(null);
   const [exportHistoryOpen, setExportHistoryOpen] = useState(false);
   const [activeTool, setActiveTool] = useState<ToolKind | null>(null);
@@ -99,11 +126,6 @@ export function TimelineView() {
   const [textOverlayFocusRequestId, setTextOverlayFocusRequestId] = useState(0);
   const [autosaveTick, setAutosaveTick] = useState(0);
   const [globalIntensity, setGlobalIntensity] = useState(0.22);
-  const [animationResolution, setAnimationResolution] = useState<VeoResolution>("720p");
-  const [animationPrompt, setAnimationPrompt] = useState("");
-  const [animateMode, setAnimateMode] = useState<"choose" | "generate">("choose");
-  const [suggestingPrompt, setSuggestingPrompt] = useState(false);
-  const [animationJob, setAnimationJob] = useState<AnimationJobRecord | null>(null);
   const [selectedClipVideoAsset, setSelectedClipVideoAsset] = useState<VideoAssetRecord | null>(null);
   const [retiming, setRetiming] = useState(false);
   const [extrapolating, setExtrapolating] = useState(false);
@@ -118,7 +140,12 @@ export function TimelineView() {
   const [confirmResetTimeline, setConfirmResetTimeline] = useState(false);
   const [confirmRemoveAllEffects, setConfirmRemoveAllEffects] = useState(false);
   const [confirmExtrapolateStills, setConfirmExtrapolateStills] = useState(false);
+  const [confirmAutoMotion, setConfirmAutoMotion] = useState(false);
+  const [motionGraphicDescription, setMotionGraphicDescription] = useState<string | null>(null);
+  const [loadingMotionGraphicDescription, setLoadingMotionGraphicDescription] = useState(false);
   const [resettingTimeline, setResettingTimeline] = useState(false);
+  const [aspectRatio, setAspectRatio] = useState<AspectRatio>("16:9");
+  const [exportFileName, setExportFileName] = useState("");
   // Caption style sliders update these synchronously (so the canvas preview
   // reacts on every drag tick), while the actual backend commit — a full
   // timeline round-trip — is debounced. `undefined` means "no draft, defer to
@@ -146,8 +173,35 @@ export function TimelineView() {
   const { timeline, setTimeline, workspace, captionSet, setCaptionSet, audioDataUrl, loading, error, setError, savingCount, refresh, undo, redo, canUndo, canRedo } = data;
 
   const redrawRequestRef = useRef<() => void>(() => {});
-  const assets = useTimelineAssets(activeVideoId, timeline, workspace, () => redrawRequestRef.current());
+  const assets = useTimelineAssets(activeVideoId, timeline, workspace, aspectRatio, () => redrawRequestRef.current());
   const { renderUrls, videoAssetUrls, subjectByRender, canvasSize, getOrLoadVideo, getImageByRenderId, getSubjectByRenderId } = assets;
+
+  useEffect(() => {
+    void projectsClient.getAppSetting("image_settings").then((raw) => {
+      try {
+        const parsed = raw ? JSON.parse(raw) : {};
+        if (parsed.aspectRatio === "9:16") setAspectRatio("9:16");
+      } catch {
+        // Malformed setting — keep the 16:9 default.
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    if (activeVideoTitle && !exportFileName) setExportFileName(activeVideoTitle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeVideoTitle]);
+
+  async function handleAspectRatioChange(ratio: AspectRatio) {
+    setAspectRatio(ratio);
+    try {
+      const raw = await projectsClient.getAppSetting("image_settings");
+      const parsed = raw ? JSON.parse(raw) : {};
+      await projectsClient.saveAppSetting("image_settings", JSON.stringify({ ...parsed, aspectRatio: ratio }));
+    } catch (caught) {
+      addToast(String(caught), "error");
+    }
+  }
 
   const [narrationDuration, setNarrationDuration] = useState(0);
   const [nativeAudioDuration, setNativeAudioDuration] = useState(0);
@@ -211,14 +265,6 @@ export function TimelineView() {
     }
     void projectsClient.listImageRenders(activeVideoId, selectedClip.groupId).then(setSelectedClipRenders).catch(() => setSelectedClipRenders([]));
   }, [selectedClip, activeVideoId]);
-
-  // Clear any typed/suggested animation prompt when the selection moves to a
-  // different clip — a prompt written for one still shouldn't silently apply
-  // to the next one the user picks.
-  useEffect(() => {
-    setAnimationPrompt("");
-    setAnimateMode("choose");
-  }, [selectedClip?.id]);
 
   // Fetches the animation clip's real stored duration so the inspector can
   // tell whether it still matches the slot it currently occupies (the slot
@@ -490,6 +536,11 @@ export function TimelineView() {
     if (!activeVideoId || !selectedClip) return;
     // Clicking the already-active preset unselects it (back to no motion).
     const next = selectedClip.motionPreset === preset ? "none" : preset;
+    // Camera movement and Motion Graphics are mutually exclusive per clip —
+    // activating one deactivates the other immediately, no silent stacking.
+    if (next !== "none" && selectedClip.motionGraphicEffect) {
+      await refresh(projectsClient.setTimelineClipMotionGraphic(activeVideoId, selectedClip.id, null, null, null));
+    }
     await refresh(projectsClient.setTimelineClipMotion(activeVideoId, selectedClip.id, next));
   }
 
@@ -510,10 +561,42 @@ export function TimelineView() {
 
   async function setMotionGraphicEffect(effect: MotionGraphicEffect) {
     if (!activeVideoId || !selectedClip) return;
-    const def = getMotionGraphicEffectDef(effect);
+    // Clicking the already-active preset unselects it (back to no motion graphic).
+    const next = selectedClip.motionGraphicEffect === effect ? null : effect;
+    // Mutually exclusive with Camera movement — see setMotion's matching comment.
+    if (next && selectedClip.motionPreset !== "none") {
+      await refresh(projectsClient.setTimelineClipMotion(activeVideoId, selectedClip.id, "none"));
+    }
+    const def = next ? getMotionGraphicEffectDef(next) : null;
     const settingsJson = def ? JSON.stringify(def.defaults) : null;
-    await refresh(projectsClient.setTimelineClipMotionGraphic(activeVideoId, selectedClip.id, effect, settingsJson, "Manually selected"));
+    await refresh(projectsClient.setTimelineClipMotionGraphic(activeVideoId, selectedClip.id, next, settingsJson, next ? "Manually selected" : null));
   }
+
+  // Re-explains why the active Motion Graphics preset fits this still
+  // whenever the selected clip or its assigned preset changes — fails
+  // silently (no toast/error state) per the spec, since this is a nice-to-
+  // have hint, not a blocking action.
+  useEffect(() => {
+    const effect = selectedClip?.motionGraphicEffect;
+    if (!activeVideoId || !selectedClip || !effect) {
+      setMotionGraphicDescription(null);
+      setLoadingMotionGraphicDescription(false);
+      return;
+    }
+    const def = getMotionGraphicEffectDef(effect);
+    if (!def) {
+      setMotionGraphicDescription(null);
+      return;
+    }
+    let cancelled = false;
+    setLoadingMotionGraphicDescription(true);
+    setMotionGraphicDescription(null);
+    void projectsClient.explainMotionGraphicChoice(activeVideoId, selectedClip.groupId, def.label, def.summary)
+      .then((description) => { if (!cancelled) setMotionGraphicDescription(description); })
+      .catch(() => { /* silent — no error surfaced for this hint */ })
+      .finally(() => { if (!cancelled) setLoadingMotionGraphicDescription(false); });
+    return () => { cancelled = true; };
+  }, [activeVideoId, selectedClip?.id, selectedClip?.groupId, selectedClip?.motionGraphicEffect]);
 
   async function setMotionGraphicSetting(key: string, value: number | string) {
     if (!activeVideoId || !selectedClip || !selectedClip.motionGraphicEffect) return;
@@ -578,7 +661,7 @@ export function TimelineView() {
     await refresh(projectsClient.applyMotionToAllClips(activeVideoId, "none", globalIntensity));
     await refresh(projectsClient.applyTransitionInToAllClips(activeVideoId, "cut"));
     await refresh(projectsClient.applyTransitionOutToAllClips(activeVideoId, "cut"));
-    await refresh(projectsClient.applyColorFilterToAllClips(activeVideoId, "none", 50));
+    await refresh(projectsClient.applyColorFilterToAllClips(activeVideoId, "none", 100));
     await refresh(projectsClient.clearMotionGraphicsForAllClips(activeVideoId));
     await refresh(projectsClient.resetStillsTimingToNatural(activeVideoId));
     addToast("Removed camera movement, transitions, color filters, motion graphics, and any gap-filling stretch from every still.", "success");
@@ -586,17 +669,27 @@ export function TimelineView() {
 
   async function analyzeMotionGraphics() {
     if (!activeVideoId || analyzingMotionGraphics) return;
+    const stillCount = stillsClips.length;
     setAnalyzingMotionGraphics(true);
     setMotionGraphicsProgress(null);
     try {
       await refresh(projectsClient.analyzeMotionGraphics(activeVideoId));
-      addToast("Motion graphics assigned to every still.", "success");
+      addToast(`Motion applied to ${stillCount} still${stillCount === 1 ? "" : "s"}.`, "success");
     } catch (caught) {
       addToast(String(caught), "error");
     } finally {
       setAnalyzingMotionGraphics(false);
       setMotionGraphicsProgress(null);
     }
+  }
+
+  function requestAutoMotion() {
+    const hasExistingEffects = stillsClips.some((clip) => clip.motionPreset !== "none" || clip.motionGraphicEffect);
+    if (hasExistingEffects) {
+      setConfirmAutoMotion(true);
+      return;
+    }
+    void analyzeMotionGraphics();
   }
 
   async function resetTimelineToDefault() {
@@ -886,16 +979,6 @@ export function TimelineView() {
     void updateGlobalCaptionStyle(DEFAULT_CAPTION_STYLE).finally(() => setPendingGlobalCaptionStyle(undefined));
   }
 
-  async function generateAnimation() {
-    if (!activeVideoId || !selectedClip || selectedClip.clipKind !== "still") return;
-    try {
-      setError(null);
-      setAnimationJob(await projectsClient.createAnimationJob(activeVideoId, selectedClip.id, animationResolution, animationPrompt));
-    } catch (caught) {
-      setError(String(caught));
-    }
-  }
-
   async function uploadAnimation() {
     if (!activeVideoId || !selectedClip || selectedClip.clipKind !== "still") return;
     setUploadingAnimation(true);
@@ -912,47 +995,6 @@ export function TimelineView() {
       setUploadingAnimation(false);
     }
   }
-
-  async function suggestAnimationPrompt() {
-    if (!activeVideoId || !selectedClip || selectedClip.clipKind !== "still") return;
-    setSuggestingPrompt(true);
-    setError(null);
-    try {
-      setAnimationPrompt(await projectsClient.suggestAnimationPrompt(activeVideoId, selectedClip.groupId));
-    } catch (caught) {
-      setError(String(caught));
-    } finally {
-      setSuggestingPrompt(false);
-    }
-  }
-
-  async function cancelAnimationGeneration() {
-    if (!animationJob) return;
-    await projectsClient.controlAnimationJob(animationJob.id, "stop");
-  }
-
-  useEffect(() => {
-    if (!animationJob || !activeVideoId || !["queued", "running"].includes(animationJob.status)) return;
-    let cancelled = false;
-    const interval = window.setInterval(async () => {
-      try {
-        const latest = await projectsClient.getLatestAnimationJob(activeVideoId);
-        if (cancelled || !latest) return;
-        setAnimationJob(latest);
-        if (latest.status === "completed") {
-          addToast("Animation generated.", "success");
-          await refresh(projectsClient.getTimeline(activeVideoId));
-        } else if (latest.status === "failed") {
-          const failedItem = latest.items.find((item) => item.status === "failed");
-          setError(failedItem?.lastError ?? "Animation generation failed.");
-        }
-      } catch {
-        // Transient — keep polling until it settles.
-      }
-    }, 1500);
-    return () => { cancelled = true; window.clearInterval(interval); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [animationJob?.id, animationJob?.status, activeVideoId]);
 
   async function adjustAnimationToDuration() {
     if (!activeVideoId || !selectedClip) return;
@@ -1009,7 +1051,8 @@ export function TimelineView() {
 
   async function startExport() {
     if (!activeVideoId) return;
-    const defaultName = `${(activeVideoTitle || "video").replace(/[\\/:*?"<>|]+/g, " ").trim() || "video"}.mp4`;
+    const sanitizedName = (exportFileName || activeVideoTitle || "video").replace(/[\\/:*?"<>|]+/g, " ").trim() || "video";
+    const defaultName = `${sanitizedName}.mp4`;
     const rememberedFolder = await projectsClient.getAppSetting("export_last_folder");
     const destinationPath = await projectsClient.pickExportDestination(defaultName, rememberedFolder);
     if (!destinationPath) return;
@@ -1088,7 +1131,6 @@ export function TimelineView() {
         case "closeTransient":
           if (contextMenu) { setContextMenu(null); return; }
           if (shortcutsHelpOpen) { setShortcutsHelpOpen(false); return; }
-          if (animateMode === "generate") { setAnimateMode("choose"); return; }
           setSelectedClip(null);
           setSelectedCaptionClip(null);
           setSelectedMusicClip(null);
@@ -1133,7 +1175,7 @@ export function TimelineView() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeVideoId, isPlaying, selectedMusicClip, selectedTextClip, selectedCaptionClip, selectedClip, timeline, contextMenu, shortcutsHelpOpen, animateMode]);
+  }, [activeVideoId, isPlaying, selectedMusicClip, selectedTextClip, selectedCaptionClip, selectedClip, timeline, contextMenu, shortcutsHelpOpen]);
 
   // The Editor owns the titlebar's right-side actions (Export video + the ⋯
   // overflow menu) since the titlebar itself has no per-page context — set
@@ -1235,10 +1277,10 @@ export function TimelineView() {
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setConfirmResetTimeline(false)}>
           <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
             <p className="eyebrow">Reset timeline</p>
-            <h2>Reset everything to default?</h2>
+            <h2>Reset timeline to default?</h2>
             <p style={{ color: "var(--muted)", fontSize: "13px", lineHeight: 1.55, marginTop: "8px" }}>
-              This discards the current still order, timing, camera movement, transitions, caption edits and styles,
-              and narration sync, then rebuilds the timeline fresh from the visual plan and captions. This can't be undone.
+              This will discard all customisation — clip order, timing, camera movement, transitions, caption edits
+              and styles, and audio settings — and rebuild the timeline from scratch. This can't be undone.
             </p>
             <div className="footer-actions">
               <button className="secondary" onClick={() => setConfirmResetTimeline(false)}>Cancel</button>
@@ -1251,7 +1293,11 @@ export function TimelineView() {
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setConfirmRemoveAllEffects(false)}>
           <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
             <p className="eyebrow">Remove all effects</p>
-            <h2>Remove all camera movement, transitions, and color filters from every clip?</h2>
+            <h2>Remove all effects?</h2>
+            <p style={{ color: "var(--muted)", fontSize: "13px", lineHeight: 1.55, marginTop: "8px" }}>
+              This will remove all camera movement, motion graphics, transitions, and colour filters from every
+              clip, and undo any gap-filling stretch. This cannot be undone.
+            </p>
             <div className="footer-actions">
               <button className="secondary" onClick={() => setConfirmRemoveAllEffects(false)}>Cancel</button>
               <button className="primary danger" onClick={() => { setConfirmRemoveAllEffects(false); void removeAllEffects(); }}>Remove all effects</button>
@@ -1262,15 +1308,29 @@ export function TimelineView() {
       {confirmExtrapolateStills && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setConfirmExtrapolateStills(false)}>
           <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
-            <p className="eyebrow">Extrapolate stills</p>
-            <h2>Stretch every still to close gaps?</h2>
+            <p className="eyebrow">Fill gaps</p>
+            <h2>Fill timeline gaps?</h2>
             <p style={{ color: "var(--muted)", fontSize: "13px", lineHeight: 1.55, marginTop: "8px" }}>
-              Stretches every still to close gaps between them (from silence between sentences), so they tile
-              back-to-back — this is what makes transitions actually visible.
+              This will stretch every still to close gaps between clips. Clip durations will change.
             </p>
             <div className="footer-actions">
               <button className="secondary" onClick={() => setConfirmExtrapolateStills(false)}>Cancel</button>
-              <button className="primary" onClick={() => { setConfirmExtrapolateStills(false); void extrapolateStills(); }}>Extrapolate</button>
+              <button className="primary danger" onClick={() => { setConfirmExtrapolateStills(false); void extrapolateStills(); }}>Fill gaps</button>
+            </div>
+          </section>
+        </div>
+      )}
+      {confirmAutoMotion && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setConfirmAutoMotion(false)}>
+          <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
+            <p className="eyebrow">Auto motion</p>
+            <h2>Apply auto motion to all stills?</h2>
+            <p style={{ color: "var(--muted)", fontSize: "13px", lineHeight: 1.55, marginTop: "8px" }}>
+              This will overwrite any existing camera movement or motion graphics on every clip.
+            </p>
+            <div className="footer-actions">
+              <button className="secondary" onClick={() => setConfirmAutoMotion(false)}>Cancel</button>
+              <button className="primary" onClick={() => { setConfirmAutoMotion(false); void analyzeMotionGraphics(); }}>Apply auto motion</button>
             </div>
           </section>
         </div>
@@ -1308,7 +1368,7 @@ export function TimelineView() {
             </p>
             <div className="footer-actions">
               <button className="secondary" onClick={() => setConfirmRegenerateCaptions(false)}>Cancel</button>
-              <button className="primary" onClick={() => { setConfirmRegenerateCaptions(false); void runCaptionGeneration(); }}>Regenerate</button>
+              <button className="primary danger" onClick={() => { setConfirmRegenerateCaptions(false); void runCaptionGeneration(); }}>Regenerate</button>
             </div>
           </section>
         </div>
@@ -1476,15 +1536,6 @@ export function TimelineView() {
                 onDurationDraftChange={setDurationDraft}
                 onCommitDuration={() => void commitClipDuration()}
                 selectedClipVideoAsset={selectedClipVideoAsset}
-                animateMode={animateMode}
-                onAnimateModeChange={setAnimateMode}
-                animationResolution={animationResolution}
-                onAnimationResolutionChange={setAnimationResolution}
-                animationPrompt={animationPrompt}
-                onAnimationPromptChange={setAnimationPrompt}
-                suggestingPrompt={suggestingPrompt}
-                onSuggestPrompt={() => void suggestAnimationPrompt()}
-                onGenerateAnimation={() => void generateAnimation()}
                 onUploadAnimation={() => void uploadAnimation()}
                 uploadingAnimation={uploadingAnimation}
                 onUndoAnimation={() => void undoAnimation()}
@@ -1508,6 +1559,8 @@ export function TimelineView() {
                 onApplyColorFilterToAll={() => void applyColorFilterToAll()}
                 onSetMotionGraphicEffect={(effect) => void setMotionGraphicEffect(effect)}
                 onSetMotionGraphicSetting={(key, value) => void setMotionGraphicSetting(key, value)}
+                motionGraphicDescription={motionGraphicDescription}
+                loadingMotionGraphicDescription={loadingMotionGraphicDescription}
                 onResetEffects={() => void resetEffects()}
               />
             ) : (
@@ -1553,9 +1606,11 @@ export function TimelineView() {
             onExtrapolateStills={() => setConfirmExtrapolateStills(true)}
             extrapolating={extrapolating}
             onRemoveAllEffects={() => setConfirmRemoveAllEffects(true)}
-            onAnalyzeMotionGraphics={() => void analyzeMotionGraphics()}
+            onAnalyzeMotionGraphics={requestAutoMotion}
             analyzingMotionGraphics={analyzingMotionGraphics}
-            motionGraphicsProgressLabel={motionGraphicsProgress ? `Analyzing ${motionGraphicsProgress.done}/${motionGraphicsProgress.total}…` : null}
+            motionGraphicsProgressLabel={motionGraphicsProgress ? `Applying motion… ${motionGraphicsProgress.done} / ${motionGraphicsProgress.total}` : null}
+            aspectRatio={aspectRatio}
+            onAspectRatioChange={(ratio) => void handleAspectRatioChange(ratio)}
           />
           <EditorToolbar
             canUndo={canUndo}
@@ -1655,6 +1710,8 @@ export function TimelineView() {
         exportProgress={exportProgress}
         settings={exportSettings}
         onSettingsChange={(patch) => setExportSettings((current) => ({ ...current, ...patch }))}
+        fileName={exportFileName}
+        onFileNameChange={setExportFileName}
         result={exportResult}
         onStart={() => void startExport()}
         onCancel={() => void cancelExport()}
@@ -1664,18 +1721,6 @@ export function TimelineView() {
       />
       {exportHistoryOpen && activeVideoId && (
         <ExportHistoryModal videoId={activeVideoId} onClose={() => setExportHistoryOpen(false)} />
-      )}
-      {animationJob && (animationJob.status === "queued" || animationJob.status === "running") && (
-        <div className="loading-overlay" role="status" aria-live="polite">
-          <div className="loading-card generation-progress">
-            <div className="progress-heading">
-              <LoaderCircle className="spin" size={26} />
-              <strong>Generating animation</strong>
-            </div>
-            <span>Veo is animating your still at {animationResolution} — this can take a few minutes.</span>
-            <button className="secondary" style={{ marginTop: "14px" }} onClick={() => void cancelAnimationGeneration()}><Square size={13} />Stop</button>
-          </div>
-        </div>
       )}
       <audio
         ref={audioRef}

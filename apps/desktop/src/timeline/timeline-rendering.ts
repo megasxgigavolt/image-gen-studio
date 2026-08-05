@@ -352,7 +352,11 @@ export function drawStillClipContent(
   if (!clip.renderId) return false;
   const img = getImage(clip.renderId);
   if (!img) return false;
-  const scale = Math.min(canvas.width / img.naturalWidth, canvas.height / img.naturalHeight);
+  // Cover-fill (not contain): when the still's natural ratio doesn't match
+  // the canvas's target aspect ratio, this crops the overflow rather than
+  // letterboxing — matches the export engine's crop-based scaling. When the
+  // ratios do match (the common case), Math.max and Math.min agree exactly.
+  const scale = Math.max(canvas.width / img.naturalWidth, canvas.height / img.naturalHeight);
   const base = {
     w: img.naturalWidth * scale,
     h: img.naturalHeight * scale,

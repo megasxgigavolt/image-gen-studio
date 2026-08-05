@@ -83,7 +83,7 @@ export function LogoTool({
           <div className="tl-inspector-group">
             <span className="tl-inspector-label">Size</span>
             <div className="tl-intensity-control">
-              <input type="range" className="tl-slider" min={1} max={100} step={1} value={logoClip.sizePercent} onChange={(event) => updateStyle({ sizePercent: Number(event.target.value) })} />
+              <input type="range" className="tl-slider" min={5} max={30} step={1} value={logoClip.sizePercent} onChange={(event) => updateStyle({ sizePercent: Number(event.target.value) })} />
               <span className="tl-intensity-value">{Math.round(logoClip.sizePercent)}%</span>
             </div>
           </div>

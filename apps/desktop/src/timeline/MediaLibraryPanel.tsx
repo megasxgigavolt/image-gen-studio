@@ -211,7 +211,10 @@ export function MediaLibraryPanel({
       {activeTab === "clip" && (
         <div className="tl-media-scroll">
           {!videoAssets.length && !libraryAssets.clip.length ? (
-            <div className="tl-source-empty">No clips yet. Animate stills in the Animate stage or import video files.</div>
+            <div className="tl-source-empty">
+              No clips yet. Go to the <button type="button" className="tl-inline-link" onClick={() => setStage("animate")}>Animate</button> stage
+              to generate motion clips, or use + Import to add your own video files.
+            </div>
           ) : (
             <>
               <div className="tl-source-section">

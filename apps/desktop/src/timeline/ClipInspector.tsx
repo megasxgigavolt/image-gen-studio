@@ -29,6 +29,7 @@ export function ClipInspector({
   onSwapRender,
   onResetEffects,
   onMotionRecipeChange,
+  onResetMotionRecipeToAi,
 }: {
   selectedClip: TimelineClipRecord;
   selectedClipRenders: ImageRenderRecord[];
@@ -45,6 +46,7 @@ export function ClipInspector({
   onSwapRender: (renderId: string) => void;
   onResetEffects: () => void;
   onMotionRecipeChange: (effect: string | null, settingsJson: string | null, reason: string | null) => void;
+  onResetMotionRecipeToAi: () => void;
 }) {
   const durationMismatch = selectedClip.clipKind === "animation" && selectedClipVideoAsset
     ? Math.abs(selectedClipVideoAsset.actualDurationSeconds - (selectedClip.endSeconds - selectedClip.startSeconds)) > 0.05
@@ -143,7 +145,7 @@ export function ClipInspector({
           </>
         )}
       </div>
-      <MotionSettingsPanel selectedClip={selectedClip} onChange={onMotionRecipeChange} />
+      <MotionSettingsPanel selectedClip={selectedClip} onChange={onMotionRecipeChange} onResetToAiDefault={onResetMotionRecipeToAi} />
       <div className="tl-inspector-actions">
         <button className="secondary" onClick={onResetEffects}><Trash2 size={14} />Remove effects (this clip only)</button>
       </div>

@@ -1,4 +1,4 @@
-import { Wand2 } from "lucide-react";
+import { RotateCcw, Wand2 } from "lucide-react";
 import {
   DEFAULT_MOTION_RECIPE,
   parseMotionRecipe,
@@ -86,15 +86,34 @@ function TlSelectRow<T extends string>({
 export function MotionSettingsPanel({
   selectedClip,
   onChange,
+  onResetToAiDefault,
 }: {
   selectedClip: TimelineClipRecord;
   onChange: (effect: string | null, settingsJson: string | null, reason: string | null) => void;
+  /** Discards any manual edit, restoring exactly what Auto Motion composed
+   * for this clip — only ever rendered when `motionGraphicAiSnapshotJson`
+   * is set, i.e. Auto Motion has actually analyzed this clip at least once
+   * (a still built from scratch by hand has nothing to reset to). */
+  onResetToAiDefault: () => void;
 }) {
   if (!selectedClip.motionGraphicEffect) {
+    // A snapshot can still be present here even with no live effect — e.g.
+    // Auto Motion composed one and "Remove effects" cleared it back to
+    // none afterward (that clears the live columns only, deliberately
+    // leaving the snapshot for exactly this recovery path).
     return (
       <div className="tl-inspector-group">
         <span className="tl-inspector-label"><Wand2 size={12} />Motion</span>
         <p className="tl-source-hint">No motion generated yet for this still — run Auto motion.</p>
+        {selectedClip.motionGraphicAiSnapshotJson && (
+          <button
+            className="tl-upload-secondary"
+            title="Bring back the treatment Auto Motion previously composed for this still"
+            onClick={onResetToAiDefault}
+          >
+            <RotateCcw size={12} />Restore AI-composed motion
+          </button>
+        )}
         <button
           className="tl-upload-secondary"
           onClick={() => onChange(
@@ -114,10 +133,9 @@ export function MotionSettingsPanel({
 
   function commit(updated: MotionRecipe) {
     // A manual settings edit keeps whatever free-text label/reason Auto
-    // Motion already wrote — they're display-only (the canvas preview and
-    // export both derive everything from settingsJson, never the label
-    // text, see approximate_motion_preset_for_effect) — so there's nothing
-    // to resynthesize here.
+    // Motion already wrote — they're display-only (the canvas preview reads
+    // settingsJson directly via applyMotionRecipe, and export always has,
+    // via services/motion-engine) — so there's nothing to resynthesize here.
     onChange(selectedClip.motionGraphicEffect, JSON.stringify(updated), selectedClip.motionGraphicReason);
   }
 
@@ -127,6 +145,15 @@ export function MotionSettingsPanel({
         <span className="tl-inspector-label"><Wand2 size={12} />Motion</span>
         {selectedClip.motionGraphicReason && (
           <p className="tl-source-hint tl-prompt-readout">{selectedClip.motionGraphicReason}</p>
+        )}
+        {selectedClip.motionGraphicAiSnapshotJson && (
+          <button
+            className="tl-upload-secondary"
+            title="Discard any manual changes below and restore what Auto Motion originally composed for this still"
+            onClick={onResetToAiDefault}
+          >
+            <RotateCcw size={12} />Reset to AI default
+          </button>
         )}
       </div>
       <TlSelectRow

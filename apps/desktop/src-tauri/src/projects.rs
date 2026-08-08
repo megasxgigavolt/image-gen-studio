@@ -705,6 +705,20 @@ ALTER TABLE animation_job_items_new RENAME TO animation_job_items;
 CREATE INDEX IF NOT EXISTS idx_animation_job_items_job ON animation_job_items(job_id, status, created_at);
 "#;
 
+/// Preserves Auto Motion's own composition for a clip (`{effect,
+/// settingsJson, reason}`, serialized) separately from the live
+/// `motion_graphic_*` columns a manual edit in `MotionSettingsPanel` freely
+/// overwrites — without this there was nowhere to restore FROM once a
+/// manual tweak overwrote the AI's original recipe (see
+/// `reset_timeline_clip_motion_graphic_to_ai`). Only ever written by
+/// `analyze_motion_graphics_batch` composing a fresh treatment; a manual
+/// edit (`set_timeline_clip_motion_graphic`) never touches it, so it always
+/// reflects the last thing Auto Motion actually composed for that clip,
+/// even across "Remove effects" clearing the live columns back to null.
+const MIGRATION_035: &str = r#"
+ALTER TABLE timeline_clips ADD COLUMN motion_graphic_ai_snapshot_json TEXT;
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -1133,6 +1147,12 @@ pub struct TimelineClip {
     pub motion_graphic_settings_json: Option<String>,
     /// Short AI-written justification for the assigned effect.
     pub motion_graphic_reason: Option<String>,
+    /// Serialized `{effect, settingsJson, reason}` snapshot of the last
+    /// treatment Auto Motion actually composed for this clip — untouched by
+    /// manual edits, so `reset_timeline_clip_motion_graphic_to_ai` always has
+    /// something to restore. `None` for a clip Auto Motion has never
+    /// analyzed (including one built from scratch via "start from scratch").
+    pub motion_graphic_ai_snapshot_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1941,6 +1961,21 @@ impl ProjectRepository {
         }
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(34, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_motion_graphic_ai_snapshot: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timeline_clips') WHERE name='motion_graphic_ai_snapshot_json')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_motion_graphic_ai_snapshot {
+            self.connection.execute_batch(MIGRATION_035).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(35, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -3987,6 +4022,7 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                 self.set_timeline_clip_motion_graphic(
                     video_id, &clip.id, Some(effect), Some("{}"), Some("test fixture"),
                 )?;
+                self.record_ai_motion_graphic_snapshot(&clip.id, effect, "{}", "test fixture")?;
             }
             let completed = already_done + batch.len();
             return Ok(MotionGraphicsBatchResult { completed, total, done: completed >= total });
@@ -4089,11 +4125,11 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                 let effect = analysis["effect"].as_str().ok_or("Motion-graphics result missing effect.")?;
                 let settings = analysis.get("settings").cloned().unwrap_or_else(|| json!({}));
                 let reason = analysis["reason"].as_str().unwrap_or_default();
+                let settings_json = serde_json::to_string(&settings).unwrap_or_default();
                 self.set_timeline_clip_motion_graphic(
-                    video_id, clip_id, Some(effect),
-                    Some(&serde_json::to_string(&settings).unwrap_or_default()),
-                    Some(reason),
+                    video_id, clip_id, Some(effect), Some(&settings_json), Some(reason),
                 )?;
+                self.record_ai_motion_graphic_snapshot(clip_id, effect, &settings_json, reason)?;
                 // Tier 3 of the recipe (see motion_graphics_engine.py) is how
                 // this clip hands off to the next one — apply it to the same
                 // `transition_out` column a human could otherwise set
@@ -5545,7 +5581,7 @@ Return JSON only:
         let caption_style = serde_json::from_str(&caption_style_raw).unwrap_or_else(|_| json!({}));
         self.backfill_missing_clip_renders(video_id)?;
         let mut statement = self.connection.prepare(
-            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
+            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason,motion_graphic_ai_snapshot_json FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
         ).map_err(|e| e.to_string())?;
         let clips = statement
             .query_map([video_id], |row| {
@@ -5569,6 +5605,7 @@ Return JSON only:
                     motion_graphic_effect: row.get(16)?,
                     motion_graphic_settings_json: row.get(17)?,
                     motion_graphic_reason: row.get(18)?,
+                    motion_graphic_ai_snapshot_json: row.get(19)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -6207,6 +6244,46 @@ Return JSON only:
         self.get_timeline(video_id)
     }
 
+    /// Records what Auto Motion just composed for a clip into the separate
+    /// `motion_graphic_ai_snapshot_json` column, independent of the live
+    /// `motion_graphic_*` columns `set_timeline_clip_motion_graphic` also
+    /// just wrote for this same clip — called right alongside it, only from
+    /// `analyze_motion_graphics_batch`'s own persistence (never from a
+    /// manual edit), so this is always "the last thing the AI actually
+    /// composed," regardless of what a person does to the live columns
+    /// afterward.
+    fn record_ai_motion_graphic_snapshot(&self, clip_id: &str, effect: &str, settings_json: &str, reason: &str) -> Result<(), String> {
+        let snapshot = json!({ "effect": effect, "settingsJson": settings_json, "reason": reason });
+        self.connection.execute(
+            "UPDATE timeline_clips SET motion_graphic_ai_snapshot_json=?1 WHERE id=?2",
+            params![serde_json::to_string(&snapshot).unwrap_or_default(), clip_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Restores a clip's live motion graphic treatment to exactly what Auto
+    /// Motion last composed for it, discarding any manual edit made since —
+    /// the undo counterpart to freely reconfiguring it in
+    /// `MotionSettingsPanel`. Errors if this clip was never analyzed by Auto
+    /// Motion (no snapshot to restore from), including one built entirely by
+    /// hand via "start from scratch".
+    pub fn reset_timeline_clip_motion_graphic_to_ai(&self, video_id: &str, clip_id: &str) -> Result<Timeline, String> {
+        let snapshot_raw: Option<String> = self.connection.query_row(
+            "SELECT motion_graphic_ai_snapshot_json FROM timeline_clips WHERE id=?1 AND video_id=?2",
+            params![clip_id, video_id],
+            |row| row.get(0),
+        ).map_err(|_| "Clip was not found.".to_string())?;
+        let Some(snapshot_raw) = snapshot_raw else {
+            return Err("This still has no AI-composed motion to reset to.".into());
+        };
+        let snapshot: serde_json::Value = serde_json::from_str(&snapshot_raw)
+            .map_err(|e| format!("Stored AI motion snapshot was invalid: {e}"))?;
+        let effect = snapshot["effect"].as_str().unwrap_or_default();
+        let settings_json = snapshot["settingsJson"].as_str().unwrap_or("{}");
+        let reason = snapshot["reason"].as_str();
+        self.set_timeline_clip_motion_graphic(video_id, clip_id, Some(effect), Some(settings_json), reason)
+    }
+
     /// Clears the AI-assigned/overridden motion graphic on every clip in the
     /// video — the bulk counterpart to `set_timeline_clip_motion_graphic`,
     /// used by the Timeline toolbar's "Remove all effects" action.
@@ -6401,14 +6478,14 @@ Return JSON only:
             group_id, render_id, label, motion_preset, transition_in, transition_out, motion_intensity,
             clip_kind, video_asset_id, media_library_asset_id, start_seconds, end_seconds,
             color_filter_preset, color_filter_intensity,
-            motion_graphic_effect, motion_graphic_settings_json, motion_graphic_reason,
-        ): (String, Option<String>, String, String, String, String, f64, String, Option<String>, Option<String>, f64, f64, String, f64, Option<String>, Option<String>, Option<String>) = self.connection.query_row(
-            "SELECT group_id,render_id,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,start_seconds,end_seconds,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason FROM timeline_clips WHERE id=?1 AND video_id=?2",
+            motion_graphic_effect, motion_graphic_settings_json, motion_graphic_reason, motion_graphic_ai_snapshot_json,
+        ): (String, Option<String>, String, String, String, String, f64, String, Option<String>, Option<String>, f64, f64, String, f64, Option<String>, Option<String>, Option<String>, Option<String>) = self.connection.query_row(
+            "SELECT group_id,render_id,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,start_seconds,end_seconds,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason,motion_graphic_ai_snapshot_json FROM timeline_clips WHERE id=?1 AND video_id=?2",
             params![clip_id, video_id],
             |row| Ok((
                 row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?,
                 row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?,
-                row.get(14)?, row.get(15)?, row.get(16)?,
+                row.get(14)?, row.get(15)?, row.get(16)?, row.get(17)?,
             )),
         ).map_err(|_| "Clip was not found.".to_string())?;
         let duration = (end_seconds - start_seconds).max(0.5);
@@ -6421,8 +6498,8 @@ Return JSON only:
             "SELECT COALESCE(MAX(ordinal),0)+1 FROM timeline_clips WHERE video_id=?1", [video_id], |row| row.get(0),
         ).map_err(|e| e.to_string())?;
         self.connection.execute(
-            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
-            params![Uuid::new_v4().to_string(), video_id, group_id, render_id, next_ordinal, new_start, new_end, label, motion_preset, transition_in, transition_out, motion_intensity, clip_kind, video_asset_id, media_library_asset_id, color_filter_preset, color_filter_intensity, motion_graphic_effect, motion_graphic_settings_json, motion_graphic_reason],
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason,motion_graphic_ai_snapshot_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+            params![Uuid::new_v4().to_string(), video_id, group_id, render_id, next_ordinal, new_start, new_end, label, motion_preset, transition_in, transition_out, motion_intensity, clip_kind, video_asset_id, media_library_asset_id, color_filter_preset, color_filter_intensity, motion_graphic_effect, motion_graphic_settings_json, motion_graphic_reason, motion_graphic_ai_snapshot_json],
         ).map_err(|e| e.to_string())?;
         self.recompute_timeline_duration(video_id)?;
         self.get_timeline(video_id)
@@ -12023,6 +12100,84 @@ mod tests {
         let third = repo.analyze_motion_graphics_batch(&video.id, temp.path()).unwrap();
         assert_eq!(third.completed, total_clips);
         assert!(third.done);
+    }
+
+    /// A manual edit (the settings panel) must never disturb what Auto
+    /// Motion originally composed — `reset_timeline_clip_motion_graphic_to_ai`
+    /// depends on the snapshot surviving untouched underneath any number of
+    /// live edits.
+    #[test]
+    fn manual_motion_edit_resets_back_to_what_auto_motion_composed() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let plan = seed_one_group_per_sentence(&repo, &video.id, 1);
+        let group = &plan.groups[0];
+        let prompt = repo.create_prompt_version(&video.id, &group.id, "{}", "system", "scene").unwrap();
+        let render_dir = temp.path().join("Projects").join(&channel.id).join(&video.id).join("renders").join(&group.id);
+        fs::create_dir_all(&render_dir).unwrap();
+        fs::write(render_dir.join("render-v1.png"), b"bytes").unwrap();
+        repo.insert_image_render(
+            "render-1", &video.id, &group.id, 1, &prompt.id, "render-v1.png",
+            &format!("renders/{}/render-v1.png", group.id), None, None, "generation",
+        ).unwrap();
+        repo.build_timeline(&video.id).unwrap();
+
+        let result = repo.analyze_motion_graphics_batch(&video.id, temp.path()).unwrap();
+        assert!(result.done);
+        let timeline = repo.get_timeline(&video.id).unwrap();
+        let clip = timeline.clips.iter().find(|c| c.render_id.is_some()).unwrap();
+        let ai_effect = clip.motion_graphic_effect.clone().unwrap();
+        let ai_settings = clip.motion_graphic_settings_json.clone().unwrap();
+        assert!(clip.motion_graphic_ai_snapshot_json.is_some(), "Auto Motion should have recorded a snapshot");
+        let clip_id = clip.id.clone();
+
+        // Simulate a manual edit in MotionSettingsPanel — a different effect
+        // label and recipe entirely.
+        repo.set_timeline_clip_motion_graphic(
+            &video.id, &clip_id, Some("manual override"), Some(r#"{"cameraEffect":"zoom_out"}"#), Some("hand-picked"),
+        ).unwrap();
+        let after_edit = repo.get_timeline(&video.id).unwrap();
+        let edited_clip = after_edit.clips.iter().find(|c| c.id == clip_id).unwrap();
+        assert_eq!(edited_clip.motion_graphic_effect.as_deref(), Some("manual override"));
+        // The snapshot must be untouched by the manual edit.
+        assert!(edited_clip.motion_graphic_ai_snapshot_json.is_some());
+
+        let restored = repo.reset_timeline_clip_motion_graphic_to_ai(&video.id, &clip_id).unwrap();
+        let restored_clip = restored.clips.iter().find(|c| c.id == clip_id).unwrap();
+        assert_eq!(restored_clip.motion_graphic_effect.as_deref(), Some(ai_effect.as_str()));
+        assert_eq!(restored_clip.motion_graphic_settings_json.as_deref(), Some(ai_settings.as_str()));
+    }
+
+    /// A clip Auto Motion never analyzed (e.g. composed entirely by hand via
+    /// "start from scratch") has no snapshot to reset to — must error
+    /// clearly rather than silently clearing the manually-authored recipe.
+    #[test]
+    fn reset_to_ai_errors_when_clip_was_never_analyzed_by_auto_motion() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let plan = seed_one_group_per_sentence(&repo, &video.id, 1);
+        let group = &plan.groups[0];
+        let prompt = repo.create_prompt_version(&video.id, &group.id, "{}", "system", "scene").unwrap();
+        let render_dir = temp.path().join("Projects").join(&channel.id).join(&video.id).join("renders").join(&group.id);
+        fs::create_dir_all(&render_dir).unwrap();
+        fs::write(render_dir.join("render-v1.png"), b"bytes").unwrap();
+        repo.insert_image_render(
+            "render-1", &video.id, &group.id, 1, &prompt.id, "render-v1.png",
+            &format!("renders/{}/render-v1.png", group.id), None, None, "generation",
+        ).unwrap();
+        repo.build_timeline(&video.id).unwrap();
+        let timeline = repo.get_timeline(&video.id).unwrap();
+        let clip = timeline.clips.iter().find(|c| c.render_id.is_some()).unwrap();
+
+        // Hand-composed via "start from scratch" — never touched Auto Motion.
+        repo.set_timeline_clip_motion_graphic(
+            &video.id, &clip.id, Some("Manual: Push In"), Some(r#"{"cameraEffect":"push_in"}"#), None,
+        ).unwrap();
+
+        let err = repo.reset_timeline_clip_motion_graphic_to_ai(&video.id, &clip.id).unwrap_err();
+        assert!(err.contains("no AI-composed motion"), "unexpected error: {err}");
     }
 
     #[test]

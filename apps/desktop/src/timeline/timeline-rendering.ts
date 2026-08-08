@@ -13,7 +13,8 @@ import {
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
-import type { CaptionStyle, MotionPreset, TransitionPreset } from "../infrastructure/projects-client";
+import type { CaptionStyle, MotionEasing, MotionPreset, MotionRecipe, TransitionPreset } from "../infrastructure/projects-client";
+import { parseMotionRecipe } from "../infrastructure/projects-client";
 
 // Mirrors the Rust default_caption_style() exactly, so an all-default style
 // looks identical to what used to be hardcoded in the export engine.
@@ -167,6 +168,80 @@ export function applyMotion(
   const w = rect.w * scaleMul;
   const h = rect.h * scaleMul;
   return { x: rect.x - (w - rect.w) * panX, y: rect.y - (h - rect.h) * panY, w, h };
+}
+
+// Cheap stand-ins for services/motion-engine/src/MotionClip.tsx's Remotion
+// `Easing` curves (see `mapEasing` there) — a plain smoothstep covers
+// "ease"/"cubic" closely enough for a preview, and "elastic" simply doesn't
+// overshoot here (a real spring wobble isn't worth reproducing in 2D canvas
+// math for a scrub preview). Only `applyMotionRecipe` uses this.
+function easeMotionProgress(t: number, easing: MotionEasing): number {
+  const clamped = Math.max(0, Math.min(1, t));
+  switch (easing) {
+    case "linear":
+      return clamped;
+    case "easeIn":
+      return clamped * clamped;
+    case "easeOut":
+      return 1 - (1 - clamped) * (1 - clamped);
+    case "ease":
+    case "cubic":
+    case "elastic":
+    default:
+      return clamped * clamped * (3 - 2 * clamped); // smoothstep
+  }
+}
+
+/** Real-time canvas approximation of a clip's actual `MotionRecipe` — the
+ * per-still settings authored via MotionSettingsPanel or composed by Auto
+ * Motion. Unlike `applyMotion` above (still used as a fallback for clips
+ * with no recipe at all), this reads the recipe's own continuous camera-tier
+ * fields directly, so every adjustment in the Motion panel is visible on the
+ * preview canvas immediately rather than being quantized through
+ * `approximate_motion_preset_for_effect`'s handful of discrete presets (that
+ * backend approximation still exists and still gets written for
+ * `motion_preset` — it remains the export engine's ffmpeg fallback for a
+ * clip whose real motion-graphic render fails — this function just isn't
+ * the preview's primary path anymore when a full recipe is available).
+ *
+ * Mirrors MotionClip.tsx's CSS `transform: translate(pan%) scale(s)`
+ * semantics — percentages relative to the frame, anchored at
+ * `transform-origin: originX% originY%` — using plain rect math instead of
+ * a real transform matrix: for any point p, p' = origin + pan + scale*(p -
+ * origin), which is exactly what that translate-then-scale chain produces.
+ * Rotation, motion blur/shake, and Tiers 2 (aside from `focus_shift`'s
+ * simple whole-frame blur, which needs no foreground/background split) 3-5
+ * (transitions, masks/freeze/path, environment particles) aren't reproduced
+ * here — those only render exactly at export via the real Remotion
+ * component; building an accurate canvas approximation of a soft-masked
+ * two-layer depth split or a seeded particle system wasn't worth it for a
+ * scrub preview whose whole point is to be cheap. */
+export function applyMotionRecipe(
+  recipe: MotionRecipe,
+  elapsedSeconds: number,
+  duration: number,
+  rect: { x: number; y: number; w: number; h: number },
+  canvasWidth: number,
+  canvasHeight: number,
+): { x: number; y: number; w: number; h: number; blurPx: number } {
+  const t = easeMotionProgress(duration > 0 ? elapsedSeconds / duration : 0, recipe.easing);
+  const scale = recipe.scaleFrom + (recipe.scaleTo - recipe.scaleFrom) * t;
+  const panXPercent = recipe.panXFrom + (recipe.panXTo - recipe.panXFrom) * t;
+  const panYPercent = recipe.panYFrom + (recipe.panYTo - recipe.panYFrom) * t;
+  const originPxX = (recipe.originX / 100) * canvasWidth;
+  const originPxY = (recipe.originY / 100) * canvasHeight;
+  const panPxX = (panXPercent / 100) * canvasWidth;
+  const panPxY = (panYPercent / 100) * canvasHeight;
+  const blurPx = recipe.depthEffect === "focus_shift"
+    ? Math.max(0, recipe.blurFromPx + (recipe.blurToPx - recipe.blurFromPx) * t)
+    : 0;
+  return {
+    w: rect.w * scale,
+    h: rect.h * scale,
+    x: originPxX + panPxX + scale * (rect.x - originPxX),
+    y: originPxY + panPxY + scale * (rect.y - originPxY),
+    blurPx,
+  };
 }
 
 // Matches the export engine's fade window: proportional to the clip's own
@@ -324,6 +399,11 @@ type ClipLike = {
   endSeconds: number;
   motionPreset: MotionPreset;
   motionIntensity: number;
+  /** Present once Auto Motion (or a manual edit) has composed a full
+   * MotionRecipe for this clip — when set, `drawStillClipContent` reads its
+   * continuous camera-tier fields directly via `applyMotionRecipe` instead
+   * of falling back to the coarser `motionPreset`/`motionIntensity` pair. */
+  motionGraphicSettingsJson: string | null;
   colorFilterPreset: string;
   colorFilterIntensity: number;
 };
@@ -370,17 +450,27 @@ export function drawStillClipContent(
     y: (canvas.height - img.naturalHeight * scale) / 2,
   };
   const clipDuration = clip.endSeconds - clip.startSeconds;
+  const elapsedClamped = Math.max(0, elapsedSeconds);
+  // A clip with a composed MotionRecipe (Auto Motion, or a manual edit in
+  // MotionSettingsPanel) previews from its actual continuous fields; one
+  // without falls back to the coarser motionPreset/motionIntensity pair —
+  // see applyMotionRecipe's doc comment for why this exists at all.
+  const recipe = clip.motionGraphicSettingsJson ? parseMotionRecipe(clip.motionGraphicSettingsJson) : null;
   // Zoom-to-subject is only ever detected against a generated render — an
   // imported still (no renderId) just falls back to frame-center motion.
   const subject = clip.renderId ? getSubject(clip.renderId) : undefined;
-  const rect = applyMotion(clip.motionPreset, Math.max(0, elapsedSeconds), clipDuration, clip.motionIntensity, base, subject);
+  const recipeResult = recipe
+    ? applyMotionRecipe(recipe, elapsedClamped, clipDuration, base, canvas.width, canvas.height)
+    : null;
+  const rect = recipeResult ?? applyMotion(clip.motionPreset, elapsedClamped, clipDuration, clip.motionIntensity, base, subject);
   const extraScale = options?.extraScale ?? 1;
   const w = rect.w * extraScale;
   const h = rect.h * extraScale;
   const x = rect.x - (w - rect.w) / 2 + (options?.translateXPx ?? 0);
   const y = rect.y - (h - rect.h) / 2;
   const colorCss = buildColorFilterCss(clip.colorFilterPreset, clip.colorFilterIntensity);
-  const blurCss = options?.blurPx ? `blur(${options.blurPx.toFixed(1)}px)` : "";
+  const totalBlurPx = (options?.blurPx ?? 0) + (recipeResult?.blurPx ?? 0);
+  const blurCss = totalBlurPx > 0 ? `blur(${totalBlurPx.toFixed(1)}px)` : "";
   ctx.filter = [colorCss === "none" ? "" : colorCss, blurCss].filter(Boolean).join(" ") || "none";
   ctx.drawImage(img, x, y, w, h);
   ctx.filter = "none";

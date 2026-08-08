@@ -248,6 +248,14 @@ export type TimelineClipRecord = {
   motionGraphicSettingsJson: string | null;
   /** Short AI-written justification for the composed treatment. */
   motionGraphicReason: string | null;
+  /** Non-null once Auto Motion has composed a treatment for this clip at
+   * least once — a manual edit in MotionSettingsPanel never clears or
+   * updates this, so its presence (not `motionGraphicEffect`'s) is what
+   * gates showing "Reset to AI default": there's always something to
+   * restore to as long as this is set, even after several manual edits or
+   * "Remove effects". Content is opaque here — only
+   * `resetTimelineClipMotionGraphicToAi` reads it, server-side. */
+  motionGraphicAiSnapshotJson: string | null;
 };
 
 /** Free text now — see the `motionGraphicEffect` field doc above. Kept as its own named type
@@ -895,6 +903,16 @@ export const projectsClient = {
   },
   async setTimelineClipMotionGraphic(videoId: string, clipId: string, effect: MotionGraphicEffect | null, settingsJson: string | null, reason: string | null): Promise<TimelineRecord> {
     if (isTauri()) return invoke("set_timeline_clip_motion_graphic", { videoId, clipId, effect, settingsJson, reason });
+    throw new Error("Timeline requires the native application.");
+  },
+  /** Discards whatever a manual edit in MotionSettingsPanel has done since,
+   * restoring the clip's live motion graphic to exactly what Auto Motion
+   * last composed for it. Rejects if this clip was never analyzed by Auto
+   * Motion (e.g. one built entirely by hand via "start from scratch") — see
+   * `motionGraphicAiSnapshotJson`, which is what gates showing the button
+   * for this in the UI. */
+  async resetTimelineClipMotionGraphicToAi(videoId: string, clipId: string): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("reset_timeline_clip_motion_graphic_to_ai", { videoId, clipId });
     throw new Error("Timeline requires the native application.");
   },
   async clearMotionGraphicsForAllClips(videoId: string): Promise<TimelineRecord> {

@@ -517,6 +517,22 @@ export function TimelineView() {
     await refresh(projectsClient.setTimelineClipMotionGraphic(activeVideoId, selectedClip.id, effect, settingsJson, reason));
   }
 
+  /** Discards any manual edit on the selected clip's Motion panel, restoring
+   * exactly what Auto Motion originally composed for it (see
+   * `motionGraphicAiSnapshotJson`'s doc comment) — MotionSettingsPanel only
+   * ever shows the triggering button when that snapshot exists, but this
+   * still surfaces a toast rather than throwing silently on the off chance
+   * it's stale by the time the click lands. */
+  async function resetMotionRecipeToAi() {
+    if (!activeVideoId || !selectedClip) return;
+    try {
+      await refresh(projectsClient.resetTimelineClipMotionGraphicToAi(activeVideoId, selectedClip.id));
+      addToast("Motion reset to what Auto Motion originally composed.", "success");
+    } catch (caught) {
+      addToast(String(caught), "error");
+    }
+  }
+
   async function removeAllEffects() {
     if (!activeVideoId) return;
     await refresh(projectsClient.applyMotionToAllClips(activeVideoId, "none", globalIntensity));
@@ -1454,6 +1470,7 @@ export function TimelineView() {
                 onSwapRender={(renderId) => void swapRender(renderId)}
                 onResetEffects={() => void resetEffects()}
                 onMotionRecipeChange={(effect, settingsJson, reason) => void setMotionRecipe(effect, settingsJson, reason)}
+                onResetMotionRecipeToAi={() => void resetMotionRecipeToAi()}
               />
             ) : (
               <div className="tl-inspector-empty">

@@ -593,6 +593,17 @@ fn set_timeline_clip_motion_graphic(
 }
 
 #[tauri::command]
+fn reset_timeline_clip_motion_graphic_to_ai(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.reset_timeline_clip_motion_graphic_to_ai(&video_id, &clip_id)
+    })
+}
+
+#[tauri::command]
 async fn apply_creative_instructions_to_all(
     app: tauri::AppHandle,
     state: State<'_, RepositoryState>,
@@ -2812,6 +2823,7 @@ pub fn run() {
             set_timeline_clip_motion_intensity,
             set_timeline_clip_color_filter,
             set_timeline_clip_motion_graphic,
+            reset_timeline_clip_motion_graphic_to_ai,
             clear_motion_graphics_for_all_clips,
             apply_color_filter_to_all_clips,
             apply_motion_to_all_clips,

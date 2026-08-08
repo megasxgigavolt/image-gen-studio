@@ -27,8 +27,9 @@ export function useTimelinePlayback(params: {
   canvasSize: { width: number; height: number };
   renderUrls: Record<string, string>;
   videoAssetUrls: Record<string, string>;
+  mediaAssetUrls: Record<string, string>;
   subjectByRender: Record<string, { x: number; y: number }>;
-  getImageByRenderId: (renderId: string) => HTMLImageElement | null;
+  getImageByAssetId: (assetId: string) => HTMLImageElement | null;
   getSubjectByRenderId: (renderId: string) => { x: number; y: number } | undefined;
   getOrLoadVideo: (url: string) => HTMLVideoElement;
   effectiveGlobalCaptionStyle: CaptionStyle;
@@ -45,7 +46,7 @@ export function useTimelinePlayback(params: {
 }) {
   const {
     timeline, stillsClips, captionClips, totalDuration, canvasSize,
-    renderUrls, videoAssetUrls, subjectByRender, getImageByRenderId, getSubjectByRenderId, getOrLoadVideo,
+    renderUrls, videoAssetUrls, mediaAssetUrls, subjectByRender, getImageByAssetId, getSubjectByRenderId, getOrLoadVideo,
     effectiveGlobalCaptionStyle, pendingSelectedCaptionStyle, selectedCaptionClip, audioDataUrl,
     previewCanvasRef, audioRef, canvasScrollRef, pixelsPerSecond, onTimeChange,
   } = params;
@@ -60,6 +61,18 @@ export function useTimelinePlayback(params: {
   const drawFrameRef = useRef<(time: number) => void>(() => {});
   const activeVideoElRef = useRef<HTMLVideoElement | null>(null);
   const activeAnimationAssetIdRef = useRef<string | null>(null);
+  // Throttles how often a playing rAF tick pushes previewTime into React
+  // state (and everything that cascades from it: clip-selection sync,
+  // auto-scroll, and — the expensive part — a full re-render of every clip
+  // and caption block in TimelineTracks, which isn't memoized against a
+  // per-frame prop). The canvas preview itself still redraws every tick via
+  // drawFrameRef below, so playback stays visually smooth; only the
+  // React-side timeline UI updates at a lower, still-fluid cadence. Without
+  // this, a caption-dense project can't finish reconciling one frame's
+  // worth of DOM before the next rAF tick requests another, and the render
+  // thread never catches up — see the "Editor gets stuck while playing" bug.
+  const lastReactSyncRef = useRef(0);
+  const REACT_SYNC_INTERVAL_MS = 66; // ~15/sec
   // A long-running play session keeps re-invoking the same `stepFrame`
   // closure (see its own comment below) — indirecting through a ref here,
   // the same trick `drawFrameRef` uses, means the *latest* stillsClips
@@ -71,14 +84,14 @@ export function useTimelinePlayback(params: {
   useEffect(() => { previewTimeRef.current = previewTime; }, [previewTime]);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
 
-  function scrollTimelineToTime(time: number) {
+  function scrollTimelineToTime(time: number, behavior: ScrollBehavior = "smooth") {
     const container = canvasScrollRef.current;
     if (!container) return;
     const targetPx = secondsToPixels(time, pixelsPerSecond);
     const viewStart = container.scrollLeft;
     const viewEnd = viewStart + container.clientWidth;
     if (targetPx < viewStart || targetPx > viewEnd) {
-      container.scrollTo({ left: Math.max(0, targetPx - container.clientWidth / 2), behavior: "smooth" });
+      container.scrollTo({ left: Math.max(0, targetPx - container.clientWidth / 2), behavior });
     }
   }
 
@@ -91,22 +104,27 @@ export function useTimelinePlayback(params: {
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     const clip = findClipAtTime(stillsClips, time);
 
-    // Live playback of a generated animation clip draws real video frames;
-    // while paused/scrubbing it falls through to the poster-frame path below
-    // (renderId still points at the source still for every animation clip).
+    // Live playback of a generated animation clip (or an imported video
+    // clip, same treatment) draws real video frames; while paused/scrubbing
+    // it falls through to the poster-frame path below (renderId still points
+    // at the source still for every animation clip; an imported clip has no
+    // poster frame of its own, so it just draws nothing while paused).
     let drewVideoFrame = false;
-    const isAnimationClip = clip?.clipKind === "animation" && !!clip.videoAssetId;
-    if (activeVideoElRef.current && (!isAnimationClip || activeAnimationAssetIdRef.current !== clip?.videoAssetId)) {
+    const videoSourceId = clip?.clipKind === "animation" ? clip.videoAssetId
+      : clip?.clipKind === "imported-clip" ? clip.mediaLibraryAssetId
+      : null;
+    const isVideoClip = !!videoSourceId;
+    if (activeVideoElRef.current && (!isVideoClip || activeAnimationAssetIdRef.current !== videoSourceId)) {
       activeVideoElRef.current.pause();
       activeVideoElRef.current = null;
       activeAnimationAssetIdRef.current = null;
     }
-    if (isAnimationClip && isPlayingRef.current) {
-      const videoUrl = videoAssetUrls[clip.videoAssetId as string];
+    if (clip && isVideoClip && isPlayingRef.current) {
+      const videoUrl = videoAssetUrls[videoSourceId as string] ?? mediaAssetUrls[videoSourceId as string];
       if (videoUrl) {
         const video = getOrLoadVideo(videoUrl);
         activeVideoElRef.current = video;
-        activeAnimationAssetIdRef.current = clip.videoAssetId as string;
+        activeAnimationAssetIdRef.current = videoSourceId as string;
         const elapsedSeconds = Math.max(0, time - clip.startSeconds);
         if (Math.abs(video.currentTime - elapsedSeconds) > 0.15) {
           video.currentTime = elapsedSeconds;
@@ -133,7 +151,7 @@ export function useTimelinePlayback(params: {
       }
     }
 
-    if (!drewVideoFrame && clip?.renderId) {
+    if (!drewVideoFrame && (clip?.renderId || clip?.mediaLibraryAssetId)) {
       // Clamp to 0 rather than going negative during the leading-gap
       // fallback (time before this clip's own start) — freezes on the
       // clip's first frame instead of extrapolating zoom/fade backwards.
@@ -157,8 +175,8 @@ export function useTimelinePlayback(params: {
 
       if (inJoinWindow && nextClip) {
         const progress = Math.max(0, Math.min(1, (elapsedSeconds - (clipDuration - transitionSeconds)) / transitionSeconds));
-        drawJoinTransitionFrame(ctx, canvas, clip, nextClip, elapsedSeconds, progress * transitionSeconds, progress, clip.transitionOut, getImageByRenderId, getSubjectByRenderId);
-      } else if (drawStillClipContent(ctx, canvas, clip, elapsedSeconds, getImageByRenderId, getSubjectByRenderId)) {
+        drawJoinTransitionFrame(ctx, canvas, clip, nextClip, elapsedSeconds, progress * transitionSeconds, progress, clip.transitionOut, getImageByAssetId, getSubjectByRenderId);
+      } else if (drawStillClipContent(ctx, canvas, clip, elapsedSeconds, getImageByAssetId, getSubjectByRenderId)) {
         // A fade-in/out at the two hard edges of the whole timeline has
         // nothing to fade from/to, so it just opens or closes on black —
         // ignore the setting there even if "Fade all" applied it globally.
@@ -202,7 +220,7 @@ export function useTimelinePlayback(params: {
 
   useEffect(() => {
     drawFrameRef.current(previewTimeRef.current);
-  }, [stillsClips, captionClips, effectiveGlobalCaptionStyle, pendingSelectedCaptionStyle, selectedCaptionClip, renderUrls, videoAssetUrls, canvasSize, subjectByRender]);
+  }, [stillsClips, captionClips, effectiveGlobalCaptionStyle, pendingSelectedCaptionStyle, selectedCaptionClip, renderUrls, videoAssetUrls, mediaAssetUrls, canvasSize, subjectByRender]);
 
   useEffect(() => {
     return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
@@ -238,7 +256,12 @@ export function useTimelinePlayback(params: {
       // off to the audio element so the two stay in lockstep from there on.
       if (audio && audioDataUrl && t >= narrationOffset) {
         audio.currentTime = Math.max(0, t - narrationOffset);
-        void audio.play();
+        // A play() that a near-immediate pause() interrupts (fast pause
+        // right after crossing the offset, rapid scrubbing, etc.) rejects
+        // with a standard, harmless AbortError — swallow it like the
+        // animation-clip video.play() below already does, so it doesn't
+        // spam the console/dev overlay as an unhandled rejection.
+        void audio.play().catch(() => {});
         playStartRef.current = null;
       }
     }
@@ -250,10 +273,19 @@ export function useTimelinePlayback(params: {
       return;
     }
     previewTimeRef.current = t;
-    setPreviewTime(t);
     drawFrameRef.current(t);
-    updateSelectionForTime(t);
-    scrollTimelineToTime(t);
+    const now = performance.now();
+    if (now - lastReactSyncRef.current >= REACT_SYNC_INTERVAL_MS) {
+      lastReactSyncRef.current = now;
+      setPreviewTime(t);
+      updateSelectionForTime(t);
+      // "auto" (instant), not "smooth" — during playback this fires up to
+      // REACT_SYNC_INTERVAL_MS apart, and re-triggering a smooth-scroll
+      // animation that often never lets the previous one finish just piles
+      // up competing scroll animations on the compositor instead of
+      // tracking the playhead.
+      scrollTimelineToTime(t, "auto");
+    }
     if (isPlayingRef.current) rafRef.current = requestAnimationFrame(stepFrame);
   }
 
@@ -263,12 +295,13 @@ export function useTimelinePlayback(params: {
     if (startAt >= totalDuration) startAt = 0;
     isPlayingRef.current = true;
     setIsPlaying(true);
+    lastReactSyncRef.current = performance.now();
     previewTimeRef.current = startAt;
     setPreviewTime(startAt);
     const narrationOffset = timeline?.narrationOffsetSeconds ?? 0;
     if (audioRef.current && audioDataUrl && startAt >= narrationOffset) {
       audioRef.current.currentTime = startAt - narrationOffset;
-      void audioRef.current.play();
+      void audioRef.current.play().catch(() => {});
     } else {
       playStartRef.current = { wallStart: performance.now(), timeStart: startAt };
     }
@@ -284,7 +317,7 @@ export function useTimelinePlayback(params: {
     if (audioRef.current && audioDataUrl && pastOffset) {
       audioRef.current.currentTime = clamped - narrationOffset;
       if (isPlayingRef.current) {
-        void audioRef.current.play();
+        void audioRef.current.play().catch(() => {});
         playStartRef.current = null;
       }
     } else if (audioRef.current && audioDataUrl) {

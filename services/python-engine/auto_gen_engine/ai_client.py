@@ -1,5 +1,5 @@
 """
-Shared OpenAI/Gemini client + structured-output parsing helpers.
+Shared OpenAI/Gemini/Claude-CLI client + structured-output parsing helpers.
 
 Extracted out of scene_grouping_engine.py so motion_graphics_engine.py (and
 any future AI-pass engine) doesn't duplicate this — both need the same
@@ -10,6 +10,15 @@ parser for compatible openai package versions)" logic.
 Gemini support exists purely as a fallback for when OpenAI itself is down
 (rate-limited, exhausted billing credits) — mirrors the same OpenAI-primary/
 Gemini-last-resort pattern used throughout the Rust side (see projects.rs).
+
+Claude CLI support (`parse_structured_vision_claude_cli` below) is a third,
+different kind of provider: it doesn't call a billed API at all. It shells
+out to a locally installed, already-authenticated `claude` binary (Claude
+Code) and rides whatever Claude subscription is already logged into it on
+this machine — no ANTHROPIC_API_KEY, no separate bill. Deliberately never
+passes `--bare` to the CLI, since bare mode requires its own API key and
+refuses to read the OAuth/subscription session, which would defeat the
+entire point of using it instead of paying for API access again.
 """
 
 from __future__ import annotations
@@ -17,6 +26,11 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
+import subprocess
+import tempfile
+import uuid
+from pathlib import Path
 
 
 def get_openai_client():
@@ -225,3 +239,120 @@ def parse_structured_vision_gemini(
     if parsed is None:
         raise RuntimeError("Gemini returned no parsed structured output.")
     return parsed
+
+
+def get_claude_cli_path() -> str | None:
+    """Locates the Claude Code CLI binary on PATH, if any. Returns None (not
+    an exception) when it's missing — unlike the OpenAI/Gemini client
+    getters, "not installed" is an ordinary, expected state on most machines
+    and should just fall through to whatever other providers are configured,
+    not surface as a scary error."""
+    return shutil.which("claude")
+
+
+def parse_structured_vision_claude_cli(
+    claude_path: str,
+    system_prompt: str,
+    content_blocks: list[dict],
+    response_model,
+    timeout: float = 300.0,
+    effort: str | None = "high",
+    model: str | None = "sonnet",
+):
+    """
+    Claude Code CLI equivalent of `parse_structured_vision`/`_gemini`. Unlike
+    those, this doesn't hold an API client — it shells out to `claude -p`
+    per call, using whatever account is already logged into the CLI on this
+    machine (subscription usage), not a metered API key.
+
+    The CLI has no way to attach an inline image the way the OpenAI/Gemini
+    SDKs do, so each base64 image block is decoded out to a temp file first
+    and referenced by path in the prompt text; the only tool granted to the
+    session (`Read`) is what actually loads it off disk on Claude's side.
+    `--json-schema` (built directly from the Pydantic response_model, via
+    `.model_json_schema()`) constrains the reply to a parseable shape,
+    surfaced back here in the CLI's own `structured_output` response field.
+
+    `effort` ("low"/"medium"/"high"/"xhigh"/"max", or None for the CLI's own
+    default) is worth spending on this call specifically — motion-graphics
+    selection is a real spatial/compositional judgment call (what's in the
+    frame, where the subject actually is, what won't get cropped out by a
+    given move), not a quick lookup, and it draws no metered cost here the
+    way it would through a billed API, so there's no reason to default to a
+    cheap pass.
+
+    `model` is pinned to "sonnet" (the latest Claude Sonnet) rather than left
+    to whatever the CLI session's own default happens to be — this call
+    should always get a specific, known-good model regardless of what the
+    user has their interactive CLI sessions set to elsewhere.
+    """
+    schema = response_model.model_json_schema()
+
+    with tempfile.TemporaryDirectory(prefix="claude-cli-vision-") as tmp_dir:
+        prompt_parts: list[str] = []
+        for block in content_blocks:
+            if block["type"] == "input_text":
+                prompt_parts.append(block["text"])
+            elif block["type"] == "input_image":
+                header, _, b64data = block["image_url"].partition(",")
+                mime_type = header.removeprefix("data:").split(";")[0]
+                extension = mime_type.split("/")[-1] or "png"
+                image_path = Path(tmp_dir) / f"{uuid.uuid4().hex}.{extension}"
+                image_path.write_bytes(base64.b64decode(b64data))
+                prompt_parts.append(f"[image: {image_path}]")
+
+        args = [
+            claude_path,
+            "-p", "\n\n".join(prompt_parts),
+            "--output-format", "json",
+            "--tools", "Read",
+            "--allowedTools", "Read",
+            "--add-dir", tmp_dir,
+            "--system-prompt", system_prompt,
+            "--json-schema", json.dumps(schema),
+            "--no-session-persistence",
+        ]
+        if effort:
+            args += ["--effort", effort]
+        if model:
+            args += ["--model", model]
+
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Claude CLI exited with code "
+                f"{result.returncode}: {(result.stderr or result.stdout).strip()[:500]}"
+            )
+
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"Claude CLI returned non-JSON output: {result.stdout[:500]}"
+            ) from error
+
+        if payload.get("is_error"):
+            raise RuntimeError(f"Claude CLI reported an error: {payload.get('result')}")
+
+        structured = payload.get("structured_output")
+        if structured is None:
+            # Older/edge-case runs can land the JSON back in `result` (a plain
+            # string) instead of the dedicated field — still worth parsing
+            # rather than treating as a hard failure.
+            raw_result = payload.get("result")
+            if isinstance(raw_result, str):
+                try:
+                    structured = json.loads(raw_result)
+                except json.JSONDecodeError:
+                    structured = None
+        if structured is None:
+            raise RuntimeError("Claude CLI returned no structured output.")
+
+        return response_model.model_validate(structured)

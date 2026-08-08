@@ -78,7 +78,7 @@ describe("TimelineView", () => {
     expect(await screen.findByRole("heading", { name: "Editor" })).toBeInTheDocument();
     expect(screen.getByText(/add stills to the timeline to begin editing/i)).toBeInTheDocument();
     expect(screen.getByText(/select a clip or audio in the timeline/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /no captions/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /captions/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /undo/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /redo/i })).toBeDisabled();
   });
@@ -88,8 +88,8 @@ describe("TimelineView", () => {
     useAppStore.setState({ activeVideoId: "video-1", activeVideoTitle: "My Video" });
     render(<TimelineView />);
 
-    const captionsBadge = await screen.findByRole("button", { name: /no captions/i });
-    fireEvent.click(captionsBadge);
+    const captionsButton = await screen.findByRole("button", { name: /captions/i });
+    fireEvent.click(captionsButton);
     expect(await screen.findByRole("button", { name: /generate captions/i })).toBeInTheDocument();
 
     fireEvent.keyDown(window, { key: "Escape" });

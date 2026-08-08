@@ -55,8 +55,14 @@ export function useTimelineData(
 
     (async () => {
       try {
+        // getImageWorkspace requires a generated visual plan and throws hard
+        // if there isn't one (e.g. a raw "Import video" project, which never
+        // has one) — kept separate from the Promise.all below so that
+        // failure can't take the real timeline/narration/captions data down
+        // with it. Editor features that need workspace (jump-to-still,
+        // Generated grid) just see an empty one; everything else loads fine.
         const [loadedWorkspace, inputs] = await Promise.all([
-          projectsClient.getImageWorkspace(activeVideoId),
+          projectsClient.getImageWorkspace(activeVideoId).catch(() => null),
           projectsClient.getVideoInputs(activeVideoId),
         ]);
         if (cancelled) return;

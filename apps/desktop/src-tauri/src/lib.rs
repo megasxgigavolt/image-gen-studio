@@ -767,7 +767,7 @@ fn export_latest_stills(
 }
 
 #[tauri::command]
-fn export_project_bundle(
+async fn export_project_bundle(
     app: tauri::AppHandle,
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -782,16 +782,32 @@ fn export_project_bundle(
     else {
         return Ok(None);
     };
-    with_repository(state, |repository| {
+    // A real project's renders/animations/media library can run into the
+    // hundreds of MB — zipping that synchronously on the command-dispatch
+    // thread froze the whole window (Windows flags it "Not Responding")
+    // until it finished. Same fix as generate_visual_plan/generate_captions:
+    // hand off to a blocking worker with its own connection, so the UI
+    // thread keeps pumping messages the entire time.
+    let (database_path, projects_dir) = {
+        let repository = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        repository.paths()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
         repository.export_project_bundle(&video_id, &path)
     })
+    .await
+    .map_err(|error| format!("Export worker failed: {error}"))?
     .map(Some)
 }
 
 #[tauri::command]
-fn import_project_bundle(
+async fn import_project_bundle(
     app: tauri::AppHandle,
     state: State<'_, RepositoryState>,
+    channel_id: String,
 ) -> Result<Option<Video>, String> {
     let Some(path) = app
         .dialog()
@@ -802,7 +818,38 @@ fn import_project_bundle(
     else {
         return Ok(None);
     };
-    with_repository(state, |repository| repository.import_project_bundle(&path)).map(Some)
+    // Same reasoning as export_project_bundle: unpacking a large bundle and
+    // restoring every table row is real work — keep it off the UI thread.
+    let (database_path, projects_dir) = {
+        let repository = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        repository.paths()
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.import_project_bundle(&path, &channel_id)
+    })
+    .await
+    .map_err(|error| format!("Import worker failed: {error}"))?
+    .map(Some)
+}
+
+#[tauri::command]
+fn import_asset_folder(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+) -> Result<Option<Video>, String> {
+    let Some(path) = app
+        .dialog()
+        .file()
+        .blocking_pick_folder()
+        .and_then(|value| value.as_path().map(ToOwned::to_owned))
+    else {
+        return Ok(None);
+    };
+    let engine_dir = resolve_engine_dir(&app)?;
+    with_repository(state, |repository| repository.import_asset_folder(&path, &engine_dir)).map(Some)
 }
 
 #[tauri::command]
@@ -1207,7 +1254,10 @@ fn pick_and_import_media_library_asset(
     let mut picker = app.dialog().file();
     picker = match kind.as_deref() {
         Some("still") => picker.add_filter("Images", &["png", "jpg", "jpeg", "webp"]),
-        Some("clip") => picker.add_filter("Video clips", &["mp4", "mov", "webm", "mkv"]),
+        Some("clip") => picker.add_filter(
+            "Clips",
+            &["mp4", "mov", "webm", "mkv", "png", "jpg", "jpeg", "webp"],
+        ),
         Some("audio") => picker.add_filter("Audio", &["mp3", "wav", "m4a", "aac", "flac", "ogg"]),
         _ => picker.add_filter(
             "Media",
@@ -1260,6 +1310,18 @@ fn get_media_library_asset_file_path(
         repository
             .media_library_asset_file_path(&asset_id)
             .map(|path| path.to_string_lossy().into_owned())
+    })
+}
+
+#[tauri::command]
+fn denoise_media_library_asset(
+    app: tauri::AppHandle,
+    state: State<'_, RepositoryState>,
+    asset_id: String,
+) -> Result<MediaLibraryAsset, String> {
+    let engine_dir = resolve_engine_dir(&app)?;
+    with_repository(state, |repository| {
+        repository.denoise_media_library_asset(&asset_id, &engine_dir)
     })
 }
 
@@ -2756,6 +2818,7 @@ pub fn run() {
             export_latest_stills,
             export_project_bundle,
             import_project_bundle,
+            import_asset_folder,
             build_timeline,
             get_timeline,
             update_timeline_view,
@@ -2796,6 +2859,7 @@ pub fn run() {
             list_media_library_assets,
             remove_media_library_asset,
             get_media_library_asset_file_path,
+            denoise_media_library_asset,
             list_video_assets,
             add_video_asset_clip_to_stills_track,
             add_library_asset_to_stills_track,

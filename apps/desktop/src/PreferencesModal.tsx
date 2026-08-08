@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { CheckCircle2, FolderOpen, Info, LoaderCircle, X, XCircle } from "lucide-react";
 import { projectsClient, type ExportCaptionsMode, type ExportQuality, type ExportResolution } from "./infrastructure/projects-client";
+import { useAppStore } from "./store/app-store";
 
 type TestState = "idle" | "testing" | "ok" | "failed";
 
@@ -10,15 +11,18 @@ const QUALITIES: ExportQuality[] = ["compressed", "balanced", "high"];
 const CAPTION_MODES: ExportCaptionsMode[] = ["burned-in", "srt", "both"];
 const CAPTION_MODE_LABELS: Record<ExportCaptionsMode, string> = { "burned-in": "Burned-in", srt: "SRT", both: "Both" };
 
+type AutosaveInterval = "30s" | "1m" | "2m" | "manual";
+const AUTOSAVE_INTERVALS: AutosaveInterval[] = ["30s", "1m", "2m", "manual"];
+const AUTOSAVE_INTERVAL_LABELS: Record<AutosaveInterval, string> = { "30s": "30s", "1m": "1 min", "2m": "2 min", manual: "Manual only" };
+
 /** Centered Preferences popup — general/AI-provider/export-default settings,
- * all local draft state until "Save". Two settings described in the original
- * spec are intentionally left out rather than faked: auto-save interval
- * (autosave here is reactive-on-edit, not timer-based, so the control
- * wouldn't do anything) and "Check for updates" (this build has no update
- * server to check against). */
+ * all local draft state until "Save". "Check for updates" from the original
+ * spec is intentionally left out rather than faked — this build has no
+ * update server to check against. */
 export function PreferencesModal({ onClose }: { onClose: () => void }) {
   const [appVersion, setAppVersion] = useState("");
   const [saveLocation, setSaveLocation] = useState("");
+  const [autosaveInterval, setAutosaveInterval] = useState<AutosaveInterval>("30s");
   const [exportResolution, setExportResolution] = useState<ExportResolution>("1080p");
   const [exportQuality, setExportQuality] = useState<ExportQuality>("balanced");
   const [exportCaptions, setExportCaptions] = useState<ExportCaptionsMode>("burned-in");
@@ -28,25 +32,31 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
   const [geminiKeyDraft, setGeminiKeyDraft] = useState("");
   const [openaiTest, setOpenaiTest] = useState<TestState>("idle");
   const [geminiTest, setGeminiTest] = useState<TestState>("idle");
+  const [testMode, setTestMode] = useState(false);
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
+  const addToast = useAppStore((state) => state.addToast);
 
   useEffect(() => {
     void (async () => {
-      const [version, folder, resolution, quality, captions, openaiStatus, geminiStatus] = await Promise.all([
+      const [version, folder, autosave, resolution, quality, captions, testModeSetting, openaiStatus, geminiStatus] = await Promise.all([
         projectsClient.getApplicationVersion(),
         projectsClient.getAppSetting("download_folder"),
+        projectsClient.getAppSetting("autosave_interval"),
         projectsClient.getAppSetting("export_default_resolution"),
         projectsClient.getAppSetting("export_default_quality"),
         projectsClient.getAppSetting("export_default_captions"),
+        projectsClient.getAppSetting("ai_test_mode"),
         projectsClient.getProviderKeyStatus("openai"),
         projectsClient.getProviderKeyStatus("gemini"),
       ]);
       setAppVersion(version);
       setSaveLocation(folder ?? "");
+      if (autosave && (AUTOSAVE_INTERVALS as string[]).includes(autosave)) setAutosaveInterval(autosave as AutosaveInterval);
       if (resolution && (RESOLUTIONS as string[]).includes(resolution)) setExportResolution(resolution as ExportResolution);
       if (quality && (QUALITIES as string[]).includes(quality)) setExportQuality(quality as ExportQuality);
       if (captions && (CAPTION_MODES as string[]).includes(captions)) setExportCaptions(captions as ExportCaptionsMode);
+      setTestMode(testModeSetting === "true");
       setOpenaiConfigured(openaiStatus.configured);
       setGeminiConfigured(geminiStatus.configured);
       setLoading(false);
@@ -79,12 +89,15 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
     try {
       await Promise.all([
         projectsClient.saveAppSetting("download_folder", saveLocation),
+        projectsClient.saveAppSetting("autosave_interval", autosaveInterval),
         projectsClient.saveAppSetting("export_default_resolution", exportResolution),
         projectsClient.saveAppSetting("export_default_quality", exportQuality),
         projectsClient.saveAppSetting("export_default_captions", exportCaptions),
+        projectsClient.saveAppSetting("ai_test_mode", testMode ? "true" : "false"),
         openaiKeyDraft.trim() ? projectsClient.saveProviderKey("openai", openaiKeyDraft.trim()) : Promise.resolve(),
         geminiKeyDraft.trim() ? projectsClient.saveProviderKey("gemini", geminiKeyDraft.trim()) : Promise.resolve(),
       ]);
+      addToast("Preferences saved", "success", 2000);
       onClose();
     } finally {
       setSaving(false);
@@ -129,11 +142,27 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
               </select>
               <small className="tl-source-hint">More languages are planned — English only for now.</small>
             </label>
+            <div className="pref-field">
+              <span className="field-heading">Auto-save interval</span>
+              <div className="tl-preset-grid four">
+                {AUTOSAVE_INTERVALS.map((value) => (
+                  <button key={value} type="button" className={autosaveInterval === value ? "tl-preset-btn active" : "tl-preset-btn"} onClick={() => setAutosaveInterval(value)}><span>{AUTOSAVE_INTERVAL_LABELS[value]}</span></button>
+                ))}
+              </div>
+            </div>
 
             <div className="panel-section-heading" style={{ marginTop: "18px" }}><h3>AI Providers</h3></div>
             <p className="tl-source-hint"><Info size={12} style={{ marginRight: "4px", verticalAlign: "-1px" }} />API keys are stored locally on your machine and never sent to our servers.</p>
+            <div className="pref-toggle-row">
+              <span className="field-heading">Test mode</span>
+              <label className="pref-switch">
+                <input type="checkbox" checked={testMode} onChange={(event) => setTestMode(event.target.checked)} aria-label="Test mode" />
+                <span className="pref-switch-track" />
+              </label>
+            </div>
+            <small className="tl-source-hint">Enables offline stubs — no API calls are made. Use during development.</small>
             <label className="pref-field">
-              <span className="field-heading">Prompt generation (OpenAI)</span>
+              <span className="field-heading">Motion graphics fallback (OpenAI)</span>
               <div className="pref-path-row">
                 <input
                   type="password"
@@ -145,6 +174,7 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
                 <button type="button" className="secondary" onClick={() => void testKey("openai")} disabled={openaiTest === "testing" || (!openaiConfigured && !openaiKeyDraft.trim())}>Test</button>
               </div>
               {testBadge(openaiTest)}
+              <small className="tl-source-hint">Optional — only used as a last-resort fallback for Motion Graphics analysis. Bulk Gen planning uses the Claude Code CLI (if logged in) and Gemini, not OpenAI.</small>
             </label>
             <label className="pref-field">
               <span className="field-heading">Image generation &amp; Animation (Gemini)</span>

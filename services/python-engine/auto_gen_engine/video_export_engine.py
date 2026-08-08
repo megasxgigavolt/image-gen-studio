@@ -167,20 +167,42 @@ def assign_frame_counts(segments: list[dict], fps: int) -> None:
         cumulative_frame += segment["frames"]
 
 
-# These 4 transitions need both neighboring clips' pixel data blended
+# These 6 transitions need both neighboring clips' pixel data blended
 # together, unlike cut/fade/dip-to-white which only ever touch one segment's
 # own frames — see `expand_join_transitions`. Mapped onto ffmpeg's `xfade`
 # filter's built-in transition catalog rather than hand-built filter_complex
-# graphs per type, since xfade already covers all of these reliably.
-JOIN_TRANSITIONS = {"cross-fade", "slide-left", "slide-right", "zoom-blur"}
+# graphs per type, since xfade already covers all of these reliably. Also
+# the set of Tier-3 "transitionOut" values the motion-graphics AI (see
+# motion_graphics_engine.py) can pick between clips — "whip-pan" and
+# "blur-transition" both approximate their look with ffmpeg's `hblur`
+# (there's no true isotropic/gaussian blur transition built into xfade),
+# distinguished only by duration (see JOIN_TRANSITION_SECONDS below): a
+# short, snappy hblur reads as a whip-pan; a longer one reads as a softer
+# blur dissolve. Documented as an approximation, not exact optical blur.
+JOIN_TRANSITIONS = {"cross-fade", "slide-left", "slide-right", "zoom-blur", "whip-pan", "blur-transition"}
 _XFADE_TRANSITION_NAMES = {
-    "cross-fade": "fade",
+    # "dissolve" (a direct A-to-B blend) reads as a truer cross-dissolve than
+    # xfade's "fade" (which itself is already a plain crossfade, just named
+    # confusingly close to the unrelated per-clip fade-to-black transition
+    # elsewhere in this module).
+    "cross-fade": "dissolve",
     "slide-left": "slideleft",
     "slide-right": "slideright",
     # xfade has no literal "zoom + motion blur" preset; "zoomin" (the
     # incoming clip zooms in while cross-dissolving) is the closest built-in
     # analog and reads as a zoom-blur at typical transition speeds.
     "zoom-blur": "zoomin",
+    "whip-pan": "hblur",
+    "blur-transition": "hblur",
+}
+# Per-type (min, max) transition duration bounds, in seconds — overrides the
+# generic default in `expand_join_transitions` for the two transitions that
+# share an xfade filter name (see above) and rely entirely on duration to
+# read as different things: short and snappy for a whip-pan, longer and
+# softer for a blur dissolve.
+_JOIN_TRANSITION_SECONDS = {
+    "whip-pan": (0.12, 0.25),
+    "blur-transition": (0.4, 0.7),
 }
 
 
@@ -227,7 +249,8 @@ def expand_join_transitions(segments: list[dict], fps: int) -> list[dict]:
             continue
         duration_a = segment["end"] - segment["start"]
         duration_b = next_segment["end"] - next_segment["start"]
-        transition_seconds = max(0.2, min(0.75, min(duration_a, duration_b) / 3))
+        seconds_lo, seconds_hi = _JOIN_TRANSITION_SECONDS.get(transition_type, (0.2, 0.75))
+        transition_seconds = max(seconds_lo, min(seconds_hi, min(duration_a, duration_b) / 3))
         transition_frames = max(1, min(round(transition_seconds * fps), next_segment["frames"] - 1))
         next_segment["frames"] -= transition_frames
         next_segment["_trimStartFrames"] = next_segment.get("_trimStartFrames", 0) + transition_frames
@@ -458,10 +481,11 @@ def run_ffmpeg(args: list[str]) -> None:
         raise RuntimeError(f"ffmpeg failed: {result.stderr[-2000:]}")
 
 
-# services/motion-engine — the parameterized Remotion project that actually
-# renders the 7 SOP motion-graphic treatments (Ken Burns, Sequential Panel
-# Reveal, Speed Pan & Motion Blur, Ominous Push-In, Candlelight Flicker,
-# Focus Pull, Iris Reveal). Sibling of python-engine under services/.
+# services/motion-engine — the Remotion project that renders whatever
+# free-form "motion recipe" motion_graphics_engine.py composed for a clip (see
+# that module's docstring — there's no fixed catalog of named treatments
+# anymore, just a shared vocabulary of independent primitives). Sibling of
+# python-engine under services/.
 MOTION_ENGINE_DIR = Path(__file__).resolve().parents[2] / "motion-engine"
 
 
@@ -500,7 +524,7 @@ def _render_motion_graphic(
     image_path: str, effect: str, settings: dict,
     frames: int, fps: int, width: int, height: int, out_path: Path,
 ) -> None:
-    """Renders one clip's AI-assigned (or manually overridden) SOP treatment
+    """Renders one clip's AI-composed (or manually overridden) motion recipe
     via services/motion-engine's generalized `MotionClip` composition,
     writing a plain MP4 to `out_path` — the caller (`_encode_segment_to_path`)
     still applies this segment's own color filter / transition fades and the
@@ -508,13 +532,18 @@ def _render_motion_graphic(
     pass, same as every other segment kind. `--public-dir` points Remotion's
     headless Chromium at the still's own folder so `staticFile(imagePath)`
     inside the composition can load it — Chromium refuses to load `file://`
-    URLs outside a folder it's been told is servable."""
+    URLs outside a folder it's been told is servable.
+
+    `effect` (the free-text treatment label, kept as its own DB column for
+    quick display/debugging — see projects.rs) is only used here for the
+    error message; the composition itself reads everything it needs — label
+    included — from `settings`, forwarded whole as the single `recipe` prop
+    (see services/motion-engine/src/types.ts's `MotionRecipe`)."""
     _ensure_motion_engine_ready()
     image_file = Path(image_path)
     props = {
         "imagePath": image_file.name,
-        "effect": effect,
-        "settings": settings,
+        "recipe": settings,
         "durationInFrames": max(1, frames),
         "fps": fps,
         "width": width,
@@ -564,8 +593,8 @@ def _encode_segment_to_path(
     original_frames = segment.get("_originalFrames", output_frames)
     trim_start_frames = segment.get("_trimStartFrames", 0)
     if segment["kind"] == "image" and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings"):
-        # AI-assigned (or manually overridden) SOP treatment: render the real
-        # effect via services/motion-engine instead of approximating it with
+        # AI-composed (or manually overridden) motion recipe: render the real
+        # thing via services/motion-engine instead of approximating it with
         # a zoompan preset, then apply this segment's own color filter and
         # transition fades on top in an ordinary second ffmpeg pass — same
         # post-processing every other segment kind already gets.
@@ -1292,11 +1321,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Composite a timeline arrangement of stills, captions, and narration audio into a final MP4, "
                      "or export it as separate editor-ready assets (--mode bundle), "
                      "or just report a media file's real duration (--mode probe), "
-                     "or stretch/trim a generated animation clip to a target duration (--mode retime).",
+                     "or stretch/trim a generated animation clip to a target duration (--mode retime), "
+                     "or remove steady-state background noise from an audio file (--mode denoise).",
     )
-    parser.add_argument("manifest", help="Path to the timeline export manifest JSON, or a media file path for --mode probe/retime")
-    parser.add_argument("--output", metavar="PATH", help="Output video path, or destination folder for --mode bundle (unused for --mode probe)")
-    parser.add_argument("--mode", choices=["video", "bundle", "probe", "retime", "detect-subject"], default="video", help="'video' bakes one MP4 (default); 'bundle' exports separate clip/audio/caption assets; 'probe' reports a media file's real duration; 'retime' stretches/trims a clip to a target duration; 'detect-subject' locates a still's automatic zoom-anchor point")
+    parser.add_argument("manifest", help="Path to the timeline export manifest JSON, or a media file path for --mode probe/retime/denoise")
+    parser.add_argument("--output", metavar="PATH", help="Output video path, or destination folder for --mode bundle, or cleaned audio path for --mode denoise (unused for --mode probe)")
+    parser.add_argument("--mode", choices=["video", "bundle", "probe", "retime", "detect-subject", "denoise"], default="video", help="'video' bakes one MP4 (default); 'bundle' exports separate clip/audio/caption assets; 'probe' reports a media file's real duration; 'retime' stretches/trims a clip to a target duration; 'detect-subject' locates a still's automatic zoom-anchor point; 'denoise' removes steady-state background noise from an audio file")
     parser.add_argument("--source-duration", type=float, help="The input clip's real duration in seconds (required for --mode retime)")
     parser.add_argument("--target-duration", type=float, help="The desired output duration in seconds (required for --mode retime)")
     return parser
@@ -1332,6 +1362,22 @@ def run_detect_subject(image_path: Path) -> None:
     print(json.dumps({"x": x, "y": y}), flush=True)
 
 
+def run_denoise(source_path: Path, output_path: Path) -> None:
+    """Reduces steady-state background noise (hiss, hum, fan/AC static) in a
+    narration or imported audio file. Filter chain: a highpass at 80Hz drops
+    sub-bass rumble that doesn't carry voice; `afftdn` is an FFT-based noise
+    gate that estimates and subtracts the broadband noise floor without
+    needing a separate noise-only sample; a lowpass at 15kHz trims hiss
+    above the range speech energy lives in; `loudnorm` renormalizes loudness
+    afterward since denoising can otherwise leave the file perceptibly
+    quieter than the source."""
+    run_ffmpeg([
+        "-y", "-i", str(source_path),
+        "-af", "highpass=f=80,afftdn=nf=-25,lowpass=f=15000,loudnorm=I=-16:TP=-1.5:LRA=11",
+        str(output_path),
+    ])
+
+
 if __name__ == "__main__":
     cli_parser = build_parser()
     if len(sys.argv) == 1:
@@ -1339,12 +1385,15 @@ if __name__ == "__main__":
         sys.exit(0)
     args = cli_parser.parse_args()
     if args.mode not in ("probe", "detect-subject") and not args.output:
-        cli_parser.error("--output is required for --mode video/bundle")
+        cli_parser.error("--output is required for --mode video/bundle/retime/denoise")
     try:
         if args.mode == "probe":
             run_probe(Path(args.manifest).expanduser().resolve())
         elif args.mode == "detect-subject":
             run_detect_subject(Path(args.manifest).expanduser().resolve())
+        elif args.mode == "denoise":
+            run_denoise(Path(args.manifest).expanduser().resolve(), Path(args.output).expanduser().resolve())
+            print(f"Output: {args.output}", flush=True)
         elif args.mode == "retime":
             if args.source_duration is None or args.target_duration is None:
                 cli_parser.error("--source-duration and --target-duration are required for --mode retime")

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { resolveRenderUrl, resolveVideoAssetUrl } from "../infrastructure/media-cache";
+import { resolveMediaLibraryAssetUrl, resolveRenderUrl, resolveVideoAssetUrl } from "../infrastructure/media-cache";
 import { projectsClient, type ImageWorkspaceRecord, type TimelineRecord } from "../infrastructure/projects-client";
 import type { AspectRatio } from "./Toolbar";
 
@@ -26,6 +26,11 @@ export function useTimelineAssets(
 ) {
   const [renderUrls, setRenderUrls] = useState<Record<string, string>>({});
   const [videoAssetUrls, setVideoAssetUrls] = useState<Record<string, string>>({});
+  // clipKind 'imported-still'/'imported-clip' clips (e.g. from "Import video"
+  // or a Media Library drag) have no renderId/videoAssetId — they're backed
+  // by a media_library_assets row instead, resolved here the same
+  // stale-while-revalidate way as the other two asset kinds.
+  const [mediaAssetUrls, setMediaAssetUrls] = useState<Record<string, string>>({});
   const [subjectByRender, setSubjectByRender] = useState<Record<string, { x: number; y: number }>>({});
   // A pure derivation of the aspect-ratio setting, not independent state.
   const canvasSize = canvasSizeForAspectRatio(aspectRatio);
@@ -79,6 +84,14 @@ export function useTimelineAssets(
     }));
   }, [timeline, videoAssetUrls]);
 
+  useEffect(() => {
+    const mediaAssetIds = (timeline?.clips ?? []).map((clip) => clip.mediaLibraryAssetId).filter(Boolean) as string[];
+    void Promise.all(mediaAssetIds.filter((id) => !mediaAssetUrls[id]).map(async (id) => {
+      const url = await resolveMediaLibraryAssetUrl(id);
+      setMediaAssetUrls((current) => ({ ...current, [id]: url }));
+    }));
+  }, [timeline, mediaAssetUrls]);
+
   function getOrLoadImage(url: string): HTMLImageElement | null {
     const cache = imageElsRef.current;
     let img = cache.get(url);
@@ -112,6 +125,14 @@ export function useTimelineAssets(
     return url ? getOrLoadImage(url) : null;
   }
 
+  // Render ids and media library asset ids are drawn from different tables
+  // (never collide), so a still clip's asset — whichever of the two it's
+  // actually backed by — can be looked up through one combined getter.
+  function getImageByAssetId(id: string): HTMLImageElement | null {
+    const url = renderUrls[id] ?? mediaAssetUrls[id];
+    return url ? getOrLoadImage(url) : null;
+  }
+
   function getSubjectByRenderId(renderId: string): { x: number; y: number } | undefined {
     return subjectByRender[renderId];
   }
@@ -119,11 +140,13 @@ export function useTimelineAssets(
   return {
     renderUrls,
     videoAssetUrls,
+    mediaAssetUrls,
     subjectByRender,
     canvasSize,
     getOrLoadImage,
     getOrLoadVideo,
     getImageByRenderId,
+    getImageByAssetId,
     getSubjectByRenderId,
   };
 }

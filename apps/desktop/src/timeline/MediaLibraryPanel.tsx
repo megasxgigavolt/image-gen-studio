@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ImageOff, Plus, Trash2, Upload } from "lucide-react";
+import { ImageOff, LoaderCircle, Plus, Trash2, Upload, Wand2 } from "lucide-react";
 import { useAppStore } from "../store/app-store";
 import { resolveMediaLibraryAssetUrl, resolveVideoAssetUrl } from "../infrastructure/media-cache";
 import { projectsClient, type ImageWorkspaceRecord, type MediaLibraryAssetRecord, type MediaLibraryKind, type VideoAssetRecord } from "../infrastructure/projects-client";
@@ -44,6 +44,7 @@ export function MediaLibraryPanel({
   const [videoAssets, setVideoAssets] = useState<VideoAssetRecord[]>([]);
   const [assetUrls, setAssetUrls] = useState<Record<string, string>>({});
   const [importing, setImporting] = useState(false);
+  const [denoisingId, setDenoisingId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
   const setStage = useAppStore((state) => state.setStage);
@@ -122,6 +123,23 @@ export function MediaLibraryPanel({
     }
   }
 
+  /** Cleans up hiss/hum/static in an Audio-tab file. Non-destructive — the
+   * result lands as a new "(denoised)" asset next to the original, which is
+   * left untouched. */
+  async function denoiseAsset(asset: MediaLibraryAssetRecord) {
+    if (denoisingId) return;
+    setDenoisingId(asset.id);
+    try {
+      const result = await projectsClient.denoiseMediaLibraryAsset(asset.id);
+      await reload();
+      addToast(`Removed background noise — added "${result.originalName}".`, "success");
+    } catch (caught) {
+      addToast(String(caught), "error");
+    } finally {
+      setDenoisingId(null);
+    }
+  }
+
   function dragStart(event: React.DragEvent, payload: MediaDragPayload) {
     event.dataTransfer.setData(MEDIA_DRAG_MIME, JSON.stringify(payload));
     event.dataTransfer.effectAllowed = "copy";
@@ -151,9 +169,16 @@ export function MediaLibraryPanel({
           </button>
         ))}
       </div>
-      <button className="secondary full tl-media-import-btn" disabled={importing} onClick={() => void importAsset(null)}>
-        <Upload size={14} />{importing ? "Importing…" : "+ Import"}
-      </button>
+      {activeTab === "clip" && (
+        <button className="secondary full tl-media-import-btn" disabled={importing} onClick={() => void importAsset("clip")}>
+          <Upload size={14} />{importing ? "Importing…" : "+ Import clips"}
+        </button>
+      )}
+      {activeTab === "audio" && (
+        <button className="secondary full tl-media-import-btn" disabled={importing} onClick={() => void importAsset("audio")}>
+          <Upload size={14} />{importing ? "Importing…" : "+ Import audio"}
+        </button>
+      )}
 
       {activeTab === "still" && (
         <div className="tl-media-scroll">
@@ -176,35 +201,39 @@ export function MediaLibraryPanel({
               ))}
               {!workspace?.groups.length && (
                 <div className="tl-source-empty">
-                  No stills generated yet.<br />
+                  No stills generated yet. Go to Visuals to generate images.<br />
                   <button className="tl-apply-all-btn" onClick={() => setStage("images")}>Go to Visuals →</button>
                 </div>
               )}
             </div>
           </div>
-          <div className="tl-source-section">
-            <strong>Imported<span>{libraryAssets.still.length}</span></strong>
-            <div className="tl-media-grid">
-              {libraryAssets.still.map((asset) => (
-                <div
-                  key={asset.id}
-                  className={selectedIds.has(asset.id) ? "tl-media-card multi-selected" : "tl-media-card"}
-                  draggable
-                  onClick={(event) => toggleSelected(event, asset.id)}
-                  onDragStart={(event) => dragStartAsset(event, asset, libraryAssets.still)}
-                  onContextMenu={(event) => openContextMenu(event, [
-                    { label: "Add to timeline", onSelect: () => onAddLibraryAsset(asset) },
-                    { label: "Remove from library", danger: true, onSelect: () => void removeLibraryAsset(asset) },
-                  ])}
-                >
-                  {assetUrls[asset.id] ? <img src={assetUrls[asset.id]} alt="" draggable={false} /> : <ImageOff size={16} />}
-                  <button className="tl-media-card-add" title="Add to timeline at playhead" onClick={() => onAddLibraryAsset(asset)}><Plus size={12} /></button>
-                  <button className="tl-media-card-remove" title="Remove from library" onClick={() => void removeLibraryAsset(asset)}><Trash2 size={11} /></button>
-                </div>
-              ))}
-              {!libraryAssets.still.length && <div className="tl-source-empty">No imported images yet.</div>}
+          {/* Stills can no longer be imported from the Editor (Visuals-only,
+              per design), but assets imported before that rule keep showing
+              here so nothing already in a project silently disappears. */}
+          {libraryAssets.still.length > 0 && (
+            <div className="tl-source-section">
+              <strong>Imported<span>{libraryAssets.still.length}</span></strong>
+              <div className="tl-media-grid">
+                {libraryAssets.still.map((asset) => (
+                  <div
+                    key={asset.id}
+                    className={selectedIds.has(asset.id) ? "tl-media-card multi-selected" : "tl-media-card"}
+                    draggable
+                    onClick={(event) => toggleSelected(event, asset.id)}
+                    onDragStart={(event) => dragStartAsset(event, asset, libraryAssets.still)}
+                    onContextMenu={(event) => openContextMenu(event, [
+                      { label: "Add to timeline", onSelect: () => onAddLibraryAsset(asset) },
+                      { label: "Remove from library", danger: true, onSelect: () => void removeLibraryAsset(asset) },
+                    ])}
+                  >
+                    {assetUrls[asset.id] ? <img src={assetUrls[asset.id]} alt="" draggable={false} /> : <ImageOff size={16} />}
+                    <button className="tl-media-card-add" title="Add to timeline at playhead" onClick={() => onAddLibraryAsset(asset)}><Plus size={12} /></button>
+                    <button className="tl-media-card-remove" title="Remove from library" onClick={() => void removeLibraryAsset(asset)}><Trash2 size={11} /></button>
+                  </div>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
         </div>
       )}
 
@@ -213,7 +242,7 @@ export function MediaLibraryPanel({
           {!videoAssets.length && !libraryAssets.clip.length ? (
             <div className="tl-source-empty">
               No clips yet. Go to the <button type="button" className="tl-inline-link" onClick={() => setStage("animate")}>Animate</button> stage
-              to generate motion clips, or use + Import to add your own video files.
+              to generate motion clips, or use + Import clips to add your own video or image files.
             </div>
           ) : (
             <>
@@ -278,17 +307,26 @@ export function MediaLibraryPanel({
                   onClick={(event) => toggleSelected(event, asset.id)}
                   onDragStart={(event) => dragStartAsset(event, asset, libraryAssets.audio)}
                   onContextMenu={(event) => openContextMenu(event, [
-                    { label: "Add to music track", onSelect: () => onAddLibraryAsset(asset) },
+                    { label: "Add to audio track", onSelect: () => onAddLibraryAsset(asset) },
+                    { label: "Remove background noise", onSelect: () => void denoiseAsset(asset) },
                     { label: "Remove from library", danger: true, onSelect: () => void removeLibraryAsset(asset) },
                   ])}
                 >
                   <span className="tl-media-row-name" title={asset.originalName}>{asset.originalName}</span>
                   <span className="tl-media-row-duration">{asset.durationSeconds ? `${asset.durationSeconds.toFixed(1)}s` : ""}</span>
-                  <button className="tl-media-card-add" title="Add to music track at playhead" onClick={() => onAddLibraryAsset(asset)}><Plus size={12} /></button>
+                  <button className="tl-media-card-add" title="Add to audio track at playhead" onClick={() => onAddLibraryAsset(asset)}><Plus size={12} /></button>
+                  <button
+                    className="tl-media-card-denoise"
+                    title="Remove background noise (adds a cleaned copy, keeps the original)"
+                    disabled={denoisingId === asset.id}
+                    onClick={() => void denoiseAsset(asset)}
+                  >
+                    {denoisingId === asset.id ? <LoaderCircle className="spin" size={12} /> : <Wand2 size={12} />}
+                  </button>
                   <button className="tl-media-card-remove" title="Remove from library" onClick={() => void removeLibraryAsset(asset)}><Trash2 size={11} /></button>
                 </div>
               ))}
-              {!libraryAssets.audio.length && <div className="tl-source-empty">No audio files. Import music or SFX using the + Import button.</div>}
+              {!libraryAssets.audio.length && <div className="tl-source-empty">No audio files. Use + Import audio to add music or SFX.</div>}
             </div>
           </div>
         </div>

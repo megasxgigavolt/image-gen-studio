@@ -146,7 +146,7 @@ function ToastDisplay() {
   const { toast, dismissToast } = useAppStore();
   useEffect(() => {
     if (!toast) return;
-    const timer = window.setTimeout(dismissToast, 4500);
+    const timer = window.setTimeout(dismissToast, toast.durationMs);
     return () => window.clearTimeout(timer);
   }, [toast?.id, dismissToast]);
   if (!toast) return null;
@@ -283,9 +283,10 @@ function Header() {
   );
 }
 
-function RowMenu({ anchorRect, onRename, onDelete, onClose }: {
+function RowMenu({ anchorRect, onRename, onShare, onDelete, onClose }: {
   anchorRect: DOMRect;
   onRename: () => void;
+  onShare?: () => void;
   onDelete: () => void;
   onClose: () => void;
 }) {
@@ -313,6 +314,7 @@ function RowMenu({ anchorRect, onRename, onDelete, onClose }: {
       onClick={(e) => e.stopPropagation()}
     >
       <button role="menuitem" onClick={() => { onRename(); onClose(); }}>Rename</button>
+      {onShare && <button role="menuitem" onClick={() => { onShare(); onClose(); }}>Share project…</button>}
       <button role="menuitem" className="danger-action" onClick={() => { onDelete(); onClose(); }}>Delete</button>
     </div>,
     document.body,
@@ -350,7 +352,7 @@ function StageProgress({ stage }: { stage: AppStage }) {
 let hasShownResumeBannerThisSession = false;
 
 function HomeView() {
-  const { setStage, setActiveProject, activeChannelId } = useAppStore();
+  const { setStage, setActiveProject, activeChannelId, addToast } = useAppStore();
   const [showResumeBanner] = useState(() => {
     const isFirstVisit = !hasShownResumeBannerThisSession;
     hasShownResumeBannerThisSession = true;
@@ -363,6 +365,10 @@ function HomeView() {
   const [dialog, setDialog] = useState<"channel" | "video" | null>(null);
   const [name, setName] = useState("");
   const [channelAbout, setChannelAbout] = useState("");
+  // Tracks whether the name field has been interacted with, so the "Name
+  // cannot be empty" error only appears after the user actually tried
+  // something — never on initial modal render.
+  const [nameTouched, setNameTouched] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [renamingChannelId, setRenamingChannelId] = useState<string | null>(null);
@@ -373,6 +379,8 @@ function HomeView() {
   const [videoMenu, setVideoMenu] = useState<{ id: string; rect: DOMRect } | null>(null);
   const [appVersion, setAppVersion] = useState("");
   const [preferencesOpen, setPreferencesOpen] = useState(false);
+  const [importingProject, setImportingProject] = useState(false);
+  const [sharingVideoId, setSharingVideoId] = useState<string | null>(null);
   const clickTimers = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -446,7 +454,10 @@ function HomeView() {
 
   async function submitCreate(event: FormEvent) {
     event.preventDefault();
-    if (!name.trim()) return;
+    if (!name.trim()) {
+      setNameTouched(true);
+      return;
+    }
     try {
       if (dialog === "channel") {
         const channel = await projectsClient.createChannel(name.trim(), channelAbout.trim() || undefined);
@@ -457,24 +468,79 @@ function HomeView() {
       setDialog(null);
       setName("");
       setChannelAbout("");
+      setNameTouched(false);
       await loadWorkspace();
     } catch (caught) {
       setError(String(caught));
     }
   }
 
+  // Full-fidelity project bundle (.agsproj) — round-trips the entire
+  // project: visual plan, every render/animation version, the Editor
+  // timeline, media library, and overlay tracks. Meant for sending a whole
+  // project to someone else and having it open looking exactly as it did
+  // here.
+  async function shareProject(video: VideoRecord) {
+    setError(null);
+    setSharingVideoId(video.id);
+    try {
+      const result = await projectsClient.exportProjectBundle(video.id);
+      if (!result) return; // user cancelled the save dialog
+      addToast(`Saved project bundle: ${result.path}`, "success");
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setSharingVideoId(null);
+    }
+  }
+
+  // A project bundle is just a video — it always imports into the
+  // currently selected channel (same as "+ New video"), never a channel of
+  // its own.
+  async function importProjectBundle() {
+    if (!selectedChannelId) return;
+    setError(null);
+    setImportingProject(true);
+    try {
+      const video = await projectsClient.importProjectBundle(selectedChannelId);
+      if (!video) return; // user cancelled the file picker
+      await loadWorkspace();
+      const channel = channels.find((candidate) => candidate.id === video.channelId);
+      if (channel) {
+        setActiveProject(channel.id, channel.name, video.id, video.title);
+        setStage(video.stage);
+      }
+      addToast(`Imported "${video.title}"`, "success");
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setImportingProject(false);
+    }
+  }
+
   async function openVideo(video: VideoRecord) {
     const channel = channels.find((candidate) => candidate.id === video.channelId);
     if (!channel) return;
+    // A video at 100% progress (e.g. an "Import video" bundle) is done — its
+    // only stage with real content is the Editor. `stage` on the record is
+    // really "last tab visited," not "furthest real progress": every stage
+    // switch persists as the new resume point (see the [stage] effect
+    // below), so idly checking an intentionally-empty Script/Visuals tab on
+    // a finished project silently drags the saved stage backwards there,
+    // and the next time the card is clicked it reopens on that empty tab —
+    // looks exactly like "the import is broken" even though the data is
+    // fine. Finished projects always reopen on Editor regardless of
+    // whichever tab was looked at last.
+    const effectiveStage = video.progress === 100 && video.stage !== "timeline" ? "timeline" : video.stage;
     // Navigate first; persisting resume/snapshot is best-effort and must never
     // block or cancel navigation if a database write happens to fail.
     setActiveProject(channel.id, channel.name, video.id, video.title);
-    setStage(video.stage);
+    setStage(effectiveStage);
     try {
-      await projectsClient.setResume(channel.id, video.id, video.stage);
+      await projectsClient.setResume(channel.id, video.id, effectiveStage);
       await projectsClient.createSnapshot(video.id, {
         reason: "video-opened",
-        stage: video.stage,
+        stage: effectiveStage,
       });
     } catch (caught) {
       log("error", "open_video_side_effects_failed", { message: String(caught) });
@@ -597,7 +663,7 @@ function HomeView() {
             <strong>→</strong>
           </button>
         )}
-        <div className="section-heading"><h2>Videos</h2><div><button disabled={!selectedChannelId} onClick={() => setDialog("video")}><Plus size={14} /> New video</button></div></div>
+        <div className="section-heading"><h2>Videos</h2><div><button disabled={!selectedChannelId} onClick={() => setDialog("video")}><Plus size={14} /> New video</button><button className="secondary" disabled={!selectedChannelId || importingProject} onClick={() => void importProjectBundle()} title="Import a project someone shared with you (.agsproj) into this channel">{importingProject ? <><LoaderCircle className="spin" size={14} />Importing…</> : <><Download size={14} /> Import project</>}</button></div></div>
         {!loading && channels.length > 0 && (
           <div className="video-grid">
             {videos.map((video) => (
@@ -630,12 +696,14 @@ function HomeView() {
                 <button
                   className={videoMenu?.id === video.id ? "row-menu-trigger card-menu-trigger menu-open" : "row-menu-trigger card-menu-trigger"}
                   aria-label={`Options for ${video.title}`}
+                  disabled={sharingVideoId === video.id}
                   onClick={(e) => setVideoMenu({ id: video.id, rect: e.currentTarget.getBoundingClientRect() })}
-                ><MoreHorizontal size={16} /></button>
+                >{sharingVideoId === video.id ? <LoaderCircle className="spin" size={16} /> : <MoreHorizontal size={16} />}</button>
                 {videoMenu?.id === video.id && (
                   <RowMenu
                     anchorRect={videoMenu.rect}
                     onRename={() => void startRenameVideo(video)}
+                    onShare={() => void shareProject(video)}
                     onDelete={() => void deleteVideo(video.id)}
                     onClose={() => setVideoMenu(null)}
                   />
@@ -650,15 +718,22 @@ function HomeView() {
         )}
       </section>
       {(dialog === "channel" || dialog === "video") && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={() => { setDialog(null); setName(""); setChannelAbout(""); }}>
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => { setDialog(null); setName(""); setChannelAbout(""); setNameTouched(false); }}>
           <form className="modal" onSubmit={(event) => void submitCreate(event)} onMouseDown={(event) => event.stopPropagation()}>
             <p className="eyebrow">{dialog === "channel" ? "New workspace" : "New production"}</p>
             <h2>{dialog === "channel" ? "Create channel" : "Create video"}</h2>
-            <label>{dialog === "channel" ? "Channel name" : "Video title"}<input autoFocus value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(e) => { if (e.key === "Escape") { setDialog(null); setName(""); setChannelAbout(""); } }} /></label>
-            {!name.trim() && <p style={{ fontSize: "11px", color: "var(--muted)", marginTop: "4px" }}>Name cannot be empty.</p>}
+            <label>{dialog === "channel" ? "Channel name" : "Video title"}<input
+              autoFocus
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              onBlur={() => { if (!name.trim()) setNameTouched(true); }}
+              onKeyDown={(e) => { if (e.key === "Escape") { setDialog(null); setName(""); setChannelAbout(""); setNameTouched(false); } }}
+            /></label>
+            {nameTouched && !name.trim() && <p style={{ fontSize: "11px", color: "var(--muted)", marginTop: "4px" }}>Name cannot be empty.</p>}
             {dialog === "channel" && (
               <label style={{ marginTop: "10px" }}>
                 <span style={{ display: "flex", justifyContent: "space-between" }}>About this channel<small style={{ color: "var(--muted)", fontWeight: 500 }}>Optional</small></span>
+                <small className="modal-hint">Used by the AI when generating plans, prompts, and suggestions.</small>
                 <textarea
                   rows={3}
                   value={channelAbout}
@@ -667,7 +742,7 @@ function HomeView() {
                 />
               </label>
             )}
-            <div className="footer-actions"><button type="button" className="secondary" onClick={() => { setDialog(null); setName(""); setChannelAbout(""); }}>Cancel</button><button className="primary" type="submit" disabled={!name.trim()}>Create</button></div>
+            <div className="footer-actions"><button type="button" className="secondary" onClick={() => { setDialog(null); setName(""); setChannelAbout(""); setNameTouched(false); }}>Cancel</button><button className="primary" type="submit" disabled={!name.trim()}>Create</button></div>
           </form>
         </div>
       )}
@@ -884,7 +959,36 @@ function InputsView() {
         </article>
         <div className="panel-stack">
           <article className="panel"><div className="panel-heading"><div><h2>Narration audio</h2><p>Used for word-level timing.</p></div><button className="secondary" onClick={() => void importAsset("audio")}><Upload size={15} />{audio ? "Replace" : "Import"}</button></div>{audio ? <div className="file-row"><span>♪</span><div><strong>{audio.originalName}</strong><small>{(audio.sizeBytes / 1024 / 1024).toFixed(1)} MB</small></div><button className="icon-button" onClick={() => void removeAsset(audio.id)}><X size={15} /></button></div> : <div className="asset-empty">WAV, MP3, M4A, AAC, or FLAC</div>}</article>
-          <article className="panel"><div className="pacing-heading"><div><h2>Scene pacing</h2><p>Preferred duration range per still</p></div><strong>{pacingPreset === "per-sentence" ? "1 sentence" : `${pacingMin}–${pacingMax} sec`}</strong></div><div className="pacing-options">{([["calm","Calm","10–16s"],["balanced","Balanced","6–10s"],["fast","Fast","3–6s"],["per-sentence","Every sentence","1:1 split"],["custom","Custom","Choose range"]] as const).map(([value,label,detail]) => <button key={value} className={pacingPreset === value ? "active" : ""} onClick={() => void choosePacing(value)}><strong>{label}</strong><small>{detail}</small></button>)}</div>{pacingPreset === "per-sentence" ? <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"8px 0 0"}}>Every sentence becomes its own still — no AI grouping, fastest to generate.</p> : <div className="custom-pacing"><label>Minimum<input type="number" min="2" max="30" value={pacingMin} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMin(Number(event.target.value))} onBlur={(event) => { if (pacingPreset === "custom") void choosePacing("custom", Number(event.target.value), pacingMax); }} /></label><label>Maximum<input type="number" min="2" max="30" value={pacingMax} disabled={pacingPreset !== "custom"} onChange={(event) => setPacingMax(Number(event.target.value))} onBlur={(event) => { if (pacingPreset === "custom") void choosePacing("custom", pacingMin, Number(event.target.value)); }} /></label></div>}</article>
+          <article className="panel pacing-panel">
+            <div className="pacing-heading">
+              <div><h2>Scene pacing</h2><p>Preferred duration range per still</p></div>
+              <strong>{pacingPreset === "per-sentence" ? "1 sentence" : `${pacingMin}–${pacingMax} sec`}</strong>
+            </div>
+            <div className="pacing-options">
+              {([["calm", "Calm", "10–16s per still"], ["balanced", "Balanced", "6–10s per still"], ["fast", "Fast", "3–6s per still"], ["per-sentence", "Every sentence", "One still per sentence"]] as const).map(([value, label, detail]) => (
+                <button key={value} type="button" className={pacingPreset === value ? "pacing-tile active" : "pacing-tile"} onClick={() => void choosePacing(value)}>
+                  <strong>{label}</strong>
+                  <small>{detail}</small>
+                </button>
+              ))}
+              <div
+                className={pacingPreset === "custom" ? "pacing-tile custom active expanded" : "pacing-tile custom"}
+                role="button"
+                tabIndex={0}
+                onClick={() => { if (pacingPreset !== "custom") void choosePacing("custom"); }}
+                onKeyDown={(event) => { if ((event.key === "Enter" || event.key === " ") && pacingPreset !== "custom") { event.preventDefault(); void choosePacing("custom"); } }}
+              >
+                <strong>Custom</strong>
+                {pacingPreset === "custom" ? (
+                  <div className="custom-pacing-inline" onClick={(event) => event.stopPropagation()}>
+                    <label>Minimum<input type="number" min="2" max="30" value={pacingMin} onChange={(event) => setPacingMin(Number(event.target.value))} onBlur={(event) => void choosePacing("custom", Number(event.target.value), pacingMax)} /></label>
+                    <label>Maximum<input type="number" min="2" max="30" value={pacingMax} onChange={(event) => setPacingMax(Number(event.target.value))} onBlur={(event) => void choosePacing("custom", pacingMin, Number(event.target.value))} /></label>
+                  </div>
+                ) : <small>Choose your own range</small>}
+              </div>
+            </div>
+            {pacingPreset === "per-sentence" && <p style={{ fontSize: "12px", color: "var(--muted)", margin: "8px 0 0" }}>Every sentence becomes its own still — no AI grouping, fastest to generate.</p>}
+          </article>
         </div>
       </div>
       <div className="footer-actions">{hasPlan && inputSignature === generatedInputSignature ? <button className="primary" onClick={() => setStage("visual-plan")}>View visual plan →</button> : <button className="primary" disabled={!ready || !activeVideoId || generating} onClick={() => void generatePlan()}>{generating ? <><LoaderCircle className="spin" size={16} />Generating…</> : "Generate visual plan →"}</button>}</div>

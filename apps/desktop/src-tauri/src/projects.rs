@@ -36,6 +36,27 @@ fn find_python() -> &'static str {
         "python".to_string()
     })
 }
+
+// Cached "is a logged-in Claude Code CLI on PATH" probe — used only to decide
+// whether `analyze_motion_graphics` can proceed without an OpenAI/Gemini key
+// configured (motion_graphics_engine.py tries the CLI itself; this is just the
+// up-front gate so a missing-key error isn't shown when the CLI alone is enough).
+#[cfg(not(test))]
+static CLAUDE_CLI_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[cfg(not(test))]
+fn claude_cli_available() -> bool {
+    *CLAUDE_CLI_AVAILABLE.get_or_init(|| {
+        std::process::Command::new("claude")
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
+}
 use uuid::Uuid;
 use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
@@ -61,6 +82,37 @@ enum GeminiAuth {
     Vertex { access_token: String, project_id: String },
 }
 
+/// Resolved credentials for a motion-graphics engine invocation
+/// (`analyze_motion_graphics`) — factored out into its own resolution/gating
+/// step rather than inlined, so the credential logic and `Command` env-var
+/// wiring stay in one place.
+struct MotionGraphicsCredentials {
+    openai_api_key: Option<String>,
+    gemini_api_key: Option<String>,
+    gemini_vertex: Option<(String, String)>,
+    gemini_auth_error: Option<String>,
+}
+
+impl MotionGraphicsCredentials {
+    #[cfg(not(test))]
+    fn apply_env(&self, command: &mut Command) {
+        if let Some(key) = &self.openai_api_key {
+            command.env("OPENAI_API_KEY", key);
+        }
+        if let Some(key) = &self.gemini_api_key {
+            command.env("GEMINI_API_KEY", key);
+        }
+        if let Some((access_token, project_id)) = &self.gemini_vertex {
+            command
+                .env("GEMINI_VERTEX_ACCESS_TOKEN", access_token)
+                .env("GEMINI_VERTEX_PROJECT_ID", project_id);
+        }
+        if let Some(error) = &self.gemini_auth_error {
+            command.env("GEMINI_AUTH_ERROR", error);
+        }
+    }
+}
+
 pub const EDUCATIONAL_VISUAL_PLANNER_VERSION: &str = "3.0.0-bulk-plan-v2";
 
 /// Shared validation list for `timeline_clips.motion_preset` — kept as one
@@ -79,9 +131,9 @@ pub const MOTION_PRESETS: [&str; 10] = [
 /// `transition_in` still accepts them for schema simplicity, but the picker
 /// UI only offers them on the "out" side to avoid a setting that visibly
 /// does nothing.
-pub const VALID_TRANSITIONS: [&str; 7] = [
+pub const VALID_TRANSITIONS: [&str; 9] = [
     "cut", "fade", "dip-to-white",
-    "cross-fade", "slide-left", "slide-right", "zoom-blur",
+    "cross-fade", "slide-left", "slide-right", "zoom-blur", "whip-pan", "blur-transition",
 ];
 
 /// Shared validation list for `timeline_clips.color_filter_preset`. The
@@ -90,70 +142,53 @@ pub const VALID_TRANSITIONS: [&str; 7] = [
 /// `eq` filter) — kept numerically identical there so preview and export agree.
 pub const COLOR_FILTER_PRESETS: [&str; 7] = ["none", "warm", "cool", "cinematic", "bright", "muted", "dark"];
 
-/// Shared validation list for `timeline_clips.motion_graphic_effect` — the
-/// 7 treatments documented in `SOPs/Motion_Graphics_SOP_v1.md` and rendered
-/// for real by `services/motion-engine`'s `MotionClip` composition at export
-/// time (see `video_export_engine.py`'s `_render_motion_graphic`). Distinct
-/// from (and not to be confused with) `MOTION_PRESETS`'s simpler `"ken-burns"`
-/// value above, which the ffmpeg zoompan pipeline renders for clips that were
-/// never assigned one of these 7 — `approximate_motion_preset_for_effect`
-/// below still maps this richer set onto that simpler one, but only for the
-/// live canvas preview now, not for the real export.
-pub const MOTION_GRAPHIC_EFFECTS: [&str; 7] = [
-    "Ken Burns",
-    "Sequential Panel Reveal",
-    "Speed Pan & Motion Blur",
-    "Ominous Push-In",
-    "Candlelight Flicker",
-    "Focus Pull",
-    "Iris Reveal",
-];
+/// Maps a clip's freely-composed `motion_graphic_settings_json` recipe (see
+/// services/motion-engine/src/types.ts's `MotionRecipe` — there is no fixed
+/// catalog of named treatments anymore, just a shared vocabulary of
+/// independent primitives) onto the nearest existing `MOTION_PRESETS` value,
+/// for the canvas's instant-scrub live preview only (`timeline-rendering.ts`'s
+/// `applyMotion`) — the real export doesn't use this approximation for a clip
+/// that has a motion graphic assigned; it renders the actual recipe via
+/// `services/motion-engine` instead (see `video_export_engine.py`'s
+/// `_render_motion_graphic`). This function stays only because re-running a
+/// full Remotion/Chromium render on every timeline scrub would make the
+/// editor unusably slow — the preview trades exactness for speed, the export
+/// doesn't have to. Reads the recipe's own numeric fields directly (a
+/// dominant pan, an organic flicker, a reveal mask, a panel-cut sequence)
+/// rather than switching on an effect name, since that name is now free text
+/// the AI invented for display purposes and carries no structural meaning.
+fn approximate_motion_preset_for_effect(_effect: &str, settings_json: Option<&str>) -> &'static str {
+    let settings: serde_json::Value = settings_json
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let num = |key: &str| settings.get(key).and_then(|v| v.as_f64());
 
-/// Maps a MOTION_GRAPHIC_EFFECTS name onto the nearest existing
-/// `MOTION_PRESETS` value for the canvas's instant-scrub live preview only
-/// (`timeline-rendering.ts`'s `applyMotion`) — the real export no longer uses
-/// this approximation for a clip that has a `motion_graphic_effect` assigned;
-/// it renders the actual treatment via `services/motion-engine` instead (see
-/// `video_export_engine.py`'s `_render_motion_graphic`). This function stays
-/// only because re-running a full Remotion/Chromium render on every timeline
-/// scrub would make the editor unusably slow — the preview trades exactness
-/// for speed, the export doesn't have to.
-fn approximate_motion_preset_for_effect(effect: &str, settings_json: Option<&str>) -> &'static str {
-    match effect {
-        // Zoom + pan from off-center toward center — the one preset that
-        // actually combines both motions.
-        "Ken Burns" => "ken-burns",
-        // "zoom-in-subject" IS genuinely distinct from plain "zoom-in" —
-        // `useTimelineAssets.ts` auto-calls `detect_render_subject` for any
-        // clip with this preset, caching a real per-image subject point
-        // that both the canvas preview and (after fixing build_segments()'s
-        // dropped-field bug alongside this change) the actual ffmpeg export
-        // now use to anchor the push — a steep, content-aware push toward
-        // the detected subject, no pan, distinct from Ken Burns's combined
-        // zoom+pan toward frame-center.
-        "Ominous Push-In" | "Focus Pull" | "Iris Reveal" => "zoom-in-subject",
-        // A pulse (in, then back out) reads as "breathing" — the closest
-        // available analog to an organic flicker; a flat zoom wouldn't.
-        "Candlelight Flicker" => "zoom-pulse",
-        // The real thing now: hard cuts between static crops (see the
-        // "cuts" preset in video_export_engine.py's build_segments/
-        // build_image_filter) — wide shot, then pushes to the detected
-        // subject and its complementary corner, rather than one continuous
-        // motion. The actual "add cuts" capability the SOP's panel-reveal
-        // effect could never be represented as before.
-        "Sequential Panel Reveal" => "cuts",
-        "Speed Pan & Motion Blur" => {
-            // Direction from panXFrom/panXTo if present (SOP: sign encodes
-            // direction, positive-to-negative is left-to-right).
-            let settings: serde_json::Value = settings_json
-                .and_then(|raw| serde_json::from_str(raw).ok())
-                .unwrap_or_else(|| json!({}));
-            let from = settings.get("panXFrom").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let to = settings.get("panXTo").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            if from > to { "pan-right" } else { "pan-left" }
-        }
-        _ => "zoom-in",
+    let pan_x_delta = num("panXTo").unwrap_or(0.0) - num("panXFrom").unwrap_or(0.0);
+    let pan_y_delta = num("panYTo").unwrap_or(0.0) - num("panYFrom").unwrap_or(0.0);
+    // A dominant horizontal pan reads best as a directional pan preset — sign
+    // encodes direction (positive-to-negative is left-to-right).
+    if pan_x_delta.abs() > 0.5 && pan_x_delta.abs() >= pan_y_delta.abs() {
+        return if num("panXFrom").unwrap_or(0.0) > num("panXTo").unwrap_or(0.0) { "pan-right" } else { "pan-left" };
     }
+    // An organic flicker (candle/firelight-style) reads closest as a pulse —
+    // a flat zoom wouldn't capture the "breathing" quality.
+    if num("glowFlicker").unwrap_or(0.0) > 0.05 {
+        return "zoom-pulse";
+    }
+    // A reveal/rack-focus mask is the case "zoom-in-subject"'s content-aware
+    // push — `useTimelineAssets.ts` auto-calls `detect_render_subject` for
+    // any clip with this preset, anchoring the push at a real detected
+    // subject point instead of frame-center — is the closest available
+    // analog for.
+    if settings.get("maskShape").and_then(|v| v.as_str()).unwrap_or("none") != "none" {
+        return "zoom-in-subject";
+    }
+    // Zoom + pan from off-center toward center — the one preset that
+    // actually combines both motions.
+    if pan_x_delta.abs() > 0.5 || pan_y_delta.abs() > 0.5 {
+        return "ken-burns";
+    }
+    "zoom-in"
 }
 
 /// Parses a `TimelineClip`'s raw `motion_graphic_settings_json` string
@@ -908,9 +943,90 @@ struct ProjectBundleManifest {
     video_title: String,
     stage: String,
     progress: i64,
+    /// Kept for version-1 bundles (exported before full-fidelity mode) and
+    /// still filled on every export for backward display purposes — the
+    /// authoritative copy for version-2+ bundles lives in
+    /// `tables["video_inputs"]`.
     script_text: String,
     pacing_seconds: i64,
     files: Vec<String>,
+    /// Version 2+ only: the source project's own ids, used to seed the
+    /// id-remap table on import so every row's ids can be rewritten to fresh
+    /// ones without colliding with anything already in the importer's
+    /// database (see `restore_project_tables`).
+    #[serde(default)]
+    video_id: String,
+    #[serde(default)]
+    channel_id: String,
+    /// Version 2+ only: a full row-for-row dump of every table that makes up
+    /// this video's state (visual plan, renders, animations, timeline,
+    /// media library, captions, music/text/logo overlays — everything short
+    /// of ephemeral job-queue/undo history), keyed by table name. This is
+    /// what makes the bundle a complete, self-contained copy of the project
+    /// rather than just its raw files.
+    #[serde(default)]
+    tables: std::collections::BTreeMap<String, Vec<serde_json::Map<String, serde_json::Value>>>,
+}
+
+/// Every table that makes up a video's project state, in an order that's
+/// safe to INSERT in under `PRAGMA foreign_keys = ON` (each table only
+/// references tables earlier in this list, or itself via a nullable
+/// self-reference that's always satisfied because rows are restored in
+/// original creation order). `import_project_bundle`'s rollback path
+/// deletes in the reverse of this order.
+///
+/// Deliberately excluded: `image_jobs`/`image_job_items`,
+/// `animation_jobs`/`animation_job_items`, `export_jobs` (operational job
+/// history — doesn't affect what the project looks like), and
+/// `video_snapshots` (undo history — starts fresh for the importer, same as
+/// any other newly opened project).
+const PROJECT_TABLES: &[&str] = &[
+    "video_inputs",
+    "input_assets",
+    "visual_plan_sentences",
+    "visual_plan_groups",
+    "visual_plan_meta",
+    "prompt_versions",
+    "image_renders",
+    "media_library_assets",
+    "video_assets",
+    "educational_visual_plans",
+    "captions",
+    "timeline_caption_clips",
+    "timelines",
+    "timeline_clips",
+    "timeline_music_clips",
+    "timeline_text_clips",
+    "timeline_logo_clips",
+];
+
+/// Columns whose value is a single, whole id — looked up directly (O(1)) in
+/// the id-remap table. Covers both a row's own primary key (`id`,
+/// `still_id`, `video_id`) and every foreign-key-shaped reference to another
+/// row in the bundle. Harmless to list a column that doesn't exist on a
+/// given table — `remap_row`/`seed_id_map` only ever look one up if it's
+/// actually present on that row.
+const ATOMIC_ID_COLUMNS: &[&str] = &[
+    "id", "video_id", "group_id", "render_id", "prompt_version_id", "parent_render_id",
+    "source_render_id", "video_asset_id", "parent_video_asset_id", "media_library_asset_id",
+    "still_id", "visual_plan_row_id", "audio_asset_id", "generation_audio_id", "clip_id",
+];
+
+/// `visual_plan_sentences.id` and `visual_plan_groups.id` are the only
+/// primary keys in the schema that aren't a flat id — `save_plan`/
+/// `write_renumbered_plan` store them namespaced as `{video_id}::{id}`
+/// (groups: `{video_id}::{current|original}::{id}`) so an id can't collide
+/// across videos even outside this bundle format. Every other column that
+/// references a sentence/group (`sentence_ids_json`, `group_id` on
+/// `prompt_versions`/`image_renders`/`timeline_clips`) uses the bare
+/// suffix — the same one `get_visual_plan`/`load_groups` strip back out for
+/// the rest of the app. Bundle restore has to know about this to remap the
+/// suffix consistently everywhere it appears, not just inside these two
+/// tables' own `id` column.
+const COMPOSITE_ID_TABLES: &[&str] = &["visual_plan_sentences", "visual_plan_groups"];
+
+fn composite_id_suffix(value: &str) -> &str {
+    value.rsplit_once("::").map(|(_, suffix)| suffix).unwrap_or(value)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1008,12 +1124,12 @@ pub struct TimelineClip {
     pub media_library_asset_id: Option<String>,
     pub color_filter_preset: String,
     pub color_filter_intensity: f64,
-    /// AI-recommended treatment name from `MOTION_GRAPHIC_EFFECTS`, or `None`
-    /// if this clip hasn't been analyzed yet. Metadata only — see the const's
-    /// doc comment.
+    /// AI-composed free-text treatment label, or `None` if this clip hasn't
+    /// been analyzed yet — display/debugging metadata only, not validated
+    /// against any list (see `set_timeline_clip_motion_graphic`'s doc comment).
     pub motion_graphic_effect: Option<String>,
-    /// JSON-serialized tunable settings for `motion_graphic_effect` (field
-    /// shape depends on which effect is assigned).
+    /// JSON-serialized `MotionRecipe` (see services/motion-engine/src/types.ts)
+    /// — the actual freely-composed treatment `motion_graphic_effect` labels.
     pub motion_graphic_settings_json: Option<String>,
     /// Short AI-written justification for the assigned effect.
     pub motion_graphic_reason: Option<String>,
@@ -1230,6 +1346,40 @@ fn words_to_json(words: &[CaptionWord]) -> Option<String> {
         return None;
     }
     serde_json::to_string(words).ok()
+}
+
+/// When a caption clip has no real per-word timestamps — never transcribed
+/// with word-level timing, or lost them after a text edit (see
+/// `update_caption_clip_text`, which intentionally drops stale ones) — word
+/// highlight still needs *something* to animate through. Splits the clip's
+/// `[start, end]` window across its words, weighted by each word's
+/// character count (a longer word roughly takes longer to say than "a" or
+/// "the") rather than splitting evenly, so the highlight still tracks the
+/// rhythm of the line reasonably well instead of just not lighting up at
+/// all. Computed on every read, never persisted — real per-word timing
+/// (from Whisper, or a fresh caption generation) should always take
+/// priority, and estimates sitting in the DB looking like real data would
+/// get in its way.
+fn estimate_word_windows(text: &str, start_seconds: f64, end_seconds: f64) -> Option<Vec<CaptionWord>> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() || end_seconds <= start_seconds {
+        return None;
+    }
+    let duration = end_seconds - start_seconds;
+    let weights: Vec<f64> = words.iter().map(|word| word.chars().count().max(1) as f64).collect();
+    let total_weight: f64 = weights.iter().sum();
+    let mut cursor = start_seconds;
+    let mut result = Vec::with_capacity(words.len());
+    for (word, weight) in words.into_iter().zip(weights) {
+        let word_end = (cursor + duration * weight / total_weight).min(end_seconds);
+        result.push(CaptionWord {
+            text: word.to_string(),
+            start_seconds: cursor,
+            end_seconds: word_end,
+        });
+        cursor = word_end;
+    }
+    Some(result)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2409,7 +2559,22 @@ impl ProjectRepository {
     }
 
     pub fn get_image_workspace(&self, video_id: &str) -> Result<ImageWorkspace, String> {
-        let plan = self.get_visual_plan(video_id)?;
+        // A project that never had a visual plan generated (e.g. an
+        // "Import video" asset-folder project, which is built directly from
+        // finished clips and has no plan at all) isn't an error state for a
+        // pure read like this one — every caller here is display-only, so
+        // it degrades to an empty workspace instead of failing outright.
+        // `get_visual_plan` itself stays strict: its many *mutation* callers
+        // (split/merge sentence, save plan edits, etc.) genuinely have
+        // nothing valid to act on without a real plan, and should keep
+        // erroring.
+        let plan = self.get_visual_plan(video_id).unwrap_or_else(|_| VisualPlan {
+            video_id: video_id.into(),
+            timing_source: String::new(),
+            sentences: Vec::new(),
+            groups: Vec::new(),
+            updated_at: String::new(),
+        });
         let sentences = plan.sentences.clone();
         let groups = plan
             .groups
@@ -3059,18 +3224,21 @@ Return exactly one plan for every supplied row, in the same order."#,
     }
 
     pub fn extract_image_settings_from_directive(&self, directive: &str) -> Result<StyleExtraction, String> {
-        // Prefer OpenAI (which internally falls back across OpenAI model tiers on
-        // failure — see request_openai_directive_extract). Gemini is the last resort:
-        // used when no OpenAI key is configured at all, OR when every OpenAI model
-        // tier failed (e.g. an org-wide $0-balance billing gate, which blocks every
-        // OpenAI model identically — no amount of OpenAI-side retrying gets past that).
-        if let Some(key) = self.get_provider_key("openai")? {
-            match request_openai_directive_extract(&key, directive) {
+        // Claude CLI first — no metered cost, rides whatever Claude
+        // subscription is already logged into the CLI on this machine (see
+        // run_claude_cli's doc comment). Gemini is the fallback. OpenAI has
+        // been removed from Bulk Gen planning entirely.
+        #[cfg(not(test))]
+        let claude_cli = claude_cli_available();
+        #[cfg(test)]
+        let claude_cli = false;
+        if claude_cli {
+            match request_claude_cli_directive_extract(directive) {
                 Ok(result) => return Ok(result),
-                Err(openai_error) => match self.gemini_auth() {
+                Err(claude_error) => match self.gemini_auth() {
                     Ok(auth) => return self.extract_image_settings_via_gemini(&auth, directive)
-                        .map_err(|gemini_error| format!("{openai_error} (Gemini fallback also failed: {gemini_error})")),
-                    Err(_) => return Err(openai_error),
+                        .map_err(|gemini_error| format!("Claude CLI: {claude_error} (Gemini fallback also failed: {gemini_error})")),
+                    Err(_) => return Err(format!("Claude CLI: {claude_error}")),
                 },
             }
         }
@@ -3120,9 +3288,9 @@ Return JSON only — no markdown, no explanation:
     /// new one) for the "Character Consistency" toggle in Bulk Gen Config.
     /// Returns plain prose (not JSON) — deliberately, to sidestep the
     /// markdown-fence JSON-parsing footguns fixed elsewhere in this file.
-    /// Prefers whichever provider `plan_bulk_visuals` is already using for
-    /// planning (passed in via `openai_key`/`gemini_auth`) rather than
-    /// hard-coding a provider, unlike `extract_reference_style`.
+    /// Claude CLI first, Gemini fallback — same provider order as the rest
+    /// of Bulk Gen planning (OpenAI has been removed from this path
+    /// entirely), unlike `extract_reference_style` which hard-codes Gemini.
     /// Reads the video's reference image bytes (see `list_assets(video_id,
     /// "reference")` — guaranteed 0-or-1 row). Shared by
     /// `character_description_for_video` (vision analysis) and
@@ -3143,55 +3311,63 @@ Return JSON only — no markdown, no explanation:
     fn character_description_for_video(
         &self,
         video_id: &str,
-        openai_key: &Option<String>,
         gemini_auth: &Option<GeminiAuth>,
     ) -> Result<String, String> {
         let (media_type, bytes) = self.reference_image_bytes(video_id)?
             .ok_or("Character Consistency requires a reference image — upload one in Bulk Gen Config first.")?;
         let prompt = "Identify the single main character or protagonist in this reference image (a person, animal, or creature — not a background object or environment). Write a concise, reusable physical description of that character for an illustrator to redraw consistently across dozens of separate scenes. You MUST explicitly cover: species/type; approximate age; physical proportions and build; exact hair color, length, and style (or fur/feather coloring and pattern if not human) — this is the single most common detail illustrators get inconsistent, so describe it precisely; eye color; skin/fur tone; and any distinguishing marks or features. Deliberately do NOT describe clothing, outfit, or props — those must change scene-to-scene to match each still's own context, not stay fixed like the physical identity. Do not describe the pose, background, camera angle, or art/rendering style either — only the character's inherent physical identity, in 4-6 sentences of plain prose. If no clear single character is present, describe the closest candidate subject instead. Return only the description, no preamble, no labels, no markdown.";
-        match openai_key {
-            // Try a second OpenAI model tier before reaching for Gemini (stays on the
-            // high-quota free tier); Gemini is the true last resort, for when an
-            // org-wide $0-balance billing gate blocks every OpenAI model identically.
-            Some(key) => match request_openai_character_description(key, prompt, &media_type, &bytes, "gpt-4.1-mini") {
-                Ok(result) => Ok(result),
-                Err(primary_error) => match request_openai_character_description(key, prompt, &media_type, &bytes, OPENAI_PRIMARY_HIGH_QUOTA_MODEL) {
-                    Ok(result) => Ok(result),
-                    Err(secondary_error) => match gemini_auth.as_ref() {
-                        Some(auth) => request_gemini_vision(auth, prompt, &media_type, &bytes).map_err(|gemini_error| {
-                            format!("{primary_error} (fallback model also failed: {secondary_error}; Gemini fallback also failed: {gemini_error})")
-                        }),
-                        None => Err(format!("{primary_error} (fallback model also failed: {secondary_error})")),
-                    },
+        #[cfg(not(test))]
+        let claude_cli = claude_cli_available();
+        #[cfg(test)]
+        let claude_cli = false;
+        if claude_cli {
+            match request_claude_cli_character_description(prompt, &media_type, &bytes) {
+                Ok(result) => return Ok(result),
+                Err(claude_error) => match gemini_auth.as_ref() {
+                    Some(auth) => return request_gemini_vision(auth, prompt, &media_type, &bytes).map_err(|gemini_error| {
+                        format!("Claude CLI: {claude_error} (Gemini fallback also failed: {gemini_error})")
+                    }),
+                    None => return Err(format!("Claude CLI: {claude_error}")),
                 },
-            },
-            None => request_gemini_vision(
-                gemini_auth.as_ref().ok_or("Configure an OpenAI or Gemini API key to use Character Consistency.")?,
-                prompt, &media_type, &bytes,
-            ),
+            }
         }
+        request_gemini_vision(
+            gemini_auth.as_ref().ok_or("Configure a Gemini API key, or log in with the Claude Code CLI, to use Character Consistency.")?,
+            prompt, &media_type, &bytes,
+        )
     }
 
     pub fn plan_bulk_visuals<F: Fn(usize, usize)>(&self, video_id: &str, style_directive: &str, base_settings_json: &str, creative_instruction: &str, character_consistency: bool, on_progress: F) -> Result<BulkPlanResult, String> {
-        let openai_key = self.get_provider_key("openai")?;
-        // When OpenAI is configured, still resolve Gemini as a best-effort last resort
-        // (`.ok()` swallows "no Gemini key configured" so the OpenAI-only happy path is
-        // unaffected) — request_openai_v2_plan already falls back across OpenAI model
-        // tiers, but an org-wide $0-balance billing gate blocks every OpenAI model
-        // identically, so Gemini is the only thing that can still get a batch through.
-        let gemini_auth = if openai_key.is_none() {
-            Some(self.gemini_auth()?)
-        } else {
+        // Claude CLI first — no metered cost, rides whatever Claude
+        // subscription is already logged into the CLI on this machine, so
+        // it alone is enough to plan even with no Gemini key configured.
+        // Gemini is the only fallback — OpenAI has been removed from Bulk
+        // Gen planning entirely (see run_claude_cli's doc comment).
+        #[cfg(not(test))]
+        let claude_cli = claude_cli_available();
+        #[cfg(test)]
+        let claude_cli = false;
+        // Gemini only needs to actually resolve when Claude CLI isn't available at
+        // all — `.ok()` swallows "no Gemini key configured" so the Claude-only happy
+        // path is unaffected.
+        let gemini_auth = if claude_cli {
             self.gemini_auth().ok()
+        } else {
+            Some(self.gemini_auth()?)
         };
-        // Gemini Flash hard-caps output at ~8000 tokens; OpenAI's mini tier supports
-        // 18000. Only size batches for the larger cap when Gemini can never end up
-        // serving one — i.e. pure OpenAI with no Gemini fallback configured at all.
-        // The moment Gemini could be asked to handle a batch (as primary, or as the
-        // fallback above), size for its smaller cap: a batch sized for OpenAI (6
-        // stills) silently overflows Gemini's output limit and comes back as
-        // unparseable/truncated non-JSON text instead of a clean error.
-        let chunk_size_for_provider: usize = if openai_key.is_some() && gemini_auth.is_none() { 6 } else { 3 };
+        if gemini_auth.is_none() && !claude_cli {
+            return Err("A logged-in Claude Code CLI, or a Gemini API key, is required for Bulk planning. Run `claude` once to log in, or add a Gemini key in Settings.".into());
+        }
+        // Gemini Flash hard-caps output at ~8000 tokens; Claude comfortably supports
+        // larger batches. Size for Claude's larger cap whenever Claude CLI is the
+        // primary path — Gemini being configured as a fallback doesn't matter, since
+        // it only ever serves a batch when Claude itself fails, at which point one
+        // truncated-JSON batch retried at the smaller size is a rare, acceptable
+        // trade-off against every batch paying Gemini's cap for a provider that's
+        // almost never the one actually answering. Only pure-Gemini (no Claude CLI
+        // at all) sizes small up front, since Gemini is the one serving every batch
+        // in that case.
+        let chunk_size_for_provider: usize = if claude_cli || gemini_auth.is_none() { 6 } else { 3 };
         let visual_plan = self.get_visual_plan(video_id)?;
         if visual_plan.groups.is_empty() {
             return Err("No stills found. Generate a visual plan first.".into());
@@ -3230,21 +3406,35 @@ Return JSON only — no markdown, no explanation:
         // Computed once (a real vision API call), not per-chunk like
         // director_note below — then interpolated into every chunk's prompt.
         let character_block = if character_consistency {
-            let description = self.character_description_for_video(video_id, &openai_key, &gemini_auth)?;
+            let description = self.character_description_for_video(video_id, &gemini_auth)?;
             format!(
                 "\n\n════════════════════════════════════════\n\
                  MANDATORY CHARACTER CONSISTENCY — NON-NEGOTIABLE\n\
                  ════════════════════════════════════════\n\
-                 Every still that depicts a character, protagonist, or narrator figure MUST depict this\n\
-                 EXACT same character, described from the user's reference image:\n\n\
+                 This rule governs IDENTITY ONLY — it does NOT mean the character must appear in every\n\
+                 still. IF a still genuinely depicts a character, protagonist, or narrator figure, THEN\n\
+                 that figure MUST be this EXACT same character, described from the user's reference image:\n\n\
                  {}\n\n\
                  Maintain this character's species/type, physical proportions, coloring, and distinguishing\n\
-                 features consistently across every still — do not redesign or vary their physical identity\n\
-                 between stills. Clothing/attire is the one exception: do NOT keep it fixed — design each\n\
-                 still's outfit to fit that still's own narration, setting, weather, and activity (e.g. a coat\n\
-                 in a cold-weather scene, workout clothes in an exercise scene), the same way you would for any\n\
-                 other subject. If a still's narration does not call for a character, omit them naturally\n\
-                 rather than forcing their presence.\n\
+                 features consistently across every still that DOES include them — do not redesign or vary\n\
+                 their physical identity between stills. Clothing/attire is the one exception: do NOT keep it\n\
+                 fixed — design each still's outfit to fit that still's own narration, setting, weather, and\n\
+                 activity (e.g. a coat in a cold-weather scene, workout clothes in an exercise scene), the\n\
+                 same way you would for any other subject.\n\n\
+                 WHEN TO OMIT THE CHARACTER (do this deliberately, not as an afterthought):\n\
+                 - Second-person (\"you\") narration describing an internal state, a fact, a process, a\n\
+                   diagram, a statistic, an object, or an environment does NOT require a literal on-screen\n\
+                   character — express it through the object/environment/diagram/abstraction alone instead.\n\
+                 - For any visualType other than Character Scene or Character Close-Up / Reaction, do NOT\n\
+                   include this character at all — not even a partial glimpse (hand, silhouette, shadow,\n\
+                   reflection) — unless the still is literally impossible to plan without them.\n\
+                 - Budget: across the WHOLE video, this character should appear in roughly a THIRD of\n\
+                   stills, not most or all of them. If the running share for this batch (accounting for\n\
+                   prior batches in the context below) is already near or above that, plan the remaining\n\
+                   stills in this batch WITHOUT the character.\n\
+                 SELF-CHECK before finalizing this batch: count how many of your planned stills include the\n\
+                 character. If it is more than roughly a third, revise the weakest justifications — the ones\n\
+                 where the character isn't doing anything the scene actually needs — to remove them.\n\
                  ════════════════════════════════════════\n",
                 description.trim()
             )
@@ -3414,17 +3604,20 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                 serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
                 serde_json::to_string_pretty(chunk).unwrap_or_default(),
             );
-            let response = match &openai_key {
-                Some(key) => match request_openai_v2_plan(key, &prompt) {
+            // Claude CLI first (no metered cost); Gemini is the only fallback —
+            // OpenAI has been removed from Bulk Gen planning entirely.
+            let response = if claude_cli {
+                match request_claude_cli_v2_plan(&prompt) {
                     Ok(response) => response,
-                    Err(openai_error) => match gemini_auth.as_ref() {
+                    Err(claude_error) => match gemini_auth.as_ref() {
                         Some(auth) => request_gemini_v2_plan(auth, &prompt).map_err(|gemini_error| {
-                            format!("{openai_error} (Gemini fallback also failed: {gemini_error})")
+                            format!("Claude CLI: {claude_error} | Gemini fallback also failed: {gemini_error}")
                         })?,
-                        None => return Err(openai_error),
+                        None => return Err(format!("Claude CLI: {claude_error}")),
                     },
-                },
-                None => request_gemini_v2_plan(gemini_auth.as_ref().unwrap(), &prompt)?,
+                }
+            } else {
+                request_gemini_v2_plan(gemini_auth.as_ref().unwrap(), &prompt)?
             };
             // Match plans back to rows by id rather than strict positional order: models
             // occasionally reorder or duplicate entries in the array, and a single
@@ -3503,36 +3696,29 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
         })
     }
 
-    /// Assigns every timeline clip that has a rendered image one of the 7
-    /// `MOTION_GRAPHIC_EFFECTS` treatments + tunable settings, by batching
-    /// them (image + the clip's own narration text together) through
-    /// `services/python-engine/auto_gen_engine/motion_graphics_engine.py` —
-    /// see that module's docstring for why this replaced the old per-clip,
-    /// image-only, single-OpenAI-call-in-Rust implementation (it converged
-    /// heavily on "Ken Burns" with no way to see either the narration or
-    /// what neighboring clips had already been assigned). The Python engine
-    /// batches clips together and carries a running tally of effects used so
-    /// far across the whole video into every batch, actively balancing the
-    /// mix instead of picking each clip in a vacuum.
-    pub fn analyze_motion_graphics<F: Fn(usize, usize)>(
-        &self, video_id: &str, engine_dir: &Path, on_progress: F,
-    ) -> Result<Timeline, String> {
-        let api_key = self.get_provider_key("openai")?;
-        // OpenAI is preferred (see the Python engine's module docstring); Gemini
-        // credentials are forwarded too so the engine can fall back to it if OpenAI
-        // itself fails (rate limit, exhausted billing credits) or isn't configured at
-        // all — same OpenAI-primary/Gemini-last-resort pattern used throughout this
-        // file. Reuses gemini_auth() (the exact function every other successful Gemini
-        // call in this app already goes through) rather than re-deriving credentials
-        // independently, so whichever of its two auth paths — a plain API key, or a
-        // Vertex service account — is actually configured just works here too. The
-        // Vertex access token is short-lived (~1hr), but that's fine: this analysis
-        // run completes well within that window.
-        // The Err case is intentionally not fatal by itself (OpenAI alone is a valid
-        // setup) — but the reason gemini_auth() failed is forwarded to the Python
-        // engine too (GEMINI_AUTH_ERROR below) rather than silently discarded, so a
-        // real, fixable Gemini-side problem doesn't look identical to "no Gemini
-        // configured at all" if OpenAI's own call also fails.
+    /// Resolves and gates credentials for a motion-graphics engine run
+    /// (`analyze_motion_graphics`). OpenAI is preferred (see the Python
+    /// engine's module docstring); Gemini credentials are forwarded too so
+    /// the engine can fall back to it if OpenAI itself fails (rate limit,
+    /// exhausted billing credits) or isn't configured at all — same
+    /// OpenAI-primary/Gemini-last-resort pattern used throughout this file.
+    /// Reuses gemini_auth() (the exact function every other successful
+    /// Gemini call in this app already goes through) rather than re-deriving
+    /// credentials independently, so whichever of its two auth paths — a
+    /// plain API key, or a Vertex service account — is actually configured
+    /// just works here too. The Vertex access token is short-lived (~1hr),
+    /// but that's fine: one analysis run completes well within that window.
+    /// The Err case from gemini_auth() is intentionally not fatal by itself
+    /// (OpenAI alone is a valid setup) — but the reason it failed is
+    /// forwarded to the Python engine too (GEMINI_AUTH_ERROR) rather than
+    /// silently discarded, so a real, fixable Gemini-side problem doesn't
+    /// look identical to "no Gemini configured at all" if OpenAI's own call
+    /// also fails. Claude CLI (tried first inside the Python engine — see
+    /// its module docstring) needs no key here, just a logged-in `claude` on
+    /// PATH, so it alone is enough to skip the final gate below even with no
+    /// OpenAI/Gemini configured.
+    fn resolve_motion_graphics_credentials(&self) -> Result<MotionGraphicsCredentials, String> {
+        let openai_api_key = self.get_provider_key("openai")?;
         let mut gemini_auth_error: Option<String> = None;
         let (gemini_api_key, gemini_vertex): (Option<String>, Option<(String, String)>) =
             match self.gemini_auth() {
@@ -3543,11 +3729,34 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                     (None, None)
                 }
             };
-        if api_key.is_none() && gemini_api_key.is_none() && gemini_vertex.is_none() {
+        #[cfg(not(test))]
+        let claude_available = claude_cli_available();
+        #[cfg(test)]
+        let claude_available = false;
+        if openai_api_key.is_none() && gemini_api_key.is_none() && gemini_vertex.is_none() && !claude_available {
             return Err(gemini_auth_error.map(|error| format!(
-                "An OpenAI or Gemini API key is required for Motion Graphics analysis. Add one in Settings. (Gemini: {error})"
-            )).unwrap_or_else(|| "An OpenAI or Gemini API key is required for Motion Graphics analysis. Add one in Settings.".into()));
+                "An OpenAI or Gemini API key, or a logged-in Claude Code CLI, is required for Motion Graphics analysis. Add a key in Settings, or run `claude` once to log in. (Gemini: {error})"
+            )).unwrap_or_else(|| "An OpenAI or Gemini API key, or a logged-in Claude Code CLI, is required for Motion Graphics analysis. Add a key in Settings, or run `claude` once to log in.".into()));
         }
+        Ok(MotionGraphicsCredentials { openai_api_key, gemini_api_key, gemini_vertex, gemini_auth_error })
+    }
+
+    /// Assigns every timeline clip that has a rendered image a freely-composed
+    /// motion recipe (see services/motion-engine/src/types.ts's `MotionRecipe`
+    /// — there's no fixed catalog of named treatments to pick from), by
+    /// batching them (image + the clip's own narration text together) through
+    /// `services/python-engine/auto_gen_engine/motion_graphics_engine.py` —
+    /// see that module's docstring for why this replaced the old per-clip,
+    /// image-only, single-OpenAI-call-in-Rust implementation (it converged
+    /// heavily on "Ken Burns" with no way to see either the narration or
+    /// what neighboring clips had already been assigned). The Python engine
+    /// batches clips together and carries forward what earlier clips in the
+    /// same video were already given so far across the whole video into every
+    /// batch, actively varying the mix instead of picking each clip in a vacuum.
+    pub fn analyze_motion_graphics<F: Fn(usize, usize)>(
+        &self, video_id: &str, engine_dir: &Path, on_progress: F,
+    ) -> Result<Timeline, String> {
+        let credentials = self.resolve_motion_graphics_credentials()?;
         let timeline = self.get_timeline(video_id)?;
         let clips: Vec<&TimelineClip> = timeline.clips.iter().filter(|clip| clip.render_id.is_some()).collect();
         let total = clips.len();
@@ -3558,15 +3767,14 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
         #[cfg(test)]
         {
             let _ = engine_dir;
-            let _ = &api_key;
-            let _ = &gemini_api_key;
-            let _ = &gemini_vertex;
-            let _ = &gemini_auth_error;
-            // No Python/network in tests — deterministically cycle through
-            // the catalog so callers can still exercise the resulting
-            // Timeline shape.
+            let _ = &credentials;
+            // No Python/network in tests — deterministically cycle through a
+            // few fixture labels so callers can still exercise the resulting
+            // Timeline shape. The label is free text now (see doc comment
+            // above), so any small fixed set works fine here.
+            const TEST_FIXTURE_LABELS: [&str; 3] = ["test push", "test reveal", "test drift"];
             for (index, clip) in clips.iter().enumerate() {
-                let effect = MOTION_GRAPHIC_EFFECTS[index % MOTION_GRAPHIC_EFFECTS.len()];
+                let effect = TEST_FIXTURE_LABELS[index % TEST_FIXTURE_LABELS.len()];
                 self.set_timeline_clip_motion_graphic(
                     video_id, &clip.id, Some(effect), Some("{}"), Some("test fixture"),
                 )?;
@@ -3608,8 +3816,28 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                     "endSeconds": clip.end_seconds,
                 }))
             }).collect::<Result<_, _>>()?;
-            fs::write(&manifest_path, serde_json::to_vec(&json!({ "clips": clip_manifest })).unwrap_or_default())
-                .map_err(|e| e.to_string())?;
+            // Only used by the engine's validator pass (renders a few sample
+            // frames of each candidate recipe to actually look at — see
+            // motion_graphics_engine.py's `_render_validation_frames`), not
+            // by composition itself: every recipe field is fraction/percent-
+            // based, not absolute-pixel, so this doesn't need to match the
+            // eventual real export resolution exactly. Mirrors the same
+            // "1080p + configured aspect ratio" default the real export uses
+            // (see run_export's own resolution_dimensions call) rather than
+            // a value pulled from thin air.
+            let settings_raw = self.get_app_setting("image_settings")?.unwrap_or_default();
+            let image_settings: serde_json::Value =
+                serde_json::from_str(&settings_raw).unwrap_or_else(|_| json!({}));
+            let (manifest_width, manifest_height) = resolution_dimensions("1080p", requested_aspect_ratio(&image_settings));
+            fs::write(
+                &manifest_path,
+                serde_json::to_vec(&json!({
+                    "clips": clip_manifest,
+                    "width": manifest_width,
+                    "height": manifest_height,
+                    "fps": 30,
+                })).unwrap_or_default(),
+            ).map_err(|e| e.to_string())?;
 
             let engine_script = engine_dir.join("auto_gen_engine/motion_graphics_engine.py");
             if !engine_script.exists() {
@@ -3627,20 +3855,7 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                 .current_dir(engine_dir)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            if let Some(key) = &api_key {
-                command.env("OPENAI_API_KEY", key);
-            }
-            if let Some(key) = &gemini_api_key {
-                command.env("GEMINI_API_KEY", key);
-            }
-            if let Some((access_token, project_id)) = &gemini_vertex {
-                command
-                    .env("GEMINI_VERTEX_ACCESS_TOKEN", access_token)
-                    .env("GEMINI_VERTEX_PROJECT_ID", project_id);
-            }
-            if let Some(error) = &gemini_auth_error {
-                command.env("GEMINI_AUTH_ERROR", error);
-            }
+            credentials.apply_env(&mut command);
             #[cfg(windows)]
             command.creation_flags(0x08000000);
             let mut child = command
@@ -3700,6 +3915,16 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                     Some(&serde_json::to_string(&settings).unwrap_or_default()),
                     Some(reason),
                 )?;
+                // Tier 3 of the recipe (see motion_graphics_engine.py) is how
+                // this clip hands off to the next one — apply it to the same
+                // `transition_out` column a human could otherwise set
+                // manually from the Timeline (see VALID_TRANSITIONS), rather
+                // than inventing a separate storage path for it.
+                if let Some(transition) = settings.get("transitionOut").and_then(|v| v.as_str()) {
+                    if VALID_TRANSITIONS.contains(&transition) {
+                        self.set_timeline_clip_transition_out(video_id, clip_id, transition)?;
+                    }
+                }
                 on_progress(index + 1, total);
             }
             self.get_timeline(video_id)
@@ -3985,47 +4210,28 @@ Return JSON only, in exactly this shape: {{"description": "the explanation text"
         }
 
         let total = entries.len();
-        let openai_key = self.get_provider_key("openai")?;
-        // When OpenAI is configured, still resolve Gemini as a best-effort last resort
-        // (`.ok()` swallows "no Gemini key configured" so the OpenAI-only happy path is
-        // unaffected) — call_openai below already falls back across OpenAI model tiers,
-        // but an org-wide $0-balance billing gate blocks every OpenAI model identically,
-        // so Gemini is the only thing that can still get a batch through.
-        let gemini_auth = if openai_key.is_none() {
-            Some(self.gemini_auth()?)
-        } else {
+        // Claude CLI first — no metered cost, rides whatever Claude
+        // subscription is already logged into the CLI on this machine.
+        // Gemini is the only fallback — OpenAI has been removed from Bulk
+        // Gen planning entirely (see run_claude_cli's doc comment).
+        #[cfg(not(test))]
+        let claude_cli = claude_cli_available();
+        #[cfg(test)]
+        let claude_cli = false;
+        let gemini_auth = if claude_cli {
             self.gemini_auth().ok()
+        } else {
+            Some(self.gemini_auth()?)
         };
-        // Only size batches for OpenAI's larger cap when Gemini can never end up serving
-        // one (pure OpenAI, no fallback configured) — see plan_bulk_visuals for why a
-        // Gemini fallback needs the smaller, safer batch size.
-        let chunk_size: usize = if openai_key.is_some() && gemini_auth.is_none() { 6 } else { 3 };
+        if gemini_auth.is_none() && !claude_cli {
+            return Err("A logged-in Claude Code CLI, or a Gemini API key, is required to apply creative instructions. Run `claude` once to log in, or add a Gemini key in Settings.".into());
+        }
+        // Gemini Flash hard-caps output at ~8000 tokens; Claude comfortably supports
+        // larger batches — see plan_bulk_visuals for why this sizes for Claude
+        // whenever it's the primary path, not just when Gemini is entirely absent.
+        let chunk_size: usize = if claude_cli || gemini_auth.is_none() { 6 } else { 3 };
         let now = Utc::now().to_rfc3339();
         let mut applied = 0usize;
-
-        let http = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(180))
-            .build().map_err(|e| format!("HTTP client error: {e}"))?;
-        let call_openai = |key: &str, prompt: &str, model: &str| -> Result<String, String> {
-            // Use Chat Completions with json_object mode — the Responses API
-            // can emit unescaped quotes in freeform output.
-            let resp = http.post("https://api.openai.com/v1/chat/completions")
-                .bearer_auth(key)
-                .json(&json!({
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 8000,
-                    "response_format": {"type": "json_object"}
-                }))
-                .send()
-                .map_err(|e| format!("OpenAI request failed: {e}"))?;
-            if !resp.status().is_success() {
-                let body: serde_json::Value = resp.json().unwrap_or_default();
-                return Err(format!("OpenAI error: {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown")));
-            }
-            let body: serde_json::Value = resp.json().map_err(|e| format!("OpenAI JSON parse: {e}"))?;
-            Ok(body.pointer("/choices/0/message/content").and_then(|v| v.as_str()).unwrap_or_default().to_string())
-        };
 
         for chunk in entries.chunks(chunk_size) {
             // Use a numeric index (n) for matching — LLMs can corrupt long UUID strings.
@@ -4059,24 +4265,18 @@ Return JSON only:
                 serde_json::to_string_pretty(&batch).unwrap_or_default(),
             );
 
-            let response_text = match &openai_key {
-                Some(key) => match call_openai(key, &prompt, "gpt-4.1-mini") {
+            let response_text = if claude_cli {
+                match run_claude_cli(&prompt, &[]) {
                     Ok(text) => text,
-                    // First fall back to a sibling OpenAI model (stays on the same
-                    // high-quota free tier); only reach for Gemini if that also fails —
-                    // e.g. an org-wide $0-balance billing gate blocks every OpenAI
-                    // model identically, so Gemini is the only thing left that works.
-                    Err(primary_error) => match call_openai(key, &prompt, OPENAI_PRIMARY_HIGH_QUOTA_MODEL) {
-                        Ok(text) => text,
-                        Err(secondary_error) => match gemini_auth.as_ref() {
-                            Some(auth) => request_gemini_text(auth, &prompt).map_err(|gemini_error| {
-                                format!("{primary_error} (fallback model also failed: {secondary_error}; Gemini fallback also failed: {gemini_error})")
-                            })?,
-                            None => return Err(format!("{primary_error} (fallback model also failed: {secondary_error})")),
-                        },
+                    Err(claude_error) => match gemini_auth.as_ref() {
+                        Some(auth) => request_gemini_text(auth, &prompt).map_err(|gemini_error| {
+                            format!("Claude CLI: {claude_error} | Gemini fallback also failed: {gemini_error}")
+                        })?,
+                        None => return Err(format!("Claude CLI: {claude_error}")),
                     },
-                },
-                None => request_gemini_text(gemini_auth.as_ref().unwrap(), &prompt)?,
+                }
+            } else {
+                request_gemini_text(gemini_auth.as_ref().unwrap(), &prompt)?
             };
 
             let cleaned = extract_json_from_text(&response_text);
@@ -4764,12 +4964,16 @@ Return JSON only:
                 [video_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
             ).map_err(|_| "Video was not found.".to_string())?;
         let inputs = self.get_video_inputs(video_id)?;
-        let root = self.projects_dir.join(channel_id).join(video_id);
+        let root = self.projects_dir.join(&channel_id).join(video_id);
         let mut relative_files = Vec::new();
         collect_relative_files(&root, &root, &mut relative_files)?;
+        let mut tables = std::collections::BTreeMap::new();
+        for table in PROJECT_TABLES {
+            tables.insert((*table).to_string(), self.dump_table_rows(table, video_id)?);
+        }
         let manifest = ProjectBundleManifest {
             format: "auto-gen-studio-project".into(),
-            version: 1,
+            version: 2,
             exported_at: Utc::now().to_rfc3339(),
             channel_name,
             video_title,
@@ -4778,6 +4982,9 @@ Return JSON only:
             script_text: inputs.script_text,
             pacing_seconds: inputs.pacing_seconds,
             files: relative_files.clone(),
+            video_id: video_id.to_string(),
+            channel_id,
+            tables,
         };
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -4804,7 +5011,11 @@ Return JSON only:
         })
     }
 
-    pub fn import_project_bundle(&self, source: &Path) -> Result<Video, String> {
+    /// Imports into `channel_id` — an existing channel, picked by whoever's
+    /// importing, exactly like "+ New video" — rather than spawning a new
+    /// channel of its own. A project bundle is just a video; it doesn't
+    /// need a home of its own any more than any other video does.
+    pub fn import_project_bundle(&self, source: &Path, channel_id: &str) -> Result<Video, String> {
         let file = fs::File::open(source)
             .map_err(|_| "Project bundle could not be opened.".to_string())?;
         let mut archive = ZipArchive::new(file)
@@ -4816,7 +5027,7 @@ Return JSON only:
             serde_json::from_reader(&mut entry)
                 .map_err(|_| "Project bundle manifest is invalid.".to_string())?
         };
-        if manifest.format != "auto-gen-studio-project" || manifest.version != 1 {
+        if manifest.format != "auto-gen-studio-project" || !(1..=2).contains(&manifest.version) {
             return Err("Unsupported project bundle format.".into());
         }
         for path in &manifest.files {
@@ -4825,13 +5036,11 @@ Return JSON only:
                 .by_name(&format!("assets/{path}"))
                 .map_err(|_| format!("Bundle asset is missing: {path}"))?;
         }
-        let channel =
-            self.create_channel(&format!("{} (Imported)", manifest.channel_name), None)?;
-        let video =
-            self.create_video(&channel.id, &format!("{} (Imported)", manifest.video_title))?;
-        let target = self.projects_dir.join(&channel.id).join(&video.id);
+        // create_video validates channel_id itself ("Channel was not found."
+        // if it's missing or trashed) — no separate check needed here.
+        let video = self.create_video(channel_id, &format!("{} (Imported)", manifest.video_title))?;
+        let target = self.projects_dir.join(channel_id).join(&video.id);
         let result = (|| {
-            self.save_video_inputs(&video.id, &manifest.script_text, manifest.pacing_seconds)?;
             for path in &manifest.files {
                 let mut entry = archive
                     .by_name(&format!("assets/{path}"))
@@ -4843,24 +5052,264 @@ Return JSON only:
                 let mut output = fs::File::create(destination).map_err(|e| e.to_string())?;
                 std::io::copy(&mut entry, &mut output).map_err(|e| e.to_string())?;
             }
+            if manifest.version >= 2 && !manifest.tables.is_empty() {
+                self.restore_project_tables(&manifest, &video.id)?;
+            } else {
+                // Version-1 bundle (or a version-2 bundle exported before any
+                // real project state existed): all we ever had was the raw
+                // script — same as before full-fidelity mode.
+                self.save_video_inputs(&video.id, &manifest.script_text, manifest.pacing_seconds)?;
+            }
+            self.connection.execute(
+                "UPDATE videos SET stage=?1, progress=?2, updated_at=?3 WHERE id=?4",
+                params![manifest.stage, manifest.progress, Utc::now().to_rfc3339(), video.id],
+            ).map_err(|e| e.to_string())?;
             Ok(())
         })();
         if let Err(error) = result {
             let _ = fs::remove_dir_all(&target);
+            for table in PROJECT_TABLES.iter().rev() {
+                let _ = self
+                    .connection
+                    .execute(&format!("DELETE FROM {table} WHERE video_id=?1"), [&video.id]);
+            }
             let _ = self
                 .connection
                 .execute("DELETE FROM video_snapshots WHERE video_id=?1", [&video.id]);
             let _ = self
                 .connection
-                .execute("DELETE FROM video_inputs WHERE video_id=?1", [&video.id]);
-            let _ = self
-                .connection
                 .execute("DELETE FROM videos WHERE id=?1", [&video.id]);
-            let _ = self
-                .connection
-                .execute("DELETE FROM channels WHERE id=?1", [&channel.id]);
             return Err(error);
         }
+        let mut video = video;
+        video.stage = manifest.stage.clone();
+        video.progress = manifest.progress;
+        Ok(video)
+    }
+
+    /// Reads every column of every row in `table` for `video_id`, as a
+    /// generic `column name -> JSON value` map — no per-table struct to
+    /// maintain, and it automatically picks up any column ever added to
+    /// these tables. Used only for building a project bundle export; live
+    /// reads elsewhere in the app go through their own typed queries.
+    fn dump_table_rows(
+        &self,
+        table: &str,
+        video_id: &str,
+    ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, String> {
+        let sql = format!("SELECT * FROM {table} WHERE video_id = ?1 ORDER BY rowid");
+        let mut statement = self.connection.prepare(&sql).map_err(|e| e.to_string())?;
+        let column_names: Vec<String> = statement
+            .column_names()
+            .into_iter()
+            .map(|name| name.to_string())
+            .collect();
+        let rows = statement
+            .query_map([video_id], |row| {
+                let mut map = serde_json::Map::new();
+                for (index, name) in column_names.iter().enumerate() {
+                    let json_value = match row.get_ref(index)? {
+                        rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                        rusqlite::types::ValueRef::Integer(value) => serde_json::Value::from(value),
+                        rusqlite::types::ValueRef::Real(value) => serde_json::Number::from_f64(value)
+                            .map(serde_json::Value::Number)
+                            .unwrap_or(serde_json::Value::Null),
+                        rusqlite::types::ValueRef::Text(value) => {
+                            serde_json::Value::String(String::from_utf8_lossy(value).into_owned())
+                        }
+                        rusqlite::types::ValueRef::Blob(_) => serde_json::Value::Null,
+                    };
+                    map.insert(name.clone(), json_value);
+                }
+                Ok(map)
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// Real column names for `table`, read straight from the live schema —
+    /// used as an allowlist so a bundle's JSON can only ever supply
+    /// *values*, never table/column names, when it's turned back into SQL.
+    fn table_columns(&self, table: &str) -> Result<Vec<String>, String> {
+        let sql = format!("PRAGMA table_info({table})");
+        let mut statement = self.connection.prepare(&sql).map_err(|e| e.to_string())?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        Ok(names)
+    }
+
+    /// Every dumped row, id-remapped and reinserted, in `PROJECT_TABLES`
+    /// order — reconstructs the imported video's entire visual plan,
+    /// renders, animations, timeline, media library, captions, and overlay
+    /// tracks so the project opens looking exactly like it did for whoever
+    /// exported it, not just its finished clips.
+    fn restore_project_tables(
+        &self,
+        manifest: &ProjectBundleManifest,
+        new_video_id: &str,
+    ) -> Result<(), String> {
+        let mut id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        if !manifest.video_id.is_empty() {
+            id_map.insert(manifest.video_id.clone(), new_video_id.to_string());
+        }
+        seed_id_map(&manifest.tables, &mut id_map);
+        for table in PROJECT_TABLES {
+            let Some(rows) = manifest.tables.get(*table) else { continue };
+            if rows.is_empty() {
+                continue;
+            }
+            let known_columns = self.table_columns(table)?;
+            for row in rows {
+                let remapped = remap_row(table, row.clone(), &id_map);
+                self.insert_dynamic_row(table, &remapped, &known_columns)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Inserts one dumped-and-remapped row back into `table`, keeping only
+    /// the columns that actually exist on the live schema (`known_columns`)
+    /// — both a safety allowlist (see `table_columns`) and forward/backward
+    /// compatibility if the exporting and importing app versions differ.
+    fn insert_dynamic_row(
+        &self,
+        table: &str,
+        row: &serde_json::Map<String, serde_json::Value>,
+        known_columns: &[String],
+    ) -> Result<(), String> {
+        let columns: Vec<&String> = known_columns.iter().filter(|c| row.contains_key(c.as_str())).collect();
+        if columns.is_empty() {
+            return Ok(());
+        }
+        let column_list = columns.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(",");
+        let placeholders = (1..=columns.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+        let sql = format!("INSERT INTO {table} ({column_list}) VALUES ({placeholders})");
+        let boxed: Vec<Box<dyn rusqlite::ToSql>> =
+            columns.iter().map(|c| json_to_sql(&row[c.as_str()])).collect();
+        let refs: Vec<&dyn rusqlite::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
+        self.connection
+            .execute(&sql, refs.as_slice())
+            .map_err(|e| format!("Could not restore {table} row: {e}"))?;
+        Ok(())
+    }
+
+    /// Imports a raw asset folder produced by the "Export project" (editor
+    /// bundle) flow — `clips/seg_NNNN.mp4` + `timing.txt` + `narration.*` +
+    /// an optional `captions.srt` — and rebuilds it as a new project whose
+    /// Editor timeline matches the original layout exactly. Unlike
+    /// `import_project_bundle` (which round-trips this app's own `.agsproj`
+    /// zip), this reads the plain folder a user gets after unzipping that
+    /// export, or one assembled by hand/another tool in the same shape.
+    pub fn import_asset_folder(&self, source_dir: &Path, engine_dir: &Path) -> Result<Video, String> {
+        if !source_dir.is_dir() {
+            return Err("That folder could not be found.".into());
+        }
+        let timing_text = fs::read_to_string(source_dir.join("timing.txt")).map_err(|_| {
+            "This doesn't look like an exported project folder — timing.txt is missing.".to_string()
+        })?;
+        let segments = parse_timing_file(&timing_text)?;
+        let clips_dir = source_dir.join("clips");
+        if !clips_dir.is_dir() {
+            return Err(
+                "This doesn't look like an exported project folder — a clips/ folder is missing.".into(),
+            );
+        }
+        let narration_path = fs::read_dir(source_dir)
+            .map_err(|e| e.to_string())?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_stem().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("narration")).unwrap_or(false)
+                    && path.extension().and_then(|e| e.to_str())
+                        .map(|ext| ["mp3", "wav", "m4a", "aac", "flac", "ogg"].contains(&ext.to_ascii_lowercase().as_str()))
+                        .unwrap_or(false)
+            })
+            .ok_or("This doesn't look like an exported project folder — no narration audio file was found.")?;
+
+        let channel_label = source_dir
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Imported");
+        let video_label = source_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Imported Video");
+
+        let channel = self.create_channel(&format!("{channel_label} (Imported)"), None)?;
+        let mut video = self.create_video(&channel.id, video_label)?;
+
+        let result = (|| -> Result<(), String> {
+            self.import_asset(&video.id, &narration_path, "audio")?;
+
+            let captions_path = source_dir.join("captions.srt");
+            if captions_path.is_file() {
+                let srt_text = fs::read_to_string(&captions_path).map_err(|e| e.to_string())?;
+                let entries = parse_srt(&srt_text);
+                // The Script tab has nothing else to source text from for a raw
+                // asset-folder import (there's no original script file) — the
+                // captions ARE what was actually narrated, so re-join them into
+                // one script, in reading order, deduplicating a caption engine's
+                // typical one-line-repeated-as-several-word-groups pattern isn't
+                // attempted here: this is a best-effort read-only reference, not
+                // something regeneration will run against.
+                let script_text = entries.iter().map(|(_, _, text)| text.as_str()).collect::<Vec<_>>().join(" ");
+                if !script_text.is_empty() {
+                    self.save_video_inputs(&video.id, &script_text, 8)?;
+                }
+                for (ordinal, (start, end, text)) in entries.into_iter().enumerate() {
+                    self.connection.execute(
+                        "INSERT INTO timeline_caption_clips(id,video_id,source_chunk_index,text,ordinal,start_seconds,end_seconds,words_json) VALUES(?1,?2,NULL,?3,?4,?5,?6,NULL)",
+                        params![Uuid::new_v4().to_string(), video.id, text, ordinal as i64, start, end],
+                    ).map_err(|e| e.to_string())?;
+                }
+            }
+
+            self.ensure_timeline_row(&video.id)?;
+            for (ordinal, (file_name, start, end)) in segments.iter().enumerate() {
+                let clip_path = clips_dir.join(file_name);
+                if !clip_path.is_file() {
+                    // Timing entries with no matching file on disk are skipped
+                    // rather than aborting the whole import — the rest of the
+                    // timeline is still worth having.
+                    continue;
+                }
+                let asset = self.import_media_library_asset_with_known_duration(
+                    &video.id, &clip_path, Some("clip"), engine_dir, Some(end - start),
+                )?;
+                self.connection.execute(
+                    "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label,clip_kind,media_library_asset_id) VALUES(?1,?2,?3,NULL,?4,?5,?6,?7,'imported-clip',?8)",
+                    params![Uuid::new_v4().to_string(), video.id, format!("library:{}", asset.id), ordinal as i64, start, end, asset.original_name, asset.id],
+                ).map_err(|e| e.to_string())?;
+            }
+            self.recompute_timeline_duration(&video.id)?;
+            self.connection.execute(
+                "UPDATE videos SET stage='timeline', progress=100, updated_at=?1 WHERE id=?2",
+                params![Utc::now().to_rfc3339(), video.id],
+            ).map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(self.projects_dir.join(&channel.id).join(&video.id));
+            let _ = self.connection.execute("DELETE FROM timeline_clips WHERE video_id=?1", [&video.id]);
+            let _ = self.connection.execute("DELETE FROM timeline_caption_clips WHERE video_id=?1", [&video.id]);
+            let _ = self.connection.execute("DELETE FROM media_library_assets WHERE video_id=?1", [&video.id]);
+            let _ = self.connection.execute("DELETE FROM timelines WHERE video_id=?1", [&video.id]);
+            let _ = self.connection.execute("DELETE FROM input_assets WHERE video_id=?1", [&video.id]);
+            let _ = self.connection.execute("DELETE FROM video_inputs WHERE video_id=?1", [&video.id]);
+            let _ = self.connection.execute("DELETE FROM video_snapshots WHERE video_id=?1", [&video.id]);
+            let _ = self.connection.execute("DELETE FROM videos WHERE id=?1", [&video.id]);
+            let _ = self.connection.execute("DELETE FROM channels WHERE id=?1", [&channel.id]);
+            return Err(error);
+        }
+        video.stage = "timeline".into();
+        video.progress = 100;
         Ok(video)
     }
 
@@ -5001,15 +5450,26 @@ Return JSON only:
             .query_map([video_id], |row| {
                 let style_raw: Option<String> = row.get(6)?;
                 let words_raw: Option<String> = row.get(7)?;
+                let text: String = row.get(2)?;
+                let start_seconds: f64 = row.get(4)?;
+                let end_seconds: f64 = row.get(5)?;
+                let real_words: Option<Vec<CaptionWord>> =
+                    words_raw.and_then(|raw| serde_json::from_str(&raw).ok());
+                // Real (Whisper/regenerated) timing always wins; only estimate
+                // when there's genuinely nothing precise on this clip — see
+                // `estimate_word_windows`.
+                let words = real_words
+                    .filter(|words| !words.is_empty())
+                    .or_else(|| estimate_word_windows(&text, start_seconds, end_seconds));
                 Ok(TimelineCaptionClip {
                     id: row.get(0)?,
                     source_chunk_index: row.get(1)?,
-                    text: row.get(2)?,
+                    text,
                     ordinal: row.get(3)?,
-                    start_seconds: row.get(4)?,
-                    end_seconds: row.get(5)?,
+                    start_seconds,
+                    end_seconds,
                     style: style_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
-                    words: words_raw.and_then(|raw| serde_json::from_str(&raw).ok()),
+                    words,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -5589,22 +6049,20 @@ Return JSON only:
         self.get_timeline(video_id)
     }
 
-    /// Sets (or clears, when `effect` is `None`) a clip's AI-assigned or
+    /// Sets (or clears, when `effect` is `None`) a clip's AI-composed or
     /// manually-overridden motion graphic treatment. `settings_json` and
     /// `reason` are cleared together with `effect` since they only make
-    /// sense alongside an assigned effect.
-    /// Sets the AI-assigned/overridden motion graphic AND, when assigning
-    /// (not clearing), approximates it onto the existing `motion_preset`
-    /// field so it's actually visible in the canvas preview and rendered on
-    /// export via the ffmpeg pipeline (`video_export_engine.py`) — the SOP's
-    /// 5 richer effects (glow/desaturation/ghost-trails/flicker) still
-    /// aren't rendered, only their base camera movement is approximated.
+    /// sense alongside an assigned effect. `effect` itself is now a free-text
+    /// label the AI invented (see services/python-engine/auto_gen_engine/
+    /// motion_graphics_engine.py's module docstring — there's no fixed
+    /// catalog to validate against anymore), kept as its own column purely
+    /// for quick display/debugging; the actual recipe lives in
+    /// `settings_json`. Also approximates the recipe onto the existing
+    /// `motion_preset` field so it's visible in the canvas preview and
+    /// rendered on export via the ffmpeg pipeline as a fallback — the real
+    /// export renders the full recipe for real via services/motion-engine,
+    /// this approximation is preview-only (see `approximate_motion_preset_for_effect`).
     pub fn set_timeline_clip_motion_graphic(&self, video_id: &str, clip_id: &str, effect: Option<&str>, settings_json: Option<&str>, reason: Option<&str>) -> Result<Timeline, String> {
-        if let Some(chosen) = effect {
-            if !MOTION_GRAPHIC_EFFECTS.contains(&chosen) {
-                return Err("Unknown motion graphic effect.".into());
-            }
-        }
         match effect.map(|chosen| approximate_motion_preset_for_effect(chosen, settings_json)) {
             Some(preset) => self.connection.execute(
                 "UPDATE timeline_clips SET motion_graphic_effect=?1, motion_graphic_settings_json=?2, motion_graphic_reason=?3, motion_preset=?4 WHERE id=?5 AND video_id=?6",
@@ -5725,6 +6183,10 @@ Return JSON only:
         if clips.is_empty() {
             return self.get_timeline(video_id);
         }
+        // Snapshotted before any mutation below, so the update loop can tell
+        // which clips actually moved and invalidate their stale motion recipe
+        // accordingly (see the loop's comment).
+        let original: Vec<(f64, f64)> = clips.iter().map(|c| (c.1, c.2)).collect();
         clips[0].1 = 0.0;
         let len = clips.len();
         for i in 0..len.saturating_sub(1) {
@@ -5735,11 +6197,27 @@ Return JSON only:
             last.2 = last.2.max(total_duration_seconds);
         }
 
-        for (id, start, end) in &clips {
+        for (i, (id, start, end)) in clips.iter().enumerate() {
             self.connection.execute(
                 "UPDATE timeline_clips SET start_seconds=?1, end_seconds=?2 WHERE id=?3",
                 params![start, end, id],
             ).map_err(|e| e.to_string())?;
+            // A still's AI-composed motion recipe is validated against its
+            // duration at the time Auto Motion ran — several of its fields
+            // (fadeInFrames/fadeOutFrames, maskHoldFrames, freezeHoldFrames)
+            // are absolute frame counts, not proportions, so silently
+            // stretching/shrinking the clip underneath an existing recipe
+            // can leave it badly mismatched rather than just slightly off.
+            // Clear it here so the clip falls back to "no motion assigned"
+            // (see ClipInspector's empty state) and Auto Motion recomputes
+            // it fresh for the new duration next time it runs.
+            let (orig_start, orig_end) = original[i];
+            if (*start - orig_start).abs() > 1e-6 || (*end - orig_end).abs() > 1e-6 {
+                self.connection.execute(
+                    "UPDATE timeline_clips SET motion_graphic_effect=NULL, motion_graphic_settings_json=NULL, motion_graphic_reason=NULL WHERE id=?1 AND motion_graphic_effect IS NOT NULL",
+                    [id],
+                ).map_err(|e| e.to_string())?;
+            }
         }
         self.recompute_timeline_duration(video_id)?;
         self.get_timeline(video_id)
@@ -5843,6 +6321,22 @@ Return JSON only:
         kind: Option<&str>,
         engine_dir: &Path,
     ) -> Result<MediaLibraryAsset, String> {
+        self.import_media_library_asset_with_known_duration(video_id, source, kind, engine_dir, None)
+    }
+
+    /// Same as `import_media_library_asset`, but skips the ffprobe duration
+    /// probe when the caller already knows the exact duration (e.g.
+    /// `import_asset_folder`, where `timing.txt` already states it) — probing
+    /// spawns a Python subprocess per file, which is the whole cost of
+    /// importing dozens of clips one at a time.
+    fn import_media_library_asset_with_known_duration(
+        &self,
+        video_id: &str,
+        source: &Path,
+        kind: Option<&str>,
+        engine_dir: &Path,
+        known_duration_seconds: Option<f64>,
+    ) -> Result<MediaLibraryAsset, String> {
         let extension = source.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
         let resolved_kind = match kind {
             Some(k) => k,
@@ -5851,7 +6345,9 @@ Return JSON only:
         };
         let allowed = match resolved_kind {
             "still" => ["png", "jpg", "jpeg", "webp"].contains(&extension.as_str()),
-            "clip" => ["mp4", "mov", "webm", "mkv"].contains(&extension.as_str()),
+            // Clips accept video files as well as images — a still can be
+            // dropped onto the Clips track and treated as a static clip.
+            "clip" => ["mp4", "mov", "webm", "mkv", "png", "jpg", "jpeg", "webp"].contains(&extension.as_str()),
             "audio" => ["mp3", "wav", "m4a", "aac", "flac", "ogg"].contains(&extension.as_str()),
             _ => false,
         };
@@ -5880,8 +6376,11 @@ Return JSON only:
         let media_type = extension_to_media_type(&extension).to_string();
         // Stills don't need a probed duration (the timeline gives them a
         // default slot length); clips and audio do, via the same ffprobe
-        // wrapper used for narration duration.
-        let duration_seconds = if resolved_kind != "still" {
+        // wrapper used for narration duration — unless the caller already
+        // knows it precisely, in which case probing would be redundant work.
+        let duration_seconds = if known_duration_seconds.is_some() {
+            known_duration_seconds
+        } else if resolved_kind != "still" {
             Self::probe_audio_duration(engine_dir, &destination).ok()
         } else {
             None
@@ -5937,6 +6436,52 @@ Return JSON only:
             "SELECT channel_id FROM videos WHERE id=?1", [&asset.video_id], |row| row.get(0),
         ).map_err(|e| e.to_string())?;
         Ok(self.projects_dir.join(channel_id).join(&asset.video_id).join(&asset.relative_path))
+    }
+
+    /// Removes steady-state background noise (hiss, hum, static) from an
+    /// Audio-tab library asset. Non-destructive like every other
+    /// file-producing action in the editor (motion graphics, retiming): the
+    /// cleaned audio lands as a brand-new library asset alongside the
+    /// original rather than overwriting it, so the source is never lost and
+    /// any timeline clip already using the original is unaffected.
+    pub fn denoise_media_library_asset(&self, asset_id: &str, engine_dir: &Path) -> Result<MediaLibraryAsset, String> {
+        let asset = self.media_library_asset_by_id(asset_id)?.ok_or("Media library asset was not found.")?;
+        if asset.kind != "audio" {
+            return Err("Only files in the Audio tab can have background noise removed.".into());
+        }
+        let channel_id: String = self.connection.query_row(
+            "SELECT channel_id FROM videos WHERE id=?1", [&asset.video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let video_dir = self.projects_dir.join(&channel_id).join(&asset.video_id);
+        let source_path = video_dir.join(&asset.relative_path);
+        let extension = Path::new(&asset.relative_path)
+            .extension().and_then(|value| value.to_str()).unwrap_or("mp3");
+        let id = Uuid::new_v4().to_string();
+        let stored_name = format!("{id}.{extension}");
+        let destination_dir = video_dir.join("library/audio");
+        fs::create_dir_all(&destination_dir).map_err(|e| e.to_string())?;
+        let destination = destination_dir.join(&stored_name);
+        Self::run_denoise_audio(engine_dir, &source_path, &destination)?;
+        let size_bytes = fs::metadata(&destination).map_err(|e| e.to_string())?.len() as i64;
+        // Loudness-normalizing shouldn't meaningfully change duration, but
+        // re-probe rather than trust the source's stored value — cheap, and
+        // matches how every other imported/derived audio file gets its
+        // duration (see `import_media_library_asset`).
+        let duration_seconds = Self::probe_audio_duration(engine_dir, &destination).ok();
+        let relative_path = format!("library/audio/{stored_name}");
+        let original_name = match asset.original_name.rsplit_once('.') {
+            Some((stem, ext)) => format!("{stem} (denoised).{ext}"),
+            None => format!("{} (denoised)", asset.original_name),
+        };
+        let created_at = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO media_library_assets(id,video_id,kind,original_name,relative_path,media_type,size_bytes,duration_seconds,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![id, asset.video_id, "audio", original_name, relative_path, asset.media_type, size_bytes, duration_seconds, created_at],
+        ).map_err(|e| e.to_string())?;
+        Ok(MediaLibraryAsset {
+            id, video_id: asset.video_id.clone(), kind: "audio".into(), original_name,
+            relative_path, media_type: asset.media_type.clone(), size_bytes, duration_seconds, created_at,
+        })
     }
 
     /// All Veo-generated clips for a video (across every still), for the
@@ -8308,6 +8853,54 @@ Return JSON only:
         }
     }
 
+    /// Runs the export engine's `--mode denoise` on a single audio file:
+    /// removes steady-state background noise (hiss, hum, fan/AC static) via
+    /// an FFT noise gate plus a highpass/lowpass to trim rumble and top-end
+    /// hiss, then loudness-normalizes so the cleaned file doesn't come out
+    /// perceptibly quieter than the source. See `denoise_media_library_asset`
+    /// for the caller — it writes the result to a brand-new library asset
+    /// rather than overwriting `source_path`, so a disappointing result
+    /// never costs the original file.
+    fn run_denoise_audio(engine_dir: &Path, source_path: &Path, output_path: &Path) -> Result<(), String> {
+        #[cfg(test)]
+        {
+            let _ = engine_dir;
+            fs::copy(source_path, output_path).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            let export_engine = engine_dir.join("auto_gen_engine/video_export_engine.py");
+            if !export_engine.exists() {
+                return Err(format!(
+                    "Internal video export engine was not found at {}.",
+                    export_engine.display()
+                ));
+            }
+            let mut command = Command::new(find_python());
+            command
+                .arg(&export_engine)
+                .arg(source_path)
+                .arg("--output")
+                .arg(output_path)
+                .arg("--mode")
+                .arg("denoise")
+                .current_dir(engine_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(windows)]
+            command.creation_flags(0x08000000);
+            let output = command
+                .output()
+                .map_err(|e| format!("Could not start the video export engine: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Could not remove background noise: {}", stderr.trim()));
+            }
+            Ok(())
+        }
+    }
+
     pub fn create_export_job(&self, video_id: &str, destination_path: &str) -> Result<String, String> {
         let id = Uuid::new_v4().to_string();
         self.connection.execute(
@@ -9377,133 +9970,6 @@ fn repair_excessive_consecutive_visual_types(planned: &mut [V2PlanStillResponse]
     }
 }
 
-// gpt-5.4-mini and gpt-4.1-mini both sit in OpenAI's much larger "millions of tokens/day"
-// free-usage tier (shared-traffic program), unlike plain gpt-4.1/gpt-5.4/etc., which only
-// get a far smaller daily allowance before billing (or a hard 429) kicks in. Using these as
-// the primary/fallback pair keeps the app's heaviest AI calls inside the generous free tier
-// instead of quietly depending on paid credits.
-const OPENAI_PRIMARY_HIGH_QUOTA_MODEL: &str = "gpt-5.4-mini";
-const OPENAI_SECONDARY_HIGH_QUOTA_MODEL: &str = "gpt-4.1-mini";
-
-fn request_openai_v2_plan(api_key: &str, prompt: &str) -> Result<V2PlanChunkResponse, String> {
-    match request_openai_v2_plan_with_model(api_key, prompt, OPENAI_PRIMARY_HIGH_QUOTA_MODEL) {
-        Ok(response) => Ok(response),
-        // Fall back to a sibling OpenAI model (not Gemini) — stays on the same
-        // high-quota free tier rather than depending on a second provider's key.
-        Err(primary_error) => request_openai_v2_plan_with_model(api_key, prompt, OPENAI_SECONDARY_HIGH_QUOTA_MODEL)
-            .map_err(|fallback_error| format!("{primary_error} (fallback model also failed: {fallback_error})")),
-    }
-}
-
-fn request_openai_v2_plan_with_model(api_key: &str, prompt: &str, model: &str) -> Result<V2PlanChunkResponse, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build().map_err(|e| format!("Could not initialize OpenAI client: {e}"))?;
-    for attempt in 0u32..4 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_secs(5 * 2_u64.pow(attempt - 1)));
-        }
-        // Chat Completions API with json_object mode guarantees syntactically valid JSON —
-        // the Responses API has no such enforcement and can emit unescaped quotes mid-string.
-        let response = match client.post("https://api.openai.com/v1/chat/completions")
-            .bearer_auth(api_key)
-            .json(&json!({
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 16000,
-                "response_format": {"type": "json_object"}
-            }))
-            .send() {
-            Ok(r) => r,
-            Err(_) if attempt < 3 => continue,
-            Err(e) => return Err(format!("Could not reach OpenAI: {e}")),
-        };
-        let status = response.status();
-        let body: serde_json::Value = match response.json() {
-            Ok(value) => value,
-            Err(_) if attempt < 3 => continue,
-            Err(e) => return Err(format!("OpenAI returned unreadable response: {e}")),
-        };
-        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-            if attempt < 3 { continue; }
-            return Err(format!("OpenAI bulk planning failed ({status}, model {model}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("server error")));
-        }
-        if !status.is_success() {
-            return Err(format!("OpenAI bulk planning failed ({status}, model {model}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
-        }
-        let text = body.pointer("/choices/0/message/content").and_then(|v| v.as_str())
-            .ok_or("OpenAI returned no bulk plan.")?;
-        return normalize_bulk_plan_response(extract_json_from_text(text))
-            .map_err(|e| e.replace("Gemini", "OpenAI"));
-    }
-    Err(format!("OpenAI bulk planning failed after retries (model {model})."))
-}
-
-fn request_openai_directive_extract(api_key: &str, directive: &str) -> Result<StyleExtraction, String> {
-    let prompt = format!(
-        r#"You are a visual production assistant. Your job is to clean up a Style Directive so it contains ONLY global visual style rules — nothing about specific subjects, characters, objects, or scene content.
-
-Style Directive to clean:
-{directive}
-
-WHAT TO KEEP in the cleaned styleDirective (global aesthetics that apply to every still):
-- Art style name / brand (e.g. "Pixar 3D animation", "photorealistic", "watercolor illustration")
-- Color palette description (e.g. "warm oranges and browns", "desaturated cool tones")
-- Color grading (e.g. "teal and orange", "vintage film grain", "high saturation")
-- Rendering quality / medium (e.g. "polished 3D render", "oil painting texture", "cel-shaded")
-- Detail level and texture rules (e.g. "highly detailed", "smooth surfaces", "grainy film look")
-- Global mood / atmosphere (e.g. "cozy and heartwarming", "dark and moody") — only if NOT tied to a specific scene subject
-- Genre or era style (e.g. "cyberpunk", "fantasy", "retro 1980s")
-- Lighting style as a global rule (e.g. "cinematic lighting overall", "soft diffused look") — only very general rules, not per-shot specifics
-- Visual consistency rules, brand rules, exclusion rules (e.g. "no text", "always soft shadows")
-
-WHAT TO REMOVE from the styleDirective (these go in the User Prompt per still, NOT here):
-- Any specific characters: named people, animals, creatures (e.g. "a young woman", "a cute cat", "a wizard")
-- Any physical descriptions of subjects (e.g. "large eyes", "soft smile", "fluffy fur")
-- Any scene-specific content (e.g. "sitting on a chair", "in a forest")
-- Anything that answers "WHO is in the image" or "WHAT specific object/creature"
-
-Per-still structured fields to extract from imageSettings:
-Available fields: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, lensType, lightDirection, lightQuality, shadowType, contrast, focusType, exposure, motion, composition, saturation, vignette, grainIntensity, colorCastTint, surfaceEffects.
-Only populate imageSettings if the directive specifies a concrete per-shot value (e.g. "shallow depth of field" → depthOfField). Leave imageSettings as {{}} if nothing concrete is specified.
-
-Return JSON only — no markdown, no explanation:
-{{"styleDirective":"<global style rules only — no subjects, no scene content>","imageSettings":{{"<field>":"<value>"}}}}"#
-    );
-    match request_openai_directive_extract_with_model(api_key, &prompt, "gpt-4.1-mini") {
-        Ok(result) => Ok(result),
-        // Fall back to a sibling OpenAI model (not Gemini) — stays on the same
-        // high-quota free tier rather than depending on a second provider's key.
-        Err(primary_error) => request_openai_directive_extract_with_model(api_key, &prompt, OPENAI_PRIMARY_HIGH_QUOTA_MODEL)
-            .map_err(|fallback_error| format!("{primary_error} (fallback model also failed: {fallback_error})")),
-    }
-}
-
-fn request_openai_directive_extract_with_model(api_key: &str, prompt: &str, model: &str) -> Result<StyleExtraction, String> {
-    // Use Chat Completions with json_object mode to guarantee valid JSON output
-    let client = reqwest::blocking::Client::new();
-    let response = client.post("https://api.openai.com/v1/chat/completions")
-        .bearer_auth(api_key)
-        .json(&json!({
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 1200,
-            "response_format": {"type": "json_object"}
-        }))
-        .send()
-        .map_err(|e| format!("Could not reach OpenAI: {e}"))?;
-    let status = response.status();
-    let body: serde_json::Value = response.json()
-        .map_err(|e| format!("OpenAI returned unreadable response: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("OpenAI style extraction failed ({status}, model {model}): {}", body.pointer("/error/message").and_then(|v| v.as_str()).unwrap_or("unknown error")));
-    }
-    let text = body.pointer("/choices/0/message/content").and_then(|v| v.as_str())
-        .ok_or("OpenAI returned no style extraction.")?;
-    let cleaned = extract_json_from_text(text);
-    serde_json::from_str(cleaned).map_err(|_| "Style extraction was not valid JSON.".to_string())
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EducationalPlanResponse {
@@ -9593,34 +10059,6 @@ fn request_openai_style(api_key: &str, mime: &str, bytes: &[u8]) -> Result<Style
         .ok_or("OpenAI returned no style analysis.")?;
     let cleaned = extract_json_from_text(text);
     serde_json::from_str(cleaned).map_err(|_| "OpenAI style analysis was not valid JSON.".to_string())
-}
-
-/// Vision analysis for the Character Consistency toggle in Bulk Gen Config —
-/// unlike `request_openai_style`, the prompt asks for plain prose (not
-/// JSON), so the response is returned as-is with no parsing step.
-fn request_openai_character_description(api_key: &str, prompt: &str, mime: &str, bytes: &[u8], model: &str) -> Result<String, String> {
-    let image_url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
-    let response = reqwest::blocking::Client::new()
-        .post("https://api.openai.com/v1/responses")
-        .bearer_auth(api_key)
-        .json(&json!({
-            "model": model,
-            "input": [{"role":"user","content":[
-                {"type":"input_text","text":prompt},
-                {"type":"input_image","image_url":image_url}
-            ]}],
-            "max_output_tokens": 400
-        }))
-        .send().map_err(|error| format!("Could not reach OpenAI: {error}"))?;
-    let status = response.status();
-    let body: serde_json::Value = response.json()
-        .map_err(|error| format!("OpenAI returned an unreadable response: {error}"))?;
-    if !status.is_success() {
-        return Err(format!("OpenAI character analysis failed ({status}, model {model}): {}", body.pointer("/error/message").and_then(|value| value.as_str()).unwrap_or("unknown error")));
-    }
-    let text = body.pointer("/output/0/content/0/text").and_then(|value| value.as_str())
-        .ok_or("OpenAI returned no character analysis.")?;
-    Ok(text.trim().to_string())
 }
 
 fn gemini_generatecontent_url(auth: &GeminiAuth, model: &str) -> String {
@@ -9799,6 +10237,152 @@ fn normalize_bulk_plan_response(cleaned: &str) -> Result<V2PlanChunkResponse, St
 
     serde_json::from_value(value)
         .map_err(|e| format!("Gemini bulk plan was not valid JSON: {e}"))
+}
+
+/// Shared low-level Claude CLI invocation for every Bulk Gen planning call in
+/// this file (plan batches, style-directive extraction, character
+/// description, retroactive creative-instruction application) — none of
+/// these hold a billed API client the way the OpenAI/Gemini paths did before
+/// OpenAI was removed from Bulk Gen entirely. Instead this shells out to a
+/// locally installed, already-authenticated `claude` binary (Claude Code)
+/// and rides whatever Claude subscription is already logged into it on this
+/// machine — no ANTHROPIC_API_KEY, no separate bill. Same idea as the Python
+/// engine's `parse_structured_vision_claude_cli` (see that function's doc
+/// comment in ai_client.py), reimplemented directly in Rust since none of
+/// these calls need a Python round trip — the one call that needs vision
+/// (`request_claude_cli_character_description`) attaches its image via a
+/// scratch temp file + the CLI's own `Read` tool, the same trick the Python
+/// helper uses. `--no-session-persistence` keeps every call stateless — no
+/// leftover conversation history should leak from one planning batch into
+/// the next. `extra_args` carries whatever a specific caller needs on top of
+/// the shared flags (e.g. `--effort high` for planning, or
+/// `--tools Read --allowedTools Read --add-dir <dir>` for vision).
+fn run_claude_cli(prompt: &str, extra_args: &[&str]) -> Result<String, String> {
+    #[cfg(test)]
+    {
+        let _ = (prompt, extra_args);
+        Err("Claude CLI is not available in tests.".to_string())
+    }
+    #[cfg(not(test))]
+    {
+        let mut command = Command::new("claude");
+        command
+            .arg("-p").arg(prompt)
+            .arg("--output-format").arg("json")
+            .arg("--no-session-persistence")
+            .arg("--model").arg("sonnet")
+            .args(extra_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        command.creation_flags(0x08000000);
+        let output = command.output().map_err(|e| format!("Could not start the Claude CLI: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Claude CLI exited with an error: {}", stderr.trim()));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let payload: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|_| {
+            format!("Claude CLI returned non-JSON output: {}", stdout.chars().take(500).collect::<String>())
+        })?;
+        if payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Err(format!(
+                "Claude CLI reported an error: {}",
+                payload.get("result").and_then(|v| v.as_str()).unwrap_or("unknown error")
+            ));
+        }
+        payload.get("result").and_then(|v| v.as_str())
+            .map(str::trim).filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| "Claude CLI returned no text.".to_string())
+    }
+}
+
+/// Claude CLI plan request for `plan_bulk_visuals`. Worth spending `--effort
+/// high` on specifically — visual planning is a real creative/compositional
+/// judgment call across dozens of stills, not a quick lookup, and it draws
+/// no metered cost here the way it would through a billed API. Reuses
+/// `normalize_bulk_plan_response`/`extract_json_from_text` on the raw result
+/// text rather than requesting a JSON-schema-constrained reply — matches how
+/// Gemini is parsed here too, and avoids needing a JSON-schema generator for
+/// `V2PlanChunkResponse` on the Rust side.
+fn request_claude_cli_v2_plan(prompt: &str) -> Result<V2PlanChunkResponse, String> {
+    let text = run_claude_cli(prompt, &["--effort", "high"])?;
+    normalize_bulk_plan_response(extract_json_from_text(&text))
+        .map_err(|e| e.replace("Gemini", "Claude CLI"))
+}
+
+/// Claude CLI request for `extract_image_settings_from_directive`, routed
+/// through `run_claude_cli` — no metered cost, rides an existing Claude
+/// subscription instead of a billed API.
+fn request_claude_cli_directive_extract(directive: &str) -> Result<StyleExtraction, String> {
+    let prompt = format!(
+        r#"You are a visual production assistant. Your job is to clean up a Style Directive so it contains ONLY global visual style rules — nothing about specific subjects, characters, objects, or scene content.
+
+Style Directive to clean:
+{directive}
+
+WHAT TO KEEP in the cleaned styleDirective (global aesthetics that apply to every still):
+- Art style name / brand (e.g. "Pixar 3D animation", "photorealistic", "watercolor illustration")
+- Color palette description (e.g. "warm oranges and browns", "desaturated cool tones")
+- Color grading (e.g. "teal and orange", "vintage film grain", "high saturation")
+- Rendering quality / medium (e.g. "polished 3D render", "oil painting texture", "cel-shaded")
+- Detail level and texture rules (e.g. "highly detailed", "smooth surfaces", "grainy film look")
+- Global mood / atmosphere (e.g. "cozy and heartwarming", "dark and moody") — only if NOT tied to a specific scene subject
+- Genre or era style (e.g. "cyberpunk", "fantasy", "retro 1980s")
+- Lighting style as a global rule (e.g. "cinematic lighting overall", "soft diffused look") — only very general rules, not per-shot specifics
+- Visual consistency rules, brand rules, exclusion rules (e.g. "no text", "always soft shadows")
+
+WHAT TO REMOVE from the styleDirective (these go in the User Prompt per still, NOT here):
+- Any specific characters: named people, animals, creatures (e.g. "a young woman", "a cute cat", "a wizard")
+- Any physical descriptions of subjects (e.g. "large eyes", "soft smile", "fluffy fur")
+- Any scene-specific content (e.g. "sitting on a chair", "in a forest")
+- Anything that answers "WHO is in the image" or "WHAT specific object/creature"
+
+Per-still structured fields to extract from imageSettings:
+Available fields: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, lensType, lightDirection, lightQuality, shadowType, contrast, focusType, exposure, motion, composition, saturation, vignette, grainIntensity, colorCastTint, surfaceEffects.
+Only populate imageSettings if the directive specifies a concrete per-shot value (e.g. "shallow depth of field" → depthOfField). Leave imageSettings as {{}} if nothing concrete is specified.
+
+Return JSON only — no markdown, no explanation:
+{{"styleDirective":"<global style rules only — no subjects, no scene content>","imageSettings":{{"<field>":"<value>"}}}}"#
+    );
+    let text = run_claude_cli(&prompt, &[])?;
+    let cleaned = extract_json_from_text(&text);
+    serde_json::from_str(cleaned).map_err(|_| "Style extraction was not valid JSON.".to_string())
+}
+
+/// Deletes its directory (and everything written into it) when dropped —
+/// cleans up the scratch temp folder `request_claude_cli_character_description`
+/// writes the reference image into for the CLI's `Read` tool to load, on
+/// every exit path (success, error, or an early `?` return) without
+/// duplicating a cleanup call at each one.
+struct ScratchDirGuard(PathBuf);
+
+impl Drop for ScratchDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Claude CLI request for `character_description_for_video`'s vision call.
+/// The CLI has no way to attach an inline image the way the OpenAI/Gemini
+/// SDKs do, so the reference image is written out to a scratch temp file
+/// first and referenced by path in the prompt text — the only tool granted
+/// to the session (`Read`) is what actually loads it off disk on Claude's
+/// side. Mirrors the Python engine's `parse_structured_vision_claude_cli`
+/// (used by motion graphics) for the same reason, just without needing a
+/// Python round trip for this one call.
+fn request_claude_cli_character_description(prompt: &str, mime: &str, bytes: &[u8]) -> Result<String, String> {
+    let extension = mime.split('/').next_back().unwrap_or("png");
+    let scratch_dir = std::env::temp_dir().join(format!("ags-claude-vision-{}", Uuid::new_v4()));
+    fs::create_dir_all(&scratch_dir).map_err(|e| e.to_string())?;
+    let _guard = ScratchDirGuard(scratch_dir.clone());
+    let image_path = scratch_dir.join(format!("reference.{extension}"));
+    fs::write(&image_path, bytes).map_err(|e| e.to_string())?;
+    let full_prompt = format!("{prompt}\n\n[image: {}]", image_path.display());
+    let scratch_dir_arg = scratch_dir.to_string_lossy().into_owned();
+    run_claude_cli(&full_prompt, &["--tools", "Read", "--allowedTools", "Read", "--add-dir", scratch_dir_arg.as_str()])
 }
 
 fn request_gemini_v2_plan(auth: &GeminiAuth, prompt: &str) -> Result<V2PlanChunkResponse, String> {
@@ -10376,6 +10960,185 @@ fn collect_relative_files(
     Ok(())
 }
 
+/// Scans every `ATOMIC_ID_COLUMNS` value across every dumped table/row and
+/// assigns each distinct old id a fresh random one, so a bundle imported
+/// into any database (including the one it was exported from) never
+/// collides with an existing row. Table order/column role doesn't matter
+/// here — the same old id always maps to the same new id everywhere it's
+/// seen, whether that occurrence is a row's own primary key or a foreign
+/// key pointing at another row in the bundle, because `HashMap::entry`
+/// only ever assigns a mapping the first time an old id is encountered.
+fn seed_id_map(
+    tables: &std::collections::BTreeMap<String, Vec<serde_json::Map<String, serde_json::Value>>>,
+    id_map: &mut std::collections::HashMap<String, String>,
+) {
+    for table in PROJECT_TABLES {
+        let Some(rows) = tables.get(*table) else { continue };
+        let is_composite_table = COMPOSITE_ID_TABLES.contains(table);
+        for row in rows {
+            for column in ATOMIC_ID_COLUMNS {
+                if let Some(serde_json::Value::String(value)) = row.get(*column) {
+                    if value.is_empty() {
+                        continue;
+                    }
+                    // For the two namespaced tables, seed the bare suffix
+                    // (what every reference to this row elsewhere in the
+                    // bundle actually uses) — not the raw `video_id::...`
+                    // column value, which appears nowhere else verbatim.
+                    let key = if is_composite_table && *column == "id" {
+                        composite_id_suffix(value).to_string()
+                    } else {
+                        value.clone()
+                    };
+                    id_map.entry(key).or_insert_with(|| Uuid::new_v4().to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Splits a namespaced id (`video_id::suffix` or `video_id::variant::suffix`)
+/// on `::`, remaps the first segment (video_id) and the last segment
+/// (suffix) via exact lookups, and rejoins — never substring-matching.
+/// Substring matching was tried first and was wrong: this app's own
+/// split-sentence ids are literally one id with a digit appended (`s1` →
+/// `s1`/`s2`, or a group's `…d18` → `…d18`/`…d182`), so a shorter id is
+/// routinely a prefix of an unrelated longer one. Scanning for "does this
+/// string contain that id" would rewrite `s1` inside `s10`..`s19`, or
+/// `…d18` inside `…d182`, corrupting ids that were never supposed to
+/// change. Splitting on the known `::` boundaries first and only
+/// exact-matching each whole segment avoids that entirely.
+fn remap_composite_id(value: &str, id_map: &std::collections::HashMap<String, String>) -> String {
+    let mut parts: Vec<&str> = value.split("::").collect();
+    let Some(last) = parts.len().checked_sub(1).filter(|&n| n > 0) else {
+        return value.to_string();
+    };
+    let mapped_head = id_map.get(parts[0]).map(String::as_str);
+    let mapped_tail = id_map.get(parts[last]).map(String::as_str);
+    if mapped_head.is_none() && mapped_tail.is_none() {
+        return value.to_string();
+    }
+    if let Some(head) = mapped_head {
+        parts[0] = head;
+    }
+    if let Some(tail) = mapped_tail {
+        parts[last] = tail;
+    }
+    parts.join("::")
+}
+
+/// Remaps `visual_plan_groups.sentence_ids_json` (a plain JSON array of bare
+/// sentence-suffix ids) — parses it, exact-matches each element against
+/// `id_map`, re-serializes. Same "no substring matching" reasoning as
+/// `remap_composite_id`.
+fn remap_id_array_json(value: &str, id_map: &std::collections::HashMap<String, String>) -> String {
+    let Ok(mut ids) = serde_json::from_str::<Vec<String>>(value) else {
+        return value.to_string();
+    };
+    let mut changed = false;
+    for id in ids.iter_mut() {
+        if let Some(mapped) = id_map.get(id.as_str()) {
+            if mapped != id {
+                *id = mapped.clone();
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return value.to_string();
+    }
+    serde_json::to_string(&ids).unwrap_or_else(|_| value.to_string())
+}
+
+/// Remaps `visual_plan_meta.original_sentences_json` (a JSON array of
+/// sentence-snapshot objects, each with a bare-suffix `id` field) — parses,
+/// exact-matches each object's `id`, re-serializes. Every other field
+/// (text, timing) is copied through untouched.
+fn remap_sentence_snapshot_json(value: &str, id_map: &std::collections::HashMap<String, String>) -> String {
+    let Ok(mut items) = serde_json::from_str::<Vec<serde_json::Value>>(value) else {
+        return value.to_string();
+    };
+    let mut changed = false;
+    for item in items.iter_mut() {
+        let serde_json::Value::Object(obj) = item else { continue };
+        let Some(serde_json::Value::String(id)) = obj.get("id") else { continue };
+        if let Some(mapped) = id_map.get(id.as_str()) {
+            if mapped != id {
+                let mapped = mapped.clone();
+                obj.insert("id".to_string(), serde_json::Value::String(mapped));
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return value.to_string();
+    }
+    serde_json::to_string(&items).unwrap_or_else(|_| value.to_string())
+}
+
+/// Rewrites every id-shaped value in one dumped row using `id_map`: an
+/// exact lookup for `ATOMIC_ID_COLUMNS`, and structured (never
+/// substring-based — see `remap_composite_id`) handling for the two
+/// namespaced tables' own `id` column and the JSON columns that embed ids.
+/// Any id with no entry in the map (nothing in the bundle ever introduced
+/// it — e.g. a stale id left over in a point-in-time snapshot) is left
+/// exactly as exported.
+fn remap_row(
+    table: &str,
+    mut row: serde_json::Map<String, serde_json::Value>,
+    id_map: &std::collections::HashMap<String, String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let is_composite_table = COMPOSITE_ID_TABLES.contains(&table);
+    for column in ATOMIC_ID_COLUMNS {
+        // `id` on the two namespaced tables is `video_id::[variant::]suffix`
+        // — not a single opaque id — handled below via remap_composite_id.
+        if is_composite_table && *column == "id" {
+            continue;
+        }
+        if let Some(serde_json::Value::String(value)) = row.get(*column) {
+            if let Some(mapped) = id_map.get(value) {
+                if mapped != value {
+                    row.insert((*column).to_string(), serde_json::Value::String(mapped.clone()));
+                }
+            }
+        }
+    }
+    if is_composite_table {
+        if let Some(serde_json::Value::String(value)) = row.get("id") {
+            let updated = remap_composite_id(value, id_map);
+            if &updated != value {
+                row.insert("id".to_string(), serde_json::Value::String(updated));
+            }
+        }
+    }
+    if let Some(serde_json::Value::String(value)) = row.get("sentence_ids_json") {
+        let updated = remap_id_array_json(value, id_map);
+        if &updated != value {
+            row.insert("sentence_ids_json".to_string(), serde_json::Value::String(updated));
+        }
+    }
+    if let Some(serde_json::Value::String(value)) = row.get("original_sentences_json") {
+        let updated = remap_sentence_snapshot_json(value, id_map);
+        if &updated != value {
+            row.insert("original_sentences_json".to_string(), serde_json::Value::String(updated));
+        }
+    }
+    row
+}
+
+fn json_to_sql(value: &serde_json::Value) -> Box<dyn rusqlite::ToSql> {
+    match value {
+        serde_json::Value::Null => Box::new(Option::<String>::None),
+        serde_json::Value::Bool(flag) => Box::new(*flag as i64),
+        serde_json::Value::Number(number) => match number.as_i64() {
+            Some(value) => Box::new(value),
+            None => Box::new(number.as_f64().unwrap_or(0.0)),
+        },
+        serde_json::Value::String(text) => Box::new(text.clone()),
+        other => Box::new(other.to_string()),
+    }
+}
+
 fn validate_bundle_path(path: &str) -> Result<(), String> {
     let candidate = Path::new(path);
     if candidate.is_absolute()
@@ -10386,6 +11149,72 @@ fn validate_bundle_path(path: &str) -> Result<(), String> {
         return Err("Project bundle contains an unsafe path.".into());
     }
     Ok(())
+}
+
+/// Parses the `timing.txt` written by `video_export_engine.py`'s editor
+/// bundle export — tab-separated lines of
+/// `<clip file>\t<kind>\t<start>s - <end>s\t(<duration>s)`, interleaved with
+/// free-form instruction prose that this simply ignores (any line that
+/// doesn't start with a recognized clip filename is skipped).
+fn parse_timing_file(text: &str) -> Result<Vec<(String, f64, f64)>, String> {
+    const CLIP_EXTENSIONS: &[&str] = &["mp4", "mov", "webm", "mkv", "png", "jpg", "jpeg", "webp"];
+    let mut segments = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let file_name = parts[0].trim();
+        let has_clip_extension = file_name
+            .rsplit('.')
+            .next()
+            .map(|ext| CLIP_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+            .unwrap_or(false);
+        if !has_clip_extension {
+            continue;
+        }
+        let Some((start_str, end_str)) = parts[2].trim().split_once(" - ") else { continue };
+        let Some(start_str) = start_str.trim().strip_suffix('s') else { continue };
+        let Some(end_str) = end_str.trim().strip_suffix('s') else { continue };
+        let (Ok(start), Ok(end)) = (start_str.parse::<f64>(), end_str.parse::<f64>()) else { continue };
+        segments.push((file_name.to_string(), start, end));
+    }
+    if segments.is_empty() {
+        return Err("timing.txt did not contain any recognizable clip timing entries.".into());
+    }
+    Ok(segments)
+}
+
+/// Parses a plain `.srt` file into `(start_seconds, end_seconds, text)`
+/// entries. Tolerant of the index-number line, CRLF line endings, and
+/// multi-line captions — anything it can't confidently parse is skipped
+/// rather than aborting the whole import.
+fn parse_srt(text: &str) -> Vec<(f64, f64, String)> {
+    let normalized = text.replace("\r\n", "\n");
+    let mut entries = Vec::new();
+    for block in normalized.split("\n\n") {
+        let lines: Vec<&str> = block.lines().filter(|line| !line.trim().is_empty()).collect();
+        let Some(timestamp_index) = lines.iter().position(|line| line.contains("-->")) else { continue };
+        let Some((start_str, end_str)) = lines[timestamp_index].split_once("-->") else { continue };
+        let (Some(start), Some(end)) = (parse_srt_timestamp(start_str.trim()), parse_srt_timestamp(end_str.trim())) else { continue };
+        let text = lines[timestamp_index + 1..].join(" ").trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        entries.push((start, end, text));
+    }
+    entries
+}
+
+fn parse_srt_timestamp(value: &str) -> Option<f64> {
+    let value = value.trim();
+    let (time_part, millis_part) = value.split_once(',').or_else(|| value.split_once('.'))?;
+    let mut components = time_part.split(':');
+    let hours: f64 = components.next()?.trim().parse().ok()?;
+    let minutes: f64 = components.next()?.trim().parse().ok()?;
+    let seconds: f64 = components.next()?.trim().parse().ok()?;
+    let millis: f64 = millis_part.trim().parse().ok()?;
+    Some(hours * 3600.0 + minutes * 60.0 + seconds + millis / 1000.0)
 }
 
 #[cfg(test)]
@@ -10937,12 +11766,21 @@ mod tests {
                 .file_count
                 >= 2
         );
-        let imported = repo.import_project_bundle(&bundle).unwrap();
+        // Imports into an existing, unrelated channel — the destination
+        // someone picks, exactly like "+ New video" — never a channel of
+        // its own.
+        let destination_channel = repo.create_channel("Friend's Channel", None).unwrap();
+        let imported = repo
+            .import_project_bundle(&bundle, &destination_channel.id)
+            .unwrap();
         assert_ne!(imported.id, video.id);
+        assert_eq!(imported.channel_id, destination_channel.id);
+        assert_eq!(repo.list_channels(false).unwrap().len(), 2);
         assert_eq!(
             repo.get_video_inputs(&imported.id).unwrap().script_text,
             "Portable script."
         );
+        assert!(repo.import_project_bundle(&bundle, "missing-channel").is_err());
         assert!(temp
             .path()
             .join("Projects")
@@ -10952,10 +11790,368 @@ mod tests {
             .exists());
     }
 
+    /// The shallow v1 bundle only ever round-tripped the raw script — a
+    /// friend importing it got an empty Visuals/Animate/Editor. This drives
+    /// a real project through visual plan, an image render, the Editor
+    /// timeline, a media-library asset, and a music clip, then asserts the
+    /// imported copy's own rows are internally consistent (every foreign
+    /// key resolves to a row that actually exists in the *imported*
+    /// project) rather than merely checking the old ids were preserved —
+    /// they're deliberately not, so a bundle can be imported anywhere,
+    /// including back into the database it was exported from, without id
+    /// collisions.
+    #[test]
+    fn project_bundle_round_trips_full_project_state() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Source Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Source Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        assert!(!plan.groups.is_empty());
+        let group_id = plan.groups[0].id.clone();
+
+        let prompt = repo
+            .create_prompt_version(&video.id, &group_id, "{}", "system prompt", "scene prompt")
+            .unwrap();
+        let render_dir = temp
+            .path()
+            .join("Projects")
+            .join(&channel.id)
+            .join(&video.id)
+            .join("renders")
+            .join(&group_id);
+        fs::create_dir_all(&render_dir).unwrap();
+        fs::write(render_dir.join("render-v1.png"), b"render-bytes").unwrap();
+        let render = repo
+            .insert_image_render(
+                "render-1", &video.id, &group_id, 1, &prompt.id, "render-v1.png",
+                &format!("renders/{group_id}/render-v1.png"), None, None, "generation",
+            )
+            .unwrap();
+        let timeline = repo.build_timeline(&video.id).unwrap();
+        assert!(timeline.clips.iter().any(|clip| clip.render_id.as_deref() == Some(render.id.as_str())));
+
+        let still_path = temp.path().join("logo.png");
+        fs::write(&still_path, b"still-bytes").unwrap();
+        let media_asset = repo
+            .import_media_library_asset(&video.id, &still_path, Some("still"), temp.path())
+            .unwrap();
+        let audio_path = temp.path().join("song.mp3");
+        fs::write(&audio_path, b"song-bytes").unwrap();
+        let music_asset = repo
+            .import_media_library_asset(&video.id, &audio_path, Some("audio"), temp.path())
+            .unwrap();
+        repo.add_music_clip(&video.id, &music_asset.id, 0.0).unwrap();
+
+        let bundle = temp.path().join("full-project.agsproj");
+        repo.export_project_bundle(&video.id, &bundle).unwrap();
+        // Imported back into the very same channel it came from — this is
+        // the no-collision case that matters most, since ids from the
+        // export are already live in this exact database.
+        let imported = repo.import_project_bundle(&bundle, &channel.id).unwrap();
+        assert_ne!(imported.id, video.id);
+        assert_eq!(imported.channel_id, channel.id);
+        assert_eq!(repo.list_channels(false).unwrap().len(), 1);
+
+        // Visual plan carried over, with fresh ids.
+        let imported_plan = repo.get_visual_plan(&imported.id).unwrap();
+        assert_eq!(imported_plan.groups.len(), plan.groups.len());
+        assert_eq!(imported_plan.sentences.len(), plan.sentences.len());
+        assert_ne!(imported_plan.groups[0].id, group_id);
+        // A group's sentence_ids_json must point at THIS project's sentences,
+        // not the leftover ids from the source project.
+        let imported_sentence_ids: std::collections::HashSet<_> =
+            imported_plan.sentences.iter().map(|s| s.id.as_str()).collect();
+        assert!(imported_plan.groups[0]
+            .sentence_ids
+            .iter()
+            .all(|id| imported_sentence_ids.contains(id.as_str())));
+
+        // The render survived, with its file, under the new group id.
+        let imported_group_id = imported_plan.groups[0].id.clone();
+        let imported_renders = repo.list_image_renders(&imported.id, &imported_group_id).unwrap();
+        assert_eq!(imported_renders.len(), 1);
+        assert_ne!(imported_renders[0].id, render.id);
+        assert_ne!(imported_renders[0].prompt_version_id, prompt.id);
+        assert!(temp
+            .path()
+            .join("Projects")
+            .join(&imported.channel_id)
+            .join(&imported.id)
+            .join(&imported_renders[0].relative_path)
+            .exists());
+
+        // The Editor timeline's clip points at a render that actually
+        // exists in the imported project (not the old, now-foreign id).
+        let imported_timeline = repo.get_timeline(&imported.id).unwrap();
+        let imported_render_ids: std::collections::HashSet<_> =
+            imported_renders.iter().map(|r| r.id.as_str()).collect();
+        assert!(imported_timeline
+            .clips
+            .iter()
+            .any(|clip| clip.render_id.as_deref().is_some_and(|id| imported_render_ids.contains(id))));
+
+        // Media library + music clip survived and reference each other correctly.
+        let imported_stills = repo.list_media_library_assets(&imported.id, Some("still")).unwrap();
+        assert_eq!(imported_stills.len(), 1);
+        assert_ne!(imported_stills[0].id, media_asset.id);
+        assert_eq!(imported_timeline.music_clips.len(), 1);
+        assert_ne!(imported_timeline.music_clips[0].media_library_asset_id, music_asset.id);
+        let imported_audio_assets: std::collections::HashSet<_> = repo
+            .list_media_library_assets(&imported.id, Some("audio"))
+            .unwrap()
+            .into_iter()
+            .map(|asset| asset.id)
+            .collect();
+        assert!(imported_audio_assets.contains(&imported_timeline.music_clips[0].media_library_asset_id));
+
+        // Re-importing the exact same bundle a second time (e.g. the friend
+        // downloads it twice, or it's imported back on the machine that
+        // exported it) must not collide on any primary key.
+        let second_import = repo.import_project_bundle(&bundle, &channel.id).unwrap();
+        assert_ne!(second_import.id, imported.id);
+        assert_ne!(second_import.id, video.id);
+        assert_eq!(repo.get_visual_plan(&second_import.id).unwrap().groups.len(), plan.groups.len());
+    }
+
+    /// Regression test for a real bug found in production: sentences and
+    /// groups get plain sequential ids (`s1`, `s2`, … and `g1`, `g2`, …), so
+    /// `s1` is a literal string prefix of `s10`..`s19`, and `g1` of
+    /// `g10`..`g19`. An earlier version of `remap_row` rewrote ids with a
+    /// substring scan-and-replace, which would find `s1` *inside* `s10` and
+    /// corrupt it. On a real 82-still project this silently broke ~45 of
+    /// the 82 stills — they looked generated (the render existed) but the
+    /// Visuals tab showed "No image generated yet" because the timeline
+    /// clip's `render_id`/`group_id` no longer pointed at a row that
+    /// existed under the new, mangled id. This builds 12 sentences/groups
+    /// (enough to guarantee `s1`/`g1` collide with `s10`+/`g10`+) directly
+    /// via SQL — bypassing the generation pipeline's own grouping
+    /// heuristics, which aren't the thing under test — and asserts every
+    /// single one survives the round trip correctly paired, not just that
+    /// the totals match.
+    #[test]
+    fn project_bundle_remaps_prefix_colliding_sequential_ids() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let render_root = temp
+            .path()
+            .join("Projects")
+            .join(&channel.id)
+            .join(&video.id)
+            .join("renders");
+
+        repo.connection.execute(
+            "INSERT INTO visual_plan_meta(video_id,timing_source,generated_at,updated_at) VALUES(?1,'test',?2,?2)",
+            params![video.id, Utc::now().to_rfc3339()],
+        ).unwrap();
+
+        for n in 1..=12i64 {
+            let sentence_id = format!("{}::s{n}", video.id);
+            repo.connection.execute(
+                "INSERT INTO visual_plan_sentences(id,video_id,ordinal,text,start_seconds,end_seconds) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![sentence_id, video.id, n, format!("Sentence {n}."), (n - 1) as f64 * 2.0, n as f64 * 2.0],
+            ).unwrap();
+            let group_id = format!("{}::current::g{n}", video.id);
+            repo.connection.execute(
+                "INSERT INTO visual_plan_groups(id,video_id,ordinal,label,kind,sentence_ids_json,is_original) VALUES(?1,?2,?3,?4,'subject',?5,0)",
+                params![group_id, video.id, n, format!("Scene {n}"), serde_json::to_string(&vec![format!("s{n}")]).unwrap()],
+            ).unwrap();
+
+            let group_suffix = format!("g{n}");
+            let prompt = repo.create_prompt_version(&video.id, &group_suffix, "{}", "system", "scene").unwrap();
+            let render_dir = render_root.join(&group_suffix);
+            fs::create_dir_all(&render_dir).unwrap();
+            fs::write(render_dir.join("render-v1.png"), format!("bytes-{n}")).unwrap();
+            repo.insert_image_render(
+                &format!("render-{n}"), &video.id, &group_suffix, 1, &prompt.id, "render-v1.png",
+                &format!("renders/{group_suffix}/render-v1.png"), None, None, "generation",
+            ).unwrap();
+        }
+        let timeline = repo.build_timeline(&video.id).unwrap();
+        assert_eq!(timeline.clips.len(), 12);
+        assert!(timeline.clips.iter().all(|clip| clip.render_id.is_some()));
+
+        let bundle = temp.path().join("collision-test.agsproj");
+        repo.export_project_bundle(&video.id, &bundle).unwrap();
+        let imported = repo.import_project_bundle(&bundle, &channel.id).unwrap();
+
+        let imported_plan = repo.get_visual_plan(&imported.id).unwrap();
+        assert_eq!(imported_plan.groups.len(), 12);
+        assert_eq!(imported_plan.sentences.len(), 12);
+        let imported_sentence_ids: std::collections::HashSet<_> =
+            imported_plan.sentences.iter().map(|s| s.id.as_str()).collect();
+
+        let imported_timeline = repo.get_timeline(&imported.id).unwrap();
+        assert_eq!(imported_timeline.clips.len(), 12);
+        let mut linked_render_ids = std::collections::HashSet::new();
+        for group in &imported_plan.groups {
+            // Every group's own sentence must resolve within THIS project —
+            // this is exactly what the substring-scan bug corrupted for g1
+            // (whose sentence_ids_json entry "s1" got mangled wherever an
+            // unrelated s10/s11/s12 remap ran first).
+            assert!(
+                group.sentence_ids.iter().all(|id| imported_sentence_ids.contains(id.as_str())),
+                "group {} (ordinal {}) has a sentence id that doesn't exist in the imported plan: {:?}",
+                group.id, group.ordinal, group.sentence_ids,
+            );
+            let renders = repo.list_image_renders(&imported.id, &group.id).unwrap();
+            assert_eq!(
+                renders.iter().filter(|r| r.is_final).count(), 1,
+                "group {} (ordinal {}) should have exactly one final render after import", group.id, group.ordinal,
+            );
+            let render = renders.iter().find(|r| r.is_final).unwrap();
+            assert!(temp.path().join("Projects").join(&imported.channel_id).join(&imported.id).join(&render.relative_path).exists());
+            linked_render_ids.insert(render.id.clone());
+
+            let clip = imported_timeline.clips.iter().find(|c| c.group_id == group.id)
+                .unwrap_or_else(|| panic!("no timeline clip for group {} (ordinal {})", group.id, group.ordinal));
+            assert_eq!(
+                clip.render_id.as_deref(), Some(render.id.as_str()),
+                "timeline clip for group {} (ordinal {}) points at the wrong render", group.id, group.ordinal,
+            );
+        }
+        // All 12 renders are distinct — none of them collapsed onto each
+        // other via a corrupted shared id.
+        assert_eq!(linked_render_ids.len(), 12);
+    }
+
+    #[test]
+    fn remap_composite_id_does_not_corrupt_ids_that_are_prefixes_of_others() {
+        let mut id_map = std::collections::HashMap::new();
+        id_map.insert("video-a".to_string(), "video-Z".to_string());
+        id_map.insert("s1".to_string(), "sentence-A".to_string());
+        id_map.insert("s10".to_string(), "sentence-B".to_string());
+        id_map.insert("g1".to_string(), "group-A".to_string());
+        id_map.insert("g18".to_string(), "group-B".to_string());
+
+        assert_eq!(remap_composite_id("video-a::s1", &id_map), "video-Z::sentence-A");
+        assert_eq!(remap_composite_id("video-a::s10", &id_map), "video-Z::sentence-B");
+        assert_eq!(remap_composite_id("video-a::current::g1", &id_map), "video-Z::current::group-A");
+        assert_eq!(remap_composite_id("video-a::current::g18", &id_map), "video-Z::current::group-B");
+        // The video_id segment still gets remapped even when the suffix has
+        // no entry in the map (e.g. a group with no matching row survived
+        // in this bundle) — only the unmapped suffix is left untouched.
+        assert_eq!(remap_composite_id("video-a::original::g99", &id_map), "video-Z::original::g99");
+        // Nothing in the map at all: the whole id is left untouched.
+        assert_eq!(remap_composite_id("video-b::original::g99", &id_map), "video-b::original::g99");
+    }
+
+    #[test]
+    fn remap_id_array_json_does_not_corrupt_prefix_colliding_ids() {
+        let mut id_map = std::collections::HashMap::new();
+        id_map.insert("s1".to_string(), "sentence-A".to_string());
+        id_map.insert("s10".to_string(), "sentence-B".to_string());
+        id_map.insert("s11".to_string(), "sentence-C".to_string());
+
+        let result = remap_id_array_json(r#"["s1","s10","s11"]"#, &id_map);
+        let parsed: Vec<String> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed, vec!["sentence-A", "sentence-B", "sentence-C"]);
+    }
+
+    #[test]
+    fn remap_sentence_snapshot_json_remaps_id_field_only() {
+        let mut id_map = std::collections::HashMap::new();
+        id_map.insert("s1".to_string(), "sentence-A".to_string());
+        id_map.insert("s10".to_string(), "sentence-B".to_string());
+
+        let source = r#"[{"id":"s1","ordinal":1,"text":"Hello","startSeconds":0.0,"endSeconds":1.0},{"id":"s10","ordinal":2,"text":"World","startSeconds":1.0,"endSeconds":2.0}]"#;
+        let result = remap_sentence_snapshot_json(source, &id_map);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed[0]["id"], "sentence-A");
+        assert_eq!(parsed[0]["text"], "Hello");
+        assert_eq!(parsed[1]["id"], "sentence-B");
+        assert_eq!(parsed[1]["text"], "World");
+    }
+
     #[test]
     fn rejects_unsafe_bundle_paths() {
         assert!(validate_bundle_path("../secret.txt").is_err());
         assert!(validate_bundle_path("renders/safe.png").is_ok());
+    }
+
+    #[test]
+    fn imports_editor_bundle_asset_folder() {
+        let (temp, repo) = repository();
+        let source_dir = temp.path().join("Life OK").join("Project 1");
+        let clips_dir = source_dir.join("clips");
+        fs::create_dir_all(&clips_dir).unwrap();
+        fs::write(clips_dir.join("seg_0001.mp4"), b"clip-one").unwrap();
+        fs::write(clips_dir.join("seg_0002.mp4"), b"clip-two").unwrap();
+        fs::write(source_dir.join("narration.mp3"), b"narration-bytes").unwrap();
+        fs::write(
+            source_dir.join("timing.txt"),
+            "Import the files in clips/ in numeric filename order onto a video track.\n\n\
+             Narration audio starts at 0 on its track and needs no further alignment.\n\n\
+             seg_0001.mp4\timage\t0.000s - 3.000s\t(3.000s)\n\
+             seg_0002.mp4\timage\t3.000s - 7.500s\t(4.500s)\n",
+        )
+        .unwrap();
+        fs::write(
+            source_dir.join("captions.srt"),
+            "1\n00:00:00,000 --> 00:00:02,500\nHello there.\n\n\
+             2\n00:00:02,500 --> 00:00:05,000\nSecond caption line.\n",
+        )
+        .unwrap();
+
+        let imported = repo.import_asset_folder(&source_dir, temp.path()).unwrap();
+        assert_eq!(imported.stage, "timeline");
+
+        let channel: String = repo.connection.query_row(
+            "SELECT name FROM channels WHERE id=?1", [&imported.channel_id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(channel, "Life OK (Imported)");
+        assert_eq!(imported.title, "Project 1");
+
+        let timeline = repo.get_timeline(&imported.id).unwrap();
+        assert_eq!(timeline.clips.len(), 2);
+        assert_eq!(timeline.clips[0].clip_kind, "imported-clip");
+        assert_eq!(timeline.clips[0].start_seconds, 0.0);
+        assert_eq!(timeline.clips[0].end_seconds, 3.0);
+
+        // A raw asset-folder import has no visual plan at all — Visuals/
+        // Animate/Editor all read the workspace to render, and it must
+        // degrade to empty rather than erroring (get_visual_plan itself
+        // still errors for this video; only the display-only aggregator
+        // tolerates the missing plan).
+        assert!(repo.get_visual_plan(&imported.id).is_err());
+        let workspace = repo.get_image_workspace(&imported.id).unwrap();
+        assert!(workspace.groups.is_empty());
+        assert!(workspace.sentences.is_empty());
+        assert_eq!(timeline.clips[1].start_seconds, 3.0);
+        assert_eq!(timeline.clips[1].end_seconds, 7.5);
+
+        let clips = repo.list_media_library_assets(&imported.id, Some("clip")).unwrap();
+        assert_eq!(clips.len(), 2);
+
+        let inputs = repo.get_video_inputs(&imported.id).unwrap();
+        assert!(inputs.audio.is_some());
+        assert_eq!(inputs.script_text, "Hello there. Second caption line.");
+
+        let captions = repo.get_timeline(&imported.id).unwrap().caption_clips;
+        assert_eq!(captions.len(), 2);
+        assert_eq!(captions[0].text, "Hello there.");
+        assert_eq!(captions[1].start_seconds, 2.5);
+    }
+
+    #[test]
+    fn parses_timing_file_and_srt() {
+        let segments = parse_timing_file(
+            "instructions here\n\nseg_0001.mp4\timage\t0.000s - 3.000s\t(3.000s)\nseg_0002.mp4\timage\t3.000s - 7.500s\t(4.500s)\n",
+        ).unwrap();
+        assert_eq!(segments, vec![
+            ("seg_0001.mp4".to_string(), 0.0, 3.0),
+            ("seg_0002.mp4".to_string(), 3.0, 7.5),
+        ]);
+        assert!(parse_timing_file("no clip lines here").is_err());
+
+        let entries = parse_srt("1\n00:00:00,000 --> 00:00:02,500\nHello there.\n\n2\n00:00:02,500 --> 00:00:05,000\nSecond line.\n");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (0.0, 2.5, "Hello there.".to_string()));
+        assert_eq!(entries[1].1, 5.0);
     }
 
     #[test]
@@ -11036,6 +12232,101 @@ mod tests {
     }
 
     #[test]
+    fn denoises_audio_asset_non_destructively() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio_path = temp.path().join("narration.mp3");
+        fs::write(&audio_path, b"mp3-bytes").unwrap();
+        let asset = repo
+            .import_media_library_asset(&video.id, &audio_path, Some("audio"), temp.path())
+            .unwrap();
+
+        let cleaned = repo.denoise_media_library_asset(&asset.id, temp.path()).unwrap();
+        // A brand-new asset, not a mutation of the original.
+        assert_ne!(cleaned.id, asset.id);
+        assert_eq!(cleaned.kind, "audio");
+        assert_eq!(cleaned.original_name, "narration (denoised).mp3");
+        assert_eq!(cleaned.video_id, video.id);
+
+        // The original is untouched and still listed alongside the cleaned copy.
+        let all = repo.list_media_library_assets(&video.id, Some("audio")).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|item| item.id == asset.id));
+        assert!(all.iter().any(|item| item.id == cleaned.id));
+
+        // Only Audio-tab assets qualify.
+        let image_path = temp.path().join("logo.png");
+        fs::write(&image_path, b"png-bytes").unwrap();
+        let still_asset = repo
+            .import_media_library_asset(&video.id, &image_path, Some("still"), temp.path())
+            .unwrap();
+        assert!(repo.denoise_media_library_asset(&still_asset.id, temp.path()).is_err());
+    }
+
+    #[test]
+    fn edited_captions_fall_back_to_estimated_word_highlight_timing() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        repo.connection.execute(
+            "INSERT INTO timelines(video_id,duration_seconds,playhead_seconds,zoom,updated_at) VALUES(?1,10,0,1,'now')",
+            [&video.id],
+        ).unwrap();
+        let real_words = serde_json::to_string(&vec![
+            CaptionWord { text: "Hello".into(), start_seconds: 0.0, end_seconds: 0.4 },
+            CaptionWord { text: "world.".into(), start_seconds: 0.4, end_seconds: 1.0 },
+        ]).unwrap();
+        let clip_id = Uuid::new_v4().to_string();
+        repo.connection.execute(
+            "INSERT INTO timeline_caption_clips(id,video_id,source_chunk_index,text,ordinal,start_seconds,end_seconds,words_json) VALUES(?1,?2,NULL,'Hello world.',0,0,1,?3)",
+            params![clip_id, video.id, real_words],
+        ).unwrap();
+
+        // Real per-word timing round-trips untouched.
+        let before = repo.get_timeline(&video.id).unwrap();
+        let clip = before.caption_clips.iter().find(|c| c.id == clip_id).unwrap();
+        let words = clip.words.as_ref().expect("real words should be present");
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].text, "Hello");
+        assert_eq!(words[1].end_seconds, 1.0);
+
+        // Editing the text drops the now-stale real timing (existing
+        // behavior — the words no longer correspond to the new text)...
+        let after_edit = repo
+            .update_caption_clip_text(&video.id, &clip_id, "A completely different sentence now.")
+            .unwrap();
+        let edited = after_edit.caption_clips.iter().find(|c| c.id == clip_id).unwrap();
+        // ...but word highlight still has something to animate through: an
+        // estimated timing spanning the clip's own [start, end], one entry
+        // per word of the NEW text, in order, filling the whole window.
+        let estimated = edited.words.as_ref().expect("should fall back to an estimate, not None");
+        assert_eq!(estimated.len(), 5); // "A completely different sentence now."
+        assert_eq!(estimated[0].text, "A");
+        assert_eq!(estimated.last().unwrap().text, "now.");
+        assert_eq!(estimated[0].start_seconds, edited.start_seconds);
+        assert!((estimated.last().unwrap().end_seconds - edited.end_seconds).abs() < 1e-9);
+        // Windows are contiguous (no gaps a highlight could fall through)
+        // and in order.
+        for pair in estimated.windows(2) {
+            assert_eq!(pair[0].end_seconds, pair[1].start_seconds);
+        }
+        // Longer words get proportionally more time than short ones —
+        // "completely" should span more than "A".
+        let a_span = estimated[0].end_seconds - estimated[0].start_seconds;
+        let completely_span = estimated[1].end_seconds - estimated[1].start_seconds;
+        assert!(completely_span > a_span);
+
+        // The estimate is never written back to the database as if it were
+        // real — only NULL is stored, so a future real transcription is
+        // never shadowed by a stale-looking estimate.
+        let stored_words_json: Option<String> = repo.connection.query_row(
+            "SELECT words_json FROM timeline_caption_clips WHERE id=?1", [&clip_id], |row| row.get(0),
+        ).unwrap();
+        assert!(stored_words_json.is_none());
+    }
+
+    #[test]
     fn music_clips_persist_settings_and_reject_overlap() {
         let (temp, repo) = repository();
         let channel = repo.create_channel("Channel", None).unwrap();
@@ -11089,7 +12380,7 @@ mod tests {
 
         assert!(repo.set_timeline_clip_color_filter(&video.id, &first_clip_id, "bogus", 50.0).is_err());
         assert!(repo.set_timeline_clip_transition(&video.id, &first_clip_id, "dip-to-white").is_ok());
-        for join_transition in ["cross-fade", "slide-left", "slide-right", "zoom-blur"] {
+        for join_transition in ["cross-fade", "slide-left", "slide-right", "zoom-blur", "whip-pan", "blur-transition"] {
             assert!(
                 repo.set_timeline_clip_transition_out(&video.id, &first_clip_id, join_transition).is_ok(),
                 "{join_transition} should be a valid transition_out value",
@@ -11380,6 +12671,61 @@ mod tests {
 
         // A still with no cached animation at all can't be "restored".
         assert!(repo.restore_animation_clip(&video.id, "clip2").is_err());
+    }
+
+    #[test]
+    fn extrapolate_stills_clears_motion_only_on_clips_whose_duration_actually_changed() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+
+        repo.connection.execute(
+            "INSERT INTO timelines(video_id,duration_seconds,playhead_seconds,zoom,updated_at) VALUES(?1,20,0,1,'now')",
+            [&video.id],
+        ).unwrap();
+        // clip1 has a gap before clip2 (5 -> 7) — its end must stretch, so its
+        // motion recipe should be invalidated.
+        repo.connection.execute(
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label) VALUES('clip1',?1,'g1',NULL,1,0,5,'Scene 1')",
+            [&video.id],
+        ).unwrap();
+        // clip2 already abuts clip3 exactly (10 -> 10) — no gap, so its end
+        // should end up unchanged and its motion recipe should survive.
+        repo.connection.execute(
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label) VALUES('clip2',?1,'g2',NULL,2,7,10,'Scene 2')",
+            [&video.id],
+        ).unwrap();
+        // clip3 is the last clip and its end (20) already covers the total
+        // duration (20), so it's untouched too.
+        repo.connection.execute(
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label) VALUES('clip3',?1,'g3',NULL,3,10,20,'Scene 3')",
+            [&video.id],
+        ).unwrap();
+
+        repo.set_timeline_clip_motion_graphic(&video.id, "clip1", Some("push in"), Some(r#"{"cameraEffect":"push_in"}"#), Some("test reason")).unwrap();
+        repo.set_timeline_clip_motion_graphic(&video.id, "clip2", Some("pan left"), Some(r#"{"cameraEffect":"position_pan"}"#), Some("test reason")).unwrap();
+
+        let timeline = repo.extrapolate_stills_to_fill_gaps(&video.id, 20.0).unwrap();
+        let clip1 = timeline.clips.iter().find(|c| c.id == "clip1").unwrap();
+        let clip2 = timeline.clips.iter().find(|c| c.id == "clip2").unwrap();
+        let clip3 = timeline.clips.iter().find(|c| c.id == "clip3").unwrap();
+
+        // clip1's end moved from 5 to 7 (closing the gap) — its stale recipe
+        // must be cleared so Auto Motion recomputes it for the new duration.
+        assert_eq!(clip1.end_seconds, 7.0);
+        assert!(clip1.motion_graphic_effect.is_none());
+        assert!(clip1.motion_graphic_settings_json.is_none());
+        assert!(clip1.motion_graphic_reason.is_none());
+
+        // clip2's start/end are both unchanged — its recipe must survive.
+        assert_eq!((clip2.start_seconds, clip2.end_seconds), (7.0, 10.0));
+        assert_eq!(clip2.motion_graphic_effect.as_deref(), Some("pan left"));
+        assert!(clip2.motion_graphic_settings_json.is_some());
+        assert_eq!(clip2.motion_graphic_reason.as_deref(), Some("test reason"));
+
+        // clip3 had no motion assigned to begin with — stays that way.
+        assert_eq!((clip3.start_seconds, clip3.end_seconds), (10.0, 20.0));
+        assert!(clip3.motion_graphic_effect.is_none());
     }
 
     #[test]

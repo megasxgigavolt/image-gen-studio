@@ -13,7 +13,7 @@ import {
   Undo2,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
-import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type WheelEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type WheelEvent } from "react";
 import { lastSelectedStill, useAppStore } from "./store/app-store";
 import { formatTime, secondsToPixels } from "./domain/timecode";
 import { setCachedData } from "./infrastructure/media-cache";
@@ -23,13 +23,10 @@ import {
   type ColorFilterPreset,
   type ExportSettingsRecord,
   type ImageRenderRecord,
-  type MotionGraphicEffect,
-  type MotionPreset,
   type TimelineCaptionClipRecord,
   type TimelineClipRecord,
   type TimelineMusicClipRecord,
   type TimelineTextClipRecord,
-  type TransitionPreset,
   type VideoAssetRecord,
 } from "./infrastructure/projects-client";
 import { MediaLibraryPanel, MEDIA_DRAG_MIME, type MediaDragPayload } from "./timeline/MediaLibraryPanel";
@@ -41,11 +38,10 @@ import { MusicTool } from "./timeline/tools/MusicTool";
 import { LogoTool } from "./timeline/tools/LogoTool";
 import { TextOverlayTool } from "./timeline/tools/TextOverlayTool";
 import { FiltersTool } from "./timeline/tools/FiltersTool";
-import { EditorToolbar, ZOOM_MAX, ZOOM_MIN } from "./timeline/EditorToolbar";
+import { PlaybackControls, ZOOM_MAX, ZOOM_MIN } from "./timeline/EditorToolbar";
 import { TimelinePreview } from "./timeline/TimelinePreview";
 import { TimelineTracks } from "./timeline/TimelineTracks";
 import { ClipInspector } from "./timeline/ClipInspector";
-import { getMotionGraphicEffectDef, parseMotionGraphicSettings } from "./timeline/motion-graphics";
 import { CaptionsInspector } from "./timeline/CaptionsInspector";
 import { DEFAULT_CAPTION_STYLE, findClipAtTime } from "./timeline/timeline-rendering";
 import { isTypingTarget, resolveShortcutAction } from "./timeline/shortcut-resolver";
@@ -123,9 +119,13 @@ export function TimelineView() {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
   const [selectedTrack, setSelectedTrack] = useState<"narration" | null>(null);
   const [durationDraft, setDurationDraft] = useState<string | null>(null);
-  const [textOverlayFocusRequestId, setTextOverlayFocusRequestId] = useState(0);
+  const [textOverlayFocusRequestId] = useState(0);
   const [autosaveTick, setAutosaveTick] = useState(0);
-  const [globalIntensity, setGlobalIntensity] = useState(0.22);
+  // "Remove all effects" (Toolbar) still needs a fixed intensity value to
+  // pass through to the reset-to-"none" call below — no UI sets this
+  // anymore since the per-clip intensity slider was removed from the
+  // inspector, so it's a constant rather than state now.
+  const globalIntensity = 0.22;
   const [selectedClipVideoAsset, setSelectedClipVideoAsset] = useState<VideoAssetRecord | null>(null);
   const [retiming, setRetiming] = useState(false);
   const [extrapolating, setExtrapolating] = useState(false);
@@ -141,8 +141,6 @@ export function TimelineView() {
   const [confirmRemoveAllEffects, setConfirmRemoveAllEffects] = useState(false);
   const [confirmExtrapolateStills, setConfirmExtrapolateStills] = useState(false);
   const [confirmAutoMotion, setConfirmAutoMotion] = useState(false);
-  const [motionGraphicDescription, setMotionGraphicDescription] = useState<string | null>(null);
-  const [loadingMotionGraphicDescription, setLoadingMotionGraphicDescription] = useState(false);
   const [resettingTimeline, setResettingTimeline] = useState(false);
   const [aspectRatio, setAspectRatio] = useState<AspectRatio>("16:9");
   const [exportFileName, setExportFileName] = useState("");
@@ -174,7 +172,7 @@ export function TimelineView() {
 
   const redrawRequestRef = useRef<() => void>(() => {});
   const assets = useTimelineAssets(activeVideoId, timeline, workspace, aspectRatio, () => redrawRequestRef.current());
-  const { renderUrls, videoAssetUrls, subjectByRender, canvasSize, getOrLoadVideo, getImageByRenderId, getSubjectByRenderId } = assets;
+  const { renderUrls, videoAssetUrls, mediaAssetUrls, subjectByRender, canvasSize, getOrLoadVideo, getImageByAssetId, getSubjectByRenderId } = assets;
 
   useEffect(() => {
     void projectsClient.getAppSetting("image_settings").then((raw) => {
@@ -216,10 +214,14 @@ export function TimelineView() {
   // a slightly-too-short duration, leaving a small trailing gap at export.
   const totalDuration = Math.max(timeline?.durationSeconds ?? 0, nativeAudioDuration || narrationDuration, 1);
   const totalWidthPx = secondsToPixels(totalDuration, pixelsPerSecond);
-  const stillsClips = [...(timeline?.clips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds);
-  const captionClips = [...(timeline?.captionClips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds);
-  const musicClips = [...(timeline?.musicClips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds);
-  const textClips = [...(timeline?.textClips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds);
+  // Memoized so these keep a stable reference across the ~15/sec re-renders
+  // a playing preview drives (see useTimelinePlayback's throttled
+  // setPreviewTime) — otherwise TimelineLanes' React.memo would see a "new"
+  // array on every tick and re-diff every clip/caption regardless.
+  const stillsClips = useMemo(() => [...(timeline?.clips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds), [timeline?.clips]);
+  const captionClips = useMemo(() => [...(timeline?.captionClips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds), [timeline?.captionClips]);
+  const musicClips = useMemo(() => [...(timeline?.musicClips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds), [timeline?.musicClips]);
+  const textClips = useMemo(() => [...(timeline?.textClips ?? [])].sort((a, b) => a.startSeconds - b.startSeconds), [timeline?.textClips]);
   const logoClips = timeline?.logoClips ?? [];
   const globalCaptionStyle = timeline?.captionStyle ?? {};
   const captionInterval = captionSet?.intervalSeconds ?? 1;
@@ -239,7 +241,7 @@ export function TimelineView() {
 
   const playback = useTimelinePlayback({
     timeline, stillsClips, captionClips, totalDuration, canvasSize,
-    renderUrls, videoAssetUrls, subjectByRender, getImageByRenderId, getSubjectByRenderId, getOrLoadVideo,
+    renderUrls, videoAssetUrls, mediaAssetUrls, subjectByRender, getImageByAssetId, getSubjectByRenderId, getOrLoadVideo,
     effectiveGlobalCaptionStyle, pendingSelectedCaptionStyle, selectedCaptionClip, audioDataUrl,
     previewCanvasRef, audioRef, canvasScrollRef, pixelsPerSecond,
     onTimeChange: updateSelectionForTime,
@@ -365,32 +367,6 @@ export function TimelineView() {
       const nextPixelsPerSecond = BASE_PIXELS_PER_SECOND * clamped;
       const nextAnchorPx = secondsToPixels(previewTimeRef.current, nextPixelsPerSecond);
       nextContainer.scrollLeft = Math.max(0, nextAnchorPx - offsetInViewport);
-    });
-  }
-
-  function fitTimelineToWindow() {
-    const container = canvasScrollRef.current;
-    if (!container || !totalDuration) return;
-    const fitZoom = container.clientWidth / (BASE_PIXELS_PER_SECOND * totalDuration);
-    void zoomKeepingPlayheadFixed(fitZoom);
-  }
-
-  /** Zooms in on just the selected still clip, centering the view on it —
-   * useful for fine-tuning a short clip's transitions/timing on a long
-   * timeline without manually scrolling and zooming. */
-  function zoomToSelection() {
-    const container = canvasScrollRef.current;
-    if (!container || !selectedClip) return;
-    const duration = Math.max(0.1, selectedClip.endSeconds - selectedClip.startSeconds);
-    const fitZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, (container.clientWidth * 0.8) / (BASE_PIXELS_PER_SECOND * duration)));
-    void updateZoom(fitZoom).then(() => {
-      requestAnimationFrame(() => {
-        const nextContainer = canvasScrollRef.current;
-        if (!nextContainer || !selectedClip) return;
-        const nextPixelsPerSecond = BASE_PIXELS_PER_SECOND * fitZoom;
-        const centerPx = secondsToPixels((selectedClip.startSeconds + selectedClip.endSeconds) / 2, nextPixelsPerSecond);
-        nextContainer.scrollLeft = Math.max(0, centerPx - nextContainer.clientWidth / 2);
-      });
     });
   }
 
@@ -532,128 +508,14 @@ export function TimelineView() {
     await refresh(projectsClient.setTimelineClipRender(activeVideoId, selectedClip.id, renderId));
   }
 
-  async function setMotion(preset: MotionPreset) {
-    if (!activeVideoId || !selectedClip) return;
-    // Clicking the already-active preset unselects it (back to no motion).
-    const next = selectedClip.motionPreset === preset ? "none" : preset;
-    // Camera movement and Motion Graphics are mutually exclusive per clip —
-    // activating one deactivates the other immediately, no silent stacking.
-    if (next !== "none" && selectedClip.motionGraphicEffect) {
-      await refresh(projectsClient.setTimelineClipMotionGraphic(activeVideoId, selectedClip.id, null, null, null));
-    }
-    await refresh(projectsClient.setTimelineClipMotion(activeVideoId, selectedClip.id, next));
-  }
-
-  async function setTransitionIn(preset: TransitionPreset) {
-    if (!activeVideoId || !selectedClip) return;
-    await refresh(projectsClient.setTimelineClipTransition(activeVideoId, selectedClip.id, preset));
-  }
-
-  async function setTransitionOut(preset: TransitionPreset) {
-    if (!activeVideoId || !selectedClip) return;
-    await refresh(projectsClient.setTimelineClipTransitionOut(activeVideoId, selectedClip.id, preset));
-  }
-
   async function setColorFilter(preset: ColorFilterPreset, intensity: number) {
     if (!activeVideoId || !selectedClip) return;
     await refresh(projectsClient.setTimelineClipColorFilter(activeVideoId, selectedClip.id, preset, intensity));
   }
 
-  async function setMotionGraphicEffect(effect: MotionGraphicEffect) {
+  async function setMotionRecipe(effect: string | null, settingsJson: string | null, reason: string | null) {
     if (!activeVideoId || !selectedClip) return;
-    // Clicking the already-active preset unselects it (back to no motion graphic).
-    const next = selectedClip.motionGraphicEffect === effect ? null : effect;
-    // Mutually exclusive with Camera movement — see setMotion's matching comment.
-    if (next && selectedClip.motionPreset !== "none") {
-      await refresh(projectsClient.setTimelineClipMotion(activeVideoId, selectedClip.id, "none"));
-    }
-    const def = next ? getMotionGraphicEffectDef(next) : null;
-    const settingsJson = def ? JSON.stringify(def.defaults) : null;
-    await refresh(projectsClient.setTimelineClipMotionGraphic(activeVideoId, selectedClip.id, next, settingsJson, next ? "Manually selected" : null));
-  }
-
-  // Re-explains why the active Motion Graphics preset fits this still
-  // whenever the selected clip or its assigned preset changes — fails
-  // silently (no toast/error state) per the spec, since this is a nice-to-
-  // have hint, not a blocking action.
-  useEffect(() => {
-    const effect = selectedClip?.motionGraphicEffect;
-    if (!activeVideoId || !selectedClip || !effect) {
-      setMotionGraphicDescription(null);
-      setLoadingMotionGraphicDescription(false);
-      return;
-    }
-    const def = getMotionGraphicEffectDef(effect);
-    if (!def) {
-      setMotionGraphicDescription(null);
-      return;
-    }
-    let cancelled = false;
-    setLoadingMotionGraphicDescription(true);
-    setMotionGraphicDescription(null);
-    void projectsClient.explainMotionGraphicChoice(activeVideoId, selectedClip.groupId, def.label, def.summary)
-      .then((description) => { if (!cancelled) setMotionGraphicDescription(description); })
-      .catch(() => { /* silent — no error surfaced for this hint */ })
-      .finally(() => { if (!cancelled) setLoadingMotionGraphicDescription(false); });
-    return () => { cancelled = true; };
-  }, [activeVideoId, selectedClip?.id, selectedClip?.groupId, selectedClip?.motionGraphicEffect]);
-
-  async function setMotionGraphicSetting(key: string, value: number | string) {
-    if (!activeVideoId || !selectedClip || !selectedClip.motionGraphicEffect) return;
-    const current = parseMotionGraphicSettings(selectedClip.motionGraphicSettings);
-    const nextSettings = { ...current, [key]: value };
-    await refresh(projectsClient.setTimelineClipMotionGraphic(
-      activeVideoId, selectedClip.id, selectedClip.motionGraphicEffect, JSON.stringify(nextSettings), selectedClip.motionGraphicReason,
-    ));
-  }
-
-  async function applyColorFilterToAll() {
-    if (!activeVideoId || !selectedClip) return;
-    await refresh(projectsClient.applyColorFilterToAllClips(activeVideoId, selectedClip.colorFilterPreset, selectedClip.colorFilterIntensity));
-    addToast("Color filter applied to all stills.", "success");
-  }
-
-  async function applyMotionToAll() {
-    if (!activeVideoId || !selectedClip) return;
-    await refresh(projectsClient.applyMotionToAllClips(activeVideoId, selectedClip.motionPreset, globalIntensity));
-    addToast("Camera movement applied to all stills.", "success");
-  }
-
-  async function applyTransitionInToAll() {
-    if (!activeVideoId || !selectedClip) return;
-    await refresh(projectsClient.applyTransitionInToAllClips(activeVideoId, selectedClip.transitionIn));
-    addToast("Transition in applied to all stills.", "success");
-  }
-
-  async function applyTransitionOutToAll() {
-    if (!activeVideoId || !selectedClip) return;
-    await refresh(projectsClient.applyTransitionOutToAllClips(activeVideoId, selectedClip.transitionOut));
-    addToast("Transition out applied to all stills.", "success");
-  }
-
-  async function applyGlobalIntensity() {
-    if (!activeVideoId) return;
-    await refresh(projectsClient.applyMotionIntensityToAllClips(activeVideoId, globalIntensity));
-  }
-
-  async function alternateZoom() {
-    if (!activeVideoId) return;
-    await refresh(projectsClient.alternateZoomForAllClips(activeVideoId, globalIntensity));
-    addToast("Alternating zoom in/out applied across all stills.", "success");
-  }
-
-  async function applyFadeTransitionToAll() {
-    if (!activeVideoId) return;
-    await refresh(projectsClient.applyTransitionInToAllClips(activeVideoId, "fade"));
-    await refresh(projectsClient.applyTransitionOutToAllClips(activeVideoId, "fade"));
-    addToast("Fade transition applied to every still.", "success");
-  }
-
-  async function removeTransitionFromAll() {
-    if (!activeVideoId) return;
-    await refresh(projectsClient.applyTransitionInToAllClips(activeVideoId, "cut"));
-    await refresh(projectsClient.applyTransitionOutToAllClips(activeVideoId, "cut"));
-    addToast("Transition removed from every still.", "success");
+    await refresh(projectsClient.setTimelineClipMotionGraphic(activeVideoId, selectedClip.id, effect, settingsJson, reason));
   }
 
   async function removeAllEffects() {
@@ -719,8 +581,24 @@ export function TimelineView() {
         // No narration audio yet, or the probe failed — fall back rather than
         // blocking the action entirely.
       }
-      await refresh(projectsClient.extrapolateStillsToFillGaps(activeVideoId, duration));
+      // Extrapolation can invalidate an already-assigned motion recipe (its
+      // duration no longer matches what Auto Motion composed it for) — the
+      // backend clears those clips' motion fields rather than leave a stale
+      // recipe silently applied. Diff before/after so the user knows which
+      // stills need Auto Motion re-run, rather than just seeing them go
+      // quiet with no explanation.
+      const previousMotion = new Map((timeline?.clips ?? []).map((clip) => [clip.id, clip.motionGraphicEffect]));
+      const resultPromise = projectsClient.extrapolateStillsToFillGaps(activeVideoId, duration);
+      await refresh(resultPromise);
+      const updated = await resultPromise;
+      const clearedCount = updated.clips.filter((clip) => previousMotion.get(clip.id) && !clip.motionGraphicEffect).length;
       addToast("Stills stretched to close every gap.", "success");
+      if (clearedCount > 0) {
+        addToast(
+          `${clearedCount} still${clearedCount === 1 ? "" : "s"}' motion effect${clearedCount === 1 ? " was" : "s were"} cleared — duration${clearedCount === 1 ? "" : "s"} changed, re-run Auto motion.`,
+          "info",
+        );
+      }
     } finally {
       setExtrapolating(false);
     }
@@ -793,12 +671,6 @@ export function TimelineView() {
     setActiveTool("captions");
   }
 
-  function selectMusicClip(clip: TimelineMusicClipRecord) {
-    setSelectedMusicClip(clip);
-    setSelectedTrack(null);
-    setActiveTool(null);
-  }
-
   function updateSelectedMusicClip(patch: Partial<{
     volumePercent: number; fadeInEnabled: boolean; fadeInSeconds: number;
     fadeOutEnabled: boolean; fadeOutSeconds: number; autoDuck: boolean; loopEnabled: boolean;
@@ -814,13 +686,6 @@ export function TimelineView() {
       patch.autoDuck ?? selectedMusicClip.autoDuck,
       patch.loopEnabled ?? selectedMusicClip.loopEnabled,
     ));
-  }
-
-  function selectTextClip(clip: TimelineTextClipRecord) {
-    setSelectedTextClip(clip);
-    setSelectedMusicClip(null);
-    setSelectedTrack(null);
-    setActiveTool("text");
   }
 
   function selectNarrationTrack() {
@@ -1543,25 +1408,8 @@ export function TimelineView() {
                 onAdjustAnimationToDuration={() => void adjustAnimationToDuration()}
                 retiming={retiming}
                 onSwapRender={(renderId) => void swapRender(renderId)}
-                onSetMotion={(preset) => void setMotion(preset)}
-                onApplyMotionToAll={() => void applyMotionToAll()}
-                globalIntensity={globalIntensity}
-                onGlobalIntensityChange={setGlobalIntensity}
-                onApplyGlobalIntensity={() => void applyGlobalIntensity()}
-                onAlternateZoom={() => void alternateZoom()}
-                onSetTransitionIn={(preset) => void setTransitionIn(preset)}
-                onApplyTransitionInToAll={() => void applyTransitionInToAll()}
-                onSetTransitionOut={(preset) => void setTransitionOut(preset)}
-                onApplyTransitionOutToAll={() => void applyTransitionOutToAll()}
-                onApplyFadeTransitionToAll={() => void applyFadeTransitionToAll()}
-                onRemoveTransitionFromAll={() => void removeTransitionFromAll()}
-                onSetColorFilter={(preset, intensity) => void setColorFilter(preset, intensity)}
-                onApplyColorFilterToAll={() => void applyColorFilterToAll()}
-                onSetMotionGraphicEffect={(effect) => void setMotionGraphicEffect(effect)}
-                onSetMotionGraphicSetting={(key, value) => void setMotionGraphicSetting(key, value)}
-                motionGraphicDescription={motionGraphicDescription}
-                loadingMotionGraphicDescription={loadingMotionGraphicDescription}
                 onResetEffects={() => void resetEffects()}
+                onMotionRecipeChange={(effect, settingsJson, reason) => void setMotionRecipe(effect, settingsJson, reason)}
               />
             ) : (
               <div className="tl-inspector-empty">
@@ -1600,6 +1448,21 @@ export function TimelineView() {
           {!timeline.sequenceLocked && (
             <div className="tl-lock-banner">Sequence unlocked — clips are no longer synced to narration.</div>
           )}
+          <PlaybackControls
+            canUndo={canUndo}
+            canRedo={canRedo}
+            onUndo={() => void undo()}
+            onRedo={() => void redo()}
+            previewTime={previewTime}
+            totalDuration={totalDuration}
+            isPlaying={isPlaying}
+            onTogglePlay={() => (isPlaying ? pausePreview() : playPreview())}
+            hasStillsClips={stillsClips.length > 0}
+            onJumpPreviousClip={jumpToPreviousClip}
+            onJumpNextClip={jumpToNextClip}
+            onStepBackward={stepBackward}
+            onStepForward={stepForward}
+          />
           <Toolbar
             activeTool={activeTool}
             onSelectTool={handleSelectTool}
@@ -1611,28 +1474,6 @@ export function TimelineView() {
             motionGraphicsProgressLabel={motionGraphicsProgress ? `Applying motion… ${motionGraphicsProgress.done} / ${motionGraphicsProgress.total}` : null}
             aspectRatio={aspectRatio}
             onAspectRatioChange={(ratio) => void handleAspectRatioChange(ratio)}
-          />
-          <EditorToolbar
-            canUndo={canUndo}
-            canRedo={canRedo}
-            onUndo={() => void undo()}
-            onRedo={() => void redo()}
-            previewTime={previewTime}
-            totalDuration={totalDuration}
-            isPlaying={isPlaying}
-            onTogglePlay={() => (isPlaying ? pausePreview() : playPreview())}
-            hasStillsClips={stillsClips.length > 0}
-            zoom={zoom}
-            onFit={fitTimelineToWindow}
-            onZoomChange={(next) => void zoomKeepingPlayheadFixed(next)}
-            onZoomToSelection={zoomToSelection}
-            canZoomToSelection={Boolean(selectedClip)}
-            onJumpPreviousClip={jumpToPreviousClip}
-            onJumpNextClip={jumpToNextClip}
-            onStepBackward={stepBackward}
-            onStepForward={stepForward}
-            captionCount={captionClips.length}
-            onOpenCaptionsTool={() => setActiveTool("captions")}
           />
           <TimelineTracks
             pixelsPerSecond={pixelsPerSecond}
@@ -1648,16 +1489,10 @@ export function TimelineView() {
             onSelectNarrationTrack={selectNarrationTrack}
             onBeginPlayheadDrag={drag.beginPlayheadDrag}
             onBeginNarrationDrag={drag.beginNarrationDrag}
-            musicClips={musicClips}
-            musicDragPreview={drag.musicDragPreview}
-            fadeDragPreview={drag.fadeDragPreview}
-            selectedMusicClipId={selectedMusicClip?.id ?? null}
-            onBeginMusicDrag={drag.beginMusicDrag}
-            onSelectMusicClip={selectMusicClip}
-            onBeginFadeHandleDrag={drag.beginFadeHandleDrag}
             stillsClips={stillsClips}
             stillsDragPreview={drag.stillsDragPreview}
             renderUrls={renderUrls}
+            mediaAssetUrls={mediaAssetUrls}
             selectedClipId={selectedClip?.id ?? null}
             sequenceLocked={timeline.sequenceLocked}
             onBeginStillsDrag={drag.beginStillsDrag}
@@ -1665,15 +1500,6 @@ export function TimelineView() {
             onDuplicateStillsClip={(clip) => void duplicateStillsClip(clip)}
             onRemoveStillsClip={(clip) => void removeStillsClip(clip)}
             onGoToStillInVisuals={goToStillInVisuals}
-            logoClips={logoClips}
-            textClips={textClips}
-            overlayDragPreview={drag.overlayDragPreview}
-            activeTool={activeTool}
-            selectedTextClipId={selectedTextClip?.id ?? null}
-            onBeginOverlayDrag={drag.beginOverlayDrag}
-            onSelectLogoTool={() => setActiveTool("logo")}
-            onSelectTextClip={selectTextClip}
-            onDoubleClickTextClip={(clip) => { selectTextClip(clip); setTextOverlayFocusRequestId((id) => id + 1); }}
             captionClips={captionClips}
             captionDragPreview={drag.captionDragPreview}
             selectedCaptionClipId={selectedCaptionClip?.id ?? null}

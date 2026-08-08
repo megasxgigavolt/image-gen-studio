@@ -11,7 +11,7 @@ export type AppStage = "home" | "inputs" | "visual-plan" | "images" | "animate" 
 export const lastSelectedStill = new Map<string, string>();
 export type Theme = "light" | "dark";
 
-type Toast = { id: number; message: string; kind: "success" | "error" | "info" };
+type Toast = { id: number; message: string; kind: "success" | "error" | "info"; durationMs: number };
 
 type AppState = {
   stage: AppStage;
@@ -39,7 +39,7 @@ type AppState = {
     videoTitle: string,
   ) => void;
   clearActiveProject: () => void;
-  addToast: (message: string, kind?: Toast["kind"]) => void;
+  addToast: (message: string, kind?: Toast["kind"], durationMs?: number) => void;
   dismissToast: () => void;
 };
 
@@ -88,8 +88,8 @@ export const useAppStore = create<AppState>((set) => ({
       activeVideoId: null,
       activeVideoTitle: null,
     }),
-  addToast: (message, kind = "info") =>
-    set({ toast: { id: ++toastCounter, message, kind } }),
+  addToast: (message, kind = "info", durationMs = 4500) =>
+    set({ toast: { id: ++toastCounter, message, kind, durationMs } }),
   dismissToast: () => set({ toast: null }),
   moveSentence: (sentenceId, targetGroupId) =>
     set((state) => {

@@ -198,7 +198,9 @@ export type MotionPreset =
   | "zoom-out-subject"
   | "ken-burns"
   | "cuts";
-export type TransitionPreset = "cut" | "fade" | "dip-to-white" | "cross-fade" | "slide-left" | "slide-right" | "zoom-blur";
+export type TransitionPreset =
+  | "cut" | "fade" | "dip-to-white"
+  | "cross-fade" | "slide-left" | "slide-right" | "zoom-blur" | "whip-pan" | "blur-transition";
 export type ExportResolution = "2160p" | "1080p" | "720p";
 export type ExportQuality = "high" | "balanced" | "compressed";
 export type ExportCaptionsMode = "burned-in" | "srt" | "both";
@@ -228,22 +230,124 @@ export type TimelineClipRecord = {
   mediaLibraryAssetId: string | null;
   colorFilterPreset: ColorFilterPreset;
   colorFilterIntensity: number;
-  /** AI-recommended (or manually overridden) treatment name, or null if this clip hasn't been analyzed yet. */
+  /** AI-composed free-text treatment label (e.g. "slow push with a warm pulsing glow"), or null
+   * if this clip hasn't been analyzed yet. Display/debugging only — not validated against any
+   * list, there's no fixed catalog of treatments anymore. */
   motionGraphicEffect: MotionGraphicEffect | null;
-  /** JSON-stringified tunable settings for motionGraphicEffect — shape depends on which effect is assigned. */
-  motionGraphicSettings: string | null;
-  /** Short AI-written justification for the assigned effect. */
+  /** JSON-stringified `MotionRecipe` for motionGraphicEffect — parse with `parseMotionRecipe`.
+   * Field name must match the wire key the Rust struct actually serializes
+   * (`motion_graphic_settings_json` -> camelCase `motionGraphicSettingsJson`) — a prior
+   * `motionGraphicSettings` name here didn't match and silently deserialized to `undefined`. */
+  motionGraphicSettingsJson: string | null;
+  /** Short AI-written justification for the composed treatment. */
   motionGraphicReason: string | null;
 };
 
-export type MotionGraphicEffect =
-  | "Ken Burns"
-  | "Sequential Panel Reveal"
-  | "Speed Pan & Motion Blur"
-  | "Ominous Push-In"
-  | "Candlelight Flicker"
-  | "Focus Pull"
-  | "Iris Reveal";
+/** Free text now — see the `motionGraphicEffect` field doc above. Kept as its own named type
+ * (rather than inlining `string`) purely so call sites document intent. */
+export type MotionGraphicEffect = string;
+
+// ===== Motion recipe (Timeline editor's per-still Motion panel) =====
+// Manually mirrors services/motion-engine/src/types.ts's `MotionRecipe` field-for-field
+// (camelCase, same as the Rust struct's `#[serde(rename_all = "camelCase")]` on
+// `motion_graphic_settings_json`'s deserialized shape). That package isn't a workspace
+// dependency of this app — it's a standalone Remotion project invoked as a subprocess by
+// the Python export engine — so there's no shared import to reach for instead; the Python
+// side (`motion_graphics_engine.py`'s Pydantic `MotionRecipe`) already mirrors it
+// independently the same way, and this is a third, equally manual copy.
+export type CameraEffect =
+  | "position_pan" | "zoom_in" | "zoom_out" | "push_in" | "pull_out" | "camera_drift" | "dynamic_reframing";
+export type DepthEffect = "none" | "parallax_3d" | "subject_separation" | "depth_blur" | "focus_shift" | "motion_tracking";
+export type StoryEffect = "none" | "speed_ramp" | "freeze_frame" | "mask_reveal" | "track_matte" | "path_animation";
+export type EnvironmentEffect =
+  | "none" | "dust" | "smoke" | "fog" | "rain" | "snow" | "fire_embers" | "floating_particles" | "light_rays";
+export type MotionEasing = "linear" | "ease" | "easeIn" | "easeOut" | "cubic" | "elastic";
+export type MaskShape = "none" | "circle" | "linear-h" | "linear-v";
+export type SpeedCurve = "linear_pace" | "punch_in_hold" | "slow_fast_slow" | "fast_start_ease_out";
+
+export type PanPoint = { x: number; y: number };
+
+export type MotionRecipe = {
+  cameraEffect: CameraEffect;
+  scaleFrom: number; scaleTo: number;
+  panXFrom: number; panXTo: number; panYFrom: number; panYTo: number;
+  rotationFromDeg: number; rotationToDeg: number;
+  originX: number; originY: number;
+  easing: MotionEasing;
+  motionBlurStrength: number; shakeAmount: number;
+  subjectRegionX: number; subjectRegionY: number; subjectRegionW: number; subjectRegionH: number;
+  depthEffect: DepthEffect;
+  fgScaleFrom: number; fgScaleTo: number;
+  fgPanXFrom: number; fgPanXTo: number; fgPanYFrom: number; fgPanYTo: number;
+  bgBlurFromPx: number; bgBlurToPx: number;
+  subjectMaskSoftness: number;
+  blurFromPx: number; blurToPx: number;
+  transitionOut: TransitionPreset;
+  whipDirection: "left" | "right";
+  storyEffect: StoryEffect;
+  maskShape: MaskShape;
+  maskFromRadius: number; maskToRadius: number;
+  maskX: number; maskY: number;
+  maskHoldFrames: number; maskSoftness: number;
+  freezeAtProgress: number; freezeHoldFrames: number;
+  pathPoints: PanPoint[] | null;
+  speedCurve: SpeedCurve;
+  environmentEffect: EnvironmentEffect;
+  environmentIntensity: number;
+  saturationFrom: number; saturationTo: number;
+  glowColor: string | null;
+  glowX: number; glowY: number; glowOpacity: number; glowFlicker: number;
+  vignette: number;
+  fadeInFrames: number; fadeOutFrames: number;
+};
+
+export const DEFAULT_MOTION_RECIPE: MotionRecipe = {
+  cameraEffect: "push_in",
+  scaleFrom: 1.05, scaleTo: 1.2,
+  panXFrom: 0, panXTo: 0, panYFrom: 0, panYTo: 0,
+  rotationFromDeg: 0, rotationToDeg: 0,
+  originX: 50, originY: 50,
+  easing: "ease",
+  motionBlurStrength: 0, shakeAmount: 0,
+  subjectRegionX: 0.3, subjectRegionY: 0.25, subjectRegionW: 0.4, subjectRegionH: 0.5,
+  depthEffect: "none",
+  fgScaleFrom: 1, fgScaleTo: 1,
+  fgPanXFrom: 0, fgPanXTo: 0, fgPanYFrom: 0, fgPanYTo: 0,
+  bgBlurFromPx: 0, bgBlurToPx: 0,
+  subjectMaskSoftness: 0.35,
+  blurFromPx: 0, blurToPx: 0,
+  transitionOut: "cut",
+  whipDirection: "left",
+  storyEffect: "none",
+  maskShape: "none",
+  maskFromRadius: 0, maskToRadius: 1,
+  maskX: 0.5, maskY: 0.5,
+  maskHoldFrames: 0, maskSoftness: 0.3,
+  freezeAtProgress: 0.5, freezeHoldFrames: 0,
+  pathPoints: null,
+  speedCurve: "linear_pace",
+  environmentEffect: "none",
+  environmentIntensity: 0.35,
+  saturationFrom: 1, saturationTo: 1,
+  glowColor: null,
+  glowX: 0.5, glowY: 0.5, glowOpacity: 0, glowFlicker: 0,
+  vignette: 0.15,
+  fadeInFrames: 14, fadeOutFrames: 14,
+};
+
+/** Parses a clip's `motionGraphicSettingsJson` into a `MotionRecipe`, filling in any
+ * missing fields from `DEFAULT_MOTION_RECIPE` (forward-compatible with older persisted
+ * recipes that predate a newly added field). Returns `DEFAULT_MOTION_RECIPE` as-is for
+ * `null`/unparseable input rather than throwing — callers treat that as "start fresh". */
+export function parseMotionRecipe(settingsJson: string | null): MotionRecipe {
+  if (!settingsJson) return DEFAULT_MOTION_RECIPE;
+  try {
+    const parsed = JSON.parse(settingsJson) as Partial<MotionRecipe>;
+    return { ...DEFAULT_MOTION_RECIPE, ...parsed };
+  } catch {
+    return DEFAULT_MOTION_RECIPE;
+  }
+}
 
 export type MediaLibraryKind = "still" | "clip" | "audio";
 export type MediaLibraryAssetRecord = {
@@ -690,8 +794,12 @@ export const projectsClient = {
     if (isTauri()) return invoke("export_project_bundle", { videoId });
     throw new Error("Export requires the native application.");
   },
-  async importProjectBundle(): Promise<VideoRecord | null> {
-    if (isTauri()) return invoke("import_project_bundle");
+  async importProjectBundle(channelId: string): Promise<VideoRecord | null> {
+    if (isTauri()) return invoke("import_project_bundle", { channelId });
+    throw new Error("Import requires the native application.");
+  },
+  async importAssetFolder(): Promise<VideoRecord | null> {
+    if (isTauri()) return invoke("import_asset_folder");
     throw new Error("Import requires the native application.");
   },
   async buildTimeline(videoId: string): Promise<TimelineRecord> {
@@ -853,6 +961,13 @@ export const projectsClient = {
   async getMediaLibraryAssetFilePath(assetId: string): Promise<string> {
     if (isTauri()) return invoke("get_media_library_asset_file_path", { assetId });
     return "";
+  },
+  /** Removes steady-state background noise (hiss, hum, static) from an
+   * Audio-tab asset. Non-destructive — lands as a new "(denoised)" asset
+   * alongside the original rather than replacing it. */
+  async denoiseMediaLibraryAsset(assetId: string): Promise<MediaLibraryAssetRecord> {
+    if (isTauri()) return invoke("denoise_media_library_asset", { assetId });
+    throw new Error("Background noise removal requires the native application.");
   },
   async listVideoAssets(videoId: string): Promise<VideoAssetRecord[]> {
     if (isTauri()) return invoke("list_video_assets", { videoId });
@@ -1131,6 +1246,10 @@ export const projectsClient = {
     if (isTauri()) return invoke("plan_bulk_visuals", { videoId, styleDirective, baseSettingsJson, creativeInstruction, characterConsistency });
     throw new Error("Bulk planning requires the native application.");
   },
+  /** Runs the fully backend-owned "Auto motion" pass: composes, renders, and
+   * validates a motion treatment for every still on the timeline (see
+   * SOPs/Motion_Graphics_SOP_v1.md) — no client-side settings or feedback,
+   * the engine decides everything on its own. */
   async analyzeMotionGraphics(videoId: string): Promise<TimelineRecord> {
     if (isTauri()) return invoke("analyze_motion_graphics", { videoId });
     throw new Error("Motion graphics analysis requires the native application.");

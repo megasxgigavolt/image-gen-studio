@@ -8,7 +8,8 @@ import {
   Shuffle,
   Sparkles,
   Sun,
-  Film,
+  Wind,
+  Droplets,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
@@ -69,11 +70,10 @@ export const MOTION_OPTIONS: { value: MotionPreset; label: string; icon: typeof 
   { value: "zoom-in-subject", label: "Zoom in on subject", icon: ZoomIn },
   { value: "zoom-out-subject", label: "Zoom out on subject", icon: ZoomOut },
   { value: "ken-burns", label: "Ken Burns", icon: Move },
-  { value: "cuts", label: "Cuts", icon: Film },
   { value: "none", label: "None", icon: Ban },
 ];
 
-// The last 4 are "join" transitions (blend into the next clip) — only ever
+// The last 6 are "join" transitions (blend into the next clip) — only ever
 // meaningful on the "out" side of a boundary, see VALID_TRANSITIONS's doc
 // comment in projects.rs. The "in" picker only renders the first 3.
 export const TRANSITION_OPTIONS: { value: TransitionPreset; label: string; icon: typeof Scissors }[] = [
@@ -84,6 +84,8 @@ export const TRANSITION_OPTIONS: { value: TransitionPreset; label: string; icon:
   { value: "slide-left", label: "Slide left", icon: ArrowLeft },
   { value: "slide-right", label: "Slide right", icon: ArrowRight },
   { value: "zoom-blur", label: "Zoom blur", icon: ZoomIn },
+  { value: "whip-pan", label: "Whip pan", icon: Wind },
+  { value: "blur-transition", label: "Blur", icon: Droplets },
 ];
 export const TRANSITION_IN_OPTIONS = TRANSITION_OPTIONS.slice(0, 3);
 
@@ -310,11 +312,14 @@ export function joinTransitionSeconds(durationA: number, durationB: number): num
 
 // Mirrors JOIN_TRANSITIONS in video_export_engine.py — these need both
 // neighboring clips' pixel data blended together, unlike cut/fade/dip-to-white.
-export const JOIN_TRANSITIONS = new Set(["cross-fade", "slide-left", "slide-right", "zoom-blur"]);
+export const JOIN_TRANSITIONS = new Set(["cross-fade", "slide-left", "slide-right", "zoom-blur", "whip-pan", "blur-transition"]);
 
 type ClipLike = {
   id: string;
   renderId: string | null;
+  /** Set for clipKind 'imported-still' — falls back to this when renderId is
+   * absent, so an imported still draws from its media library asset instead. */
+  mediaLibraryAssetId: string | null;
   startSeconds: number;
   endSeconds: number;
   motionPreset: MotionPreset;
@@ -345,12 +350,13 @@ export function drawStillClipContent(
   canvas: HTMLCanvasElement,
   clip: ClipLike,
   elapsedSeconds: number,
-  getImage: (renderId: string) => HTMLImageElement | null,
+  getImage: (assetId: string) => HTMLImageElement | null,
   getSubject: (renderId: string) => { x: number; y: number } | undefined,
   options?: { translateXPx?: number; extraScale?: number; blurPx?: number },
 ): boolean {
-  if (!clip.renderId) return false;
-  const img = getImage(clip.renderId);
+  const assetId = clip.renderId ?? clip.mediaLibraryAssetId;
+  if (!assetId) return false;
+  const img = getImage(assetId);
   if (!img) return false;
   // Cover-fill (not contain): when the still's natural ratio doesn't match
   // the canvas's target aspect ratio, this crops the overflow rather than
@@ -364,7 +370,9 @@ export function drawStillClipContent(
     y: (canvas.height - img.naturalHeight * scale) / 2,
   };
   const clipDuration = clip.endSeconds - clip.startSeconds;
-  const subject = getSubject(clip.renderId);
+  // Zoom-to-subject is only ever detected against a generated render — an
+  // imported still (no renderId) just falls back to frame-center motion.
+  const subject = clip.renderId ? getSubject(clip.renderId) : undefined;
   const rect = applyMotion(clip.motionPreset, Math.max(0, elapsedSeconds), clipDuration, clip.motionIntensity, base, subject);
   const extraScale = options?.extraScale ?? 1;
   const w = rect.w * extraScale;
@@ -411,6 +419,31 @@ export function drawJoinTransitionFrame(
       extraScale: 1 + (1 - progress) * 0.25,
       blurPx: (1 - Math.abs(progress - 0.5) * 2) * 4,
     });
+    ctx.globalAlpha = 1;
+    return;
+  }
+  if (transitionType === "whip-pan") {
+    // Fast blur-pan handoff — approximated as a directional slide with heavy
+    // motion blur peaking mid-transition (the real export's ffmpeg `hblur`
+    // xfade reads similarly at the short duration this transition uses).
+    drawStillClipContent(ctx, canvas, clipA, elapsedA, getImage, getSubject, {
+      translateXPx: -progress * canvas.width * 0.4,
+      blurPx: Math.sin(progress * Math.PI) * 14,
+    });
+    ctx.globalAlpha = progress;
+    drawStillClipContent(ctx, canvas, clipB, elapsedB, getImage, getSubject, {
+      translateXPx: (1 - progress) * canvas.width * 0.4,
+      blurPx: Math.sin(progress * Math.PI) * 14,
+    });
+    ctx.globalAlpha = 1;
+    return;
+  }
+  if (transitionType === "blur-transition") {
+    // Softer, slower blur dissolve — no directional slide, just a shared
+    // blur peak at the midpoint of a longer transition window.
+    drawStillClipContent(ctx, canvas, clipA, elapsedA, getImage, getSubject, { blurPx: progress * 16 });
+    ctx.globalAlpha = progress;
+    drawStillClipContent(ctx, canvas, clipB, elapsedB, getImage, getSubject, { blurPx: (1 - progress) * 16 });
     ctx.globalAlpha = 1;
     return;
   }

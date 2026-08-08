@@ -522,31 +522,26 @@ async fn suggest_still_prompt(
 }
 
 #[tauri::command]
-async fn plan_bulk_visuals(
-    app: tauri::AppHandle,
+async fn plan_bulk_visuals_batch(
     state: State<'_, RepositoryState>,
     video_id: String,
     style_directive: String,
     base_settings_json: String,
     creative_instruction: String,
     character_consistency: bool,
-) -> Result<projects::BulkPlanResult, String> {
+    start_index: usize,
+) -> Result<projects::BulkPlanBatchResult, String> {
     let (database_path, projects_dir) =
         with_repository(state, |repository| Ok(repository.paths()))?;
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
-        repository.plan_bulk_visuals(
+        repository.plan_bulk_visuals_batch(
             &video_id,
             &style_directive,
             &base_settings_json,
             &creative_instruction,
             character_consistency,
-            |planned, total| {
-                let _ = app.emit(
-                    "bulk_plan_progress",
-                    serde_json::json!({ "planned": planned, "total": total }),
-                );
-            },
+            start_index,
         )
     })
     .await
@@ -554,11 +549,11 @@ async fn plan_bulk_visuals(
 }
 
 #[tauri::command]
-async fn analyze_motion_graphics(
+async fn analyze_motion_graphics_batch(
     app: tauri::AppHandle,
     state: State<'_, RepositoryState>,
     video_id: String,
-) -> Result<Timeline, String> {
+) -> Result<projects::MotionGraphicsBatchResult, String> {
     let (database_path, projects_dir) =
         with_repository(state, |repository| Ok(repository.paths()))?;
     let engine_dir = if cfg!(debug_assertions) {
@@ -571,12 +566,7 @@ async fn analyze_motion_graphics(
     };
     tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
-        repository.analyze_motion_graphics(&video_id, &engine_dir, |done, total| {
-            let _ = app.emit(
-                "motion_graphics_progress",
-                serde_json::json!({ "done": done, "total": total }),
-            );
-        })
+        repository.analyze_motion_graphics_batch(&video_id, &engine_dir)
     })
     .await
     .map_err(|e| format!("Motion graphics analysis stopped unexpectedly: {e}"))?
@@ -600,23 +590,6 @@ fn set_timeline_clip_motion_graphic(
             reason.as_deref(),
         )
     })
-}
-
-#[tauri::command]
-async fn approve_bulk_plan(
-    state: State<'_, RepositoryState>,
-    video_id: String,
-    style_directive: String,
-    stills: Vec<projects::BulkPlannedStill>,
-) -> Result<usize, String> {
-    let (database_path, projects_dir) =
-        with_repository(state, |repository| Ok(repository.paths()))?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
-        repository.approve_bulk_plan(&video_id, &style_directive, &stills)
-    })
-    .await
-    .map_err(|e| format!("Bulk plan approval stopped unexpectedly: {e}"))?
 }
 
 #[tauri::command]
@@ -2801,9 +2774,8 @@ pub fn run() {
             set_still_lock,
             extract_image_settings_from_directive,
             suggest_still_prompt,
-            plan_bulk_visuals,
-            analyze_motion_graphics,
-            approve_bulk_plan,
+            plan_bulk_visuals_batch,
+            analyze_motion_graphics_batch,
             apply_creative_instructions_to_all,
             apply_style_directive_to_all,
             get_render_data_url,

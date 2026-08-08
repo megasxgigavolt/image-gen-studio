@@ -1,4 +1,4 @@
-import { Clapperboard, Hexagon, LoaderCircle, Move, Music, SlidersHorizontal, Trash2 } from "lucide-react";
+import { Clapperboard, Hexagon, LoaderCircle, Move, Music, Play, SlidersHorizontal, Trash2, X } from "lucide-react";
 
 export type ToolKind = "text" | "captions" | "music" | "filters" | "logo";
 export type AspectRatio = "16:9" | "9:16";
@@ -15,7 +15,9 @@ export function Toolbar({
   extrapolating,
   onRemoveAllEffects,
   onAnalyzeMotionGraphics,
+  onStopAutoMotion,
   analyzingMotionGraphics,
+  motionGraphicsPaused,
   motionGraphicsProgressLabel,
   aspectRatio,
   onAspectRatioChange,
@@ -25,8 +27,14 @@ export function Toolbar({
   onExtrapolateStills: () => void;
   extrapolating: boolean;
   onRemoveAllEffects: () => void;
+  /** A single control whose action depends on current state — idle: start;
+   * running: pause; paused: resume. See TimelineView's `toggleAutoMotion`. */
   onAnalyzeMotionGraphics: () => void;
+  /** Only enabled (and only shown) while paused — a full run in progress is
+   * interrupted by pausing it first, not stopped outright. */
+  onStopAutoMotion: () => void;
   analyzingMotionGraphics: boolean;
+  motionGraphicsPaused: boolean;
   motionGraphicsProgressLabel: string | null;
   aspectRatio: AspectRatio;
   onAspectRatioChange: (ratio: AspectRatio) => void;
@@ -71,10 +79,19 @@ export function Toolbar({
         <button className="tl-tool-btn" disabled={extrapolating} title="Stretch every still to close gaps between them, so transitions become visible" onClick={onExtrapolateStills}>
           {extrapolating ? <LoaderCircle className="spin" size={16} /> : <Move size={16} />}<span>Fill gaps</span>
         </button>
-        <button className="tl-tool-btn" disabled={analyzingMotionGraphics} title="Automatically analyzes every still and applies the best-fitting motion graphic to each, individually" onClick={onAnalyzeMotionGraphics}>
-          {analyzingMotionGraphics ? <LoaderCircle className="spin" size={16} /> : <Clapperboard size={16} />}
-          <span>{analyzingMotionGraphics && motionGraphicsProgressLabel ? motionGraphicsProgressLabel : "Auto motion"}</span>
+        <button
+          className="tl-tool-btn"
+          title={motionGraphicsPaused ? "Resume auto motion" : analyzingMotionGraphics ? "Pause auto motion" : "Automatically analyzes every still and applies the best-fitting motion graphic to each, individually — pausable/resumable at any point"}
+          onClick={onAnalyzeMotionGraphics}
+        >
+          {analyzingMotionGraphics && !motionGraphicsPaused ? <LoaderCircle className="spin" size={16} /> : motionGraphicsPaused ? <Play size={16} /> : <Clapperboard size={16} />}
+          <span>{motionGraphicsProgressLabel ?? "Auto motion"}</span>
         </button>
+        {motionGraphicsPaused && (
+          <button className="tl-tool-btn danger" title="Stop — keep what's already been analyzed, discard the rest of this run" onClick={onStopAutoMotion}>
+            <X size={16} />
+          </button>
+        )}
         <button className="tl-tool-btn danger" title="Remove camera movement, transitions, and gap-filling stretch from every still" onClick={onRemoveAllEffects}>
           <Trash2 size={16} /><span>Remove all effects</span>
         </button>

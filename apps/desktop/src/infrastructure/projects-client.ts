@@ -164,15 +164,22 @@ export type BulkPlannedStillRecord = {
   settingsLocked: boolean;
   promptLocked: boolean;
 };
-export type BulkPlanSummaryRecord = {
+/** Result of planning (and immediately persisting) ONE batch of stills —
+ * see `planBulkVisualsBatch`. Advance a local index by `plannedCount` and
+ * keep calling until `done`. */
+export type BulkPlanBatchResultRecord = {
+  plannedCount: number;
   totalStills: number;
-  visualTypeCounts: Record<string, number>;
-  shortOverview: string;
+  lastOrdinal: number;
+  done: boolean;
 };
-export type BulkPlanResultRecord = {
-  plannerVersion: number;
-  summary: BulkPlanSummaryRecord;
-  stills: BulkPlannedStillRecord[];
+/** Result of one Auto Motion batch call — see `analyzeMotionGraphicsBatch`.
+ * Keep calling until `done`; already-analyzed clips are skipped
+ * automatically, so a paused/resumed run never redoes work. */
+export type MotionGraphicsBatchResultRecord = {
+  completed: number;
+  total: number;
+  done: boolean;
 };
 
 export type ImageJobRecord = {
@@ -1242,21 +1249,28 @@ export const projectsClient = {
     if (isTauri()) return invoke("suggest_still_prompt", { videoId, groupId, styleDirective, baseSettingsJson });
     throw new Error("Prompt suggestion requires the native application.");
   },
-  async planBulkVisuals(videoId: string, styleDirective: string, baseSettingsJson: string, creativeInstruction: string, characterConsistency: boolean): Promise<BulkPlanResultRecord> {
-    if (isTauri()) return invoke("plan_bulk_visuals", { videoId, styleDirective, baseSettingsJson, creativeInstruction, characterConsistency });
+  /** Plans AND persists ONE batch of stills, starting at `startIndex` in
+   * ordinal order — call repeatedly (advancing `startIndex` by
+   * `plannedCount` each time) until `done`, checking a pause/stop flag
+   * between calls, to drive a full pausable/resumable run. Every batch is
+   * committed to the database the moment it lands — there's no separate
+   * "approve" step, and progress survives a pause or the app closing. */
+  async planBulkVisualsBatch(
+    videoId: string, styleDirective: string, baseSettingsJson: string, creativeInstruction: string,
+    characterConsistency: boolean, startIndex: number,
+  ): Promise<BulkPlanBatchResultRecord> {
+    if (isTauri()) return invoke("plan_bulk_visuals_batch", { videoId, styleDirective, baseSettingsJson, creativeInstruction, characterConsistency, startIndex });
     throw new Error("Bulk planning requires the native application.");
   },
-  /** Runs the fully backend-owned "Auto motion" pass: composes, renders, and
-   * validates a motion treatment for every still on the timeline (see
-   * SOPs/Motion_Graphics_SOP_v1.md) — no client-side settings or feedback,
-   * the engine decides everything on its own. */
-  async analyzeMotionGraphics(videoId: string): Promise<TimelineRecord> {
-    if (isTauri()) return invoke("analyze_motion_graphics", { videoId });
+  /** Runs the fully backend-owned "Auto motion" pass on the next batch of
+   * not-yet-analyzed clips (composes, renders, and validates a motion
+   * treatment for each — no client-side settings or feedback, the engine
+   * decides everything on its own). Call repeatedly until `done`, checking
+   * a pause/stop flag between calls — already-analyzed clips are skipped
+   * automatically, so resuming never redoes completed work. */
+  async analyzeMotionGraphicsBatch(videoId: string): Promise<MotionGraphicsBatchResultRecord> {
+    if (isTauri()) return invoke("analyze_motion_graphics_batch", { videoId });
     throw new Error("Motion graphics analysis requires the native application.");
-  },
-  async approveBulkPlan(videoId: string, styleDirective: string, stills: BulkPlannedStillRecord[]): Promise<number> {
-    if (isTauri()) return invoke("approve_bulk_plan", { videoId, styleDirective, stills });
-    throw new Error("Bulk plan approval requires the native application.");
   },
   async applyStyleDirectiveToAll(videoId: string, styleDirective: string): Promise<number> {
     if (isTauri()) return invoke("apply_style_directive_to_all", { videoId, styleDirective });

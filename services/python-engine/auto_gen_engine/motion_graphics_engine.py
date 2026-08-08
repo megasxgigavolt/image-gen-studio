@@ -990,7 +990,13 @@ def run(manifest_path: Path, ai_model: str, batch_size: int) -> list[dict]:
 
     batches = [clips[i : i + batch_size] for i in range(0, len(clips), batch_size)]
 
-    treatment_history: list[str] = []
+    # Seeded from the manifest when the caller already has treatments composed
+    # for earlier clips in this same video (see auto_gen_engine's Rust side,
+    # `analyze_motion_graphics_batch`, which now calls this once per batch of
+    # the whole video rather than once for all of it — treatment_history used
+    # to simply accumulate across batches within that one longer call, so it
+    # has to be handed in explicitly now instead of always starting empty).
+    treatment_history: list[str] = list(manifest.get("treatmentHistory", []))
     composed: list[tuple[dict, MotionRecipe]] = []
 
     for batch_number, batch in enumerate(batches, start=1):

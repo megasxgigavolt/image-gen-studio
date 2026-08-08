@@ -1553,19 +1553,6 @@ function SettingSelect({ label, value, options, onChange }: { label: string; val
   );
 }
 
-// Module-level: survives ImagesView mount/unmount so navigation doesn't kill an in-flight plan
-let _planningVideoId: string | null = null;
-let _planningPromise: Promise<import("./infrastructure/projects-client").BulkPlanResultRecord> | null = null;
-// Bumped whenever the user abandons an in-flight plan (Stop) so its eventual
-// resolution/rejection is ignored instead of clobbering a later run's state.
-let _planningGeneration = 0;
-
-// Bulk plan progress events forwarded outside component lifecycle
-void listen<{ planned: number; total: number }>("bulk_plan_progress", (event) => {
-  // Only used to update whichever ImagesView instance is mounted; the component's own listener handles this.
-  void event;
-});
-
 function ImagesView() {
   const { activeVideoId, addToast, setStage } = useAppStore();
   const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
@@ -1598,18 +1585,20 @@ function ImagesView() {
   const [zoom, setZoom] = useState(1);
   const [references, setReferences] = useState<import("./infrastructure/projects-client").InputAssetRecord[]>([]);
   const [bulkOpen, setBulkOpen] = useState(false);
-  const [bulkPlan, setBulkPlan] = useState<import("./infrastructure/projects-client").BulkPlanResultRecord | null>(null);
-  const [bulkPlanLoading, setBulkPlanLoading] = useState(false);
   const [bulkInstruction, setBulkInstruction] = useState(() => localStorage.getItem("bulk_creative_instruction") ?? "");
   const [characterConsistency, setCharacterConsistency] = useState(() => localStorage.getItem("bulk_character_consistency") === "true");
-  const [bulkOverviewOpen, setBulkOverviewOpen] = useState(false);
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null);
   const [preparingGroupIds, setPreparingGroupIds] = useState<Set<string>>(new Set());
   const [promptPrepStatus, setPromptPrepStatus] = useState<"running" | "paused" | null>(null);
   const promptPrepControl = useRef<"running" | "paused" | "stopped">("stopped");
   const promptPrepTask = useRef<{ items: ImageWorkspaceRecord["groups"]; index: number } | null>(null);
+  const [bulkPlanStatus, setBulkPlanStatus] = useState<"running" | "paused" | null>(null);
+  const bulkPlanControl = useRef<"running" | "paused" | "stopped">("stopped");
+  type BulkPlanTask = { total: number; index: number; styleDirective: string; baseSettingsJson: string; creativeInstruction: string; characterConsistency: boolean };
+  const bulkPlanTask = useRef<BulkPlanTask | null>(null);
   const [referenceUrl, setReferenceUrl] = useState("");
   const promptPrepSettingKey = activeVideoId ? `prompt_prep.${activeVideoId}` : "";
+  const bulkPlanSettingKey = activeVideoId ? `bulk_plan.${activeVideoId}` : "";
 
   const selectedGroup = useMemo(
     () => workspace?.groups.find((group) => group.group.id === selectedGroupId) ?? null,
@@ -1694,6 +1683,25 @@ function ImagesView() {
               setPreparingGroupIds(new Set(loaded.groups.slice(saved.index).map((item) => item.group.id)));
             }
           } catch { /* Ignore malformed legacy preparation state. */ }
+        }
+        const savedBulkPlan = loaded.settings.find((setting) => setting.key === `bulk_plan.${activeVideoId}`)?.value;
+        if (savedBulkPlan) {
+          try {
+            const saved = JSON.parse(savedBulkPlan) as BulkPlanTask & { status: string };
+            if (saved.status === "paused" && saved.index < saved.total) {
+              setSystemPrompt(saved.styleDirective);
+              setBulkInstruction(saved.creativeInstruction);
+              setCharacterConsistency(saved.characterConsistency);
+              bulkPlanTask.current = {
+                total: saved.total, index: saved.index, styleDirective: saved.styleDirective,
+                baseSettingsJson: saved.baseSettingsJson, creativeInstruction: saved.creativeInstruction,
+                characterConsistency: saved.characterConsistency,
+              };
+              bulkPlanControl.current = "paused";
+              setBulkPlanStatus("paused");
+              setBulkProgress({ current: saved.index, total: saved.total, label: "Bulk Generation paused — ready to resume" });
+            }
+          } catch { /* Ignore malformed bulk-plan state. */ }
         }
       } catch (caught) {
         setError(String(caught));
@@ -1928,102 +1936,100 @@ function ImagesView() {
     finally { setAiLoading(false); }
   }
 
-  // Keep progress events alive while component is mounted
-  useEffect(() => {
-    const unlisten = listen<{ planned: number; total: number }>("bulk_plan_progress", (event) => {
-      setBulkProgress((prev) => prev ? { ...prev, current: event.payload.planned, total: event.payload.total } : null);
-    });
-    return () => { void unlisten.then((fn) => fn()); };
-  }, []);
-
-  // Reattach to an in-flight plan if the user navigated away and came back
-  useEffect(() => {
-    if (_planningPromise && _planningVideoId === activeVideoId) {
-      const generation = _planningGeneration;
-      setBulkPlanLoading(true);
-      setBulkProgress({ current: 0, total: 0, label: "Planning stills with AI…" });
-      void _planningPromise
-        .then((plan) => { if (generation !== _planningGeneration) return; setBulkPlan(plan); setBulkOverviewOpen(true); })
-        .catch((err: unknown) => { if (generation !== _planningGeneration) return; setError(String(err)); setBulkOpen(true); })
-        .finally(() => { if (generation !== _planningGeneration) return; setBulkPlanLoading(false); setBulkProgress(null); });
+  // Drives a full Bulk Generation run one batch at a time — the same
+  // resumable pause/resume/stop shape as prompt preparation above, just
+  // batched instead of one still at a time. Every batch is committed to the
+  // database by the backend the instant it's planned (see
+  // plan_bulk_visuals_batch), so there's no separate "review the plan, then
+  // approve it" step anymore: reaching the end of the run immediately queues
+  // generation, the same way prompt preparation already does.
+  async function runBulkPlanLoop() {
+    if (!activeVideoId || !bulkPlanTask.current) return;
+    bulkPlanControl.current = "running";
+    setBulkPlanStatus("running");
+    const task = bulkPlanTask.current;
+    try {
+      while (task.index < task.total) {
+        if (bulkPlanControl.current !== "running") break;
+        setBulkProgress({ current: task.index, total: task.total, label: `Planning still ${task.index + 1} of ${task.total}` });
+        const result = await projectsClient.planBulkVisualsBatch(
+          activeVideoId, task.styleDirective, task.baseSettingsJson, task.creativeInstruction, task.characterConsistency, task.index,
+        );
+        if (bulkPlanControl.current !== "running") break;
+        // Guard against a batch that somehow made no progress — never spin forever.
+        task.index += Math.max(result.plannedCount, 1);
+        setBulkProgress({ current: Math.min(task.index, task.total), total: task.total, label: `Still ${Math.min(task.index, task.total)} of ${task.total} planned` });
+        if (bulkPlanSettingKey) await projectsClient.saveAppSetting(bulkPlanSettingKey, JSON.stringify({ status: "running", ...task }));
+        if (result.done) break;
+      }
+      const finalControl = bulkPlanControl.current as "running" | "paused" | "stopped";
+      if (finalControl === "running" && task.index >= task.total) {
+        setBulkProgress({ current: task.total, total: task.total, label: "Starting image generation" });
+        const live = await projectsClient.getImageWorkspace(activeVideoId);
+        setCached(activeVideoId, live);
+        setWorkspace(live);
+        if (selectedGroupId) {
+          const group = live.groups.find((g) => g.group.id === selectedGroupId);
+          const pv = group?.promptVersions[0];
+          if (pv) {
+            setImageSettings(parseImageSettings(pv.settingsJson));
+            setUserPrompt(pv.userPrompt);
+            const globalDirective = live.settings.find((s) => s.key === "system_prompt")?.value;
+            setSystemPrompt(globalDirective ?? pv.systemPrompt ?? systemPrompt);
+          }
+        }
+        const newJob = await projectsClient.createImageJob(activeVideoId);
+        setJob(newJob);
+        bulkPlanTask.current = null;
+        bulkPlanControl.current = "stopped";
+        setBulkPlanStatus(null);
+        setBulkProgress(null);
+        if (bulkPlanSettingKey) await projectsClient.saveAppSetting(bulkPlanSettingKey, "");
+        addToast(`${task.total} stills planned — generation started`, "success");
+      } else if (finalControl === "paused") {
+        setBulkPlanStatus("paused");
+        if (bulkPlanSettingKey) await projectsClient.saveAppSetting(bulkPlanSettingKey, JSON.stringify({ status: "paused", ...task }));
+      } else if (finalControl === "stopped") {
+        setBulkPlanStatus(null);
+        setBulkProgress(null);
+        bulkPlanTask.current = null;
+        if (bulkPlanSettingKey) await projectsClient.saveAppSetting(bulkPlanSettingKey, "");
+      }
+    } catch (caught) {
+      setError(String(caught));
+      bulkPlanControl.current = "paused";
+      setBulkPlanStatus("paused");
+      if (bulkPlanSettingKey && bulkPlanTask.current) await projectsClient.saveAppSetting(bulkPlanSettingKey, JSON.stringify({ status: "paused", ...bulkPlanTask.current }));
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeVideoId]);
+  }
+
+  function controlBulkPlan(action: "pause" | "resume" | "stop") {
+    if (action === "pause") {
+      bulkPlanControl.current = "paused";
+      setBulkPlanStatus("paused");
+      if (bulkPlanSettingKey && bulkPlanTask.current) void projectsClient.saveAppSetting(bulkPlanSettingKey, JSON.stringify({ status: "paused", ...bulkPlanTask.current }));
+    } else if (action === "stop") {
+      bulkPlanControl.current = "stopped";
+      setBulkPlanStatus(null);
+      setBulkProgress(null);
+      bulkPlanTask.current = null;
+      if (bulkPlanSettingKey) void projectsClient.saveAppSetting(bulkPlanSettingKey, "");
+    } else if (bulkPlanTask.current) {
+      void runBulkPlanLoop();
+    }
+  }
 
   async function runBulkPlan() {
-    if (!activeVideoId || !workspace || _planningPromise) return;
-    const total = workspace.groups.length;
+    if (!activeVideoId || !workspace?.groups.length || bulkPlanTask.current) return;
     setBulkOpen(false);
-    setBulkPlanLoading(true);
-    setBulkProgress({ current: 0, total: 0, label: `Planning ${total} stills with AI…` });
     setError(null);
-    _planningVideoId = activeVideoId;
-    const generation = ++_planningGeneration;
-    const innerPromise = (async () => {
-      await projectsClient.saveAppSetting("system_prompt", systemPrompt);
-      return projectsClient.planBulkVisuals(activeVideoId, systemPrompt, settingsJson, bulkInstruction, characterConsistency);
-    })();
-    _planningPromise = innerPromise;
-    try {
-      const plan = await innerPromise;
-      if (generation !== _planningGeneration) return;
-      setBulkPlan(plan);
-      setBulkOverviewOpen(true);
-    } catch (caught) {
-      if (generation !== _planningGeneration) return;
-      setError(String(caught));
-      setBulkOpen(true);
-    } finally {
-      if (generation === _planningGeneration) {
-        setBulkPlanLoading(false);
-        setBulkProgress(null);
-      }
-      if (_planningVideoId === activeVideoId) {
-        _planningPromise = null;
-        _planningVideoId = null;
-      }
-    }
-  }
-
-  // The AI batch planner has no backend cancellation — this is a "soft stop" that
-  // abandons the in-flight call (its eventual result is discarded, see
-  // _planningGeneration) and immediately frees the UI so the user isn't stuck
-  // waiting on a run they already asked to stop.
-  function stopBulkPlan() {
-    _planningGeneration += 1;
-    _planningPromise = null;
-    _planningVideoId = null;
-    setBulkPlanLoading(false);
-    setBulkProgress(null);
-  }
-
-  async function approveBulkPlan() {
-    if (!activeVideoId || !bulkPlan) return;
-    setLoading(true);
-    setError(null);
-    try {
-      setBulkOverviewOpen(false);
-      await projectsClient.approveBulkPlan(activeVideoId, systemPrompt, bulkPlan.stills);
-      const live = await projectsClient.getImageWorkspace(activeVideoId);
-      setCached(activeVideoId, live);
-      setWorkspace(live);
-      if (selectedGroupId) {
-        const group = live.groups.find((g) => g.group.id === selectedGroupId);
-        const pv = group?.promptVersions[0];
-        if (pv) {
-          setImageSettings(parseImageSettings(pv.settingsJson));
-          setUserPrompt(pv.userPrompt);
-          const globalDirective = live.settings.find((s) => s.key === "system_prompt")?.value;
-          setSystemPrompt(globalDirective ?? pv.systemPrompt ?? systemPrompt);
-        }
-      }
-      setBulkPlan(null);
-      // Planning and generating are one action from the user's perspective —
-      // approving the plan immediately kicks off rendering for every still.
-      const newJob = await projectsClient.createImageJob(activeVideoId);
-      setJob(newJob);
-    } catch (caught) { setError(String(caught)); }
-    finally { setLoading(false); }
+    await projectsClient.saveAppSetting("system_prompt", systemPrompt);
+    bulkPlanTask.current = {
+      total: workspace.groups.length, index: 0,
+      styleDirective: systemPrompt, baseSettingsJson: settingsJson,
+      creativeInstruction: bulkInstruction, characterConsistency,
+    };
+    void runBulkPlanLoop();
   }
 
   function updateImageSetting<K extends keyof ImageSettings>(key: K, value: ImageSettings[K]) {
@@ -2310,7 +2316,7 @@ function ImagesView() {
               </div>
             </div>
           )}
-          {bulkProgress && <div className="bulk-live-progress"><div><strong>{bulkProgress.label}</strong>{bulkProgress.total > 0 && <span>{bulkProgress.current} / {bulkProgress.total}</span>}</div>{bulkProgress.total > 0 ? <progress value={bulkProgress.current} max={bulkProgress.total} /> : <progress />}{bulkProgress.total > 0 && <div className="prompt-progress-actions">{promptPrepStatus === "running" && <button className="secondary" onClick={() => controlPromptPreparation("pause")}>Pause</button>}{promptPrepStatus === "paused" && <button className="secondary" onClick={() => controlPromptPreparation("resume")}>Resume</button>}<button className="secondary" onClick={() => (bulkPlanLoading ? stopBulkPlan() : controlPromptPreparation("stop"))}>Stop</button></div>}</div>}
+          {bulkProgress && <div className="bulk-live-progress"><div><strong>{bulkProgress.label}</strong>{bulkProgress.total > 0 && <span>{bulkProgress.current} / {bulkProgress.total}</span>}</div>{bulkProgress.total > 0 ? <progress value={bulkProgress.current} max={bulkProgress.total} /> : <progress />}{bulkProgress.total > 0 && <div className="prompt-progress-actions">{(promptPrepStatus === "running" || bulkPlanStatus === "running") && <button className="secondary" onClick={() => (bulkPlanStatus ? controlBulkPlan("pause") : controlPromptPreparation("pause"))}>Pause</button>}{(promptPrepStatus === "paused" || bulkPlanStatus === "paused") && <button className="secondary" onClick={() => (bulkPlanStatus ? controlBulkPlan("resume") : controlPromptPreparation("resume"))}>Resume</button>}<button className="secondary" onClick={() => (bulkPlanStatus !== null || bulkPlanTask.current ? controlBulkPlan("stop") : controlPromptPreparation("stop"))}>Stop</button></div>}</div>}
           <header>
             <div><span className="timestamp-heading">{selectedTiming ? `${formatTimeShort(selectedTiming.start)} – ${formatTimeShort(selectedTiming.end)}` : previewLabel}</span><strong className="production-copy narration-preview">{selectedSentences.map((sentence) => sentence.text).join(" ")}</strong></div>
           </header>
@@ -2478,41 +2484,11 @@ function ImagesView() {
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still. Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
           <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cat as the main character. Show visible emotions and varied body language. Avoid showing text, labels, or close-ups on faces." rows={4} />
-          <button className="primary full" style={{marginTop:"10px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanLoading || !workspace?.groups.length || bulkProgress !== null || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>
-            {bulkPlanLoading ? "Planning…" : <><WandSparkles size={16} />Generate All Stills</>}
+          <button className="primary full" style={{marginTop:"10px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanStatus !== null || !workspace?.groups.length || bulkProgress !== null || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>
+            <WandSparkles size={16} />Generate All Stills
           </button>
-          {Boolean(job && ["queued", "running", "paused"].includes(job.status)) && <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Stop the active job to re-plan.</p>}
+          <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans and generates every still in one pausable run — no separate review step. {Boolean(job && ["queued", "running", "paused"].includes(job.status)) && "Stop the active job to re-plan."}</p>
           <button className="secondary full" style={{marginTop:"8px"}} onClick={() => setBulkOpen(false)}>Cancel</button>
-        </div>
-      </div>}
-      {bulkOverviewOpen && bulkPlan && <div className="modal-backdrop" role="presentation" onMouseDown={() => { setBulkOverviewOpen(false); setBulkPlan(null); }}>
-        <div className="modal bulk-overview-modal" onMouseDown={(e) => e.stopPropagation()}>
-          <h2>Visual Plan — {bulkPlan.summary.totalStills} Stills</h2>
-          <p className="overview-summary">{bulkPlan.summary.shortOverview}</p>
-          <div className="visual-type-counts">
-            {Object.entries(bulkPlan.summary.visualTypeCounts).sort((a, b) => b[1] - a[1]).map(([type, count]) => (
-              <span key={type} className="type-badge"><strong>{count}</strong>{type}</span>
-            ))}
-          </div>
-          <div className="bulk-overview-table">
-            <div className="overview-table-head">
-              <span>#</span><span>Timestamp</span><span>Narration</span><span>Visual Type</span><span>Scene Description</span>
-            </div>
-            {bulkPlan.stills.map((still) => (
-              <div key={still.visualPlanRowId} className="overview-table-row">
-                <span>{still.ordinal}</span>
-                <span>{formatTimeShort(still.timestampStart)}–{formatTimeShort(still.timestampEnd)}</span>
-                <span title={still.narrationPreview} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }}>{still.narrationPreview}</span>
-                <span>{still.visualType}</span>
-                <span title={still.userPrompt}>{still.userPrompt.slice(0, 70)}{still.userPrompt.length > 70 ? "…" : ""}</span>
-              </div>
-            ))}
-          </div>
-          <div className="overview-actions">
-            <button className="primary" onClick={() => void approveBulkPlan()} disabled={loading}>Apply & Generate All</button>
-            <button className="secondary" onClick={() => { setBulkOverviewOpen(false); setBulkOpen(true); }}>Back</button>
-            <button className="secondary" onClick={() => { setBulkOverviewOpen(false); setBulkPlan(null); }}>Cancel</button>
-          </div>
         </div>
       </div>}
     </section>

@@ -129,7 +129,12 @@ export function TimelineView() {
   const [selectedClipVideoAsset, setSelectedClipVideoAsset] = useState<VideoAssetRecord | null>(null);
   const [retiming, setRetiming] = useState(false);
   const [extrapolating, setExtrapolating] = useState(false);
-  const [analyzingMotionGraphics, setAnalyzingMotionGraphics] = useState(false);
+  // "running"/"paused" drives the toolbar button + progress label; the ref is
+  // what the loop itself checks each iteration to decide whether to keep
+  // going — same split React state (for render) / ref (for the loop's own
+  // control flow) already used for prompt-prep and Bulk Generation.
+  const [motionStatus, setMotionStatus] = useState<"running" | "paused" | null>(null);
+  const motionControl = useRef<"running" | "paused" | "stopped">("stopped");
   const [motionGraphicsProgress, setMotionGraphicsProgress] = useState<{ done: number; total: number } | null>(null);
   const [uploadingAnimation, setUploadingAnimation] = useState(false);
   const [selectedCaptionClip, setSelectedCaptionClip] = useState<TimelineCaptionClipRecord | null>(null);
@@ -318,12 +323,6 @@ export function TimelineView() {
   useEffect(() => {
     setCaptionText(selectedCaptionClip?.text ?? "");
   }, [selectedCaptionClip?.id, selectedCaptionClip?.text]);
-  useEffect(() => {
-    const unlisten = listen<{ done: number; total: number }>("motion_graphics_progress", (event) => {
-      setMotionGraphicsProgress({ done: event.payload.done, total: event.payload.total });
-    });
-    return () => { void unlisten.then((fn) => fn()); };
-  }, []);
   // Native <audio> volume tops out at 1.0 — values above 100% aren't
   // achievable without a Web Audio gain node, so this only ever attenuates.
   useEffect(() => {
@@ -529,20 +528,65 @@ export function TimelineView() {
     addToast("Removed camera movement, transitions, color filters, motion graphics, and any gap-filling stretch from every still.", "success");
   }
 
-  async function analyzeMotionGraphics() {
-    if (!activeVideoId || analyzingMotionGraphics) return;
-    const stillCount = stillsClips.length;
-    setAnalyzingMotionGraphics(true);
+  // Drives a full Auto Motion pass one batch (~5 clips) at a time, checking
+  // motionControl between batches so it can be paused/resumed/stopped
+  // whenever — the same shape as Bulk Generation's planning loop. Each
+  // batch's clips are analyzed AND committed to the database by the backend
+  // before this even sees the result (see analyze_motion_graphics_batch),
+  // so pausing never loses or redoes work: resuming just calls the batch
+  // command again, which only ever looks at clips that don't have a motion
+  // treatment yet.
+  async function runAutoMotionLoop() {
+    if (!activeVideoId) return;
+    motionControl.current = "running";
+    setMotionStatus("running");
     setMotionGraphicsProgress(null);
+    let pushedUndoPoint = false;
     try {
-      await refresh(projectsClient.analyzeMotionGraphics(activeVideoId));
-      addToast(`Motion applied to ${stillCount} still${stillCount === 1 ? "" : "s"}.`, "success");
+      while (motionControl.current === "running") {
+        const result = await projectsClient.analyzeMotionGraphicsBatch(activeVideoId);
+        setMotionGraphicsProgress({ done: result.completed, total: result.total });
+        // Only the FIRST batch's refresh is undo-eligible — one "before
+        // auto motion" checkpoint for the whole run, not one per batch.
+        await refresh(projectsClient.getTimeline(activeVideoId), { skipHistory: pushedUndoPoint });
+        pushedUndoPoint = true;
+        if (result.done) {
+          if (motionControl.current === "running") addToast(`Motion applied to ${result.total} still${result.total === 1 ? "" : "s"}.`, "success");
+          motionControl.current = "stopped";
+          break;
+        }
+      }
     } catch (caught) {
       addToast(String(caught), "error");
+      motionControl.current = "paused";
     } finally {
-      setAnalyzingMotionGraphics(false);
-      setMotionGraphicsProgress(null);
+      if (motionControl.current === "paused") {
+        setMotionStatus("paused");
+      } else {
+        setMotionStatus(null);
+        setMotionGraphicsProgress(null);
+      }
     }
+  }
+
+  /** The toolbar button is a single control whose action depends on current
+   * state: idle → start (via requestAutoMotion's confirm-if-overwriting
+   * check), running → pause, paused → resume. */
+  function toggleAutoMotion() {
+    if (motionStatus === "running") {
+      motionControl.current = "paused";
+      setMotionStatus("paused");
+    } else if (motionStatus === "paused") {
+      void runAutoMotionLoop();
+    } else {
+      requestAutoMotion();
+    }
+  }
+
+  function stopAutoMotion() {
+    motionControl.current = "stopped";
+    setMotionStatus(null);
+    setMotionGraphicsProgress(null);
   }
 
   function requestAutoMotion() {
@@ -551,7 +595,7 @@ export function TimelineView() {
       setConfirmAutoMotion(true);
       return;
     }
-    void analyzeMotionGraphics();
+    void runAutoMotionLoop();
   }
 
   async function resetTimelineToDefault() {
@@ -1195,7 +1239,7 @@ export function TimelineView() {
             </p>
             <div className="footer-actions">
               <button className="secondary" onClick={() => setConfirmAutoMotion(false)}>Cancel</button>
-              <button className="primary" onClick={() => { setConfirmAutoMotion(false); void analyzeMotionGraphics(); }}>Apply auto motion</button>
+              <button className="primary" onClick={() => { setConfirmAutoMotion(false); void runAutoMotionLoop(); }}>Apply auto motion</button>
             </div>
           </section>
         </div>
@@ -1469,9 +1513,11 @@ export function TimelineView() {
             onExtrapolateStills={() => setConfirmExtrapolateStills(true)}
             extrapolating={extrapolating}
             onRemoveAllEffects={() => setConfirmRemoveAllEffects(true)}
-            onAnalyzeMotionGraphics={requestAutoMotion}
-            analyzingMotionGraphics={analyzingMotionGraphics}
-            motionGraphicsProgressLabel={motionGraphicsProgress ? `Applying motion… ${motionGraphicsProgress.done} / ${motionGraphicsProgress.total}` : null}
+            onAnalyzeMotionGraphics={toggleAutoMotion}
+            onStopAutoMotion={stopAutoMotion}
+            analyzingMotionGraphics={motionStatus !== null}
+            motionGraphicsPaused={motionStatus === "paused"}
+            motionGraphicsProgressLabel={motionGraphicsProgress ? (motionStatus === "paused" ? `Paused ${motionGraphicsProgress.done} / ${motionGraphicsProgress.total}` : `Applying motion… ${motionGraphicsProgress.done} / ${motionGraphicsProgress.total}`) : null}
             aspectRatio={aspectRatio}
             onAspectRatioChange={(ratio) => void handleAspectRatioChange(ratio)}
           />

@@ -1406,14 +1406,6 @@ pub struct PlanGroup {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BulkPlanSummary {
-    pub total_stills: usize,
-    pub visual_type_counts: std::collections::HashMap<String, usize>,
-    pub short_overview: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BulkPlannedStill {
     pub visual_plan_row_id: String,
     pub ordinal: i64,
@@ -1428,13 +1420,38 @@ pub struct BulkPlannedStill {
     pub prompt_locked: bool,
 }
 
+/// Result of planning (and immediately persisting) ONE batch of stills —
+/// see `plan_bulk_visuals_batch`. The frontend drives the full run by
+/// calling that command repeatedly, advancing its own index by
+/// `plannedCount` each time, the same way it already drives per-still
+/// "Auto Educational" prompt preparation — this is what makes the whole
+/// run pausable/resumable and each batch durable the moment it lands,
+/// rather than living only in memory until a separate "approve" step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BulkPlanResult {
-    pub planner_version: u32,
-    pub summary: BulkPlanSummary,
-    pub stills: Vec<BulkPlannedStill>,
+pub struct BulkPlanBatchResult {
+    pub planned_count: usize,
+    pub total_stills: usize,
+    pub last_ordinal: i64,
+    pub done: bool,
 }
+
+/// Result of one `analyze_motion_graphics_batch` call — see that function's
+/// doc comment for why Auto Motion moved to this same per-batch, resumable
+/// shape as `plan_bulk_visuals_batch`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MotionGraphicsBatchResult {
+    pub completed: usize,
+    pub total: usize,
+    pub done: bool,
+}
+
+/// Clips per Auto Motion subprocess call — matches
+/// motion_graphics_engine.py's own `DEFAULT_BATCH_SIZE`, since each Rust
+/// call now maps to exactly one of the engine's own composition batches
+/// (see `analyze_motion_graphics_batch`).
+const MOTION_GRAPHICS_BATCH_SIZE: usize = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -3337,19 +3354,187 @@ Return JSON only — no markdown, no explanation:
         )
     }
 
-    pub fn plan_bulk_visuals<F: Fn(usize, usize)>(&self, video_id: &str, style_directive: &str, base_settings_json: &str, creative_instruction: &str, character_consistency: bool, on_progress: F) -> Result<BulkPlanResult, String> {
-        // Claude CLI first — no metered cost, rides whatever Claude
-        // subscription is already logged into the CLI on this machine, so
-        // it alone is enough to plan even with no Gemini key configured.
-        // Gemini is the only fallback — OpenAI has been removed from Bulk
-        // Gen planning entirely (see run_claude_cli's doc comment).
+    /// Reads back up to `limit` already-*persisted* stills immediately
+    /// before `before_index` (in ordinal order) as the same diversity/
+    /// continuity context shape `plan_bulk_visuals_batch`'s prompt expects
+    /// — reconstructed from the database rather than threaded through
+    /// memory, since a resumed run is a fresh function call with no memory
+    /// of earlier batches. `_coreVisualDevice`, stashed inside each still's
+    /// `settings_json` when it was persisted (see `persist_bulk_planned_still`),
+    /// round-trips back out here into the `coreVisualDevice` field the
+    /// "RECURRING SYMBOL TRACKING" prompt rule reads.
+    fn bulk_plan_prior_context(
+        &self,
+        video_id: &str,
+        groups: &[PlanGroup],
+        before_index: usize,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let start = before_index.saturating_sub(limit);
+        let mut context = Vec::new();
+        for group in &groups[start..before_index] {
+            let Some(latest) = self.list_prompt_versions(video_id, &group.id)?.into_iter().next() else {
+                continue;
+            };
+            let settings: serde_json::Value =
+                serde_json::from_str(&latest.settings_json).unwrap_or_else(|_| json!({}));
+            let visual_type = self.get_educational_visual_plan(video_id, &group.id)?
+                .map(|plan| plan.visual_intent).unwrap_or_default();
+            context.push(json!({
+                "visualPlanRowId": group.id,
+                "visualType": visual_type,
+                "mood": settings.get("mood").and_then(|v| v.as_str()),
+                "cameraAngle": settings.get("cameraAngle").and_then(|v| v.as_str()),
+                "lighting": settings.get("lighting").and_then(|v| v.as_str()),
+                "colorTemperature": settings.get("colorTemperature").and_then(|v| v.as_str()),
+                "weatherAtmosphere": settings.get("weatherAtmosphere").and_then(|v| v.as_str()),
+                "sceneAndEmotionPreview": latest.user_prompt.chars().take(320).collect::<String>(),
+                "coreVisualDevice": settings.get("_coreVisualDevice").and_then(|v| v.as_str()).unwrap_or_default(),
+            }));
+        }
+        Ok(context)
+    }
+
+    /// Saves one AI-planned still (a prompt version + the `educational_visual_plans`
+    /// row `create_image_job` checks to decide what needs rendering) — the same
+    /// persistence `approve_bulk_plan` used to do only once, for every still, after
+    /// a separate manual review step. Called immediately after each batch is
+    /// planned instead, so progress survives a pause, a crash, or the app being
+    /// closed — there is no longer an in-memory-only "planned but not saved" state.
+    /// Returns `None` (without error) for a still that's fully locked (nothing to
+    /// change) or that resolved to empty text — the same "skip, don't fail the
+    /// batch" behavior `approve_bulk_plan` had.
+    fn persist_bulk_planned_still(
+        &self,
+        video_id: &str,
+        style_directive: &str,
+        group: &PlanGroup,
+        row: &serde_json::Value,
+        mut still: V2PlanStillResponse,
+    ) -> Result<Option<BulkPlannedStill>, String> {
+        if group.settings_locked && group.prompt_locked {
+            return Ok(None);
+        }
+        let now = Utc::now().to_rfc3339();
+        let settings_json = if group.settings_locked {
+            self.list_prompt_versions(video_id, &group.id)?.into_iter().next()
+                .map(|p| p.settings_json).unwrap_or_else(|| "{}".into())
+        } else {
+            if let Some(obj) = still.image_settings.as_object_mut() {
+                obj.insert("_coreVisualDevice".to_string(), json!(still.core_visual_device));
+            }
+            still.image_settings.to_string()
+        };
+        let user_prompt = if group.prompt_locked {
+            self.list_prompt_versions(video_id, &group.id)?.into_iter().next()
+                .map(|p| p.user_prompt).unwrap_or_default()
+        } else {
+            still.user_prompt.clone()
+        };
+        if user_prompt.trim().is_empty() {
+            return Ok(None);
+        }
+        let next_version: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(version),0)+1 FROM prompt_versions WHERE video_id=?1 AND group_id=?2",
+            params![video_id, &group.id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let pv_id = Uuid::new_v4().to_string();
+        self.connection.execute(
+            "INSERT INTO prompt_versions(id,video_id,group_id,version,settings_json,system_prompt,user_prompt,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![pv_id, video_id, &group.id, next_version, &settings_json, style_directive, &user_prompt, &now],
+        ).map_err(|e| e.to_string())?;
+        let still_id = self.get_educational_visual_plan(video_id, &group.id)?
+            .map(|plan| plan.still_id).unwrap_or_else(|| Uuid::new_v4().to_string());
+        let signature = format!("v2-bulk|{}|{}|{}", EDUCATIONAL_VISUAL_PLANNER_VERSION, video_id, group.id);
+        self.connection.execute(
+            "INSERT INTO educational_visual_plans(still_id,video_id,visual_plan_row_id,educational_objective,visual_intent,subject_strategy,image_settings_json,user_prompt,plan_signature,visual_strategy_mode,planner_version,created_at,updated_at)
+             VALUES(?1,?2,?3,'Planned',?4,'Single Subject',?5,?6,?7,'Auto Educational',?8,?9,?9)
+             ON CONFLICT(still_id) DO UPDATE SET educational_objective='Planned',visual_intent=excluded.visual_intent,subject_strategy='Single Subject',image_settings_json=excluded.image_settings_json,user_prompt=excluded.user_prompt,plan_signature=excluded.plan_signature,updated_at=excluded.updated_at",
+            params![still_id, video_id, &group.id, &still.visual_type, &settings_json, &user_prompt, &signature, EDUCATIONAL_VISUAL_PLANNER_VERSION, &now],
+        ).map_err(|e| e.to_string())?;
+        Ok(Some(BulkPlannedStill {
+            visual_plan_row_id: group.id.clone(),
+            ordinal: row["ordinal"].as_i64().unwrap_or(0),
+            narration_preview: row["narration"].as_str().unwrap_or_default().chars().take(110).collect(),
+            timestamp_start: row["startSeconds"].as_f64().unwrap_or(0.0),
+            timestamp_end: row["endSeconds"].as_f64().unwrap_or(0.0),
+            visual_type: still.visual_type,
+            image_settings: serde_json::from_str(&settings_json).unwrap_or_else(|_| json!({})),
+            user_prompt,
+            reason: still.reason,
+            settings_locked: group.settings_locked,
+            prompt_locked: group.prompt_locked,
+        }))
+    }
+
+    /// Writes (overwriting) a plain-language log of every still's narration
+    /// alongside its current final generation prompt, to
+    /// `{video}/visual-plan/prompt-log.md` — refreshed after every Bulk
+    /// Generation batch so it always reflects the live plan rather than a
+    /// stale snapshot from whenever bulk gen first ran. Best-effort: an I/O
+    /// failure here is returned as an error but callers may choose to treat
+    /// it as non-fatal to the batch that triggered it.
+    fn write_bulk_prompt_log(&self, video_id: &str) -> Result<(), String> {
+        let plan = self.get_visual_plan(video_id)?;
+        let (channel_id, video_title): (String, String) = self.connection.query_row(
+            "SELECT channel_id,title FROM videos WHERE id=?1", [video_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(|e| e.to_string())?;
+        let dir = self.projects_dir.join(&channel_id).join(video_id).join("visual-plan");
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+        let mut doc = format!(
+            "# Bulk Generation prompt log — {video_title}\n\n{} stills. Regenerated automatically after every Bulk Generation batch — this always reflects the current plan, not a one-time snapshot.\n\n",
+            plan.groups.len(),
+        );
+        for group in &plan.groups {
+            let narration = group.sentence_ids.iter()
+                .filter_map(|id| plan.sentences.iter().find(|s| &s.id == id))
+                .map(|sentence| sentence.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let Some(latest) = self.list_prompt_versions(video_id, &group.id)?.into_iter().next() else {
+                continue;
+            };
+            doc.push_str(&format!("## Still {} — {}\n\n", group.ordinal, group.label));
+            doc.push_str(&format!(
+                "**Narration:** {}\n\n**Prompt:** {}\n\n---\n\n",
+                if narration.trim().is_empty() { "(no narration)" } else { narration.trim() },
+                latest.user_prompt.trim(),
+            ));
+        }
+        fs::write(dir.join("prompt-log.md"), doc).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Plans AND persists ONE batch of stills, starting at `start_index` in
+    /// ordinal order — the resumable, incrementally-committing replacement
+    /// for the old `plan_bulk_visuals` (which planned the entire video in
+    /// one long call, held every result only in memory, and needed a
+    /// separate manual "approve" step before anything was saved or
+    /// generation could start). The frontend drives a full run by calling
+    /// this repeatedly, advancing its own index by `plannedCount` each time
+    /// — the exact same pattern already used for per-still "Auto
+    /// Educational" prompt preparation — checking a pause/stop flag between
+    /// calls. Because every batch is committed to the database the moment
+    /// it's planned, pausing mid-run (or the app closing) never loses
+    /// completed work, and there's nothing left to "approve" afterward:
+    /// once the run reaches the end, the caller can queue generation
+    /// immediately.
+    pub fn plan_bulk_visuals_batch(
+        &self,
+        video_id: &str,
+        style_directive: &str,
+        base_settings_json: &str,
+        creative_instruction: &str,
+        character_consistency: bool,
+        start_index: usize,
+    ) -> Result<BulkPlanBatchResult, String> {
         #[cfg(not(test))]
         let claude_cli = claude_cli_available();
         #[cfg(test)]
         let claude_cli = false;
-        // Gemini only needs to actually resolve when Claude CLI isn't available at
-        // all — `.ok()` swallows "no Gemini key configured" so the Claude-only happy
-        // path is unaffected.
         let gemini_auth = if claude_cli {
             self.gemini_auth().ok()
         } else {
@@ -3358,21 +3543,16 @@ Return JSON only — no markdown, no explanation:
         if gemini_auth.is_none() && !claude_cli {
             return Err("A logged-in Claude Code CLI, or a Gemini API key, is required for Bulk planning. Run `claude` once to log in, or add a Gemini key in Settings.".into());
         }
-        // Gemini Flash hard-caps output at ~8000 tokens; Claude comfortably supports
-        // larger batches. Size for Claude's larger cap whenever Claude CLI is the
-        // primary path — Gemini being configured as a fallback doesn't matter, since
-        // it only ever serves a batch when Claude itself fails, at which point one
-        // truncated-JSON batch retried at the smaller size is a rare, acceptable
-        // trade-off against every batch paying Gemini's cap for a provider that's
-        // almost never the one actually answering. Only pure-Gemini (no Claude CLI
-        // at all) sizes small up front, since Gemini is the one serving every batch
-        // in that case.
-        let chunk_size_for_provider: usize = if claude_cli || gemini_auth.is_none() { 6 } else { 3 };
+        let chunk_size: usize = if claude_cli || gemini_auth.is_none() { 6 } else { 3 };
         let visual_plan = self.get_visual_plan(video_id)?;
         if visual_plan.groups.is_empty() {
             return Err("No stills found. Generate a visual plan first.".into());
         }
-        let mut row_data: Vec<serde_json::Value> = Vec::with_capacity(visual_plan.groups.len());
+        let total = visual_plan.groups.len();
+        if start_index >= total {
+            return Ok(BulkPlanBatchResult { planned_count: 0, total_stills: total, last_ordinal: 0, done: true });
+        }
+        let mut row_data: Vec<serde_json::Value> = Vec::with_capacity(total);
         for group in &visual_plan.groups {
             let members: Vec<_> = group.sentence_ids.iter()
                 .filter_map(|id| visual_plan.sentences.iter().find(|s| &s.id == id)).collect();
@@ -3394,19 +3574,26 @@ Return JSON only — no markdown, no explanation:
                 "existingPrompt": existing_prompt.as_ref().map(|p| p.user_prompt.as_str()),
             }));
         }
-        let total = row_data.len();
-        // Persisted per-video so generate_image_render can pass the actual
-        // reference image into every still's generation call too (text
-        // description alone doesn't reliably reproduce exact details like
-        // hair across independent generations — see that function).
         self.save_app_setting(
             &format!("character_consistency.{video_id}"),
             if character_consistency { "true" } else { "false" },
         )?;
-        // Computed once (a real vision API call), not per-chunk like
-        // director_note below — then interpolated into every chunk's prompt.
+        // Character description is a real vision API call — expensive enough
+        // that it's worth caching across batches (a fresh function call per
+        // batch has no in-memory way to reuse it otherwise). Invalidated by
+        // simply toggling Character Consistency off and back on with a new
+        // reference image (see the frontend), which is the only time the
+        // cached description would ever go stale.
         let character_block = if character_consistency {
-            let description = self.character_description_for_video(video_id, &gemini_auth)?;
+            let cache_key = format!("character_description.{video_id}");
+            let description = match self.get_app_setting(&cache_key)? {
+                Some(cached) if !cached.trim().is_empty() => cached,
+                _ => {
+                    let description = self.character_description_for_video(video_id, &gemini_auth)?;
+                    self.save_app_setting(&cache_key, &description)?;
+                    description
+                }
+            };
             format!(
                 "\n\n════════════════════════════════════════\n\
                  MANDATORY CHARACTER CONSISTENCY — NON-NEGOTIABLE\n\
@@ -3441,54 +3628,38 @@ Return JSON only — no markdown, no explanation:
         } else {
             String::new()
         };
-        let mut planned: Vec<V2PlanStillResponse> = Vec::with_capacity(total);
-        let chunk_size: usize = chunk_size_for_provider;
+
+        let chunk_end = (start_index + chunk_size).min(total);
+        let chunk = &row_data[start_index..chunk_end];
+        let prior_context = self.bulk_plan_prior_context(video_id, &visual_plan.groups, start_index, 12)?;
         let total_batches = total.div_ceil(chunk_size);
-        let mut next_to_plan: usize = 0;
-        let mut chunk_index: usize = 0;
-        let mut api_calls: usize = 0;
-        let max_api_calls = total_batches * 5;
-        while next_to_plan < total && api_calls < max_api_calls {
-            api_calls += 1;
-            let chunk_end = (next_to_plan + chunk_size).min(total);
-            let chunk = &row_data[next_to_plan..chunk_end];
-            let prior_context_start = planned.len().saturating_sub(12);
-            let prior_context: Vec<_> = planned[prior_context_start..].iter().map(|s| json!({
-                "visualPlanRowId": s.visual_plan_row_id,
-                "visualType": s.visual_type,
-                "mood": s.image_settings.get("mood").and_then(|v| v.as_str()),
-                "cameraAngle": s.image_settings.get("cameraAngle").and_then(|v| v.as_str()),
-                "lighting": s.image_settings.get("lighting").and_then(|v| v.as_str()),
-                "colorTemperature": s.image_settings.get("colorTemperature").and_then(|v| v.as_str()),
-                "weatherAtmosphere": s.image_settings.get("weatherAtmosphere").and_then(|v| v.as_str()),
-                "sceneAndEmotionPreview": s.user_prompt.chars().take(320).collect::<String>(),
-            })).collect();
-            let director_note = if creative_instruction.trim().is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\n\n════════════════════════════════════════\n\
-                     MANDATORY CREATIVE RULES — NON-NEGOTIABLE\n\
-                     ════════════════════════════════════════\n\
-                     The following rules were set by the user and override any other planning preference.\n\
-                     They MUST be applied to EVERY still in this batch without exception:\n\n\
-                     {}\n\n\
-                     HOW TO EMBED THESE RULES IN userPrompt (mandatory — not optional):\n\
-                     1. POSITIVE rules (include X / always show Y / use Z / feature W):\n\
-                        → Weave the required subject, character, or element directly into the scene description as a concrete physical presence.\n\
-                        → If the rule contains style words such as realistic, animated, cartoon, 3D, anime, cinematic, or illustration, treat those as Style Directive content and do NOT copy those words into userPrompt.\n\
-                        → Example rule \"always include the orange cat\" → userPrompt must contain the orange cat as an active participant in every scene.\n\
-                     2. NEGATIVE rules (avoid X / no Y / never Z / do not show W / exclude V):\n\
-                        → Parse every avoidance directive and collect them.\n\
-                        → Append them at the END of the userPrompt in this exact format: [Avoid: item1, item2, item3]\n\
-                        → Also reflect the avoidance in your choice of visualType and imageSettings where applicable.\n\
-                     3. Both positive and negative rules must be clearly visible in the output userPrompt — a reviewer must be able to confirm compliance by reading the userPrompt alone.\n\
-                     ════════════════════════════════════════\n",
-                    creative_instruction.trim()
-                )
-            };
-            let prompt = format!(
-                r#"You are an Educational Visual Director planning an entire video, not isolated stills.
+        let batch_number = start_index / chunk_size + 1;
+        let director_note = if creative_instruction.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n════════════════════════════════════════\n\
+                 MANDATORY CREATIVE RULES — NON-NEGOTIABLE\n\
+                 ════════════════════════════════════════\n\
+                 The following rules were set by the user and override any other planning preference.\n\
+                 They MUST be applied to EVERY still in this batch without exception:\n\n\
+                 {}\n\n\
+                 HOW TO EMBED THESE RULES IN userPrompt (mandatory — not optional):\n\
+                 1. POSITIVE rules (include X / always show Y / use Z / feature W):\n\
+                    → Weave the required subject, character, or element directly into the scene description as a concrete physical presence.\n\
+                    → If the rule contains style words such as realistic, animated, cartoon, 3D, anime, cinematic, or illustration, treat those as Style Directive content and do NOT copy those words into userPrompt.\n\
+                    → Example rule \"always include the orange cat\" → userPrompt must contain the orange cat as an active participant in every scene.\n\
+                 2. NEGATIVE rules (avoid X / no Y / never Z / do not show W / exclude V):\n\
+                    → Parse every avoidance directive and collect them.\n\
+                    → Append them at the END of the userPrompt in this exact format: [Avoid: item1, item2, item3]\n\
+                    → Also reflect the avoidance in your choice of visualType and imageSettings where applicable.\n\
+                 3. Both positive and negative rules must be clearly visible in the output userPrompt — a reviewer must be able to confirm compliance by reading the userPrompt alone.\n\
+                 ════════════════════════════════════════\n",
+                creative_instruction.trim()
+            )
+        };
+        let prompt = format!(
+            r#"You are an Educational Visual Director planning an entire video, not isolated stills.
 
 Style directive: {style_directive}
 Base image settings: {base_settings_json}{director_note}{character_block}
@@ -3499,6 +3670,11 @@ Current batch rows to plan:
 {}
 
 CORE GOAL: Ask "What image best helps the viewer understand this concept?" — never "What literally matches the sentence?"
+
+LITERAL-TRANSLATION TRAP (the most common planning mistake — watch for this specifically):
+- If the narration states a number ("10 reasons", "twelve followers", "ten thousand attempts"), do NOT render that number as a literal count of objects, people, or items in the image (ten steps, twelve people, thousands of coins). Convey the IDEA the number represents — scale, imbalance, rarity, crowding — never a countable illustration of the digit itself.
+- If the narration already contains its own figure of speech, analogy, or borrowed image ("you're looking at a lottery winner", "the invisible dice", "a custom-built house", "one side of a coin"), do NOT simply stage that exact image. That is the sentence's own crutch, not a visual plan — invent an independent translation of the underlying point instead. Treat the sentence's specific words as what to communicate, never as a literal shot list of what to draw.
+- Before finalizing a still, ask: "if this exact idea were phrased in a completely different sentence, would I still draw this image?" If the image only makes sense because of this sentence's specific word choice, it has failed this check — revise it.
 
 EXPRESSIVE STORYTELLING LAYER (required, not a style):
 - Every still needs a clear emotional beat or physical tension that helps the viewer feel the idea, not just identify the subject.
@@ -3522,6 +3698,10 @@ ANTI-REPETITION (enforce strictly):
 - Never assign the same visualType to more than 3 consecutive stills.
 - Vary subject framing, environment structure, and subject count across stills.
 - For animal/nature/documentary videos: mix types — character scene, close detail, object focus, environment only, comparison, diagram — do not show only character portraits.
+
+RECURRING SYMBOL TRACKING: an abstract idea (luck, a hidden mechanism, a process, a hidden truth) often recurs across a video — when it does, do not reach for the same literal object every time it comes up. Each still in the "Previously planned context" below carries a `coreVisualDevice` field naming exactly which concrete symbol/object it already used — if the idea you're planning for now has come up before, check that list and choose a genuinely different concrete image, not a repeat of the same prop or scene shape.
+
+COMPOSITIONAL DEVICE VARIETY: a split-screen / mirrored-panel / before-after layout is a legitimate device for a genuine two-state contrast, but must not become the default solution for every contrast or every "Number N" transition. Reserve it for moments that specifically need two states shown at once side by side, and vary how you visualize contrast the rest of the time instead — a single image carrying visible tension or change, a sequence built across consecutive stills rather than one split image, a before/after implied through one telling detail rather than a literal divided frame.
 
 NARRATIVE POINT CONTINUITY (decide this FIRST, before applying SETTINGS DIVERSITY below):
 - A "point" is one idea, claim, scene, or beat in the narration — usually spanning several consecutive stills before the narration moves on to its next distinct idea.
@@ -3599,100 +3779,100 @@ Allowed visualType values: Character Scene; Character Close-Up / Reaction; Behav
 
 You MUST return exactly one plan for every row in the current batch.
 OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object and NOTHING else. Do not write any introduction, restatement of the task, narration of your planning process, explanation, commentary, or markdown fences before, between, or after it. Do not describe what you are about to plan — just plan it, silently, and output only the resulting JSON. The very first character of your response must be {{ and the very last character must be }}.
-{{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content — mandatory creative rules embedded; negatives as [Avoid: ...]"}}]}}"#,
-                chunk_index + 1,
-                serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
-                serde_json::to_string_pretty(chunk).unwrap_or_default(),
-            );
-            // Claude CLI first (no metered cost); Gemini is the only fallback —
-            // OpenAI has been removed from Bulk Gen planning entirely.
-            let response = if claude_cli {
-                match request_claude_cli_v2_plan(&prompt) {
-                    Ok(response) => response,
-                    Err(claude_error) => match gemini_auth.as_ref() {
-                        Some(auth) => request_gemini_v2_plan(auth, &prompt).map_err(|gemini_error| {
-                            format!("Claude CLI: {claude_error} | Gemini fallback also failed: {gemini_error}")
-                        })?,
-                        None => return Err(format!("Claude CLI: {claude_error}")),
-                    },
-                }
-            } else {
-                request_gemini_v2_plan(gemini_auth.as_ref().unwrap(), &prompt)?
-            };
-            // Match plans back to rows by id rather than strict positional order: models
-            // occasionally reorder or duplicate entries in the array, and a single
-            // out-of-place plan used to zero out an otherwise-usable batch.
-            let mut plans_by_id: std::collections::HashMap<String, V2PlanStillResponse> = response.plans
-                .into_iter()
-                .map(|plan| (plan.visual_plan_row_id.clone(), plan))
-                .collect();
-            let valid_count = chunk.iter()
-                .take_while(|row| {
-                    row["visualPlanRowId"].as_str()
-                        .map(|id| plans_by_id.contains_key(id))
-                        .unwrap_or(false)
-                })
-                .count();
-            if valid_count == 0 {
-                return Err(format!(
-                    "No usable plans returned for stills {}-{} (batch {}). Please retry.",
-                    next_to_plan + 1, chunk_end, chunk_index + 1
-                ));
+{{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content — mandatory creative rules embedded; negatives as [Avoid: ...]","coreVisualDevice":"2-6 words naming the concrete symbol/object this still leans on, e.g. 'dice and coin', 'gears', 'split panel: podium vs porch'"}}]}}"#,
+            batch_number,
+            serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
+            serde_json::to_string_pretty(chunk).unwrap_or_default(),
+        );
+        let response = if claude_cli {
+            match request_claude_cli_v2_plan(&prompt) {
+                Ok(response) => response,
+                Err(claude_error) => match gemini_auth.as_ref() {
+                    Some(auth) => request_gemini_v2_plan(auth, &prompt).map_err(|gemini_error| {
+                        format!("Claude CLI: {claude_error} | Gemini fallback also failed: {gemini_error}")
+                    })?,
+                    None => return Err(format!("Claude CLI: {claude_error}")),
+                },
             }
-            for row in chunk.iter().take(valid_count) {
-                let id = row["visualPlanRowId"].as_str().unwrap_or_default();
-                let mut plan = match plans_by_id.remove(id) {
-                    Some(plan) => plan,
-                    None => break,
-                };
-                if row["settingsLocked"].as_bool().unwrap_or(false) {
-                    if let Some(obj) = row["existingSettings"].as_object() {
-                        plan.image_settings = serde_json::Value::Object(obj.clone());
-                    }
-                }
-                if row["promptLocked"].as_bool().unwrap_or(false) {
-                    if let Some(existing) = row["existingPrompt"].as_str() {
-                        plan.user_prompt = existing.to_string();
-                    }
-                }
-                planned.push(plan);
-            }
-            next_to_plan += valid_count;
-            on_progress(next_to_plan, total);
-            chunk_index += 1;
-        }
-        if next_to_plan < total {
-            return Err(format!("Planning incomplete after {api_calls} API calls: only {next_to_plan} of {total} stills planned."));
-        }
-        repair_excessive_consecutive_visual_types(&mut planned, &row_data);
-        let mut visual_type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for p in &planned { *visual_type_counts.entry(p.visual_type.clone()).or_insert(0) += 1; }
-        let short_overview = {
-            let mut top: Vec<_> = visual_type_counts.iter().collect();
-            top.sort_by(|a, b| b.1.cmp(a.1));
-            let parts: Vec<_> = top.iter().take(4).map(|(k, v)| format!("{} {} ({}%)", v, k, (*v * 100) / total.max(1))).collect();
-            format!("{} stills planned. Leading types: {}.", total, parts.join(", "))
+        } else {
+            request_gemini_v2_plan(gemini_auth.as_ref().unwrap(), &prompt)?
         };
-        let stills = planned.into_iter().zip(row_data.iter()).zip(visual_plan.groups.iter()).map(|((plan, row), group)| {
-            let narration = row["narration"].as_str().unwrap_or_default().to_string();
-            BulkPlannedStill {
-                visual_plan_row_id: plan.visual_plan_row_id,
-                ordinal: row["ordinal"].as_i64().unwrap_or(0),
-                narration_preview: narration.chars().take(110).collect::<String>(),
-                timestamp_start: row["startSeconds"].as_f64().unwrap_or(0.0),
-                timestamp_end: row["endSeconds"].as_f64().unwrap_or(0.0),
-                visual_type: plan.visual_type,
-                image_settings: plan.image_settings,
-                user_prompt: plan.user_prompt,
-                reason: plan.reason,
-                settings_locked: group.settings_locked,
-                prompt_locked: group.prompt_locked,
+        let mut plans_by_id: std::collections::HashMap<String, V2PlanStillResponse> = response.plans
+            .into_iter()
+            .map(|plan| (plan.visual_plan_row_id.clone(), plan))
+            .collect();
+        let valid_count = chunk.iter()
+            .take_while(|row| {
+                row["visualPlanRowId"].as_str()
+                    .map(|id| plans_by_id.contains_key(id))
+                    .unwrap_or(false)
+            })
+            .count();
+        if valid_count == 0 {
+            return Err(format!(
+                "No usable plans returned for stills {}-{} (batch {}). Please retry.",
+                start_index + 1, chunk_end, batch_number
+            ));
+        }
+        let mut batch_plans: Vec<V2PlanStillResponse> = Vec::with_capacity(valid_count);
+        for row in chunk.iter().take(valid_count) {
+            let id = row["visualPlanRowId"].as_str().unwrap_or_default();
+            if let Some(plan) = plans_by_id.remove(id) {
+                batch_plans.push(plan);
             }
-        }).collect();
-        Ok(BulkPlanResult {
-            planner_version: 2,
-            summary: BulkPlanSummary { total_stills: total, visual_type_counts, short_overview },
-            stills,
+        }
+        // Seed the "no more than 3 consecutive same visualType" check with the
+        // run already in progress at the end of prior_context, so a run that
+        // crosses this batch's own boundary still gets caught — the repair
+        // pass otherwise only ever sees this one batch's slice.
+        let (seed_run_type, seed_run_len) = {
+            let mut run_type = String::new();
+            let mut run_len = 0usize;
+            for entry in prior_context.iter().rev() {
+                let visual_type = entry.get("visualType").and_then(|v| v.as_str()).unwrap_or_default();
+                if run_len == 0 {
+                    run_type = visual_type.to_string();
+                    run_len = 1;
+                } else if visual_type == run_type {
+                    run_len += 1;
+                } else {
+                    break;
+                }
+            }
+            (run_type, run_len)
+        };
+        repair_excessive_consecutive_visual_types(&mut batch_plans, &chunk[..valid_count], &seed_run_type, seed_run_len);
+
+        let mut planned_count = 0usize;
+        let mut last_ordinal = row_data.get(start_index.wrapping_sub(1)).and_then(|row| row["ordinal"].as_i64()).unwrap_or(0);
+        for (offset, mut plan) in batch_plans.into_iter().enumerate() {
+            let index = start_index + offset;
+            let group = &visual_plan.groups[index];
+            let row = &row_data[index];
+            if row["settingsLocked"].as_bool().unwrap_or(false) {
+                if let Some(obj) = row["existingSettings"].as_object() {
+                    plan.image_settings = serde_json::Value::Object(obj.clone());
+                }
+            }
+            if row["promptLocked"].as_bool().unwrap_or(false) {
+                if let Some(existing) = row["existingPrompt"].as_str() {
+                    plan.user_prompt = existing.to_string();
+                }
+            }
+            if let Some(saved) = self.persist_bulk_planned_still(video_id, style_directive, group, row, plan)? {
+                last_ordinal = saved.ordinal;
+            }
+            planned_count += 1;
+        }
+        // Best-effort: a log-write failure shouldn't fail an otherwise-successful
+        // batch that's already durably saved in the database.
+        let _ = self.write_bulk_prompt_log(video_id);
+
+        Ok(BulkPlanBatchResult {
+            planned_count,
+            total_stills: total,
+            last_ordinal,
+            done: start_index + planned_count >= total,
         })
     }
 
@@ -3753,34 +3933,63 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
     /// batches clips together and carries forward what earlier clips in the
     /// same video were already given so far across the whole video into every
     /// batch, actively varying the mix instead of picking each clip in a vacuum.
-    pub fn analyze_motion_graphics<F: Fn(usize, usize)>(
-        &self, video_id: &str, engine_dir: &Path, on_progress: F,
-    ) -> Result<Timeline, String> {
+    /// Analyzes AND applies motion graphics for the next batch of not-yet-
+    /// analyzed clips (those with a rendered still and no
+    /// `motion_graphic_effect` yet) — the resumable, pausable replacement for
+    /// the old `analyze_motion_graphics`, which ran the entire video through
+    /// one long-lived Python subprocess call with no way to interrupt it
+    /// partway through. The frontend drives a full run by calling this
+    /// repeatedly until `done`, checking a pause/stop flag between calls —
+    /// the same pattern `plan_bulk_visuals_batch` uses. Because a clip's
+    /// `motion_graphic_effect` is written to the database the moment its
+    /// batch finishes, "resume" is simply calling this again: it naturally
+    /// only ever sees clips that don't have one yet, so a pause never redoes
+    /// or loses completed work.
+    ///
+    /// `treatmentHistory` (what earlier, already-analyzed clips in this same
+    /// video were given, feeding the engine's own diversity mechanism — see
+    /// motion_graphics_engine.py's module docstring) is reconstructed from
+    /// the database each call and passed into the manifest, rather than kept
+    /// in memory across calls the way it used to accumulate across batches
+    /// within one long subprocess run — `run()` now seeds its own
+    /// `treatment_history` from this instead of always starting empty.
+    pub fn analyze_motion_graphics_batch(
+        &self, video_id: &str, engine_dir: &Path,
+    ) -> Result<MotionGraphicsBatchResult, String> {
         let credentials = self.resolve_motion_graphics_credentials()?;
         let timeline = self.get_timeline(video_id)?;
-        let clips: Vec<&TimelineClip> = timeline.clips.iter().filter(|clip| clip.render_id.is_some()).collect();
-        let total = clips.len();
+        let eligible: Vec<&TimelineClip> = timeline.clips.iter().filter(|clip| clip.render_id.is_some()).collect();
+        let total = eligible.len();
         if total == 0 {
             return Err("No stills with a rendered image were found on this timeline.".into());
         }
+        let already_done = eligible.iter().filter(|clip| clip.motion_graphic_effect.is_some()).count();
+        let remaining: Vec<&TimelineClip> = eligible.iter().copied().filter(|clip| clip.motion_graphic_effect.is_none()).collect();
+        if remaining.is_empty() {
+            return Ok(MotionGraphicsBatchResult { completed: total, total, done: true });
+        }
+        let history_all: Vec<String> = eligible.iter().filter_map(|clip| clip.motion_graphic_effect.clone()).collect();
+        let treatment_history: Vec<String> = history_all.iter().rev().take(12).rev().cloned().collect();
+        let batch: Vec<&TimelineClip> = remaining.into_iter().take(MOTION_GRAPHICS_BATCH_SIZE).collect();
 
         #[cfg(test)]
         {
             let _ = engine_dir;
             let _ = &credentials;
+            let _ = &treatment_history;
             // No Python/network in tests — deterministically cycle through a
             // few fixture labels so callers can still exercise the resulting
             // Timeline shape. The label is free text now (see doc comment
             // above), so any small fixed set works fine here.
             const TEST_FIXTURE_LABELS: [&str; 3] = ["test push", "test reveal", "test drift"];
-            for (index, clip) in clips.iter().enumerate() {
+            for (index, clip) in batch.iter().enumerate() {
                 let effect = TEST_FIXTURE_LABELS[index % TEST_FIXTURE_LABELS.len()];
                 self.set_timeline_clip_motion_graphic(
                     video_id, &clip.id, Some(effect), Some("{}"), Some("test fixture"),
                 )?;
-                on_progress(index + 1, total);
             }
-            return self.get_timeline(video_id);
+            let completed = already_done + batch.len();
+            return Ok(MotionGraphicsBatchResult { completed, total, done: completed >= total });
         }
         #[cfg(not(test))]
         {
@@ -3804,7 +4013,7 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
             let manifest_path = work_dir.join("manifest.json");
             let results_path = work_dir.join("results.json");
 
-            let clip_manifest: Vec<serde_json::Value> = clips.iter().map(|clip| {
+            let clip_manifest: Vec<serde_json::Value> = batch.iter().map(|clip| {
                 let render_id = clip.render_id.as_ref().expect("filtered to Some above");
                 let (mime, base64_data) = self.read_render_file(render_id)?;
                 Ok::<_, String>(json!({
@@ -3836,6 +4045,7 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                     "width": manifest_width,
                     "height": manifest_height,
                     "fps": 30,
+                    "treatmentHistory": treatment_history,
                 })).unwrap_or_default(),
             ).map_err(|e| e.to_string())?;
 
@@ -3852,60 +4062,29 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                 .arg(&manifest_path)
                 .arg("--output")
                 .arg(&results_path)
+                // This batch's own manifest already contains only ONE
+                // batch's worth of clips (see MOTION_GRAPHICS_BATCH_SIZE) —
+                // telling the engine its batch size equals the whole
+                // manifest keeps its own internal batching from subdividing
+                // it further.
+                .arg("--batch-size")
+                .arg(batch.len().to_string())
                 .current_dir(engine_dir)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
             credentials.apply_env(&mut command);
             #[cfg(windows)]
             command.creation_flags(0x08000000);
-            let mut child = command
-                .spawn()
-                .map_err(|e| format!("Could not start the Python motion-graphics engine: {e}"))?;
-            let stdout = child.stdout.take().ok_or("Could not capture motion-graphics engine output.")?;
-            let stderr = child.stderr.take().ok_or("Could not capture motion-graphics engine errors.")?;
-            let stderr_thread = std::thread::spawn(move || {
-                let mut reader = BufReader::new(stderr);
-                let mut bytes = Vec::new();
-                let mut output = Vec::new();
-                loop {
-                    bytes.clear();
-                    match reader.read_until(b'\n', &mut bytes) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => output.push(String::from_utf8_lossy(&bytes).trim().to_string()),
-                    }
-                }
-                output.join("\n")
-            });
-            let mut stdout_reader = BufReader::new(stdout);
-            let mut line_bytes = Vec::new();
-            loop {
-                line_bytes.clear();
-                let count = stdout_reader
-                    .read_until(b'\n', &mut line_bytes)
-                    .map_err(|e| format!("Could not read engine progress: {e}"))?;
-                if count == 0 {
-                    break;
-                }
-                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
-                if let Some(payload) = line.strip_prefix("AUTOGEN_PROGRESS ") {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
-                        let percent = value["percent"].as_i64().unwrap_or(0).clamp(0, 100);
-                        let done = ((percent as f64 / 100.0) * total as f64).round() as usize;
-                        on_progress(done.min(total), total);
-                    }
-                }
-            }
-            let status = child.wait().map_err(|e| format!("Could not wait for motion-graphics engine: {e}"))?;
-            let raw_stderr = stderr_thread.join().unwrap_or_default();
-            if !status.success() {
-                return Err(format!("Motion graphics analysis failed. {raw_stderr}"));
+            let output = command.output().map_err(|e| format!("Could not start the Python motion-graphics engine: {e}"))?;
+            if !output.status.success() {
+                return Err(format!("Motion graphics analysis failed. {}", String::from_utf8_lossy(&output.stderr).trim()));
             }
 
             let results: serde_json::Value = serde_json::from_slice(
                 &fs::read(&results_path).map_err(|e| format!("Could not read motion-graphics results: {e}"))?,
             ).map_err(|e| format!("Motion-graphics results were invalid: {e}"))?;
             let analyses = results["analyses"].as_array().ok_or("Motion-graphics results contained no analyses.")?;
-            for (index, analysis) in analyses.iter().enumerate() {
+            for analysis in analyses {
                 let clip_id = analysis["clipId"].as_str().ok_or("Motion-graphics result missing clipId.")?;
                 let effect = analysis["effect"].as_str().ok_or("Motion-graphics result missing effect.")?;
                 let settings = analysis.get("settings").cloned().unwrap_or_else(|| json!({}));
@@ -3925,9 +4104,9 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                         self.set_timeline_clip_transition_out(video_id, clip_id, transition)?;
                     }
                 }
-                on_progress(index + 1, total);
             }
-            self.get_timeline(video_id)
+            let completed = already_done + analyses.len();
+            Ok(MotionGraphicsBatchResult { completed, total, done: completed >= total })
         }
     }
 
@@ -4124,54 +4303,6 @@ Return JSON only, in exactly this shape: {{"description": "the explanation text"
             .filter(|value| !value.is_empty())
             .ok_or("No description returned.")?;
         Ok(description.to_string())
-    }
-
-    pub fn approve_bulk_plan(&self, video_id: &str, style_directive: &str, stills: &[BulkPlannedStill]) -> Result<usize, String> {
-        let now = Utc::now().to_rfc3339();
-        let mut saved = 0usize;
-        for still in stills {
-            let group_id = &still.visual_plan_row_id;
-            let (settings_locked, prompt_locked): (bool, bool) = self.connection.query_row(
-                "SELECT COALESCE(settings_locked,0), COALESCE(prompt_locked,0) FROM visual_plan_groups WHERE video_id=?1 AND (id LIKE ?2 OR id=?2)",
-                params![video_id, format!("%::{group_id}")],
-                |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
-            ).unwrap_or((false, false));
-            if settings_locked && prompt_locked { continue; }
-            let settings_json = if settings_locked {
-                self.list_prompt_versions(video_id, group_id)?
-                    .into_iter().next().map(|p| p.settings_json).unwrap_or_else(|| "{}".into())
-            } else {
-                still.image_settings.to_string()
-            };
-            let user_prompt = if prompt_locked {
-                self.list_prompt_versions(video_id, group_id)?
-                    .into_iter().next().map(|p| p.user_prompt).unwrap_or_default()
-            } else {
-                still.user_prompt.clone()
-            };
-            if user_prompt.trim().is_empty() { continue; }
-            let next_version: i64 = self.connection.query_row(
-                "SELECT COALESCE(MAX(version),0)+1 FROM prompt_versions WHERE video_id=?1 AND group_id=?2",
-                params![video_id, group_id],
-                |row| row.get(0),
-            ).map_err(|e| e.to_string())?;
-            let pv_id = Uuid::new_v4().to_string();
-            self.connection.execute(
-                "INSERT INTO prompt_versions(id,video_id,group_id,version,settings_json,system_prompt,user_prompt,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![pv_id, video_id, group_id, next_version, settings_json, style_directive, user_prompt, now],
-            ).map_err(|e| e.to_string())?;
-            let still_id = self.get_educational_visual_plan(video_id, group_id)?
-                .map(|p| p.still_id).unwrap_or_else(|| Uuid::new_v4().to_string());
-            let signature = format!("v2-bulk|{}|{}|{}", EDUCATIONAL_VISUAL_PLANNER_VERSION, video_id, group_id);
-            self.connection.execute(
-                "INSERT INTO educational_visual_plans(still_id,video_id,visual_plan_row_id,educational_objective,visual_intent,subject_strategy,image_settings_json,user_prompt,plan_signature,visual_strategy_mode,planner_version,created_at,updated_at)
-                 VALUES(?1,?2,?3,'Planned',?4,'Single Subject',?5,?6,?7,'Auto Educational',?8,?9,?9)
-                 ON CONFLICT(still_id) DO UPDATE SET educational_objective='Planned',visual_intent=excluded.visual_intent,subject_strategy='Single Subject',image_settings_json=excluded.image_settings_json,user_prompt=excluded.user_prompt,plan_signature=excluded.plan_signature,updated_at=excluded.updated_at",
-                params![still_id, video_id, group_id, still.visual_type, settings_json, user_prompt, signature, EDUCATIONAL_VISUAL_PLANNER_VERSION, now],
-            ).map_err(|e| e.to_string())?;
-            saved += 1;
-        }
-        Ok(saved)
     }
 
     pub fn apply_creative_instructions_to_all(
@@ -9911,6 +10042,15 @@ struct V2PlanStillResponse {
     user_prompt: String,
     #[serde(default)]
     reason: String,
+    /// A short (2-6 word) name for the concrete symbol/object/device this
+    /// still's image leans on to carry its idea (e.g. "dice and coin",
+    /// "gears", "split panel: podium vs. porch") — not shown to the user,
+    /// only fed back into future batches' `priorContext` so the model can
+    /// see it's already used a given literal symbol and reach for a
+    /// different one next time an abstract idea recurs. See the
+    /// "RECURRING SYMBOL TRACKING" prompt section.
+    #[serde(alias = "core_visual_device", default)]
+    core_visual_device: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -9918,7 +10058,20 @@ struct V2PlanChunkResponse {
     plans: Vec<V2PlanStillResponse>,
 }
 
-fn repair_excessive_consecutive_visual_types(planned: &mut [V2PlanStillResponse], row_data: &[serde_json::Value]) {
+/// `seed_run_type`/`seed_run_len` let the caller carry a same-type run
+/// already in progress at the END of whatever came immediately before
+/// `planned` (e.g. the tail of `bulk_plan_prior_context`, when `planned` is
+/// only one batch of a larger resumable run — see
+/// `plan_bulk_visuals_batch`) into this check, so a run that started in an
+/// earlier, already-persisted batch and continues into this one still gets
+/// caught. Pass `("", 0)` when there's no such context (a single, complete
+/// list planned in one call).
+fn repair_excessive_consecutive_visual_types(
+    planned: &mut [V2PlanStillResponse],
+    row_data: &[serde_json::Value],
+    seed_run_type: &str,
+    seed_run_len: usize,
+) {
     let alternatives = [
         "Behavioral Demonstration",
         "Close Detail",
@@ -9932,8 +10085,8 @@ fn repair_excessive_consecutive_visual_types(planned: &mut [V2PlanStillResponse]
         "Concept Visualization",
         "Documentary Frame",
     ];
-    let mut run_type = String::new();
-    let mut run_len = 0usize;
+    let mut run_type = seed_run_type.to_string();
+    let mut run_len = seed_run_len;
 
     for index in 0..planned.len() {
         if planned[index].visual_type == run_type {
@@ -11609,6 +11762,7 @@ mod tests {
                 image_settings: json!({}),
                 user_prompt: format!("Scene {index}"),
                 reason: String::new(),
+                core_visual_device: String::new(),
             })
             .collect();
         let row_data: Vec<serde_json::Value> = (1..=5)
@@ -11621,13 +11775,254 @@ mod tests {
             })
             .collect();
 
-        repair_excessive_consecutive_visual_types(&mut planned, &row_data);
+        repair_excessive_consecutive_visual_types(&mut planned, &row_data, "", 0);
 
         assert!(planned
             .windows(4)
             .all(|window| !window.iter().all(|plan| plan.visual_type == window[0].visual_type)));
         assert_eq!(planned[0].visual_type, "Character Scene");
         assert_ne!(planned[3].visual_type, "Character Scene");
+    }
+
+    #[test]
+    fn repair_visual_types_honors_a_run_already_in_progress_from_a_prior_batch() {
+        // A run of 3 "Character Scene" already ended the PREVIOUS batch (as
+        // plan_bulk_visuals_batch reconstructs from bulk_plan_prior_context)
+        // — this batch's very first item continuing that same type should
+        // trip the repair immediately, not need 3 more of its own first.
+        let mut planned: Vec<V2PlanStillResponse> = (1..=2)
+            .map(|index| V2PlanStillResponse {
+                visual_plan_row_id: format!("g{index}"),
+                visual_type: "Character Scene".into(),
+                image_settings: json!({}),
+                user_prompt: format!("Scene {index}"),
+                reason: String::new(),
+                core_visual_device: String::new(),
+            })
+            .collect();
+        let row_data: Vec<serde_json::Value> = (1..=2)
+            .map(|index| json!({ "visualPlanRowId": format!("g{index}"), "settingsLocked": false, "promptLocked": false }))
+            .collect();
+
+        repair_excessive_consecutive_visual_types(&mut planned, &row_data, "Character Scene", 3);
+
+        assert_ne!(planned[0].visual_type, "Character Scene");
+    }
+
+    #[test]
+    fn persist_bulk_planned_still_saves_prompt_and_educational_plan() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group = &plan.groups[0];
+        let row = json!({
+            "ordinal": group.ordinal, "narration": "First scene.", "startSeconds": 0.0, "endSeconds": 2.0,
+        });
+        let still = V2PlanStillResponse {
+            visual_plan_row_id: group.id.clone(),
+            visual_type: "Character Scene".into(),
+            image_settings: json!({ "mood": "Hopeful" }),
+            user_prompt: "A hopeful scene.".into(),
+            reason: "Fits the narration.".into(),
+            core_visual_device: "lantern".into(),
+        };
+
+        let saved = repo.persist_bulk_planned_still(&video.id, "Cinematic style", group, &row, still)
+            .unwrap()
+            .expect("should have persisted");
+        assert_eq!(saved.visual_type, "Character Scene");
+        assert_eq!(saved.user_prompt, "A hopeful scene.");
+
+        let pv = repo.list_prompt_versions(&video.id, &group.id).unwrap().into_iter().next().unwrap();
+        assert_eq!(pv.user_prompt, "A hopeful scene.");
+        assert_eq!(pv.system_prompt, "Cinematic style");
+        let settings: serde_json::Value = serde_json::from_str(&pv.settings_json).unwrap();
+        assert_eq!(settings["mood"], "Hopeful");
+        // Embedded so a later batch's prior-context can read it back (see
+        // bulk_plan_prior_context) without a schema migration.
+        assert_eq!(settings["_coreVisualDevice"], "lantern");
+
+        let educational = repo.get_educational_visual_plan(&video.id, &group.id).unwrap().unwrap();
+        assert_eq!(educational.visual_intent, "Character Scene");
+        assert_eq!(educational.user_prompt, "A hopeful scene.");
+    }
+
+    #[test]
+    fn persist_bulk_planned_still_respects_locked_fields_and_skips_fully_locked() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let mut group = plan.groups[0].clone();
+        let row = json!({ "ordinal": group.ordinal, "narration": "First scene.", "startSeconds": 0.0, "endSeconds": 2.0 });
+
+        // Establish a v1 to lock onto.
+        let first = V2PlanStillResponse {
+            visual_plan_row_id: group.id.clone(), visual_type: "Object Focus".into(),
+            image_settings: json!({ "mood": "Serene Peaceful" }), user_prompt: "Original prompt.".into(),
+            reason: String::new(), core_visual_device: String::new(),
+        };
+        repo.persist_bulk_planned_still(&video.id, "Style", &group, &row, first).unwrap();
+
+        // Settings locked, prompt NOT locked: the AI's new settings must be
+        // ignored in favor of what's already saved, but the prompt is free
+        // to update.
+        group.settings_locked = true;
+        group.prompt_locked = false;
+        let second = V2PlanStillResponse {
+            visual_plan_row_id: group.id.clone(), visual_type: "Object Focus".into(),
+            image_settings: json!({ "mood": "Dramatic Intense" }), user_prompt: "An updated prompt.".into(),
+            reason: String::new(), core_visual_device: String::new(),
+        };
+        let saved = repo.persist_bulk_planned_still(&video.id, "Style", &group, &row, second).unwrap()
+            .expect("a partially-locked still still persists a new version");
+        assert_eq!(saved.user_prompt, "An updated prompt.");
+        assert_eq!(saved.image_settings["mood"], "Serene Peaceful");
+
+        // Fully locked (both) is treated as "nothing to do" — no new version at all.
+        group.prompt_locked = true;
+        let before_count = repo.list_prompt_versions(&video.id, &group.id).unwrap().len();
+        let third = V2PlanStillResponse {
+            visual_plan_row_id: group.id.clone(), visual_type: "Object Focus".into(),
+            image_settings: json!({}), user_prompt: "Yet another prompt.".into(),
+            reason: String::new(), core_visual_device: String::new(),
+        };
+        let result = repo.persist_bulk_planned_still(&video.id, "Style", &group, &row, third).unwrap();
+        assert!(result.is_none());
+        assert_eq!(repo.list_prompt_versions(&video.id, &group.id).unwrap().len(), before_count);
+    }
+
+    /// Directly inserts `count` one-sentence-each groups (bypassing the
+    /// heuristic auto-grouper's own duration-driven merging, which can't
+    /// be relied on to produce an exact group count from short fixture
+    /// sentences) — mirrors the same fixture pattern
+    /// `project_bundle_remaps_prefix_colliding_sequential_ids` uses.
+    /// Returns the resulting `VisualPlan`.
+    fn seed_one_group_per_sentence(repo: &ProjectRepository, video_id: &str, count: i64) -> VisualPlan {
+        repo.connection.execute(
+            "INSERT INTO visual_plan_meta(video_id,timing_source,generated_at,updated_at) VALUES(?1,'test',?2,?2)",
+            params![video_id, Utc::now().to_rfc3339()],
+        ).unwrap();
+        for n in 1..=count {
+            let sentence_id = format!("{video_id}::s{n}");
+            repo.connection.execute(
+                "INSERT INTO visual_plan_sentences(id,video_id,ordinal,text,start_seconds,end_seconds) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![sentence_id, video_id, n, format!("Sentence {n}."), (n - 1) as f64 * 2.0, n as f64 * 2.0],
+            ).unwrap();
+            let group_id = format!("{video_id}::current::g{n}");
+            repo.connection.execute(
+                "INSERT INTO visual_plan_groups(id,video_id,ordinal,label,kind,sentence_ids_json,is_original) VALUES(?1,?2,?3,?4,'subject',?5,0)",
+                params![group_id, video_id, n, format!("Scene {n}"), serde_json::to_string(&vec![format!("s{n}")]).unwrap()],
+            ).unwrap();
+        }
+        repo.get_visual_plan(video_id).unwrap()
+    }
+
+    #[test]
+    fn bulk_plan_prior_context_reads_back_core_visual_device() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let plan = seed_one_group_per_sentence(&repo, &video.id, 2);
+        let group0 = &plan.groups[0];
+        let row0 = json!({ "ordinal": group0.ordinal, "narration": "First scene.", "startSeconds": 0.0, "endSeconds": 2.0 });
+        let still = V2PlanStillResponse {
+            visual_plan_row_id: group0.id.clone(), visual_type: "Object Focus".into(),
+            image_settings: json!({ "mood": "Hopeful", "lighting": "Golden Hour" }),
+            user_prompt: "A lantern glowing in the dark.".into(),
+            reason: String::new(), core_visual_device: "lantern".into(),
+        };
+        repo.persist_bulk_planned_still(&video.id, "Style", group0, &row0, still).unwrap();
+
+        let context = repo.bulk_plan_prior_context(&video.id, &plan.groups, 1, 12).unwrap();
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0]["visualType"], "Object Focus");
+        assert_eq!(context[0]["coreVisualDevice"], "lantern");
+        assert_eq!(context[0]["lighting"], "Golden Hour");
+
+        // Nothing precedes the very first group.
+        let empty_context = repo.bulk_plan_prior_context(&video.id, &plan.groups, 0, 12).unwrap();
+        assert!(empty_context.is_empty());
+    }
+
+    #[test]
+    fn write_bulk_prompt_log_contains_narration_and_prompt() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "A lantern flickers in the dark.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group = &plan.groups[0];
+        let row = json!({ "ordinal": group.ordinal, "narration": "A lantern flickers in the dark.", "startSeconds": 0.0, "endSeconds": 2.0 });
+        let still = V2PlanStillResponse {
+            visual_plan_row_id: group.id.clone(), visual_type: "Object Focus".into(),
+            image_settings: json!({}), user_prompt: "A brass lantern casting long shadows.".into(),
+            reason: String::new(), core_visual_device: "lantern".into(),
+        };
+        repo.persist_bulk_planned_still(&video.id, "Style", group, &row, still).unwrap();
+
+        repo.write_bulk_prompt_log(&video.id).unwrap();
+
+        let channel_id = channel.id.clone();
+        let log_path = temp.path().join("Projects").join(&channel_id).join(&video.id).join("visual-plan").join("prompt-log.md");
+        let contents = fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("A lantern flickers in the dark."));
+        assert!(contents.contains("A brass lantern casting long shadows."));
+    }
+
+    #[test]
+    fn analyze_motion_graphics_batch_resumes_and_skips_completed_clips() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        // 7 groups/stills, so with MOTION_GRAPHICS_BATCH_SIZE = 5 this needs
+        // two batches to fully resolve.
+        let plan = seed_one_group_per_sentence(&repo, &video.id, 7);
+        for group in &plan.groups {
+            let prompt = repo.create_prompt_version(&video.id, &group.id, "{}", "system", "scene").unwrap();
+            let render_dir = temp.path().join("Projects").join(&channel.id).join(&video.id).join("renders").join(&group.id);
+            fs::create_dir_all(&render_dir).unwrap();
+            fs::write(render_dir.join("render-v1.png"), b"bytes").unwrap();
+            repo.insert_image_render(
+                &format!("render-{}", group.id), &video.id, &group.id, 1, &prompt.id, "render-v1.png",
+                &format!("renders/{}/render-v1.png", group.id), None, None, "generation",
+            ).unwrap();
+        }
+        repo.build_timeline(&video.id).unwrap();
+
+        let total_clips = plan.groups.len();
+        assert!(total_clips > MOTION_GRAPHICS_BATCH_SIZE, "test needs more than one batch to be meaningful");
+
+        let first = repo.analyze_motion_graphics_batch(&video.id, temp.path()).unwrap();
+        assert_eq!(first.completed, MOTION_GRAPHICS_BATCH_SIZE);
+        assert_eq!(first.total, total_clips);
+        assert!(!first.done);
+
+        let timeline_after_first = repo.get_timeline(&video.id).unwrap();
+        let analyzed_after_first = timeline_after_first.clips.iter().filter(|c| c.motion_graphic_effect.is_some()).count();
+        assert_eq!(analyzed_after_first, MOTION_GRAPHICS_BATCH_SIZE);
+
+        let second = repo.analyze_motion_graphics_batch(&video.id, temp.path()).unwrap();
+        assert_eq!(second.completed, total_clips);
+        assert!(second.done);
+
+        // A third call (e.g. the frontend calling once more before noticing
+        // `done`) must be a safe no-op, not reprocess anything.
+        let third = repo.analyze_motion_graphics_batch(&video.id, temp.path()).unwrap();
+        assert_eq!(third.completed, total_clips);
+        assert!(third.done);
     }
 
     #[test]

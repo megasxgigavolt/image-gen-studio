@@ -848,6 +848,22 @@ def _scaled_outline_width(style: dict, font_size: float) -> float:
     return max(0.0, (raw / 2.0) * font_size * 0.16)
 
 
+# The Timeline's canvas preview keeps captions a fixed 5% of the canvas's own
+# height away from whichever edge `position` (top/bottom) implies — see
+# `drawCaptionText`'s `margin = height * 0.05` — and constrains line-wrap
+# width to 86% of the canvas, i.e. 7% margin on each side. The export
+# previously hardcoded MarginV/MarginL/MarginR to a flat 10 ASS units
+# regardless of PlayResY/PlayResX — barely visible at 1080p+ (10px against a
+# 1080px-tall frame is under 1% of the height), so captions rendered hugging
+# the very bottom edge, well below where the same style sits in preview. Same
+# root cause `_scaled_font_size` above already fixed for font size — margin
+# was simply missed at the time.
+def _scaled_caption_margins(width: int, height: int) -> tuple[int, int, int]:
+    margin_v = round(height * 0.05)
+    margin_lr = round(width * 0.07)
+    return margin_lr, margin_lr, margin_v
+
+
 def _resolve_shadow(style: dict, height: int) -> tuple[float, float, int, str, int]:
     """Maps our {enabled, color, opacity, blur%, distance, angle} shadow shape
     onto ASS's independent \\xshad/\\yshad offsets (computed from distance +
@@ -949,6 +965,7 @@ def write_captions_ass(
     # line below always carries its own full \xshad/\yshad override anyway.
     default_xshad, default_yshad, _, _, _ = _resolve_shadow(default_style, height)
     default_shadow_depth = round((abs(default_xshad) + abs(default_yshad)) / 2)
+    margin_l, margin_r, margin_v = _scaled_caption_margins(width, height)
 
     header = (
         "[Script Info]\n"
@@ -963,7 +980,7 @@ def write_captions_ass(
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
         f"Style: Default,{default_font},{default_size},{default_color},&H000000FF&,"
         f"{default_outline_color},&H00000000&,{default_bold},0,0,0,100,100,0,0,1,"
-        f"{default_outline_width},{default_shadow_depth},{default_alignment},10,10,10,1\n"
+        f"{default_outline_width},{default_shadow_depth},{default_alignment},{margin_l},{margin_r},{margin_v},1\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"

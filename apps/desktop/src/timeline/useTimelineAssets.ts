@@ -37,6 +37,7 @@ export function useTimelineAssets(
 
   const imageElsRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const videoElsRef = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const audioElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const onAssetReadyRef = useRef(onAssetReady);
   useEffect(() => {
     onAssetReadyRef.current = onAssetReady;
@@ -92,6 +93,18 @@ export function useTimelineAssets(
     }));
   }, [timeline, mediaAssetUrls]);
 
+  // Music clips reference media_library_assets the same way an
+  // imported-still/imported-clip stills-track clip does — resolved into the
+  // same map (ids never collide across tables) so the playback hook's music
+  // preview can look them up through the one already-existing lookup.
+  useEffect(() => {
+    const musicAssetIds = (timeline?.musicClips ?? []).map((clip) => clip.mediaLibraryAssetId);
+    void Promise.all(musicAssetIds.filter((id) => !mediaAssetUrls[id]).map(async (id) => {
+      const url = await resolveMediaLibraryAssetUrl(id);
+      setMediaAssetUrls((current) => ({ ...current, [id]: url }));
+    }));
+  }, [timeline, mediaAssetUrls]);
+
   function getOrLoadImage(url: string): HTMLImageElement | null {
     const cache = imageElsRef.current;
     let img = cache.get(url);
@@ -120,6 +133,17 @@ export function useTimelineAssets(
     return video;
   }
 
+  function getOrLoadAudio(url: string): HTMLAudioElement {
+    const cache = audioElsRef.current;
+    let audio = cache.get(url);
+    if (!audio) {
+      audio = new Audio(url);
+      audio.preload = "auto";
+      cache.set(url, audio);
+    }
+    return audio;
+  }
+
   function getImageByRenderId(renderId: string): HTMLImageElement | null {
     const url = renderUrls[renderId];
     return url ? getOrLoadImage(url) : null;
@@ -145,6 +169,7 @@ export function useTimelineAssets(
     canvasSize,
     getOrLoadImage,
     getOrLoadVideo,
+    getOrLoadAudio,
     getImageByRenderId,
     getImageByAssetId,
     getSubjectByRenderId,

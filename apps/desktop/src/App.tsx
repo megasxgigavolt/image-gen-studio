@@ -1003,8 +1003,11 @@ function VisualPlanView() {
   const [draggedSentenceId, setDraggedSentenceId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
-  const [editingSentenceId, setEditingSentenceId] = useState<string | null>(null);
-  const [editText, setEditText] = useState("");
+  // Sentences aren't freely editable — this only ever marks WHERE a split
+  // would land (a character offset into that one sentence's own text),
+  // armed by clicking inside it and confirmed/cancelled explicitly. See
+  // DraggableSentence's split-armed render branch.
+  const [splitArm, setSplitArm] = useState<{ sentenceId: string; offset: number } | null>(null);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
   useEffect(() => {
     if (!activeVideoId) return;
@@ -1142,47 +1145,46 @@ function VisualPlanView() {
     }
   }
 
-  function startEditingSentence(sentence: PlanSentenceRecord) {
-    setEditingSentenceId(sentence.id);
-    setEditText(sentence.text);
+  // Clicking inside a sentence's text only ever arms a split point — never
+  // edits the wording itself. Re-arming (clicking elsewhere in the same or
+  // a different sentence) just moves the marker; nothing is committed until
+  // confirmSplit.
+  function armSplit(sentenceId: string, offset: number) {
+    setSplitArm({ sentenceId, offset });
   }
 
-  function onEditTextChange(value: string) {
-    setEditText(value);
+  function cancelSplit() {
+    setSplitArm(null);
   }
 
-  // Fires only when the just-typed character was actually a period — NOT a
-  // scan of the whole text for "does a period exist anywhere," which used
-  // to misfire on backspace (or any edit) whenever the sentence already had
-  // an unrelated period elsewhere, e.g. its own normal trailing full stop.
-  // Takes the actual left/right text the caller already sliced from the
-  // LIVE DOM content (not an offset re-applied against whatever's in the
-  // database — those can differ by the just-typed period alone, or more if
-  // earlier edits in the same session were never persisted, which silently
-  // split at the wrong point).
-  function onPeriodTyped(sentenceId: string, leftText: string, rightText: string) {
-    if (!activeVideoId) return;
-    setEditingSentenceId(null);
-    setEditText("");
-    projectsClient.splitPlanSentence(activeVideoId, sentenceId, leftText, rightText)
+  function confirmSplit() {
+    if (!activeVideoId || !splitArm) return;
+    const sentence = plan?.sentences.find((s) => s.id === splitArm.sentenceId);
+    if (!sentence) { setSplitArm(null); return; }
+    const leftText = sentence.text.slice(0, splitArm.offset);
+    const rightText = sentence.text.slice(splitArm.offset);
+    setSplitArm(null);
+    if (!leftText.trim() || !rightText.trim()) return;
+    projectsClient.splitPlanSentence(activeVideoId, splitArm.sentenceId, leftText, rightText)
       .then(setPlan)
       .catch((caught) => setError(String(caught)));
   }
 
-  async function commitSentenceEdit(sentenceId: string) {
-    if (!activeVideoId) return;
-    const text = editText;
-    setEditingSentenceId(null);
-    const original = plan?.sentences.find((s) => s.id === sentenceId)?.text;
-    if (!text.trim() || text.trim() === original) return;
-    try { setPlan(await projectsClient.updatePlanSentenceText(activeVideoId, sentenceId, text)); }
-    catch (caught) { setError(String(caught)); }
-  }
+  useEffect(() => {
+    if (!splitArm) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") cancelSplit();
+      else if (event.key === "Enter") confirmSplit();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [splitArm]);
 
   return (
     <section className="view">
       <div className="page-heading">
-        <div><h1>Visual plan</h1><p>Drag a sentence to regroup it, or onto another sentence's handle to merge. Double-click to edit. Chronological order remains enforced.</p></div>
+        <div><h1>Visual plan</h1><p>Drag a sentence onto another to merge them, or into a still to regroup it. Click inside a sentence to mark where it should split, then confirm. Chronological order remains enforced.</p></div>
         <div className="heading-actions"><button className="secondary" onClick={() => setStage("inputs")}>← Back</button><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
       </div>
       {searchOpen && (
@@ -1241,13 +1243,10 @@ function VisualPlanView() {
                     searchQuery={searchQuery}
                     activeMatchKey={activeMatchKey}
                     registerMatchRef={registerMatchRef}
-                    editing={editingSentenceId === sentence.id}
-                    editText={editText}
-                    onStartEdit={() => startEditingSentence(sentence)}
-                    onChangeText={onEditTextChange}
-                    onPeriodTyped={(leftText, rightText) => onPeriodTyped(sentence.id, leftText, rightText)}
-                    onCommit={() => void commitSentenceEdit(sentence.id)}
-                    onCancel={() => setEditingSentenceId(null)}
+                    splitOffset={splitArm?.sentenceId === sentence.id ? splitArm.offset : null}
+                    onArmSplit={(offset) => armSplit(sentence.id, offset)}
+                    onConfirmSplit={confirmSplit}
+                    onCancelSplit={cancelSplit}
                   />
                 ))}
               </div>
@@ -1302,9 +1301,27 @@ function highlightSentenceText(
   return parts.length > 0 ? parts : text;
 }
 
+/** Walks every text node under `container` in document order, accumulating
+ * length, to turn a DOM Range (which points at one specific text node —
+ * possibly a `<mark>`'s, when the sentence has an active search highlight —
+ * plus a local offset within it) into a single absolute character offset
+ * into the sentence's own full text. Generic over however many child nodes
+ * the rendered content happens to be split across. */
+function absoluteTextOffset(container: HTMLElement, range: Range): number {
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+  let offset = 0;
+  let node = walker.nextNode();
+  while (node) {
+    if (node === range.startContainer) return offset + range.startOffset;
+    offset += node.textContent?.length ?? 0;
+    node = walker.nextNode();
+  }
+  return offset;
+}
+
 function DraggableSentence({
   sentence, active, dropActive, searchQuery, activeMatchKey, registerMatchRef,
-  editing, editText, onStartEdit, onChangeText, onPeriodTyped, onCommit, onCancel,
+  splitOffset, onArmSplit, onConfirmSplit, onCancelSplit,
 }: {
   sentence: PlanSentenceRecord;
   active: boolean;
@@ -1312,89 +1329,54 @@ function DraggableSentence({
   searchQuery: string;
   activeMatchKey: string | null;
   registerMatchRef: (key: string, el: HTMLElement | null) => void;
-  editing: boolean;
-  editText: string;
-  onStartEdit: () => void;
-  onChangeText: (value: string) => void;
-  onPeriodTyped: (leftText: string, rightText: string) => void;
-  onCommit: () => void;
-  onCancel: () => void;
+  /** Character offset into THIS sentence's text where a split is currently
+   * armed, or `null` if this sentence has no armed split right now. */
+  splitOffset: number | null;
+  onArmSplit: (offset: number) => void;
+  onConfirmSplit: () => void;
+  onCancelSplit: () => void;
 }) {
-  const { attributes, listeners, setNodeRef: setDragRef, transform } = useDraggable({ id: `sentence:${sentence.id}`, disabled: editing });
-  // The merge drop target is deliberately just the grip handle, NOT the
-  // whole row — the row's own group still uses the whole area for "move
-  // into this still" (DroppableStill). Sharing one hit area for both made
-  // it a coin flip whether dropping a sentence near another one moved it
-  // into that still or merged it with that specific sentence. A small,
-  // separate handle-only target (paired with pointerWithin collision
-  // detection on the DndContext) makes the two gestures physically
-  // distinct: drop anywhere in a still to move there, drop precisely on
-  // another sentence's handle to merge with it.
-  const { setNodeRef: setMergeDropRef, isOver: isMergeOver } = useDroppable({ id: `sentence:${sentence.id}` });
-  const editableRef = useRef<HTMLSpanElement>(null);
-  useEffect(() => {
-    if (!editing || !editableRef.current) return;
-    const el = editableRef.current;
-    el.textContent = editText;
-    el.focus();
-    const range = document.createRange();
-    range.selectNodeContents(el);
-    range.collapse(false);
-    const selection = window.getSelection();
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-    // Only re-sync when entering edit mode, not on every editText change —
-    // contentEditable owns its own DOM content while focused; re-writing
-    // textContent from React state on every keystroke would reset the caret.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [editing]);
+  const armed = splitOffset !== null;
+  const { attributes, listeners, setNodeRef: setDragRef, transform } = useDraggable({ id: `sentence:${sentence.id}`, disabled: armed });
+  // The merge drop target is the WHOLE row (not just a small handle) — a
+  // sentence dragged on top of another, anywhere on it, merges the two.
+  // "Move into a different still without merging" still works by dropping
+  // on that still's own empty space or a StillDivider, both of which sit
+  // outside every sentence's own rect, so pointerWithin collision detection
+  // (see the DndContext below) resolves unambiguously between the two.
+  const { setNodeRef: setMergeDropRef, isOver: isMergeOver } = useDroppable({ id: `sentence:${sentence.id}`, disabled: armed });
+  const setRefs = useCallback((el: HTMLDivElement | null) => { setDragRef(el); setMergeDropRef(el); }, [setDragRef, setMergeDropRef]);
+  const textRef = useRef<HTMLSpanElement>(null);
   const mergeTargetActive = dropActive || isMergeOver;
+
+  function handleTextClick(event: ReactPointerEvent<HTMLSpanElement>) {
+    if (!textRef.current) return;
+    const pointFn = (document as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null }).caretRangeFromPoint;
+    const range = pointFn?.call(document, event.clientX, event.clientY);
+    if (!range) return;
+    onArmSplit(absoluteTextOffset(textRef.current, range));
+  }
+
   return <div
-    ref={setDragRef}
-    className={[active && "dragging", "sentence"].filter(Boolean).join(" ")}
+    ref={setRefs}
+    className={[active && "dragging", mergeTargetActive && "merge-target", "sentence"].filter(Boolean).join(" ")}
     style={{ transform: CSS.Translate.toString(transform), touchAction: "none" }}
-    {...(editing ? {} : listeners)}
-    {...(editing ? {} : attributes)}
+    {...(armed ? {} : listeners)}
+    {...(armed ? {} : attributes)}
   >
-    <b
-      ref={setMergeDropRef}
-      className={mergeTargetActive ? "merge-handle drag-over" : "merge-handle"}
-      title="Drag another sentence here to merge it with this one"
-    ><GripVertical size={18} /></b>
-    {editing ? (
-      <span
-        ref={editableRef}
-        className="sentence-edit-inline"
-        contentEditable
-        suppressContentEditableWarning
-        onInput={(event) => {
-          const text = event.currentTarget.textContent ?? "";
-          onChangeText(text);
-          // Only treat this as "split here" when a period was just TYPED —
-          // checking the native InputEvent's inputType/data, not re-scanning
-          // the whole text for "does a period exist anywhere" (that used to
-          // misfire on backspace, or any edit, whenever the sentence already
-          // had an unrelated period elsewhere — including its own normal
-          // trailing full stop).
-          const native = event.nativeEvent as InputEvent;
-          if (native.inputType !== "insertText" || native.data !== ".") return;
-          const selection = window.getSelection();
-          const range = selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
-          const offset = range && range.endContainer.nodeType === Node.TEXT_NODE ? range.endOffset : null;
-          if (offset === null || text.slice(offset).trim().length === 0) return;
-          // Sliced from this live DOM text (which already includes the
-          // period just typed, plus anything else edited this session) —
-          // never re-applied as an offset against server-side text later.
-          onPeriodTyped(text.slice(0, offset), text.slice(offset));
-        }}
-        onBlur={onCommit}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); }
-          else if (event.key === "Escape") { event.preventDefault(); onCancel(); }
-        }}
-      />
+    <b className="merge-handle" title="Drag onto another sentence to merge it with this one"><GripVertical size={18} /></b>
+    {armed ? (
+      <span className="sentence-split-armed">
+        <span ref={textRef} onPointerUp={handleTextClick}>{sentence.text.slice(0, splitOffset)}</span>
+        <span className="split-caret" aria-hidden="true" />
+        <span onPointerUp={handleTextClick}>{sentence.text.slice(splitOffset)}</span>
+        <span className="split-controls">
+          <button type="button" className="icon-button" title="Split here (Enter)" onClick={onConfirmSplit}><Scissors size={13} /></button>
+          <button type="button" className="icon-button" title="Cancel (Esc)" onClick={onCancelSplit}><X size={13} /></button>
+        </span>
+      </span>
     ) : (
-      <span onDoubleClick={onStartEdit} title="Double-click to edit">
+      <span ref={textRef} onPointerUp={handleTextClick} title="Click to mark where this sentence should split">
         {highlightSentenceText(sentence.text, searchQuery, sentence.id, activeMatchKey, registerMatchRef)}
       </span>
     )}
@@ -1659,13 +1641,19 @@ function ImagesView() {
           if (current && loaded.groups.some((g) => g.group.id === current)) return current;
           return loaded.groups[0]?.group.id ?? null;
         });
-        setImageSettings(parseImageSettings(loaded.settings.find((setting) => setting.key === "image_settings")?.value));
+        // Both keyed per-video (`.${activeVideoId}` suffix) — these used to be
+        // one shared key across every video in the workspace, so a style
+        // directive or settings tweak on one video silently bled into
+        // whichever video was opened next. A brand-new video with nothing
+        // saved under its own key correctly falls through to that video's
+        // own latest prompt version (or empty), never another video's.
+        setImageSettings(parseImageSettings(loaded.settings.find((setting) => setting.key === `image_settings.${activeVideoId}`)?.value));
         const inputs = await projectsClient.getVideoInputs(activeVideoId);
         setReferences(inputs.references);
         const latestJob = await projectsClient.getLatestImageJob(activeVideoId);
         setJob(latestJob && ["queued", "running", "paused", "stopped", "failed"].includes(latestJob.status) ? latestJob : null);
         const latest = loaded.groups[0]?.promptVersions[0];
-        setSystemPrompt(loaded.settings.find((s) => s.key === "system_prompt")?.value ?? latest?.systemPrompt ?? "");
+        setSystemPrompt(loaded.settings.find((s) => s.key === `system_prompt.${activeVideoId}`)?.value ?? latest?.systemPrompt ?? "");
         setUserPrompt(latest?.userPrompt ?? "");
         const latestRender = loaded.groups[0]?.imageRenders[0];
         setSelectedRenderId(latestRender?.id ?? null);
@@ -1813,8 +1801,8 @@ function ImagesView() {
     setSelectedGroupId(groupId);
     if (activeVideoId) lastSelectedStill.set(activeVideoId, groupId);
     const latest = workspace?.groups.find((item) => item.group.id === groupId)?.promptVersions[0];
-    const globalDirective = workspace?.settings.find((s) => s.key === "system_prompt")?.value;
-    setSystemPrompt(globalDirective ?? latest?.systemPrompt ?? "");
+    const videoDirective = activeVideoId ? workspace?.settings.find((s) => s.key === `system_prompt.${activeVideoId}`)?.value : undefined;
+    setSystemPrompt(videoDirective ?? latest?.systemPrompt ?? "");
     setUserPrompt(latest?.userPrompt ?? "");
     setImageSettings(parseImageSettings(latest?.settingsJson));
     const latestRender = workspace?.groups.find((item) => item.group.id === groupId)?.imageRenders[0];
@@ -1974,8 +1962,8 @@ function ImagesView() {
           if (pv) {
             setImageSettings(parseImageSettings(pv.settingsJson));
             setUserPrompt(pv.userPrompt);
-            const globalDirective = live.settings.find((s) => s.key === "system_prompt")?.value;
-            setSystemPrompt(globalDirective ?? pv.systemPrompt ?? systemPrompt);
+            const videoDirective = live.settings.find((s) => s.key === `system_prompt.${activeVideoId}`)?.value;
+            setSystemPrompt(videoDirective ?? pv.systemPrompt ?? systemPrompt);
           }
         }
         const newJob = await projectsClient.createImageJob(activeVideoId);
@@ -2023,7 +2011,7 @@ function ImagesView() {
     if (!activeVideoId || !workspace?.groups.length || bulkPlanTask.current) return;
     setBulkOpen(false);
     setError(null);
-    await projectsClient.saveAppSetting("system_prompt", systemPrompt);
+    await projectsClient.saveAppSetting(`system_prompt.${activeVideoId}`, systemPrompt);
     bulkPlanTask.current = {
       total: workspace.groups.length, index: 0,
       styleDirective: systemPrompt, baseSettingsJson: settingsJson,
@@ -2036,14 +2024,32 @@ function ImagesView() {
     setImageSettings((current) => ({ ...current, [key]: value }));
   }
 
-  // Auto-save image settings whenever they change (replaces the removed "Apply settings" button)
+  // Auto-save image settings whenever they change (replaces the removed "Apply settings"
+  // button) — keyed per-video, same reasoning as systemPrompt above: this panel's fields
+  // are this video's own composition defaults, not something every other video should
+  // inherit.
   useEffect(() => {
     if (!activeVideoId) return;
     const timer = window.setTimeout(() => {
-      void projectsClient.saveAppSetting("image_settings", settingsJson);
+      void projectsClient.saveAppSetting(`image_settings.${activeVideoId}`, settingsJson);
     }, 800);
     return () => window.clearTimeout(timer);
   }, [settingsJson, activeVideoId]);
+
+  // Aspect ratio is the one field on this panel that's deliberately NOT per-video — it's
+  // the same cross-view rendering choice the Editor/Animate stages read (still under the
+  // legacy unscoped "image_settings" key, but narrowed to just this field via a
+  // read-modify-write so it doesn't reintroduce the other fields' per-video bleed this
+  // whole change is fixing).
+  useEffect(() => {
+    if (!activeVideoId) return;
+    projectsClient.getAppSetting("image_settings").then((raw) => {
+      let parsed: Record<string, unknown> = {};
+      try { parsed = raw ? JSON.parse(raw) : {}; } catch { /* start fresh */ }
+      if (parsed.aspectRatio === imageSettings.aspectRatio) return;
+      void projectsClient.saveAppSetting("image_settings", JSON.stringify({ ...parsed, aspectRatio: imageSettings.aspectRatio }));
+    }).catch(() => {});
+  }, [imageSettings.aspectRatio, activeVideoId]);
 
   async function downloadStill(renderId: string) {
     try {
@@ -2234,6 +2240,14 @@ function ImagesView() {
     setApplyingStyle(true);
     try {
       const count = await projectsClient.applyStyleDirectiveToAll(activeVideoId, systemPrompt);
+      // Persist as this video's sticky style directive too — otherwise the
+      // apply only reaches the database rows, and reselecting a still (or
+      // reopening the video later) could show a different, older directive
+      // than what was just applied everywhere.
+      await projectsClient.saveAppSetting(`system_prompt.${activeVideoId}`, systemPrompt);
+      const refreshed = await projectsClient.getImageWorkspace(activeVideoId);
+      setWorkspace(refreshed);
+      setCached(activeVideoId, refreshed);
       addToast(`Style directive applied to ${count} prompt version${count !== 1 ? "s" : ""}.`, "success");
     } catch (caught) { setError(String(caught)); }
     finally { setApplyingStyle(false); }
@@ -2450,7 +2464,7 @@ function ImagesView() {
       </div>}
       {bulkOpen && <div className="modal-backdrop" role="presentation" onMouseDown={() => setBulkOpen(false)}>
         <div className="modal bulk-modal" onMouseDown={(e) => e.stopPropagation()}>
-          <h2>Bulk Generation Settings</h2>
+          <div className="modal-heading-row"><h2>Bulk Generation Settings</h2><button type="button" className="icon-button" aria-label="Close" onClick={() => setBulkOpen(false)}><X size={16} /></button></div>
           <div className="panel-section-heading" style={{marginTop:"4px"}}><h3>Style Directive</h3><small>Global visual style</small></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Describe overall cinematography and visual language. Avoid scene-specific details — the AI will handle those per still.</p>
           <textarea className="bulk-directive" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="e.g. Cinematic documentary style, shallow depth of field, warm color grade, soft natural lighting…" rows={4} />
@@ -2464,7 +2478,7 @@ function ImagesView() {
                 <button onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button>
               </div>
             ))}
-            <button className="secondary" onClick={() => void importReference()}><Plus size={14} />{references.length ? "Replace image" : "Upload reference image"}</button>
+            {!references.length && <button className="secondary" onClick={() => void importReference()}><Plus size={14} />Upload reference image</button>}
           </div>
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Character Consistency</h3><small>Optional</small></div>
           <label className="toggle-setting" style={{padding:"6px 0"}}>
@@ -2488,7 +2502,6 @@ function ImagesView() {
             <WandSparkles size={16} />Generate All Stills
           </button>
           <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans and generates every still in one pausable run — no separate review step. {Boolean(job && ["queued", "running", "paused"].includes(job.status)) && "Stop the active job to re-plan."}</p>
-          <button className="secondary full" style={{marginTop:"8px"}} onClick={() => setBulkOpen(false)}>Cancel</button>
         </div>
       </div>}
     </section>

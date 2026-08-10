@@ -2439,8 +2439,27 @@ fn reveal_in_file_manager(path: String) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        // Explorer's `/select,` flag is notoriously picky about forward
+        // slashes in the path that follows it — a mixed-separator path (the
+        // frontend builds some of its own path strings with `/`, e.g. the
+        // "remembered export folder" logic in TimelineView.tsx) makes it
+        // silently fail to locate the file and fall back to opening a
+        // default location instead, which reads as "opened the wrong
+        // folder" rather than an outright error.
+        let normalized = path.replace('/', "\\");
+        let target = std::path::Path::new(&normalized);
         let mut command = std::process::Command::new("explorer");
-        command.args([format!("/select,{path}")]);
+        if target.exists() {
+            command.arg(format!("/select,{normalized}"));
+        } else {
+            // The exact file is gone by the time this runs (moved/deleted
+            // since export) — fall back to just opening its parent folder
+            // rather than silently doing nothing or erroring.
+            match target.parent() {
+                Some(dir) if dir.exists() => { command.arg(dir); }
+                _ => { command.arg(format!("/select,{normalized}")); }
+            }
+        }
         command.creation_flags(0x08000000);
         command.spawn().map_err(|e| format!("Could not open the file manager: {e}"))?;
         Ok(())

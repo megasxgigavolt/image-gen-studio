@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { secondsToPixels } from "../domain/timecode";
-import type { CaptionStyle, TimelineCaptionClipRecord, TimelineClipRecord, TimelineRecord } from "../infrastructure/projects-client";
+import type { CaptionStyle, TimelineCaptionClipRecord, TimelineClipRecord, TimelineMusicClipRecord, TimelineRecord } from "../infrastructure/projects-client";
 import {
   buildColorFilterCss,
   drawCaptionText,
@@ -32,6 +32,7 @@ export function useTimelinePlayback(params: {
   getImageByAssetId: (assetId: string) => HTMLImageElement | null;
   getSubjectByRenderId: (renderId: string) => { x: number; y: number } | undefined;
   getOrLoadVideo: (url: string) => HTMLVideoElement;
+  getOrLoadAudio: (url: string) => HTMLAudioElement;
   effectiveGlobalCaptionStyle: CaptionStyle;
   pendingSelectedCaptionStyle: CaptionStyle | null | undefined;
   selectedCaptionClip: TimelineCaptionClipRecord | null;
@@ -40,15 +41,31 @@ export function useTimelinePlayback(params: {
   audioRef: RefObject<HTMLAudioElement | null>;
   canvasScrollRef: RefObject<HTMLDivElement | null>;
   pixelsPerSecond: number;
+  /** The whole music track, sorted — live-previewed here the same way a
+   * generated animation clip's own video element is (one active element at
+   * a time, switched as the playhead crosses clip boundaries). Volume is
+   * recomputed every frame from the clip's own volume, the master volume/
+   * duck-sensitivity sliders, and fade in/out — mirroring
+   * build_timeline_export_manifest's math exactly so preview and export
+   * agree on what the mix sounds like. */
+  musicClips: TimelineMusicClipRecord[];
+  musicMasterVolumePercent: number;
+  musicDuckSensitivityPercent: number;
+  /** Narration's audible span (offset through offset+duration, already
+   * net of trim) — auto-duck only applies to a clip while the playhead
+   * sits inside this window, matching export's own overlap computation. */
+  narrationStart: number;
+  narrationEnd: number;
   /** Called on every step/seek so the caller can keep clip selection synced
    * to the playhead (`updateSelectionForTime` in the original component). */
   onTimeChange?: (time: number) => void;
 }) {
   const {
     timeline, stillsClips, captionClips, totalDuration, canvasSize,
-    renderUrls, videoAssetUrls, mediaAssetUrls, subjectByRender, getImageByAssetId, getSubjectByRenderId, getOrLoadVideo,
+    renderUrls, videoAssetUrls, mediaAssetUrls, subjectByRender, getImageByAssetId, getSubjectByRenderId, getOrLoadVideo, getOrLoadAudio,
     effectiveGlobalCaptionStyle, pendingSelectedCaptionStyle, selectedCaptionClip, audioDataUrl,
-    previewCanvasRef, audioRef, canvasScrollRef, pixelsPerSecond, onTimeChange,
+    previewCanvasRef, audioRef, canvasScrollRef, pixelsPerSecond,
+    musicClips, musicMasterVolumePercent, musicDuckSensitivityPercent, narrationStart, narrationEnd, onTimeChange,
   } = params;
 
   const [previewTime, setPreviewTime] = useState(0);
@@ -58,9 +75,11 @@ export function useTimelinePlayback(params: {
   const isPlayingRef = useRef(false);
   const playStartRef = useRef<{ wallStart: number; timeStart: number } | null>(null);
   const rafRef = useRef<number | null>(null);
-  const drawFrameRef = useRef<(time: number) => void>(() => {});
+  const drawFrameRef = useRef<(time: number, forceMusicResync?: boolean) => void>(() => {});
   const activeVideoElRef = useRef<HTMLVideoElement | null>(null);
   const activeAnimationAssetIdRef = useRef<string | null>(null);
+  const activeMusicElRef = useRef<HTMLAudioElement | null>(null);
+  const activeMusicClipIdRef = useRef<string | null>(null);
   // Throttles how often a playing rAF tick pushes previewTime into React
   // state (and everything that cascades from it: clip-selection sync,
   // auto-scroll, and — the expensive part — a full re-render of every clip
@@ -95,7 +114,7 @@ export function useTimelinePlayback(params: {
     }
   }
 
-  function drawFrame(time: number) {
+  function drawFrame(time: number, forceMusicResync = false) {
     const canvas = previewCanvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
@@ -196,6 +215,58 @@ export function useTimelinePlayback(params: {
         }
       }
     }
+
+    // Music track — one active <audio> element at a time, switched as the
+    // playhead crosses clip boundaries (same pattern as the animation-clip
+    // video element above). Volume is recomputed every call from the clip's
+    // own volume, the master volume/duck-sensitivity sliders, and fade in/
+    // out — this is what makes those settings actually audible live instead
+    // of only taking effect at export.
+    const musicClip = findClipAtTime(musicClips, time);
+    if (activeMusicElRef.current && activeMusicClipIdRef.current !== (musicClip?.id ?? null)) {
+      activeMusicElRef.current.pause();
+      activeMusicElRef.current = null;
+      activeMusicClipIdRef.current = null;
+    }
+    if (musicClip) {
+      const assetUrl = mediaAssetUrls[musicClip.mediaLibraryAssetId];
+      if (assetUrl) {
+        const audioEl = getOrLoadAudio(assetUrl);
+        const isNewClip = activeMusicClipIdRef.current !== musicClip.id;
+        const elapsedSeconds = Math.max(0, time - musicClip.startSeconds);
+        if (isNewClip || forceMusicResync) {
+          activeMusicElRef.current = audioEl;
+          activeMusicClipIdRef.current = musicClip.id;
+          audioEl.loop = musicClip.loopEnabled;
+          // A looping short asset free-runs via native looping once
+          // started — re-deriving its wrapped position from elapsed time
+          // (which keeps growing past the asset's own duration) would
+          // fight that every frame instead of just letting it play.
+          audioEl.currentTime = musicClip.loopEnabled && audioEl.duration
+            ? elapsedSeconds % audioEl.duration
+            : elapsedSeconds;
+        }
+        const clipDuration = musicClip.endSeconds - musicClip.startSeconds;
+        const remaining = clipDuration - elapsedSeconds;
+        let volume = (musicClip.volumePercent / 100) * (musicMasterVolumePercent / 100);
+        if (musicClip.fadeInEnabled && musicClip.fadeInSeconds > 0 && elapsedSeconds < musicClip.fadeInSeconds) {
+          volume *= Math.max(0, elapsedSeconds / musicClip.fadeInSeconds);
+        }
+        if (musicClip.fadeOutEnabled && musicClip.fadeOutSeconds > 0 && remaining < musicClip.fadeOutSeconds) {
+          volume *= Math.max(0, remaining / musicClip.fadeOutSeconds);
+        }
+        if (musicClip.autoDuck && time >= narrationStart && time < narrationEnd) {
+          volume *= 1 - Math.max(0, Math.min(100, musicDuckSensitivityPercent)) / 100;
+        }
+        audioEl.volume = Math.max(0, Math.min(1, volume));
+        if (isPlayingRef.current) {
+          if (audioEl.paused) void audioEl.play().catch(() => {});
+        } else if (!audioEl.paused) {
+          audioEl.pause();
+        }
+      }
+    }
+
     const caption = captionClips.find((c) => time >= c.startSeconds && time < c.endSeconds);
     if (caption) {
       const isEditingThisCaption = selectedCaptionClip?.id === caption.id && pendingSelectedCaptionStyle !== undefined;
@@ -235,6 +306,7 @@ export function useTimelinePlayback(params: {
     setIsPlaying(false);
     audioRef.current?.pause();
     activeVideoElRef.current?.pause();
+    activeMusicElRef.current?.pause();
     playStartRef.current = null;
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
   }
@@ -326,7 +398,7 @@ export function useTimelinePlayback(params: {
     if (isPlayingRef.current && (!audioRef.current || !audioDataUrl || !pastOffset)) {
       playStartRef.current = { wallStart: performance.now(), timeStart: clamped };
     }
-    drawFrameRef.current(clamped);
+    drawFrameRef.current(clamped, true);
     updateSelectionForTime(clamped);
     scrollTimelineToTime(clamped);
   }

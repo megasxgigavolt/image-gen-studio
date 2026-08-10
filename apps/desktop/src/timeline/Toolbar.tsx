@@ -1,6 +1,8 @@
-import { Clapperboard, Hexagon, LoaderCircle, Move, Music, Play, SlidersHorizontal, Trash2, X } from "lucide-react";
+import { useState } from "react";
+import { Clapperboard, ChevronDown, LoaderCircle, Move, Music, Play, Trash2, X } from "lucide-react";
+import { ContextMenu } from "./ContextMenu";
 
-export type ToolKind = "text" | "captions" | "music" | "filters" | "logo";
+export type ToolKind = "text" | "captions" | "music";
 export type AspectRatio = "16:9" | "9:16";
 
 /** Slim icon toolbar between the preview and the timeline. Clicking a tool
@@ -13,6 +15,8 @@ export function Toolbar({
   onSelectTool,
   onExtrapolateStills,
   extrapolating,
+  hasSelectedClip,
+  onRemoveThisClipEffects,
   onRemoveAllEffects,
   onAnalyzeMotionGraphics,
   onStopAutoMotion,
@@ -26,6 +30,10 @@ export function Toolbar({
   onSelectTool: (tool: ToolKind | null) => void;
   onExtrapolateStills: () => void;
   extrapolating: boolean;
+  /** Gates the "this still only" option below — nothing is selected to
+   * apply it to otherwise. */
+  hasSelectedClip: boolean;
+  onRemoveThisClipEffects: () => void;
   onRemoveAllEffects: () => void;
   /** A single control whose action depends on current state — idle: start;
    * running: pause; paused: resume. See TimelineView's `toggleAutoMotion`. */
@@ -39,6 +47,8 @@ export function Toolbar({
   aspectRatio: AspectRatio;
   onAspectRatioChange: (ratio: AspectRatio) => void;
 }) {
+  const [removeMenuAnchor, setRemoveMenuAnchor] = useState<{ x: number; y: number } | null>(null);
+
   function toggle(tool: ToolKind) {
     onSelectTool(activeTool === tool ? null : tool);
   }
@@ -51,12 +61,6 @@ export function Toolbar({
         </button>
         <button className={activeTool === "music" ? "tl-tool-btn active" : "tl-tool-btn"} title="Audio" onClick={() => toggle("music")}>
           <Music size={16} /><span>Audio</span>
-        </button>
-        <button className={activeTool === "filters" ? "tl-tool-btn active" : "tl-tool-btn"} title="Filters / Color" onClick={() => toggle("filters")}>
-          <SlidersHorizontal size={16} /><span>Filters</span>
-        </button>
-        <button className={activeTool === "logo" ? "tl-tool-btn active" : "tl-tool-btn"} title="Logo / Watermark" onClick={() => toggle("logo")}>
-          <Hexagon size={16} /><span>Logo</span>
         </button>
         <div className="tl-aspect-toggle" role="group" aria-label="Aspect ratio">
           <button
@@ -92,9 +96,35 @@ export function Toolbar({
             <X size={16} />
           </button>
         )}
-        <button className="tl-tool-btn danger" title="Remove camera movement, transitions, and gap-filling stretch from every still" onClick={onRemoveAllEffects}>
-          <Trash2 size={16} /><span>Remove all effects</span>
+        <button
+          className="tl-tool-btn danger"
+          title="Remove camera movement, transitions, and gap-filling stretch"
+          onClick={(event) => {
+            const rect = event.currentTarget.getBoundingClientRect();
+            setRemoveMenuAnchor({ x: rect.left, y: rect.bottom + 4 });
+          }}
+        >
+          <Trash2 size={16} /><span>Remove effects</span><ChevronDown size={14} />
         </button>
+        {removeMenuAnchor && (
+          <ContextMenu
+            x={removeMenuAnchor.x}
+            y={removeMenuAnchor.y}
+            onClose={() => setRemoveMenuAnchor(null)}
+            items={[
+              {
+                label: "Remove effects from this still",
+                disabled: !hasSelectedClip,
+                onSelect: onRemoveThisClipEffects,
+              },
+              {
+                label: "Remove all effects",
+                danger: true,
+                onSelect: onRemoveAllEffects,
+              },
+            ]}
+          />
+        )}
       </div>
     </div>
   );

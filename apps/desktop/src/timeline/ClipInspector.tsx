@@ -1,4 +1,4 @@
-import { Clapperboard, Clock, Redo2, Trash2, Undo2, Upload } from "lucide-react";
+import { Clapperboard, Clock, Redo2, Undo2, Upload } from "lucide-react";
 import { formatTime } from "../domain/timecode";
 import type { ImageRenderRecord, TimelineClipRecord, VideoAssetRecord } from "../infrastructure/projects-client";
 import { MotionSettingsPanel } from "./MotionSettingsPanel";
@@ -27,7 +27,6 @@ export function ClipInspector({
   onAdjustAnimationToDuration,
   retiming,
   onSwapRender,
-  onResetEffects,
   onMotionRecipeChange,
   onResetMotionRecipeToAi,
 }: {
@@ -44,7 +43,6 @@ export function ClipInspector({
   onAdjustAnimationToDuration: () => void;
   retiming: boolean;
   onSwapRender: (renderId: string) => void;
-  onResetEffects: () => void;
   onMotionRecipeChange: (effect: string | null, settingsJson: string | null, reason: string | null) => void;
   onResetMotionRecipeToAi: () => void;
 }) {
@@ -146,9 +144,6 @@ export function ClipInspector({
         )}
       </div>
       <MotionSettingsPanel selectedClip={selectedClip} onChange={onMotionRecipeChange} onResetToAiDefault={onResetMotionRecipeToAi} />
-      <div className="tl-inspector-actions">
-        <button className="secondary" onClick={onResetEffects}><Trash2 size={14} />Remove effects (this clip only)</button>
-      </div>
     </div>
   );
 }

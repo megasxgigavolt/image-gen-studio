@@ -1,9 +1,13 @@
-import { Upload } from "lucide-react";
-import { projectsClient, type TimelineRecord } from "../../infrastructure/projects-client";
+import { useEffect, useState } from "react";
+import { Sparkles, Upload } from "lucide-react";
+import { projectsClient, type MediaLibraryAssetRecord, type TimelineRecord } from "../../infrastructure/projects-client";
 
-/** State 4 tool panel for the Music toolbar icon — importing music/SFX and
- * the master volume/duck-sensitivity that apply on top of each music clip's
- * own per-clip settings (edited via State 3 when a Music clip is selected). */
+/** State 4 tool panel for the Music toolbar icon — importing music/SFX, the
+ * master volume/duck-sensitivity that apply on top of each music clip's own
+ * per-clip settings (edited via State 3 when a Music clip is selected), and
+ * denoising an imported Audio-tab file (same non-destructive cleanup the
+ * Media Library panel already offers per-asset — surfaced here too since
+ * this is the panel someone tuning the music mix is already in). */
 export function MusicTool({
   videoId,
   timeline,
@@ -17,14 +21,49 @@ export function MusicTool({
   refresh: (promise: Promise<TimelineRecord>) => Promise<void>;
   addToast: (message: string, kind?: "success" | "error" | "info") => void;
 }) {
+  const [audioAssets, setAudioAssets] = useState<MediaLibraryAssetRecord[]>([]);
+  const [denoisingId, setDenoisingId] = useState<string | null>(null);
+
+  async function reloadAudioAssets() {
+    try {
+      setAudioAssets(await projectsClient.listMediaLibraryAssets(videoId, "audio"));
+    } catch {
+      // Leave whatever list is already showing.
+    }
+  }
+
+  useEffect(() => {
+    void reloadAudioAssets();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoId]);
+
   async function importMusic() {
     try {
       const asset = await projectsClient.pickAndImportMediaLibraryAsset(videoId, "audio");
       if (!asset) return;
       await refresh(projectsClient.addMusicClip(videoId, asset.id, playheadSeconds));
       addToast(`Added "${asset.originalName}" to the music track.`, "success");
+      void reloadAudioAssets();
     } catch (caught) {
       addToast(String(caught), "error");
+    }
+  }
+
+  /** Cleans up hiss/hum/static in an Audio-tab file. Non-destructive — the
+   * result lands as a new "(denoised)" asset next to the original, which is
+   * left untouched (same behavior as the Media Library panel's own version
+   * of this action). */
+  async function denoiseAsset(asset: MediaLibraryAssetRecord) {
+    if (denoisingId) return;
+    setDenoisingId(asset.id);
+    try {
+      const result = await projectsClient.denoiseMediaLibraryAsset(asset.id);
+      await reloadAudioAssets();
+      addToast(`Removed background noise — added "${result.originalName}".`, "success");
+    } catch (caught) {
+      addToast(String(caught), "error");
+    } finally {
+      setDenoisingId(null);
     }
   }
 
@@ -54,7 +93,7 @@ export function MusicTool({
         <p className="tl-source-hint">Adds the file to the Audio tab of the media library and places it on the Music track at the playhead.</p>
       </div>
       <div className="tl-inspector-group">
-        <span className="tl-inspector-label">Master music volume</span>
+        <span className="tl-inspector-label">Master volume</span>
         <div className="tl-intensity-control">
           <input
             type="range" className="tl-slider" min={0} max={200} step={1}
@@ -85,6 +124,27 @@ export function MusicTool({
         </div>
         <p className="tl-source-hint">How much quieter music gets under narration once auto-duck is enabled.</p>
       </div>
+      {audioAssets.length > 0 && (
+        <div className="tl-inspector-group">
+          <span className="tl-inspector-label">Denoise</span>
+          <p className="tl-source-hint">Removes background hiss/hum/static from an imported file — the cleaned result is added as a new file, the original is kept.</p>
+          <div className="tl-denoise-list">
+            {audioAssets.map((asset) => (
+              <div className="tl-denoise-row" key={asset.id}>
+                <span title={asset.originalName}>{asset.originalName}</span>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={denoisingId !== null}
+                  onClick={() => void denoiseAsset(asset)}
+                >
+                  <Sparkles size={12} />{denoisingId === asset.id ? "Denoising…" : "Denoise"}
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

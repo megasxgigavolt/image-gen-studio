@@ -20,7 +20,6 @@ import { setCachedData } from "./infrastructure/media-cache";
 import {
   projectsClient,
   type CaptionStyle,
-  type ColorFilterPreset,
   type ExportSettingsRecord,
   type ImageRenderRecord,
   type TimelineCaptionClipRecord,
@@ -35,9 +34,7 @@ import { Toolbar, type AspectRatio, type ToolKind } from "./timeline/Toolbar";
 import { ExportDrawer } from "./timeline/ExportDrawer";
 import { ExportHistoryModal } from "./timeline/ExportHistoryModal";
 import { MusicTool } from "./timeline/tools/MusicTool";
-import { LogoTool } from "./timeline/tools/LogoTool";
 import { TextOverlayTool } from "./timeline/tools/TextOverlayTool";
-import { FiltersTool } from "./timeline/tools/FiltersTool";
 import { PlaybackControls, ZOOM_MAX, ZOOM_MIN } from "./timeline/EditorToolbar";
 import { TimelinePreview } from "./timeline/TimelinePreview";
 import { TimelineTracks } from "./timeline/TimelineTracks";
@@ -177,7 +174,7 @@ export function TimelineView() {
 
   const redrawRequestRef = useRef<() => void>(() => {});
   const assets = useTimelineAssets(activeVideoId, timeline, workspace, aspectRatio, () => redrawRequestRef.current());
-  const { renderUrls, videoAssetUrls, mediaAssetUrls, subjectByRender, canvasSize, getOrLoadVideo, getImageByAssetId, getSubjectByRenderId } = assets;
+  const { renderUrls, videoAssetUrls, mediaAssetUrls, subjectByRender, canvasSize, getOrLoadVideo, getOrLoadAudio, getImageByAssetId, getSubjectByRenderId } = assets;
 
   useEffect(() => {
     void projectsClient.getAppSetting("image_settings").then((raw) => {
@@ -244,11 +241,16 @@ export function TimelineView() {
     });
   }
 
+  const narrationStart = timeline?.narrationOffsetSeconds ?? 0;
+  const narrationEnd = narrationStart + (nativeAudioDuration || narrationDuration);
+
   const playback = useTimelinePlayback({
     timeline, stillsClips, captionClips, totalDuration, canvasSize,
-    renderUrls, videoAssetUrls, mediaAssetUrls, subjectByRender, getImageByAssetId, getSubjectByRenderId, getOrLoadVideo,
+    renderUrls, videoAssetUrls, mediaAssetUrls, subjectByRender, getImageByAssetId, getSubjectByRenderId, getOrLoadVideo, getOrLoadAudio,
     effectiveGlobalCaptionStyle, pendingSelectedCaptionStyle, selectedCaptionClip, audioDataUrl,
     previewCanvasRef, audioRef, canvasScrollRef, pixelsPerSecond,
+    musicClips, musicMasterVolumePercent: timeline?.musicMasterVolumePercent ?? 100, musicDuckSensitivityPercent: timeline?.musicDuckSensitivityPercent ?? 0,
+    narrationStart, narrationEnd,
     onTimeChange: updateSelectionForTime,
   });
   const { previewTime, previewTimeRef, isPlaying, isPlayingRef, playPreview, pausePreview, seekPreview } = playback;
@@ -256,8 +258,6 @@ export function TimelineView() {
     redrawRequestRef.current = () => playback.drawFrameRef.current(previewTimeRef.current);
   });
 
-  const narrationStart = timeline?.narrationOffsetSeconds ?? 0;
-  const narrationEnd = narrationStart + (nativeAudioDuration || narrationDuration);
   const drag = useTimelineDrag({
     activeVideoId, timeline, canvasInnerRef, pixelsPerSecond, previewTimeRef, isPlayingRef,
     pausePreview, seekPreview, refresh, stillsClips, captionClips, musicClips, textClips, logoClips,
@@ -505,11 +505,6 @@ export function TimelineView() {
   async function swapRender(renderId: string) {
     if (!activeVideoId || !selectedClip) return;
     await refresh(projectsClient.setTimelineClipRender(activeVideoId, selectedClip.id, renderId));
-  }
-
-  async function setColorFilter(preset: ColorFilterPreset, intensity: number) {
-    if (!activeVideoId || !selectedClip) return;
-    await refresh(projectsClient.setTimelineClipColorFilter(activeVideoId, selectedClip.id, preset, intensity));
   }
 
   async function setMotionRecipe(effect: string | null, settingsJson: string | null, reason: string | null) {
@@ -978,8 +973,17 @@ export function TimelineView() {
     if (!activeVideoId) return;
     const sanitizedName = (exportFileName || activeVideoTitle || "video").replace(/[\\/:*?"<>|]+/g, " ").trim() || "video";
     const defaultName = `${sanitizedName}.mp4`;
-    const rememberedFolder = await projectsClient.getAppSetting("export_last_folder");
-    const destinationPath = await projectsClient.pickExportDestination(defaultName, rememberedFolder);
+    // The Preferences "Default save location" is a deliberate, explicit
+    // choice — it should win over "wherever the last export happened to
+    // land" so the dialog opens where the user actually told it to, letting
+    // them just confirm the filename rather than navigate there again.
+    // Falls back to the last-used export folder (e.g. Preferences was never
+    // set) and finally to the OS's own default when neither is set.
+    const [preferredFolder, rememberedFolder] = await Promise.all([
+      projectsClient.getAppSetting("download_folder"),
+      projectsClient.getAppSetting("export_last_folder"),
+    ]);
+    const destinationPath = await projectsClient.pickExportDestination(defaultName, preferredFolder || rememberedFolder);
     if (!destinationPath) return;
     const folder = destinationPath.slice(0, Math.max(destinationPath.lastIndexOf("/"), destinationPath.lastIndexOf("\\")));
     if (folder) await projectsClient.saveAppSetting("export_last_folder", folder);
@@ -1468,7 +1472,6 @@ export function TimelineView() {
                 onAdjustAnimationToDuration={() => void adjustAnimationToDuration()}
                 retiming={retiming}
                 onSwapRender={(renderId) => void swapRender(renderId)}
-                onResetEffects={() => void resetEffects()}
                 onMotionRecipeChange={(effect, settingsJson, reason) => void setMotionRecipe(effect, settingsJson, reason)}
                 onResetMotionRecipeToAi={() => void resetMotionRecipeToAi()}
               />
@@ -1492,16 +1495,6 @@ export function TimelineView() {
             )}
             {activeTool === "music" && (
               <MusicTool videoId={activeVideoId} timeline={timeline} playheadSeconds={previewTime} refresh={refresh} addToast={addToast} />
-            )}
-            {activeTool === "filters" && (
-              <FiltersTool
-                selectedClip={selectedClip}
-                onSetColorFilter={(preset, intensity) => void setColorFilter(preset, intensity)}
-                onApplyColorFilterToAll={(preset, intensity) => void refresh(projectsClient.applyColorFilterToAllClips(activeVideoId, preset, intensity))}
-              />
-            )}
-            {activeTool === "logo" && (
-              <LogoTool videoId={activeVideoId} logoClip={timeline.logoClips[0] ?? null} refresh={refresh} addToast={addToast} />
             )}
           </aside>
         </div>
@@ -1529,6 +1522,8 @@ export function TimelineView() {
             onSelectTool={handleSelectTool}
             onExtrapolateStills={() => setConfirmExtrapolateStills(true)}
             extrapolating={extrapolating}
+            hasSelectedClip={Boolean(selectedClip)}
+            onRemoveThisClipEffects={() => void resetEffects()}
             onRemoveAllEffects={() => setConfirmRemoveAllEffects(true)}
             onAnalyzeMotionGraphics={toggleAutoMotion}
             onStopAutoMotion={stopAutoMotion}

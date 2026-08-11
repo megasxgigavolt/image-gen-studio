@@ -61,8 +61,31 @@ export type VideoInputsRecord = {
 };
 
 export type PlanSentenceRecord = { id: string; ordinal: number; text: string; startSeconds: number; endSeconds: number };
-export type PlanGroupRecord = { id: string; ordinal: number; label: string; kind: string; sentenceIds: string[]; settingsLocked: boolean; promptLocked: boolean };
-export type VisualPlanRecord = { videoId: string; timingSource: string; sentences: PlanSentenceRecord[]; groups: PlanGroupRecord[]; updatedAt: string };
+export type PlanGroupRecord = { id: string; ordinal: number; label: string; kind: string; sentenceIds: string[]; settingsLocked: boolean; promptLocked: boolean; sceneId: string | null };
+// A larger narrative/visual unit that can span several stills (PlanGroupRecord).
+// narrativeRole/coreIdea/emotionalState/visualOpportunities are null/empty for
+// scenes derived without AI (per-sentence pacing, or the AI-error fallback
+// path) — the UI shows a plain "no detailed scene analysis available" note
+// for those instead of treating it as missing data.
+export type PlanSceneRecord = {
+  id: string; ordinal: number; label: string;
+  narrativeRole: string | null; coreIdea: string | null; emotionalState: string | null;
+  visualOpportunities: string[]; sentenceIds: string[]; expanded: boolean;
+};
+export type VisualPlanRecord = { videoId: string; timingSource: string; sentences: PlanSentenceRecord[]; groups: PlanGroupRecord[]; scenes: PlanSceneRecord[]; updatedAt: string };
+
+// Per-scene overrides for Bulk Generation, layered on top of the video's
+// global bulk settings. Every field is nullable — null means "inherit the
+// global value" for that one field. A scene with no saved overrides at all
+// simply has no entry in getBulkSceneSettings' result, rather than a record
+// of all-nulls.
+export type BulkSceneSettingsRecord = {
+  sceneId: string;
+  styleDirective: string | null;
+  creativeInstruction: string | null;
+  characterConsistency: boolean | null;
+  referenceAssetId: string | null;
+};
 
 export type CaptionWordRecord = { text: string; startSeconds: number; endSeconds: number };
 export type CaptionChunkRecord = { index: number; text: string; startSeconds: number; endSeconds: number; words: CaptionWordRecord[] };
@@ -128,6 +151,10 @@ export type ImageWorkspaceRecord = {
   sentences: PlanSentenceRecord[];
   groups: ImageWorkspaceGroupRecord[];
   settings: AppSettingRecord[];
+  // The same scenes getVisualPlan returns — carried along so the Images
+  // tab's left pane and Bulk Generation panel can section groups by scene
+  // (via sectionGroupsByScene) without a second fetch.
+  scenes: PlanSceneRecord[];
 };
 export type EducationalVisualPlanRecord = {
   stillId: string;
@@ -522,6 +549,28 @@ function writeBrowserData(data: BrowserData) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
 }
 
+/** Web-demo mirror of the Rust repository's `assign_scene_ids`: recomputes
+ * every group's sceneId by containment against `scenes` (a group belongs to
+ * whichever scene's sentence range contains its first sentence). Mutates
+ * `groups` in place. */
+function assignSceneIds(groups: PlanGroupRecord[], scenes: PlanSceneRecord[]): void {
+  for (const group of groups) {
+    const first = group.sentenceIds[0];
+    group.sceneId = (first && scenes.find((scene) => scene.sentenceIds.includes(first))?.id) ?? null;
+  }
+}
+
+/** Web-demo mirror of the Rust repository's `renumber_scene_sentence_ids` —
+ * applies the same per-sentence-id renumber function split/merge already use
+ * for groups to every scene's own sentenceIds, dropping any scene left with
+ * none (mirrors groups' own empty-group drop). */
+function renumberSceneSentenceIds(scenes: PlanSceneRecord[], renumber: (id: string) => string[]): PlanSceneRecord[] {
+  return scenes
+    .map((scene) => ({ ...scene, sentenceIds: scene.sentenceIds.flatMap(renumber) }))
+    .filter((scene) => scene.sentenceIds.length)
+    .map((scene, index) => ({ ...scene, ordinal: index + 1 }));
+}
+
 function formatSrtTimestamp(seconds: number): string {
   const ms = Math.round((seconds % 1) * 1000);
   const whole = Math.floor(seconds);
@@ -682,6 +731,7 @@ export const projectsClient = {
       sentences: plan.sentences,
       groups: plan.groups.map((group) => ({ group, educationalPlan: null, promptVersions: [], imageRenders: [] })),
       settings: [],
+      scenes: plan.scenes,
     };
   },
   async saveAppSetting(key: string, value: string): Promise<void> {
@@ -1118,13 +1168,25 @@ export const projectsClient = {
     if (isTauri()) return invoke("cancel_timeline_export", { videoId });
     return false;
   },
-  async createImageJob(videoId: string): Promise<ImageJobRecord> {
-    if (isTauri()) return invoke("create_image_job", { videoId });
+  /** Creates a job for exactly `groupIds`, forced — every one becomes a job
+   * item using its current newest prompt, whether or not that still's
+   * render is already up to date. See pendingStillIds for computing a
+   * sensible default selection instead of blindly passing every still. */
+  async createImageJob(videoId: string, groupIds: string[]): Promise<ImageJobRecord> {
+    if (isTauri()) return invoke("create_image_job", { videoId, groupIds });
     throw new Error("Bulk jobs require the native application.");
   },
   async getLatestImageJob(videoId: string): Promise<ImageJobRecord | null> {
     if (isTauri()) return invoke("get_latest_image_job", { videoId });
     return null;
+  },
+  /** Every still whose newest render is missing or stale relative to its
+   * newest prompt/educational plan — used purely to compute the Bulk
+   * Generation panel's default pre-checked selection (empty/outdated stills
+   * start checked; up-to-date ones start unchecked but stay selectable). */
+  async pendingStillIds(videoId: string): Promise<string[]> {
+    if (isTauri()) return invoke("pending_still_ids", { videoId });
+    return [];
   },
   async controlImageJob(jobId: string, action: "pause" | "resume" | "stop" | "cancel"): Promise<ImageJobRecord> {
     if (isTauri()) return invoke("control_image_job", { jobId, action });
@@ -1267,17 +1329,21 @@ export const projectsClient = {
     if (isTauri()) return invoke("suggest_still_prompt", { videoId, groupId, styleDirective, baseSettingsJson });
     throw new Error("Prompt suggestion requires the native application.");
   },
-  /** Plans AND persists ONE batch of stills, starting at `startIndex` in
-   * ordinal order — call repeatedly (advancing `startIndex` by
-   * `plannedCount` each time) until `done`, checking a pause/stop flag
-   * between calls, to drive a full pausable/resumable run. Every batch is
-   * committed to the database the moment it lands — there's no separate
-   * "approve" step, and progress survives a pause or the app closing. */
+  /** Plans AND persists ONE batch of stills, starting at `startIndex` into
+   * `selectedGroupIds` (scene-then-ordinal order — the caller's selection,
+   * not necessarily the whole workspace). A single AI call never spans two
+   * scenes, so the actual batch size is however many stills the scene at
+   * `startIndex` has (capped for prompt size) — call repeatedly (advancing
+   * `startIndex` by `plannedCount` each time) until `done`, checking a
+   * pause/stop flag between calls, to drive a full pausable/resumable run.
+   * Every batch is committed to the database the moment it lands — there's
+   * no separate "approve" step, and progress survives a pause or the app
+   * closing. */
   async planBulkVisualsBatch(
     videoId: string, styleDirective: string, baseSettingsJson: string, creativeInstruction: string,
-    characterConsistency: boolean, startIndex: number,
+    characterConsistency: boolean, selectedGroupIds: string[], startIndex: number,
   ): Promise<BulkPlanBatchResultRecord> {
-    if (isTauri()) return invoke("plan_bulk_visuals_batch", { videoId, styleDirective, baseSettingsJson, creativeInstruction, characterConsistency, startIndex });
+    if (isTauri()) return invoke("plan_bulk_visuals_batch", { videoId, styleDirective, baseSettingsJson, creativeInstruction, characterConsistency, selectedGroupIds, startIndex });
     throw new Error("Bulk planning requires the native application.");
   },
   /** Runs the fully backend-owned "Auto motion" pass on the next batch of
@@ -1356,8 +1422,25 @@ export const projectsClient = {
       const sentence = { id: `s${index + 1}`, ordinal: index + 1, text, startSeconds: cursor, endSeconds: cursor + duration };
       cursor += duration; return sentence;
     });
-    const groups = sentences.map((sentence, index) => ({ id: `g${index + 1}`, ordinal: index + 1, label: `Scene ${index + 1}`, kind: index ? "subject" : "establishing", sentenceIds: [sentence.id], settingsLocked: false, promptLocked: false }));
-    const plan = { videoId, timingSource: "estimated", sentences, groups, updatedAt: now() };
+    const groups: PlanGroupRecord[] = sentences.map((sentence, index) => ({ id: `g${index + 1}`, ordinal: index + 1, label: `Scene ${index + 1}`, kind: index ? "subject" : "establishing", sentenceIds: [sentence.id], settingsLocked: false, promptLocked: false, sceneId: null }));
+    // Web-demo stand-in for the real engine's AI scene segmentation: chunks
+    // every few stills into one scene, same crude fidelity as the Rust
+    // test-fixture path (build_scenes_range) — no AI context fields, since
+    // this mode never calls the AI at all.
+    const scenes: PlanSceneRecord[] = [];
+    for (let index = 0; index < groups.length; index += 3) {
+      const chunk = groups.slice(index, index + 3);
+      const ordinal = scenes.length + 1;
+      const sceneId = `sc${ordinal}`;
+      scenes.push({
+        id: sceneId, ordinal, label: `Scene ${ordinal}`,
+        narrativeRole: null, coreIdea: null, emotionalState: null,
+        visualOpportunities: [], sentenceIds: chunk.flatMap((group) => group.sentenceIds),
+        expanded: true,
+      });
+      chunk.forEach((group) => { group.sceneId = sceneId; });
+    }
+    const plan = { videoId, timingSource: "estimated", sentences, groups, scenes, updatedAt: now() };
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
     localStorage.setItem(`${STORAGE_KEY}.plan.original.${videoId}`, JSON.stringify(plan));
     return plan;
@@ -1377,6 +1460,7 @@ export const projectsClient = {
     plan.groups[source].sentenceIds = plan.groups[source].sentenceIds.filter((id) => id !== sentenceId);
     plan.groups[target].sentenceIds.push(sentenceId);
     plan.groups = plan.groups.filter((group) => group.sentenceIds.length);
+    assignSceneIds(plan.groups, plan.scenes);
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
     return plan;
   },
@@ -1388,10 +1472,11 @@ export const projectsClient = {
     plan.groups[source].sentenceIds = plan.groups[source].sentenceIds.filter((id) => id !== sentenceId);
     plan.groups = plan.groups.filter((group) => group.sentenceIds.length);
     plan.groups.splice(Math.min(insertIndex, plan.groups.length), 0, {
-      id: crypto.randomUUID(), ordinal: 0, label: "New scene", kind: "custom", sentenceIds: [sentenceId], settingsLocked: false, promptLocked: false,
+      id: crypto.randomUUID(), ordinal: 0, label: "New still", kind: "custom", sentenceIds: [sentenceId], settingsLocked: false, promptLocked: false, sceneId: null,
     });
     plan.groups.sort((a, b) => Number(a.sentenceIds[0].slice(1)) - Number(b.sentenceIds[0].slice(1)));
     plan.groups.forEach((group, index) => { group.ordinal = index + 1; });
+    assignSceneIds(plan.groups, plan.scenes);
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
     return plan;
   },
@@ -1401,6 +1486,40 @@ export const projectsClient = {
     if (!original) throw new Error("Original visual plan was not found.");
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, original);
     return JSON.parse(original) as VisualPlanRecord;
+  },
+  async setPlanSceneExpanded(videoId: string, sceneId: string, expanded: boolean): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("set_plan_scene_expanded", { videoId, sceneId, expanded });
+    const plan = await this.getVisualPlan(videoId);
+    const scene = plan.scenes.find((item) => item.id === sceneId);
+    if (!scene) throw new Error("Scene was not found.");
+    scene.expanded = expanded;
+    localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
+    return plan;
+  },
+  async getBulkSceneSettings(videoId: string): Promise<BulkSceneSettingsRecord[]> {
+    if (isTauri()) return invoke("get_bulk_scene_settings", { videoId });
+    const raw = localStorage.getItem(`${STORAGE_KEY}.bulkSceneSettings.${videoId}`);
+    return raw ? (JSON.parse(raw) as BulkSceneSettingsRecord[]) : [];
+  },
+  /** Upserts one scene's full override state — always send every field
+   * (null clears that field back to "inherit"), mirroring how the panel
+   * always holds the complete current override record in memory. */
+  async saveBulkSceneSettings(
+    videoId: string, sceneId: string,
+    styleDirective: string | null, creativeInstruction: string | null,
+    characterConsistency: boolean | null, referenceAssetId: string | null,
+  ): Promise<BulkSceneSettingsRecord> {
+    if (isTauri()) {
+      return invoke("save_bulk_scene_settings", {
+        videoId, sceneId, styleDirective, creativeInstruction, characterConsistency, referenceAssetId,
+      });
+    }
+    const key = `${STORAGE_KEY}.bulkSceneSettings.${videoId}`;
+    const all = await this.getBulkSceneSettings(videoId);
+    const record: BulkSceneSettingsRecord = { sceneId, styleDirective, creativeInstruction, characterConsistency, referenceAssetId };
+    const next = [...all.filter((item) => item.sceneId !== sceneId), record];
+    localStorage.setItem(key, JSON.stringify(next));
+    return record;
   },
   async updatePlanSentenceText(videoId: string, sentenceId: string, text: string): Promise<VisualPlanRecord> {
     if (isTauri()) return invoke("update_plan_sentence_text", { videoId, sentenceId, text });
@@ -1445,6 +1564,8 @@ export const projectsClient = {
     plan.groups = plan.groups.map((group) => ({ ...group, sentenceIds: group.sentenceIds.flatMap(renumber) }))
       .filter((group) => group.sentenceIds.length)
       .map((group, index) => ({ ...group, ordinal: index + 1 }));
+    plan.scenes = renumberSceneSentenceIds(plan.scenes, renumber);
+    assignSceneIds(plan.groups, plan.scenes);
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
     return plan;
   },
@@ -1486,6 +1607,8 @@ export const projectsClient = {
     plan.groups = plan.groups.map((group) => ({ ...group, sentenceIds: group.sentenceIds.flatMap(renumber) }))
       .filter((group) => group.sentenceIds.length)
       .map((group, index) => ({ ...group, ordinal: index + 1 }));
+    plan.scenes = renumberSceneSentenceIds(plan.scenes, renumber);
+    assignSceneIds(plan.groups, plan.scenes);
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
     return plan;
   },

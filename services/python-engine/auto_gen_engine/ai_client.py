@@ -241,6 +241,91 @@ def parse_structured_vision_gemini(
     return parsed
 
 
+def parse_structured_claude_cli(
+    claude_path: str,
+    system_prompt: str,
+    user_payload: dict | list,
+    response_model,
+    timeout: float = 300.0,
+    effort: str | None = "high",
+    model: str | None = "sonnet",
+):
+    """
+    Text-only counterpart to `parse_structured_vision_claude_cli`, matching
+    `parse_structured`'s calling shape (a JSON-serializable payload, not
+    content_blocks) for text-only passes like scene_grouping_engine.py's.
+    The CLI has no separate "structured payload" concept distinct from the
+    prompt text, so this just wraps `user_payload` as the one input_text
+    block the vision helper already knows how to handle.
+    """
+    return parse_structured_vision_claude_cli(
+        claude_path=claude_path,
+        system_prompt=system_prompt,
+        content_blocks=[
+            {"type": "input_text", "text": json.dumps(user_payload, ensure_ascii=False)}
+        ],
+        response_model=response_model,
+        timeout=timeout,
+        effort=effort,
+        model=model,
+    )
+
+
+def parse_structured_with_fallback(
+    system_prompt: str,
+    user_payload: dict | list,
+    response_model,
+    ai_model: str,
+    claude_cli_path: str | None = None,
+    temperature: float | None = None,
+):
+    """
+    Provider order for text-only structured passes: a locally logged-in
+    Claude Code CLI is tried first (no metered cost, rides an existing
+    Claude subscription — same reasoning and order as motion_graphics_
+    engine.py's vision passes), OpenAI is the fallback if the CLI isn't
+    installed/logged in or the call fails. `claude_cli_path` is resolved
+    automatically (one cheap `shutil.which` call) when not supplied — callers
+    doing many batched calls per run may still pass a pre-resolved path to
+    skip repeating that lookup, but it's optional.
+
+    Raises with both failures reported (not just the last one) so it's clear
+    which provider is actually worth fixing when neither works.
+    """
+    if claude_cli_path is None:
+        claude_cli_path = get_claude_cli_path()
+
+    claude_cli_error: Exception | None = None
+    if claude_cli_path is not None:
+        try:
+            return parse_structured_claude_cli(
+                claude_path=claude_cli_path,
+                system_prompt=system_prompt,
+                user_payload=user_payload,
+                response_model=response_model,
+            )
+        except Exception as error:  # noqa: BLE001 - genuinely any failure should fall back
+            claude_cli_error = error
+
+    try:
+        return parse_structured(
+            client=get_openai_client(),
+            model=ai_model,
+            system_prompt=system_prompt,
+            user_payload=user_payload,
+            response_model=response_model,
+            temperature=temperature,
+        )
+    except Exception as openai_error:
+        failure_notes = []
+        if claude_cli_error is not None:
+            failure_notes.append(f"Claude CLI: {claude_cli_error}")
+        failure_notes.append(f"OpenAI: {openai_error}")
+        raise RuntimeError(
+            "No AI provider succeeded for this pass (" + "; ".join(failure_notes) + ")."
+        ) from openai_error
+
+
 def get_claude_cli_path() -> str | None:
     """Locates the Claude Code CLI binary on PATH, if any. Returns None (not
     an exception) when it's missing — unlike the OpenAI/Gemini client

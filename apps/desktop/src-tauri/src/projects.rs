@@ -719,6 +719,64 @@ const MIGRATION_035: &str = r#"
 ALTER TABLE timeline_clips ADD COLUMN motion_graphic_ai_snapshot_json TEXT;
 "#;
 
+/// The Scene layer of the Visual Plan tab: a larger narrative/visual unit
+/// that can span several `visual_plan_groups` (stills). `is_original`
+/// mirrors `visual_plan_groups`' own snapshot pattern (a generated-at-plan-
+/// time copy that `reset_visual_plan` restores from, and a live copy that
+/// edits apply to). `expanded` is written explicitly per scene at generation
+/// time (and again on reset) — only the first scene starts expanded, the
+/// rest start collapsed (see the scene-building code in `generate_visual_
+/// plan`/`build_scenes_range`) — and this same flag is shared by the Visual
+/// Plan tab, the Images tab's left pane, and its Bulk Generation panel, so a
+/// collapse/expand in any one of them is reflected in the others.
+const MIGRATION_036: &str = r#"
+CREATE TABLE IF NOT EXISTS visual_plan_scenes (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    ordinal INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    narrative_role TEXT,
+    core_idea TEXT,
+    emotional_state TEXT,
+    visual_opportunities_json TEXT NOT NULL DEFAULT '[]',
+    sentence_ids_json TEXT NOT NULL,
+    is_original INTEGER NOT NULL DEFAULT 0,
+    expanded INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_plan_scenes_video ON visual_plan_scenes(video_id, is_original, ordinal);
+"#;
+
+/// A still's parent scene. Nullable (and left null) for plans generated
+/// before this column existed, or for the rare case a still's member
+/// sentences don't fall inside any known scene range — the frontend treats
+/// a null scene_id as "no strip", not an error.
+const MIGRATION_037: &str = r#"
+ALTER TABLE visual_plan_groups ADD COLUMN scene_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_plan_groups_scene ON visual_plan_groups(scene_id);
+"#;
+
+/// Per-scene overrides for Bulk Generation, layered on top of the existing
+/// global bulk settings (style directive / creative instructions /
+/// character consistency / reference image, today all per-video-only via
+/// `app_settings`/`input_assets`). Every override column is nullable —
+/// null means "inherit the global value"; a video with no row for a scene
+/// has no overrides at all. Keyed by (video_id, scene_id) rather than a
+/// composite id like `visual_plan_scenes`/`visual_plan_groups`, since this
+/// table's own `id` never needs to be referenced elsewhere.
+const MIGRATION_038: &str = r#"
+CREATE TABLE IF NOT EXISTS bulk_scene_settings (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    scene_id TEXT NOT NULL,
+    style_directive TEXT,
+    creative_instruction TEXT,
+    character_consistency INTEGER,
+    reference_asset_id TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_scene_settings_scene ON bulk_scene_settings(video_id, scene_id);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -919,6 +977,11 @@ pub struct ImageWorkspace {
     pub sentences: Vec<PlanSentence>,
     pub groups: Vec<ImageWorkspaceGroup>,
     pub settings: Vec<AppSetting>,
+    /// The same scenes `get_visual_plan` already returns — carried along so
+    /// the Images tab's left pane and Bulk Generation panel can section
+    /// `groups` by scene (via `sectionGroupsByScene`) without a second
+    /// round trip to `get_visual_plan`.
+    pub scenes: Vec<PlanScene>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -998,8 +1061,10 @@ const PROJECT_TABLES: &[&str] = &[
     "video_inputs",
     "input_assets",
     "visual_plan_sentences",
+    "visual_plan_scenes",
     "visual_plan_groups",
     "visual_plan_meta",
+    "bulk_scene_settings",
     "prompt_versions",
     "image_renders",
     "media_library_assets",
@@ -1024,6 +1089,7 @@ const ATOMIC_ID_COLUMNS: &[&str] = &[
     "id", "video_id", "group_id", "render_id", "prompt_version_id", "parent_render_id",
     "source_render_id", "video_asset_id", "parent_video_asset_id", "media_library_asset_id",
     "still_id", "visual_plan_row_id", "audio_asset_id", "generation_audio_id", "clip_id",
+    "scene_id", "reference_asset_id",
 ];
 
 /// `visual_plan_sentences.id` and `visual_plan_groups.id` are the only
@@ -1037,7 +1103,7 @@ const ATOMIC_ID_COLUMNS: &[&str] = &[
 /// the rest of the app. Bundle restore has to know about this to remap the
 /// suffix consistently everywhere it appears, not just inside these two
 /// tables' own `id` column.
-const COMPOSITE_ID_TABLES: &[&str] = &["visual_plan_sentences", "visual_plan_groups"];
+const COMPOSITE_ID_TABLES: &[&str] = &["visual_plan_sentences", "visual_plan_groups", "visual_plan_scenes"];
 
 fn composite_id_suffix(value: &str) -> &str {
     value.rsplit_once("::").map(|(_, suffix)| suffix).unwrap_or(value)
@@ -1422,6 +1488,43 @@ pub struct PlanGroup {
     pub sentence_ids: Vec<String>,
     pub settings_locked: bool,
     pub prompt_locked: bool,
+    /// The scene this still belongs to, assigned by containment against
+    /// `VisualPlan.scenes` at generation time and kept up to date by
+    /// `assign_scene_ids` on every subsequent move/split/merge/create. Null
+    /// for plans generated before scenes existed, or if no scene's sentence
+    /// range happens to contain this still's first sentence.
+    pub scene_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanScene {
+    pub id: String,
+    pub ordinal: i64,
+    pub label: String,
+    pub narrative_role: Option<String>,
+    pub core_idea: Option<String>,
+    pub emotional_state: Option<String>,
+    pub visual_opportunities: Vec<String>,
+    pub sentence_ids: Vec<String>,
+    pub expanded: bool,
+}
+
+/// Per-scene overrides for Bulk Generation, layered on top of the video's
+/// global bulk settings. Every field is nullable — `None` means "inherit
+/// the global value" for that one field; a scene with no row at all (see
+/// `get_bulk_scene_settings`, which only returns rows that exist) has no
+/// overrides. The caller (the Bulk Generation panel) always holds the full
+/// current override state in memory and re-sends every field on every save,
+/// so there's no separate "leave untouched" wire state to model here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkSceneSettings {
+    pub scene_id: String,
+    pub style_directive: Option<String>,
+    pub creative_instruction: Option<String>,
+    pub character_consistency: Option<bool>,
+    pub reference_asset_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1480,6 +1583,7 @@ pub struct VisualPlan {
     pub timing_source: String,
     pub sentences: Vec<PlanSentence>,
     pub groups: Vec<PlanGroup>,
+    pub scenes: Vec<PlanScene>,
     pub updated_at: String,
 }
 
@@ -1976,6 +2080,31 @@ impl ProjectRepository {
         }
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(35, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        self.connection.execute_batch(MIGRATION_036).map_err(|error| error.to_string())?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(36, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_group_scene_id: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('visual_plan_groups') WHERE name='scene_id')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_group_scene_id {
+            self.connection.execute_batch(MIGRATION_037).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(37, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        self.connection.execute_batch(MIGRATION_038).map_err(|error| error.to_string())?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(38, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -2625,9 +2754,11 @@ impl ProjectRepository {
             timing_source: String::new(),
             sentences: Vec::new(),
             groups: Vec::new(),
+            scenes: Vec::new(),
             updated_at: String::new(),
         });
         let sentences = plan.sentences.clone();
+        let scenes = plan.scenes.clone();
         let groups = plan
             .groups
             .into_iter()
@@ -2648,6 +2779,7 @@ impl ProjectRepository {
             sentences,
             groups,
             settings: self.list_app_settings()?,
+            scenes,
         })
     }
 
@@ -3275,6 +3407,60 @@ Return exactly one plan for every supplied row, in the same order."#,
         Ok(())
     }
 
+    /// Every scene that has at least one Bulk Generation override saved for
+    /// this video — a scene with no overrides simply has no row and isn't
+    /// present in this list, rather than a row of all-nulls.
+    pub fn get_bulk_scene_settings(&self, video_id: &str) -> Result<Vec<BulkSceneSettings>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT scene_id, style_directive, creative_instruction, character_consistency, reference_asset_id
+             FROM bulk_scene_settings WHERE video_id=?1 ORDER BY scene_id",
+        ).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([video_id], |row| {
+            Ok(BulkSceneSettings {
+                scene_id: row.get(0)?,
+                style_directive: row.get(1)?,
+                creative_instruction: row.get(2)?,
+                character_consistency: row.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+                reference_asset_id: row.get(4)?,
+            })
+        }).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// Upserts one scene's full override state — the caller (the Bulk
+    /// Generation panel) always holds the complete current override record
+    /// in memory and re-sends every field, so this always writes all four
+    /// columns rather than patching individual ones. A scene whose fields
+    /// are all `None` still leaves a row behind (harmless — reads back
+    /// identically to "no overrides"); the panel doesn't bother deleting it.
+    pub fn save_bulk_scene_settings(
+        &self,
+        video_id: &str,
+        scene_id: &str,
+        style_directive: Option<String>,
+        creative_instruction: Option<String>,
+        character_consistency: Option<bool>,
+        reference_asset_id: Option<String>,
+    ) -> Result<BulkSceneSettings, String> {
+        self.connection.execute(
+            "INSERT INTO bulk_scene_settings(id,video_id,scene_id,style_directive,creative_instruction,character_consistency,reference_asset_id,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(video_id,scene_id) DO UPDATE SET
+                style_directive=excluded.style_directive,
+                creative_instruction=excluded.creative_instruction,
+                character_consistency=excluded.character_consistency,
+                reference_asset_id=excluded.reference_asset_id,
+                updated_at=excluded.updated_at",
+            params![
+                Uuid::new_v4().to_string(), video_id, scene_id,
+                style_directive, creative_instruction,
+                character_consistency.map(|v| v as i64), reference_asset_id,
+                Utc::now().to_rfc3339(),
+            ],
+        ).map_err(|e| e.to_string())?;
+        Ok(BulkSceneSettings { scene_id: scene_id.to_string(), style_directive, creative_instruction, character_consistency, reference_asset_id })
+    }
+
     pub fn extract_image_settings_from_directive(&self, directive: &str) -> Result<StyleExtraction, String> {
         // Claude CLI first — no metered cost, rides whatever Claude
         // subscription is already logged into the CLI on this machine (see
@@ -3343,13 +3529,33 @@ Return JSON only — no markdown, no explanation:
     /// Claude CLI first, Gemini fallback — same provider order as the rest
     /// of Bulk Gen planning (OpenAI has been removed from this path
     /// entirely), unlike `extract_reference_style` which hard-codes Gemini.
-    /// Reads the video's reference image bytes (see `list_assets(video_id,
-    /// "reference")` — guaranteed 0-or-1 row). Shared by
+    /// Reads a reference image's bytes. `asset_id` selects one specific
+    /// `input_assets` row directly (used for a scene's overridden reference,
+    /// via `bulk_scene_settings.reference_asset_id`) — bypassing it falls
+    /// back to whichever asset `global_reference_asset.{video_id}` names, or
+    /// (for videos saved before that setting existed) the oldest
+    /// `reference`-kind row for the video, matching the original "0-or-1
+    /// reference per video" assumption `importReference`'s evict-before-
+    /// import behavior used to guarantee on its own. Scene references don't
+    /// evict anything, so more than one `reference`-kind row can now coexist
+    /// per video — `asset_id`/the setting are what keep the global path from
+    /// picking up a scene's reference by accident. Shared by
     /// `character_description_for_video` (vision analysis) and
     /// `generate_image_render` (passed as actual generation input, not just
     /// description text — see that function's comment for why both matter).
-    fn reference_image_bytes(&self, video_id: &str) -> Result<Option<(String, Vec<u8>)>, String> {
-        let Some(reference) = self.list_assets(video_id, "reference")?.into_iter().next() else {
+    fn reference_image_bytes(&self, video_id: &str, asset_id: Option<&str>) -> Result<Option<(String, Vec<u8>)>, String> {
+        let references = self.list_assets(video_id, "reference")?;
+        let reference = match asset_id {
+            Some(id) => references.into_iter().find(|asset| asset.id == id),
+            None => {
+                let global_id = self.get_app_setting(&format!("global_reference_asset.{video_id}"))?;
+                match global_id {
+                    Some(id) => references.into_iter().find(|asset| asset.id == id),
+                    None => references.into_iter().next(),
+                }
+            }
+        };
+        let Some(reference) = reference else {
             return Ok(None);
         };
         let channel_id: String = self.connection.query_row(
@@ -3364,8 +3570,9 @@ Return JSON only — no markdown, no explanation:
         &self,
         video_id: &str,
         gemini_auth: &Option<GeminiAuth>,
+        reference_asset_id: Option<&str>,
     ) -> Result<String, String> {
-        let (media_type, bytes) = self.reference_image_bytes(video_id)?
+        let (media_type, bytes) = self.reference_image_bytes(video_id, reference_asset_id)?
             .ok_or("Character Consistency requires a reference image — upload one in Bulk Gen Config first.")?;
         let prompt = "Identify the single main character or protagonist in this reference image (a person, animal, or creature — not a background object or environment). Write a concise, reusable physical description of that character for an illustrator to redraw consistently across dozens of separate scenes. You MUST explicitly cover: species/type; approximate age; physical proportions and build; exact hair color, length, and style (or fur/feather coloring and pattern if not human) — this is the single most common detail illustrators get inconsistent, so describe it precisely; eye color; skin/fur tone; and any distinguishing marks or features. Deliberately do NOT describe clothing, outfit, or props — those must change scene-to-scene to match each still's own context, not stay fixed like the physical identity. Do not describe the pose, background, camera angle, or art/rendering style either — only the character's inherent physical identity, in 4-6 sentences of plain prose. If no clear single character is present, describe the closest candidate subject instead. Return only the description, no preamble, no labels, no markdown.";
         #[cfg(not(test))]
@@ -3564,6 +3771,7 @@ Return JSON only — no markdown, no explanation:
         base_settings_json: &str,
         creative_instruction: &str,
         character_consistency: bool,
+        selected_group_ids: &[String],
         start_index: usize,
     ) -> Result<BulkPlanBatchResult, String> {
         #[cfg(not(test))]
@@ -3578,17 +3786,34 @@ Return JSON only — no markdown, no explanation:
         if gemini_auth.is_none() && !claude_cli {
             return Err("A logged-in Claude Code CLI, or a Gemini API key, is required for Bulk planning. Run `claude` once to log in, or add a Gemini key in Settings.".into());
         }
+        // Upper bound on how many stills a single AI planning call covers —
+        // no longer the primary chunking unit (a scene boundary always wins,
+        // see below), just a prompt-size safety cap for scenes larger than
+        // this.
         let chunk_size: usize = if claude_cli || gemini_auth.is_none() { 6 } else { 3 };
         let visual_plan = self.get_visual_plan(video_id)?;
         if visual_plan.groups.is_empty() {
             return Err("No stills found. Generate a visual plan first.".into());
         }
-        let total = visual_plan.groups.len();
+        // The caller (the Bulk Generation panel) hands us exactly the stills
+        // the user selected, in scene-then-ordinal order — everything below
+        // operates on this filtered/reordered list, not the full plan.
+        // Unknown ids (e.g. a still deleted between selection and this call)
+        // are silently skipped rather than erroring.
+        let groups_by_id: std::collections::HashMap<&str, &PlanGroup> =
+            visual_plan.groups.iter().map(|group| (group.id.as_str(), group)).collect();
+        let selected_groups: Vec<PlanGroup> = selected_group_ids.iter()
+            .filter_map(|id| groups_by_id.get(id.as_str()).map(|group| (*group).clone()))
+            .collect();
+        if selected_groups.is_empty() {
+            return Err("No stills selected.".into());
+        }
+        let total = selected_groups.len();
         if start_index >= total {
             return Ok(BulkPlanBatchResult { planned_count: 0, total_stills: total, last_ordinal: 0, done: true });
         }
         let mut row_data: Vec<serde_json::Value> = Vec::with_capacity(total);
-        for group in &visual_plan.groups {
+        for group in &selected_groups {
             let members: Vec<_> = group.sentence_ids.iter()
                 .filter_map(|id| visual_plan.sentences.iter().find(|s| &s.id == id)).collect();
             let narration = members.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
@@ -3613,18 +3838,44 @@ Return JSON only — no markdown, no explanation:
             &format!("character_consistency.{video_id}"),
             if character_consistency { "true" } else { "false" },
         )?;
+        // A chunk never spans two scenes (see chunk_end below), so the scene
+        // the still at start_index belongs to is this whole call's scene —
+        // any bulk_scene_settings override for it replaces the matching
+        // global param for this call only.
+        let current_scene_id = selected_groups[start_index].scene_id.clone();
+        let scene_settings = match &current_scene_id {
+            Some(id) => self.get_bulk_scene_settings(video_id)?.into_iter().find(|s| &s.scene_id == id),
+            None => None,
+        };
+        let EffectiveBulkSettings {
+            style_directive: effective_style_directive,
+            creative_instruction: effective_creative_instruction,
+            character_consistency: effective_character_consistency,
+            reference_asset_id: effective_reference_asset_id,
+        } = resolve_effective_bulk_settings(
+            scene_settings.as_ref(), style_directive, creative_instruction, character_consistency,
+        );
         // Character description is a real vision API call — expensive enough
         // that it's worth caching across batches (a fresh function call per
         // batch has no in-memory way to reuse it otherwise). Invalidated by
         // simply toggling Character Consistency off and back on with a new
         // reference image (see the frontend), which is the only time the
-        // cached description would ever go stale.
-        let character_block = if character_consistency {
-            let cache_key = format!("character_description.{video_id}");
+        // cached description would ever go stale. Scoped per-scene only when
+        // that scene actually overrides the reference image — a scene that
+        // only overrides character_consistency (on/off) still shares the
+        // global description/reference, so it shares the global cache entry
+        // too.
+        let character_block = if effective_character_consistency {
+            let cache_key = match (&current_scene_id, &effective_reference_asset_id) {
+                (Some(scene_id), Some(_)) => format!("character_description.{video_id}.{scene_id}"),
+                _ => format!("character_description.{video_id}"),
+            };
             let description = match self.get_app_setting(&cache_key)? {
                 Some(cached) if !cached.trim().is_empty() => cached,
                 _ => {
-                    let description = self.character_description_for_video(video_id, &gemini_auth)?;
+                    let description = self.character_description_for_video(
+                        video_id, &gemini_auth, effective_reference_asset_id.as_deref(),
+                    )?;
                     self.save_app_setting(&cache_key, &description)?;
                     description
                 }
@@ -3664,12 +3915,10 @@ Return JSON only — no markdown, no explanation:
             String::new()
         };
 
-        let chunk_end = (start_index + chunk_size).min(total);
+        let chunk_end = bulk_batch_chunk_end(&selected_groups, start_index, chunk_size);
         let chunk = &row_data[start_index..chunk_end];
-        let prior_context = self.bulk_plan_prior_context(video_id, &visual_plan.groups, start_index, 12)?;
-        let total_batches = total.div_ceil(chunk_size);
-        let batch_number = start_index / chunk_size + 1;
-        let director_note = if creative_instruction.trim().is_empty() {
+        let prior_context = self.bulk_plan_prior_context(video_id, &selected_groups, start_index, 12)?;
+        let director_note = if effective_creative_instruction.trim().is_empty() {
             String::new()
         } else {
             format!(
@@ -3690,15 +3939,15 @@ Return JSON only — no markdown, no explanation:
                     → Also reflect the avoidance in your choice of visualType and imageSettings where applicable.\n\
                  3. Both positive and negative rules must be clearly visible in the output userPrompt — a reviewer must be able to confirm compliance by reading the userPrompt alone.\n\
                  ════════════════════════════════════════\n",
-                creative_instruction.trim()
+                effective_creative_instruction.trim()
             )
         };
         let prompt = format!(
             r#"You are an Educational Visual Director planning an entire video, not isolated stills.
 
-Style directive: {style_directive}
+Style directive: {effective_style_directive}
 Base image settings: {base_settings_json}{director_note}{character_block}
-Total stills in video: {total}. This is planning batch {} of {total_batches}.
+Total stills in video: {total}. This batch covers stills {} of {total} (selected for this run).
 Previously planned context (chronological; includes earlier batches and must guide continuity, emotional variety, and non-repetition): {}
 
 Current batch rows to plan:
@@ -3815,7 +4064,7 @@ Allowed visualType values: Character Scene; Character Close-Up / Reaction; Behav
 You MUST return exactly one plan for every row in the current batch.
 OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object and NOTHING else. Do not write any introduction, restatement of the task, narration of your planning process, explanation, commentary, or markdown fences before, between, or after it. Do not describe what you are about to plan — just plan it, silently, and output only the resulting JSON. The very first character of your response must be {{ and the very last character must be }}.
 {{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content — mandatory creative rules embedded; negatives as [Avoid: ...]","coreVisualDevice":"2-6 words naming the concrete symbol/object this still leans on, e.g. 'dice and coin', 'gears', 'split panel: podium vs porch'"}}]}}"#,
-            batch_number,
+            format!("{}-{}", start_index + 1, chunk_end),
             serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
             serde_json::to_string_pretty(chunk).unwrap_or_default(),
         );
@@ -3845,8 +4094,8 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
             .count();
         if valid_count == 0 {
             return Err(format!(
-                "No usable plans returned for stills {}-{} (batch {}). Please retry.",
-                start_index + 1, chunk_end, batch_number
+                "No usable plans returned for stills {}-{}. Please retry.",
+                start_index + 1, chunk_end
             ));
         }
         let mut batch_plans: Vec<V2PlanStillResponse> = Vec::with_capacity(valid_count);
@@ -3882,7 +4131,7 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
         let mut last_ordinal = row_data.get(start_index.wrapping_sub(1)).and_then(|row| row["ordinal"].as_i64()).unwrap_or(0);
         for (offset, mut plan) in batch_plans.into_iter().enumerate() {
             let index = start_index + offset;
-            let group = &visual_plan.groups[index];
+            let group = &selected_groups[index];
             let row = &row_data[index];
             if row["settingsLocked"].as_bool().unwrap_or(false) {
                 if let Some(obj) = row["existingSettings"].as_object() {
@@ -3894,7 +4143,7 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                     plan.user_prompt = existing.to_string();
                 }
             }
-            if let Some(saved) = self.persist_bulk_planned_still(video_id, style_directive, group, row, plan)? {
+            if let Some(saved) = self.persist_bulk_planned_still(video_id, &effective_style_directive, group, row, plan)? {
                 last_ordinal = saved.ordinal;
             }
             planned_count += 1;
@@ -4660,7 +4909,11 @@ Return JSON only:
         let model = self
             .get_app_setting("gemini_model")?
             .unwrap_or_else(|| "gemini-3.1-flash-image".into());
-        let (narration, ordinal) = self.get_visual_plan(video_id).ok()
+        let plan = self.get_visual_plan(video_id).ok();
+        let scene_id = plan.as_ref()
+            .and_then(|plan| plan.groups.iter().find(|g| g.id == group_id))
+            .and_then(|group| group.scene_id.clone());
+        let (narration, ordinal) = plan.as_ref()
             .and_then(|plan| {
                 let group = plan.groups.iter().find(|g| g.id == group_id)?;
                 let narration = group.sentence_ids.iter()
@@ -4704,11 +4957,21 @@ Return JSON only:
         // description alone doesn't reliably reproduce fine visual details
         // (hair color/style especially) across independent generations —
         // conditioning on the real image is what actually anchors them.
-        let character_consistency_enabled = self
-            .get_app_setting(&format!("character_consistency.{video_id}"))?
-            .as_deref() == Some("true");
+        // A scene override (see bulk_scene_settings) takes precedence over
+        // the video-global character_consistency.{video_id} flag/reference,
+        // the same way plan_bulk_visuals_batch already resolves it at
+        // planning time — generation has to agree with what was planned.
+        let scene_settings = match &scene_id {
+            Some(id) => self.get_bulk_scene_settings(video_id)?.into_iter().find(|s| &s.scene_id == id),
+            None => None,
+        };
+        let character_consistency_enabled = scene_settings.as_ref().and_then(|s| s.character_consistency)
+            .unwrap_or(
+                self.get_app_setting(&format!("character_consistency.{video_id}"))?.as_deref() == Some("true")
+            );
+        let reference_asset_id = scene_settings.as_ref().and_then(|s| s.reference_asset_id.clone());
         let reference_for_generation = if character_consistency_enabled {
-            self.reference_image_bytes(video_id)?
+            self.reference_image_bytes(video_id, reference_asset_id.as_deref())?
         } else {
             None
         };
@@ -7261,9 +7524,16 @@ Return JSON only:
         }
     }
 
-    pub fn create_image_job(&self, video_id: &str) -> Result<ImageJob, String> {
+    /// Every still whose newest render is missing or stale relative to its
+    /// newest prompt/educational plan — the same "needs (re)generation"
+    /// check `create_image_job` used to run internally before selection
+    /// existed. Used by the Bulk Generation panel purely to compute its
+    /// default pre-checked selection (empty/outdated stills start checked,
+    /// up-to-date ones start unchecked but remain manually selectable) —
+    /// `create_image_job` itself no longer re-derives this on its own.
+    pub fn pending_still_ids(&self, video_id: &str) -> Result<Vec<String>, String> {
         let plan = self.get_visual_plan(video_id)?;
-        let mut prompts = Vec::new();
+        let mut pending = Vec::new();
         for group in plan.groups {
             let prompt = self.list_prompt_versions(video_id, &group.id)?.into_iter().next()
                 .ok_or_else(|| format!("{} needs a saved prompt before bulk generation.", group.label))?;
@@ -7277,11 +7547,33 @@ Return JSON only:
                 })
                 .unwrap_or(true);
             if needs_generation {
-                prompts.push((group.id, prompt.id));
+                pending.push(group.id);
             }
         }
-        if prompts.is_empty() {
-            return Err("There are no pending stills to generate.".into());
+        Ok(pending)
+    }
+
+    /// Creates a job for exactly the given stills, forced — every id in
+    /// `group_ids` becomes a job item using its current newest prompt
+    /// version, whether or not that still's render is already up to date.
+    /// The staleness check that used to gate this (see `pending_still_ids`)
+    /// now only informs the panel's *default* selection; an explicit
+    /// selection always means "(re)generate this," including an
+    /// already-generated still the user checked on purpose.
+    pub fn create_image_job(&self, video_id: &str, group_ids: &[String]) -> Result<ImageJob, String> {
+        if group_ids.is_empty() {
+            return Err("No stills selected.".into());
+        }
+        let plan = self.get_visual_plan(video_id)?;
+        let groups_by_id: std::collections::HashMap<&str, &PlanGroup> =
+            plan.groups.iter().map(|group| (group.id.as_str(), group)).collect();
+        let mut prompts = Vec::with_capacity(group_ids.len());
+        for group_id in group_ids {
+            let group = groups_by_id.get(group_id.as_str())
+                .ok_or_else(|| format!("Still {group_id} was not found in this video's plan."))?;
+            let prompt = self.list_prompt_versions(video_id, &group.id)?.into_iter().next()
+                .ok_or_else(|| format!("{} needs a saved prompt before bulk generation.", group.label))?;
+            prompts.push((group.id.clone(), prompt.id));
         }
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -8134,15 +8426,18 @@ Return JSON only:
                     sentence
                 })
                 .collect::<Vec<_>>();
-            let groups = build_groups_range(
+            let mut groups = build_groups_range(
                 &sentences,
                 inputs.pacing_min_seconds as f64,
                 inputs.pacing_max_seconds as f64,
             );
+            let scenes = build_scenes_range(&groups);
+            assign_scene_ids(&mut groups, &scenes);
             self.save_plan(
                 video_id,
                 &sentences,
                 &groups,
+                &scenes,
                 true,
                 "estimated test fixture",
             )?;
@@ -8152,6 +8447,7 @@ Return JSON only:
                 video_id,
                 &sentences,
                 &groups,
+                &scenes,
                 false,
                 "estimated test fixture",
             )?;
@@ -8336,6 +8632,56 @@ Return JSON only:
                         sentence_ids: (start..=end).map(|id| format!("s{id}")).collect(),
                         settings_locked: false,
                         prompt_locked: false,
+                        // Assigned authoritatively by the Python engine (it
+                        // already knows both partitions from the same
+                        // computation) — Rust only has to recompute this by
+                        // containment on later edits, see assign_scene_ids.
+                        scene_id: item["scene_id"].as_i64().map(|id| format!("sc{id}")),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let scenes = audit["scenes"]
+                .as_array()
+                .ok_or("Visual-plan audit contained no scenes.")?
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let start = item["start_sentence_id"].as_i64().unwrap_or(1);
+                    let end = item["end_sentence_id"].as_i64().unwrap_or(start);
+                    PlanScene {
+                        id: format!("sc{}", item["scene_id"].as_i64().unwrap_or(0)),
+                        ordinal: item["scene_id"].as_i64().unwrap_or(0),
+                        label: item["title"]
+                            .as_str()
+                            .filter(|v| !v.is_empty())
+                            .unwrap_or("Scene")
+                            .to_string(),
+                        narrative_role: item["narrative_role"]
+                            .as_str()
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string),
+                        core_idea: item["core_idea"]
+                            .as_str()
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string),
+                        emotional_state: item["emotional_state"]
+                            .as_str()
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string),
+                        visual_opportunities: item["visual_opportunities"]
+                            .as_array()
+                            .map(|values| {
+                                values.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+                            })
+                            .unwrap_or_default(),
+                        sentence_ids: (start..=end).map(|id| format!("s{id}")).collect(),
+                        // Only the first scene starts expanded — this flag is
+                        // shared with the Images tab's left pane (and its Bulk
+                        // Generation panel), which wants "collapsed except
+                        // scene 1" by default. An intentional, accepted change
+                        // from the earlier "every scene starts expanded"
+                        // behavior (see the Bulk Generation redesign plan).
+                        expanded: index == 0,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -8343,6 +8689,7 @@ Return JSON only:
                 video_id,
                 &sentences,
                 &groups,
+                &scenes,
                 true,
                 "whisper + AI boundary scoring",
             )?;
@@ -8352,6 +8699,7 @@ Return JSON only:
                 video_id,
                 &sentences,
                 &groups,
+                &scenes,
                 false,
                 "whisper + AI boundary scoring",
             )?;
@@ -8389,11 +8737,13 @@ Return JSON only:
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         let groups = self.load_groups(video_id, false)?;
+        let scenes = self.load_scenes(video_id, false)?;
         Ok(VisualPlan {
             video_id: video_id.into(),
             timing_source,
             sentences,
             groups,
+            scenes,
             updated_at,
         })
     }
@@ -9466,9 +9816,9 @@ Return JSON only:
             group.ordinal = index as i64 + 1;
         }
         validate_group_chronology(&groups)?;
-        let sentences = self.get_visual_plan(video_id)?.sentences;
-        let timing_source = self.get_visual_plan(video_id)?.timing_source;
-        self.save_plan(video_id, &sentences, &groups, false, &timing_source)?;
+        let plan = self.get_visual_plan(video_id)?;
+        assign_scene_ids(&mut groups, &plan.scenes);
+        self.save_plan(video_id, &plan.sentences, &groups, &plan.scenes, false, &plan.timing_source)?;
         self.get_visual_plan(video_id)
     }
 
@@ -9482,6 +9832,7 @@ Return JSON only:
     /// groups-only reset for those rather than erroring.
     pub fn reset_visual_plan(&self, video_id: &str) -> Result<VisualPlan, String> {
         let original_groups = self.load_groups(video_id, true)?;
+        let original_scenes = self.load_scenes(video_id, true)?;
         let plan = self.get_visual_plan(video_id)?;
         let snapshot_json: Option<String> = self.connection.query_row(
             "SELECT original_sentences_json FROM visual_plan_meta WHERE video_id=?1",
@@ -9492,12 +9843,16 @@ Return JSON only:
             Some(json) => serde_json::from_str(&json).map_err(|e| e.to_string())?,
             None => plan.sentences,
         };
-        // save_plan's sentence-write and is_original=1 group-write are both
-        // gated by the same `original: bool` — writing original_groups back
-        // over themselves here is a harmless no-op, it's what unlocks
-        // restoring sentences without a separate write path.
-        self.save_plan(video_id, &original_sentences, &original_groups, true, &plan.timing_source)?;
-        self.save_plan(video_id, &original_sentences, &original_groups, false, &plan.timing_source)?;
+        // save_plan's sentence-write and is_original=1 group/scene-write are
+        // both gated by the same `original: bool` — writing original_groups
+        // and original_scenes back over themselves here is a harmless no-op,
+        // it's what unlocks restoring sentences without a separate write
+        // path. Scenes restored this way also naturally come back to their
+        // generation-time expand state (only scene 1 expanded, per the
+        // original snapshot), which is the intended "reset = fresh start"
+        // behavior rather than something specially engineered here.
+        self.save_plan(video_id, &original_sentences, &original_groups, &original_scenes, true, &plan.timing_source)?;
+        self.save_plan(video_id, &original_sentences, &original_groups, &original_scenes, false, &plan.timing_source)?;
         self.get_visual_plan(video_id)
     }
 
@@ -9540,11 +9895,14 @@ Return JSON only:
             PlanGroup {
                 id: format!("g{next_id}"),
                 ordinal: 0,
-                label: "New scene".into(),
+                label: "New still".into(),
                 kind: "custom".into(),
                 sentence_ids: vec![sentence_id.into()],
                 settings_locked: false,
                 prompt_locked: false,
+                // Resolved below by assign_scene_ids — the new still keeps
+                // whichever scene already contained this sentence.
+                scene_id: None,
             },
         );
         for (index, group) in groups.iter_mut().enumerate() {
@@ -9552,13 +9910,42 @@ Return JSON only:
         }
         validate_group_chronology(&groups)?;
         let current = self.get_visual_plan(video_id)?;
+        assign_scene_ids(&mut groups, &current.scenes);
         self.save_plan(
             video_id,
             &current.sentences,
             &groups,
+            &current.scenes,
             false,
             &current.timing_source,
         )?;
+        self.get_visual_plan(video_id)
+    }
+
+    /// Persists a scene's collapsed/expanded state — shared by the Visual
+    /// Plan tab, the Images tab's left pane, and its Bulk Generation panel
+    /// (all three read/write the same `visual_plan_scenes.expanded` column,
+    /// so toggling a scene in any one of them is reflected in the others).
+    /// Reshaping scene boundaries themselves still isn't a user action (see
+    /// the Visual Scene Segmentor plan's "explicitly out of scope" list).
+    /// Only ever touches the current (`is_original=0`) snapshot — expand
+    /// state isn't part of what `reset_visual_plan` restores from the
+    /// original snapshot, it naturally comes back to each scene's
+    /// generation-time default (only scene 1 expanded) on reset, same as
+    /// everything else in that snapshot.
+    pub fn set_plan_scene_expanded(
+        &self,
+        video_id: &str,
+        scene_id: &str,
+        expanded: bool,
+    ) -> Result<VisualPlan, String> {
+        let updated = self.connection.execute(
+            "UPDATE visual_plan_scenes SET expanded=?1 WHERE video_id=?2 AND is_original=0 AND id=?3",
+            params![expanded as i64, video_id, format!("{video_id}::current::{scene_id}")],
+        ).map_err(|e| e.to_string())?;
+        if updated == 0 {
+            return Err("Scene was not found.".into());
+        }
         self.get_visual_plan(video_id)
     }
 
@@ -9583,6 +9970,27 @@ Return JSON only:
         groups.retain(|group| !group.sentence_ids.is_empty());
     }
 
+    /// Same shift as `renumber_group_sentence_ids`, applied to scenes'
+    /// sentence ranges instead of stills' — without this, a scene's
+    /// `sentence_ids_json` goes stale (referring to ids that no longer exist)
+    /// the moment a split/merge shifts every later sentence's id. A scene
+    /// can legitimately empty out and get dropped the same way a group can
+    /// (e.g. a one-sentence scene whose sole sentence gets merged into the
+    /// previous, differently-scened, sentence).
+    fn renumber_scene_sentence_ids<F>(scenes: &mut Vec<PlanScene>, mut renumber: F)
+    where
+        F: FnMut(&str) -> Option<Vec<String>>,
+    {
+        for scene in scenes.iter_mut() {
+            scene.sentence_ids = scene
+                .sentence_ids
+                .iter()
+                .flat_map(|id| renumber(id).unwrap_or_default())
+                .collect();
+        }
+        scenes.retain(|scene| !scene.sentence_ids.is_empty());
+    }
+
     /// Writes both the "current" and "original" `visual_plan_groups`
     /// snapshots plus the full `visual_plan_sentences` set in one pass —
     /// used by `split_plan_sentence`/`merge_plan_sentences`, which (unlike
@@ -9598,6 +10006,8 @@ Return JSON only:
         sentences: &[PlanSentence],
         current_groups: &[PlanGroup],
         original_groups: &[PlanGroup],
+        current_scenes: &[PlanScene],
+        original_scenes: &[PlanScene],
     ) -> Result<(), String> {
         self.connection.execute(
             "DELETE FROM visual_plan_sentences WHERE video_id = ?1",
@@ -9623,7 +10033,7 @@ Return JSON only:
             ).map_err(|e| e.to_string())?;
             for group in groups {
                 self.connection.execute(
-                    "INSERT INTO visual_plan_groups(id, video_id, ordinal, label, kind, sentence_ids_json, is_original) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    "INSERT INTO visual_plan_groups(id, video_id, ordinal, label, kind, sentence_ids_json, is_original, scene_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         format!("{video_id}::{}::{}", if original {"original"} else {"current"}, group.id),
                         video_id,
@@ -9631,7 +10041,32 @@ Return JSON only:
                         group.label,
                         group.kind,
                         serde_json::to_string(&group.sentence_ids).unwrap(),
-                        original as i64
+                        original as i64,
+                        group.scene_id
+                    ],
+                ).map_err(|e| e.to_string())?;
+            }
+        }
+        for (scenes, original) in [(current_scenes, false), (original_scenes, true)] {
+            self.connection.execute(
+                "DELETE FROM visual_plan_scenes WHERE video_id = ?1 AND is_original = ?2",
+                params![video_id, original as i64],
+            ).map_err(|e| e.to_string())?;
+            for scene in scenes {
+                self.connection.execute(
+                    "INSERT INTO visual_plan_scenes(id, video_id, ordinal, label, narrative_role, core_idea, emotional_state, visual_opportunities_json, sentence_ids_json, is_original, expanded) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                    params![
+                        format!("{video_id}::{}::{}", if original {"original"} else {"current"}, scene.id),
+                        video_id,
+                        scene.ordinal,
+                        scene.label,
+                        scene.narrative_role,
+                        scene.core_idea,
+                        scene.emotional_state,
+                        serde_json::to_string(&scene.visual_opportunities).unwrap(),
+                        serde_json::to_string(&scene.sentence_ids).unwrap(),
+                        original as i64,
+                        scene.expanded as i64
                     ],
                 ).map_err(|e| e.to_string())?;
             }
@@ -9742,17 +10177,35 @@ Return JSON only:
         };
         let mut current_groups = self.load_groups(video_id, false)?;
         let mut original_groups = self.load_groups(video_id, true)?;
+        let mut current_scenes = self.load_scenes(video_id, false)?;
+        let mut original_scenes = self.load_scenes(video_id, true)?;
         Self::renumber_group_sentence_ids(&mut current_groups, renumber);
         Self::renumber_group_sentence_ids(&mut original_groups, renumber);
+        Self::renumber_scene_sentence_ids(&mut current_scenes, renumber);
+        Self::renumber_scene_sentence_ids(&mut original_scenes, renumber);
         for groups in [&mut current_groups, &mut original_groups] {
             for (index, group) in groups.iter_mut().enumerate() {
                 group.ordinal = index as i64 + 1;
             }
         }
+        for scenes in [&mut current_scenes, &mut original_scenes] {
+            for (index, scene) in scenes.iter_mut().enumerate() {
+                scene.ordinal = index as i64 + 1;
+            }
+        }
+        assign_scene_ids(&mut current_groups, &current_scenes);
+        assign_scene_ids(&mut original_groups, &original_scenes);
         validate_group_chronology(&current_groups)?;
         validate_group_chronology(&original_groups)?;
 
-        self.write_renumbered_plan(video_id, &sentences, &current_groups, &original_groups)?;
+        self.write_renumbered_plan(
+            video_id,
+            &sentences,
+            &current_groups,
+            &original_groups,
+            &current_scenes,
+            &original_scenes,
+        )?;
         self.get_visual_plan(video_id)
     }
 
@@ -9822,17 +10275,35 @@ Return JSON only:
         };
         let mut current_groups = self.load_groups(video_id, false)?;
         let mut original_groups = self.load_groups(video_id, true)?;
+        let mut current_scenes = self.load_scenes(video_id, false)?;
+        let mut original_scenes = self.load_scenes(video_id, true)?;
         Self::renumber_group_sentence_ids(&mut current_groups, renumber);
         Self::renumber_group_sentence_ids(&mut original_groups, renumber);
+        Self::renumber_scene_sentence_ids(&mut current_scenes, renumber);
+        Self::renumber_scene_sentence_ids(&mut original_scenes, renumber);
         for groups in [&mut current_groups, &mut original_groups] {
             for (index, group) in groups.iter_mut().enumerate() {
                 group.ordinal = index as i64 + 1;
             }
         }
+        for scenes in [&mut current_scenes, &mut original_scenes] {
+            for (index, scene) in scenes.iter_mut().enumerate() {
+                scene.ordinal = index as i64 + 1;
+            }
+        }
+        assign_scene_ids(&mut current_groups, &current_scenes);
+        assign_scene_ids(&mut original_groups, &original_scenes);
         validate_group_chronology(&current_groups)?;
         validate_group_chronology(&original_groups)?;
 
-        self.write_renumbered_plan(video_id, &sentences, &current_groups, &original_groups)?;
+        self.write_renumbered_plan(
+            video_id,
+            &sentences,
+            &current_groups,
+            &original_groups,
+            &current_scenes,
+            &original_scenes,
+        )?;
         self.get_visual_plan(video_id)
     }
 
@@ -9878,6 +10349,7 @@ Return JSON only:
         video_id: &str,
         sentences: &[PlanSentence],
         groups: &[PlanGroup],
+        scenes: &[PlanScene],
         original: bool,
         timing_source: &str,
     ) -> Result<(), String> {
@@ -9911,7 +10383,7 @@ Return JSON only:
             .map_err(|e| e.to_string())?;
         for group in groups {
             self.connection.execute(
-                "INSERT INTO visual_plan_groups(id, video_id, ordinal, label, kind, sentence_ids_json, is_original) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO visual_plan_groups(id, video_id, ordinal, label, kind, sentence_ids_json, is_original, scene_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     format!(
                         "{video_id}::{}::{}",
@@ -9923,7 +10395,36 @@ Return JSON only:
                     group.label,
                     group.kind,
                     serde_json::to_string(&group.sentence_ids).unwrap(),
-                    original as i64
+                    original as i64,
+                    group.scene_id
+                ],
+            ).map_err(|e| e.to_string())?;
+        }
+        self.connection
+            .execute(
+                "DELETE FROM visual_plan_scenes WHERE video_id = ?1 AND is_original = ?2",
+                params![video_id, original as i64],
+            )
+            .map_err(|e| e.to_string())?;
+        for scene in scenes {
+            self.connection.execute(
+                "INSERT INTO visual_plan_scenes(id, video_id, ordinal, label, narrative_role, core_idea, emotional_state, visual_opportunities_json, sentence_ids_json, is_original, expanded) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    format!(
+                        "{video_id}::{}::{}",
+                        if original {"original"} else {"current"},
+                        scene.id
+                    ),
+                    video_id,
+                    scene.ordinal,
+                    scene.label,
+                    scene.narrative_role,
+                    scene.core_idea,
+                    scene.emotional_state,
+                    serde_json::to_string(&scene.visual_opportunities).unwrap(),
+                    serde_json::to_string(&scene.sentence_ids).unwrap(),
+                    original as i64,
+                    scene.expanded as i64
                 ],
             ).map_err(|e| e.to_string())?;
         }
@@ -9932,7 +10433,7 @@ Return JSON only:
     }
 
     fn load_groups(&self, video_id: &str, original: bool) -> Result<Vec<PlanGroup>, String> {
-        let mut statement = self.connection.prepare("SELECT id, ordinal, label, kind, sentence_ids_json, COALESCE(settings_locked,0), COALESCE(prompt_locked,0) FROM visual_plan_groups WHERE video_id = ?1 AND is_original = ?2 ORDER BY ordinal").map_err(|e| e.to_string())?;
+        let mut statement = self.connection.prepare("SELECT id, ordinal, label, kind, sentence_ids_json, COALESCE(settings_locked,0), COALESCE(prompt_locked,0), scene_id FROM visual_plan_groups WHERE video_id = ?1 AND is_original = ?2 ORDER BY ordinal").map_err(|e| e.to_string())?;
         let rows = statement
             .query_map(params![video_id, original as i64], |row| {
                 let stored_id: String = row.get(0)?;
@@ -9953,6 +10454,34 @@ Return JSON only:
                         .unwrap_or_default(),
                     settings_locked: row.get::<_, i64>(5)? != 0,
                     prompt_locked: row.get::<_, i64>(6)? != 0,
+                    scene_id: row.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    fn load_scenes(&self, video_id: &str, original: bool) -> Result<Vec<PlanScene>, String> {
+        let mut statement = self.connection.prepare("SELECT id, ordinal, label, narrative_role, core_idea, emotional_state, visual_opportunities_json, sentence_ids_json, COALESCE(expanded,1) FROM visual_plan_scenes WHERE video_id = ?1 AND is_original = ?2 ORDER BY ordinal").map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![video_id, original as i64], |row| {
+                let stored_id: String = row.get(0)?;
+                Ok(PlanScene {
+                    id: stored_id
+                        .rsplit_once("::")
+                        .map(|(_, id)| id.to_string())
+                        .unwrap_or(stored_id),
+                    ordinal: row.get(1)?,
+                    label: row.get(2)?,
+                    narrative_role: row.get(3)?,
+                    core_idea: row.get(4)?,
+                    emotional_state: row.get(5)?,
+                    visual_opportunities: serde_json::from_str(&row.get::<_, String>(6)?)
+                        .unwrap_or_default(),
+                    sentence_ids: serde_json::from_str(&row.get::<_, String>(7)?)
+                        .unwrap_or_default(),
+                    expanded: row.get::<_, i64>(8)? != 0,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -10133,6 +10662,61 @@ struct V2PlanStillResponse {
 #[derive(Debug, Deserialize)]
 struct V2PlanChunkResponse {
     plans: Vec<V2PlanStillResponse>,
+}
+
+/// Where a single `plan_bulk_visuals_batch` AI call's chunk ends, starting
+/// from `start_index`: walk forward while still inside the same scene as
+/// `groups[start_index]` (a `None` scene_id — legacy plan — is its own
+/// "no scene" run), capped at `chunk_size` either way. Guarantees a chunk
+/// never straddles a scene boundary; an oversized scene just takes multiple
+/// sequential calls, each still scoped to that one scene. Extracted as a
+/// pure function (rather than left inline) so the boundary logic itself is
+/// unit-testable without the AI credentials `plan_bulk_visuals_batch` as a
+/// whole requires.
+fn bulk_batch_chunk_end(groups: &[PlanGroup], start_index: usize, chunk_size: usize) -> usize {
+    let total = groups.len();
+    let current_scene_id = &groups[start_index].scene_id;
+    let mut end = start_index + 1;
+    while end < total && end < start_index + chunk_size && &groups[end].scene_id == current_scene_id {
+        end += 1;
+    }
+    end
+}
+
+/// The four Bulk Generation settings resolved for one AI planning call, after
+/// layering a scene's `bulk_scene_settings` override (if any) on top of the
+/// video's global params. An override field only wins if it's `Some` and
+/// (for the two string fields) non-blank — an empty-string override is
+/// treated the same as "not overridden," matching how the frontend clears a
+/// field back to "inherit" by leaving it blank rather than needing a
+/// separate clear action.
+struct EffectiveBulkSettings {
+    style_directive: String,
+    creative_instruction: String,
+    character_consistency: bool,
+    reference_asset_id: Option<String>,
+}
+
+fn resolve_effective_bulk_settings(
+    scene_settings: Option<&BulkSceneSettings>,
+    style_directive: &str,
+    creative_instruction: &str,
+    character_consistency: bool,
+) -> EffectiveBulkSettings {
+    EffectiveBulkSettings {
+        style_directive: scene_settings
+            .and_then(|s| s.style_directive.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| style_directive.to_string()),
+        creative_instruction: scene_settings
+            .and_then(|s| s.creative_instruction.clone())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| creative_instruction.to_string()),
+        character_consistency: scene_settings
+            .and_then(|s| s.character_consistency)
+            .unwrap_or(character_consistency),
+        reference_asset_id: scene_settings.and_then(|s| s.reference_asset_id.clone()),
+    }
 }
 
 /// `seed_run_type`/`seed_run_len` let the caller carry a same-type run
@@ -11082,7 +11666,7 @@ fn remove_tts_pause_markers(script: &str) -> (String, f64) {
         let marker = &rest[start + 2..];
         let Some(end) = marker.find("#>") else {
             cleaned.push_str(&rest[start..]);
-            return (cleaned, pauses);
+            return (normalize_paragraphs(&cleaned), pauses);
         };
         if let Ok(seconds) = marker[..end].trim().parse::<f64>() {
             pauses += seconds.max(0.0);
@@ -11093,10 +11677,41 @@ fn remove_tts_pause_markers(script: &str) -> (String, f64) {
         rest = &marker[end + 2..];
     }
     cleaned.push_str(rest);
-    (
-        cleaned.split_whitespace().collect::<Vec<_>>().join(" "),
-        pauses,
-    )
+    (normalize_paragraphs(&cleaned), pauses)
+}
+
+/// Collapses whitespace WITHIN each paragraph to single spaces (the tidying
+/// remove_tts_pause_markers always did) while preserving paragraph breaks
+/// (blank lines) BETWEEN paragraphs, which it used to destroy entirely via a
+/// single `split_whitespace().join(" ")` over the whole script.
+///
+/// That mattered more than it looked: the visual-plan engine's own
+/// `read_script()` (services/python-engine/auto_gen_engine/
+/// scene_grouping_engine.py) detects paragraph boundaries by splitting on
+/// exactly this kind of blank line, and `paragraph_scenes()` — the Scene
+/// layer's fallback for per-sentence pacing and the AI-error path, since
+/// neither has AI boundary data to work from — groups sentences into scenes
+/// by paragraph. With every paragraph break silently flattened away before
+/// the script ever reached the engine, `read_script()` could never see more
+/// than one paragraph no matter how the user had actually formatted the
+/// script, so those modes could never produce more than a single scene.
+fn normalize_paragraphs(text: &str) -> String {
+    let mut paragraphs: Vec<String> = Vec::new();
+    let mut current_lines: Vec<&str> = Vec::new();
+    for line in text.split('\n') {
+        if line.trim().is_empty() {
+            if !current_lines.is_empty() {
+                paragraphs.push(current_lines.join(" ").split_whitespace().collect::<Vec<_>>().join(" "));
+                current_lines.clear();
+            }
+        } else {
+            current_lines.push(line);
+        }
+    }
+    if !current_lines.is_empty() {
+        paragraphs.push(current_lines.join(" ").split_whitespace().collect::<Vec<_>>().join(" "));
+    }
+    paragraphs.join("\n\n")
 }
 
 fn build_groups_range(
@@ -11142,6 +11757,58 @@ fn make_group(ordinal: usize, sentences: &[&PlanSentence]) -> PlanGroup {
             .collect(),
         settings_locked: false,
         prompt_locked: false,
+        // Filled in by assign_scene_ids once scenes exist — build_groups_range
+        // has no scene knowledge of its own.
+        scene_id: None,
+    }
+}
+
+/// Test-fixture stand-in for real scene segmentation (no Python involved in
+/// tests): chunks consecutive groups into scenes of a few stills each, the
+/// same crude fidelity `build_groups_range` itself already has. Tests assert
+/// structural invariants (every group has a valid scene_id, scenes stay
+/// gapless), not narrative quality.
+const TEST_GROUPS_PER_SCENE: usize = 3;
+
+fn build_scenes_range(groups: &[PlanGroup]) -> Vec<PlanScene> {
+    groups
+        .chunks(TEST_GROUPS_PER_SCENE)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let ordinal = index as i64 + 1;
+            PlanScene {
+                id: format!("sc{ordinal}"),
+                ordinal,
+                label: format!("Scene {ordinal}"),
+                narrative_role: None,
+                core_idea: None,
+                emotional_state: None,
+                visual_opportunities: Vec::new(),
+                sentence_ids: chunk
+                    .iter()
+                    .flat_map(|group| group.sentence_ids.iter().cloned())
+                    .collect(),
+                // Only the first scene starts expanded — see the matching
+                // `expanded: index == 0` in the real generation path.
+                expanded: index == 0,
+            }
+        })
+        .collect()
+}
+
+/// Recomputes every group's `scene_id` by containment against `scenes` (a
+/// group belongs to whichever scene's sentence range contains its first
+/// sentence). Scene ranges themselves don't change from still-level edits in
+/// v1 — this just keeps a still's scene membership correct after
+/// move/split/merge/create reshuffle which sentences a still contains.
+fn assign_scene_ids(groups: &mut [PlanGroup], scenes: &[PlanScene]) {
+    for group in groups.iter_mut() {
+        group.scene_id = group.sentence_ids.first().and_then(|first_sentence_id| {
+            scenes
+                .iter()
+                .find(|scene| scene.sentence_ids.iter().any(|id| id == first_sentence_id))
+                .map(|scene| scene.id.clone())
+        });
     }
 }
 
@@ -11530,6 +12197,19 @@ mod tests {
         repo.import_asset(&video.id, &audio, "audio").unwrap();
         let original = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
         assert!(!original.groups.is_empty());
+        assert!(!original.scenes.is_empty(), "generation must always produce at least one scene");
+        assert!(
+            original.scenes[0].expanded,
+            "the first scene must start expanded right after generation"
+        );
+        assert!(
+            original.scenes[1..].iter().all(|scene| !scene.expanded),
+            "every scene after the first must start collapsed right after generation"
+        );
+        assert!(
+            original.groups.iter().all(|group| group.scene_id.is_some()),
+            "every still must be assigned to a scene at generation time"
+        );
         if original.groups.len() > 1 {
             let sentence = original.groups[0].sentence_ids.last().unwrap().clone();
             let target = original.groups[1].id.clone();
@@ -11540,6 +12220,41 @@ mod tests {
                 original.groups
             );
         }
+    }
+
+    #[test]
+    fn scene_expanded_state_toggles_and_survives_unrelated_edits_but_not_reset() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(
+            &video.id,
+            "One short sentence. A second sentence follows. The final sentence closes.",
+            4,
+        )
+        .unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let original = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let scene_id = original.scenes[0].id.clone();
+        assert!(original.scenes[0].expanded);
+
+        let collapsed = repo.set_plan_scene_expanded(&video.id, &scene_id, false).unwrap();
+        assert!(!collapsed.scenes.iter().find(|s| s.id == scene_id).unwrap().expanded);
+
+        // A fresh read must see the same persisted state, not just the
+        // in-memory return value.
+        assert!(
+            !repo.get_visual_plan(&video.id).unwrap().scenes.iter().find(|s| s.id == scene_id).unwrap().expanded
+        );
+
+        // Reset restores the generation-time default (expanded) along with
+        // everything else — see set_plan_scene_expanded's doc comment.
+        let reset = repo.reset_visual_plan(&video.id).unwrap();
+        assert!(reset.scenes.iter().find(|s| s.id == scene_id).unwrap().expanded);
+
+        assert!(repo.set_plan_scene_expanded(&video.id, "not-a-real-scene", true).is_err());
     }
 
     #[test]
@@ -11637,6 +12352,32 @@ mod tests {
             }
         }
 
+        // A group's scene_id (if set) must point at a scene that actually
+        // exists, and every scene's own sentence_ids must reference real,
+        // still-existing sentences — both invariants a split/merge's
+        // renumbering pass has to preserve alongside the sentence-id ones
+        // above.
+        fn assert_scenes_are_consistent(plan: &VisualPlan) {
+            for group in &plan.groups {
+                if let Some(scene_id) = &group.scene_id {
+                    assert!(
+                        plan.scenes.iter().any(|scene| &scene.id == scene_id),
+                        "group {} references missing scene {scene_id}",
+                        group.id
+                    );
+                }
+            }
+            for scene in &plan.scenes {
+                for id in &scene.sentence_ids {
+                    assert!(
+                        plan.sentences.iter().any(|s| &s.id == id),
+                        "scene {} references missing sentence {id}",
+                        scene.id
+                    );
+                }
+            }
+        }
+
         let first = original.sentences[0].clone();
         let offset = (first.text.len() / 2).max(1);
         let (left_text, right_text) = first.text.split_at(offset);
@@ -11644,6 +12385,7 @@ mod tests {
         assert_eq!(after_split.sentences.len(), original.sentences.len() + 1);
         assert_groups_reference_real_sentences(&after_split);
         assert_ids_are_gapless(&after_split);
+        assert_scenes_are_consistent(&after_split);
 
         let merged = repo
             .merge_plan_sentences(&video.id, &after_split.sentences[0].id, &after_split.sentences[1].id)
@@ -11651,6 +12393,7 @@ mod tests {
         assert_eq!(merged.sentences.len(), original.sentences.len());
         assert_groups_reference_real_sentences(&merged);
         assert_ids_are_gapless(&merged);
+        assert_scenes_are_consistent(&merged);
         assert_eq!(merged.sentences[0].text, first.text);
     }
 
@@ -11731,6 +12474,7 @@ mod tests {
         let reset = repo.reset_visual_plan(&video.id).unwrap();
         assert_eq!(reset.sentences, original.sentences);
         assert_eq!(reset.groups, original.groups);
+        assert_eq!(reset.scenes, original.scenes);
     }
 
     #[test]
@@ -11744,6 +12488,7 @@ mod tests {
                 sentence_ids: vec!["s1".into(), "s3".into()],
                 settings_locked: false,
                 prompt_locked: false,
+                scene_id: None,
             },
             PlanGroup {
                 id: "g2".into(),
@@ -11753,6 +12498,7 @@ mod tests {
                 sentence_ids: vec!["s2".into()],
                 settings_locked: false,
                 prompt_locked: false,
+                scene_id: None,
             },
         ];
         assert!(validate_group_chronology(&groups).is_err());
@@ -11772,6 +12518,7 @@ mod tests {
             let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
             assert_eq!(plan.sentences[0].id, "s1");
             assert_eq!(plan.groups[0].id, "g1");
+            assert_eq!(plan.scenes[0].id, "sc1");
         }
     }
 
@@ -12205,11 +12952,12 @@ mod tests {
             .unwrap();
         repo.import_asset(&video.id, &audio, "audio").unwrap();
         let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|group| group.id.clone()).collect();
         for group in plan.groups {
             repo.create_prompt_version(&video.id, &group.id, "{}", "system", "scene")
                 .unwrap();
         }
-        let job = repo.create_image_job(&video.id).unwrap();
+        let job = repo.create_image_job(&video.id, &group_ids).unwrap();
         assert_eq!(job.total_items, job.items.len() as i64);
         assert_eq!(
             repo.set_image_job_status(&job.id, "paused").unwrap().status,
@@ -12241,6 +12989,174 @@ mod tests {
         let workspace = repo.get_image_workspace(&video.id).unwrap();
         assert!(workspace.groups.iter().all(|group| group.prompt_versions.is_empty() && group.image_renders.is_empty() && group.educational_plan.is_none()));
         assert!(repo.latest_image_job(&video.id).unwrap().is_none());
+    }
+
+    fn scene_tagged_group(ordinal: i64, scene_id: Option<&str>) -> PlanGroup {
+        PlanGroup {
+            id: format!("g{ordinal}"),
+            ordinal,
+            label: format!("Still {ordinal}"),
+            kind: "still".into(),
+            sentence_ids: vec![format!("s{ordinal}")],
+            settings_locked: false,
+            prompt_locked: false,
+            scene_id: scene_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn bulk_batch_chunk_end_never_crosses_a_scene_boundary() {
+        // 2 stills in "sc1", 5 in "sc2" (bigger than the chunk_size cap
+        // below), 1 with no scene at all — see the Bulk Generation redesign
+        // plan's "dynamic, scene-bounded chunking" requirement.
+        let groups: Vec<PlanGroup> = vec![
+            scene_tagged_group(1, Some("sc1")),
+            scene_tagged_group(2, Some("sc1")),
+            scene_tagged_group(3, Some("sc2")),
+            scene_tagged_group(4, Some("sc2")),
+            scene_tagged_group(5, Some("sc2")),
+            scene_tagged_group(6, Some("sc2")),
+            scene_tagged_group(7, Some("sc2")),
+            scene_tagged_group(8, None),
+        ];
+        // sc1 (2 stills) fits in one chunk even though the cap is higher.
+        assert_eq!(bulk_batch_chunk_end(&groups, 0, 6), 2);
+        // sc2 (5 stills) also fits under a generous cap — the whole scene is
+        // one batch.
+        assert_eq!(bulk_batch_chunk_end(&groups, 2, 6), 7);
+        // The same scene under a tight cap (3) takes multiple calls, each
+        // still entirely inside sc2 — never spilling into the no-scene tail.
+        assert_eq!(bulk_batch_chunk_end(&groups, 2, 3), 5);
+        assert_eq!(bulk_batch_chunk_end(&groups, 5, 3), 7);
+        // A lone no-scene still is its own one-item chunk.
+        assert_eq!(bulk_batch_chunk_end(&groups, 7, 6), 8);
+    }
+
+    #[test]
+    fn resolve_effective_bulk_settings_layers_scene_override_over_global() {
+        // No override at all — every field falls back to the global param.
+        let none = resolve_effective_bulk_settings(None, "global style", "global rule", false);
+        assert_eq!(none.style_directive, "global style");
+        assert_eq!(none.creative_instruction, "global rule");
+        assert!(!none.character_consistency);
+        assert_eq!(none.reference_asset_id, None);
+
+        // A partial override: only style_directive and character_consistency
+        // are set, the rest stay null ("inherit").
+        let partial = BulkSceneSettings {
+            scene_id: "sc1".into(),
+            style_directive: Some("scene style".into()),
+            creative_instruction: None,
+            character_consistency: Some(true),
+            reference_asset_id: None,
+        };
+        let resolved = resolve_effective_bulk_settings(Some(&partial), "global style", "global rule", false);
+        assert_eq!(resolved.style_directive, "scene style");
+        assert_eq!(resolved.creative_instruction, "global rule", "null override must inherit the global value");
+        assert!(resolved.character_consistency);
+        assert_eq!(resolved.reference_asset_id, None);
+
+        // A blank-string override is treated the same as "not overridden" —
+        // the frontend clears a field back to inherit by leaving it blank.
+        let blank = BulkSceneSettings {
+            scene_id: "sc1".into(),
+            style_directive: Some("   ".into()),
+            creative_instruction: None,
+            character_consistency: None,
+            reference_asset_id: Some("asset-1".into()),
+        };
+        let resolved = resolve_effective_bulk_settings(Some(&blank), "global style", "global rule", true);
+        assert_eq!(resolved.style_directive, "global style");
+        assert!(resolved.character_consistency, "no override must fall back to the global param");
+        assert_eq!(resolved.reference_asset_id, Some("asset-1".into()));
+    }
+
+    #[test]
+    fn bulk_scene_settings_round_trip_and_clear_back_to_inherit() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+
+        assert!(repo.get_bulk_scene_settings(&video.id).unwrap().is_empty());
+
+        let saved = repo.save_bulk_scene_settings(
+            &video.id, "sc1",
+            Some("scene style".into()), Some("scene rule".into()), Some(true), Some("asset-1".into()),
+        ).unwrap();
+        assert_eq!(saved.style_directive.as_deref(), Some("scene style"));
+
+        let loaded = repo.get_bulk_scene_settings(&video.id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].scene_id, "sc1");
+        assert_eq!(loaded[0].character_consistency, Some(true));
+        assert_eq!(loaded[0].reference_asset_id.as_deref(), Some("asset-1"));
+
+        // Re-saving with the same (video, scene) upserts in place, and a
+        // field set back to None clears that override back to "inherit"
+        // rather than leaving the old value behind.
+        let updated = repo.save_bulk_scene_settings(&video.id, "sc1", None, Some("scene rule".into()), None, None).unwrap();
+        assert_eq!(updated.style_directive, None);
+        assert_eq!(updated.character_consistency, None);
+        assert_eq!(updated.reference_asset_id, None);
+        assert_eq!(repo.get_bulk_scene_settings(&video.id).unwrap().len(), 1, "upsert must not create a second row");
+    }
+
+    #[test]
+    fn pending_still_ids_matches_needs_generation_semantics() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        for group in &plan.groups {
+            repo.create_prompt_version(&video.id, &group.id, "{}", "system", "scene").unwrap();
+        }
+        // Give exactly the first still an up-to-date render; the rest stay
+        // pending (no render at all).
+        let up_to_date_group = &plan.groups[0];
+        let prompt = repo.list_prompt_versions(&video.id, &up_to_date_group.id).unwrap()[0].clone();
+        repo.insert_image_render(
+            "render-1", &video.id, &up_to_date_group.id, 1, &prompt.id, "a.png", "renders/a.png", None, None, "generation",
+        ).unwrap();
+
+        let pending = repo.pending_still_ids(&video.id).unwrap();
+        assert!(!pending.contains(&up_to_date_group.id), "an up-to-date still must not be pending");
+        for group in plan.groups.iter().skip(1) {
+            assert!(pending.contains(&group.id), "a still with no render must be pending");
+        }
+    }
+
+    #[test]
+    fn create_image_job_with_explicit_group_ids_forces_regeneration_of_up_to_date_still() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group = &plan.groups[0];
+        let prompt = repo.create_prompt_version(&video.id, &group.id, "{}", "system", "scene").unwrap();
+        repo.insert_image_render(
+            "render-1", &video.id, &group.id, 1, &prompt.id, "a.png", "renders/a.png", None, None, "generation",
+        ).unwrap();
+
+        // This still is fully up to date — pending_still_ids would not
+        // surface it — but an explicit selection forces it anyway.
+        assert!(!repo.pending_still_ids(&video.id).unwrap().contains(&group.id));
+        let job = repo.create_image_job(&video.id, &[group.id.clone()]).unwrap();
+        assert_eq!(job.total_items, 1);
+        assert_eq!(job.items[0].group_id, group.id);
+
+        assert!(repo.create_image_job(&video.id, &[]).is_err(), "an empty selection must be rejected");
+        assert!(
+            repo.create_image_job(&video.id, &["does-not-exist".to_string()]).is_err(),
+            "an unknown still id must be rejected"
+        );
     }
 
     #[test]
@@ -13373,6 +14289,32 @@ mod tests {
         assert_eq!(cleaned, "One. Two.");
         assert_eq!(pause, 1.75);
         assert_eq!(split_sentences("One. <#0.5#> Two."), vec!["One.", "Two."]);
+    }
+
+    #[test]
+    fn cleaning_the_script_preserves_paragraph_breaks() {
+        // Regression test: remove_tts_pause_markers used to collapse the
+        // whole script to one line via a single split_whitespace().join(" "),
+        // destroying every blank-line paragraph break before the script ever
+        // reached the visual-plan engine. Its read_script() detects
+        // paragraphs by splitting on exactly those blank lines, and
+        // paragraph_scenes() (the Scene layer's fallback for per-sentence
+        // pacing and the AI-error path) groups sentences into scenes by
+        // paragraph — so a flattened script could never produce more than
+        // one scene in those modes, no matter how the user had actually
+        // formatted it.
+        let (cleaned, _) = remove_tts_pause_markers(
+            "Paragraph one, sentence one.\nStill paragraph one. <#0.5#>\n\nParagraph two starts here.\n\n\nParagraph three.",
+        );
+        let paragraphs: Vec<&str> = cleaned.split("\n\n").collect();
+        assert_eq!(
+            paragraphs,
+            vec![
+                "Paragraph one, sentence one. Still paragraph one.",
+                "Paragraph two starts here.",
+                "Paragraph three.",
+            ]
+        );
     }
 
     #[test]

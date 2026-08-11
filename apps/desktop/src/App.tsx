@@ -52,6 +52,8 @@ import { type AppStage, lastSelectedStill, useAppStore } from "./store/app-store
 import { log } from "./infrastructure/logger";
 import { resolveAssetUrl, resolveRenderUrl } from "./infrastructure/media-cache";
 import { formatTimeShort } from "./domain/timecode";
+import { sectionGroupsByScene } from "./domain/visual-plan";
+import { sceneSelectionState, toggleScene } from "./domain/bulk-selection";
 import {
   projectsClient,
   type ChannelRecord,
@@ -59,8 +61,11 @@ import {
   type VideoRecord,
   type VisualPlanRecord,
   type ImageWorkspaceRecord,
+  type ImageWorkspaceGroupRecord,
   type ImageJobRecord,
   type ImageRenderRecord,
+  type PlanSceneRecord,
+  type BulkSceneSettingsRecord,
 } from "./infrastructure/projects-client";
 import { TimelineView } from "./TimelineView";
 import { AnimateView } from "./AnimateView";
@@ -1058,10 +1063,19 @@ function VisualPlanView() {
   }, [searchOpen]);
 
   useEffect(() => {
-    if (searchMatches.length === 0) return;
+    if (searchMatches.length === 0 || !plan) return;
     const active = searchMatches[Math.min(matchIndex, searchMatches.length - 1)];
+    // A match inside a collapsed scene isn't in the DOM yet — expand it and
+    // let the `plan` update (scene.expanded flips) re-run this effect, at
+    // which point the sentence's ref is registered and this scrolls to it.
+    const scene = plan.scenes.find((item) => item.sentenceIds.includes(active.sentenceId));
+    if (scene && !scene.expanded) {
+      void setSceneExpanded(scene.id, true);
+      return;
+    }
     matchRefs.current.get(active.key)?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [matchIndex, searchMatches]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matchIndex, searchMatches, plan]);
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -1119,6 +1133,12 @@ function VisualPlanView() {
   async function mergeSentences(firstSentenceId: string, secondSentenceId: string) {
     if (!activeVideoId) return;
     try { setPlan(await projectsClient.mergePlanSentences(activeVideoId, firstSentenceId, secondSentenceId)); }
+    catch (caught) { setError(String(caught)); }
+  }
+
+  async function setSceneExpanded(sceneId: string, expanded: boolean) {
+    if (!activeVideoId) return;
+    try { setPlan(await projectsClient.setPlanSceneExpanded(activeVideoId, sceneId, expanded)); }
     catch (caught) { setError(String(caught)); }
   }
 
@@ -1181,6 +1201,16 @@ function VisualPlanView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [splitArm]);
 
+  // Sibling rows in the same flat .plan-list — a scene strip is interleaved
+  // before its section's first still, not a wrapper around it, so the
+  // existing DndContext/StillDivider drop-target model needs no changes.
+  const sections = useMemo(() => (plan ? sectionGroupsByScene(plan.groups, plan.scenes) : []), [plan]);
+  // Independent of what's actually rendered (a collapsed scene's stills are
+  // skipped below) — divider insertIndex/plan-index always need this
+  // group's true position in the full plan.groups array, not its position
+  // among currently-visible rows.
+  const groupIndexById = useMemo(() => new Map(plan?.groups.map((group, index) => [group.id, index]) ?? []), [plan]);
+
   return (
     <section className="view">
       <div className="page-heading">
@@ -1208,7 +1238,7 @@ function VisualPlanView() {
       {error && <div className="inline-error">{error}</div>}
       {!plan && !error && <div className="empty-state">Loading visual plan…</div>}
       {confirmReset && <ConfirmDialog title="Reset visual plan?" message="This restores everything to exactly how it was right after generation — groupings, and any sentence edits, splits, or merges. Everything you've changed since then will be lost." confirmLabel="Reset" onConfirm={() => { setConfirmReset(false); void resetPlan(); }} onCancel={() => setConfirmReset(false)} />}
-      {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{formatTimeShort(plan.sentences.at(-1)?.endSeconds ?? 0)} total · Average {((plan.sentences.at(-1)?.endSeconds ?? 0) / plan.groups.length).toFixed(1)} sec</span></div>
+      {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{formatTimeShort(plan.sentences.at(-1)?.endSeconds ?? 0)} total · Average {((plan.sentences.at(-1)?.endSeconds ?? 0) / plan.groups.length).toFixed(1)} sec · {plan.scenes.length} scene{plan.scenes.length === 1 ? "" : "s"}</span></div>
       <div className="plan-scroll"><DndContext
         sensors={sensors}
         // pointerWithin (not the default rectIntersection) so a small
@@ -1226,33 +1256,54 @@ function VisualPlanView() {
       >
       <div className="plan-list">
         <StillDivider insertIndex={0} active={dropTarget === "divider:0"} />
-        {plan.groups.map((group, index) => {
-          const members = group.sentenceIds.map((id) => plan.sentences.find((sentence) => sentence.id === id)).filter((sentence): sentence is NonNullable<typeof sentence> => Boolean(sentence)).sort((a,b) => a.ordinal-b.ordinal);
-          const timing = { startSeconds: members[0].startSeconds, endSeconds: members.at(-1)!.endSeconds, durationSeconds: members.at(-1)!.endSeconds-members[0].startSeconds, members };
-          return <div className="plan-group-shell" key={group.id}>
-            <DroppableStill groupId={group.id} active={dropTarget === `group:${group.id}`}>
-              <span className="plan-index">{String(index + 1).padStart(2, "0")}</span>
-              <div className="timing"><strong>{formatTimeShort(timing.startSeconds)} – {formatTimeShort(timing.endSeconds)}</strong><small>{timing.durationSeconds.toFixed(1)} sec</small></div>
-              <div className="sentences">
-                {timing.members.map((sentence) => (
-                  <DraggableSentence
-                    key={sentence.id}
-                    sentence={sentence}
-                    active={draggedSentenceId === sentence.id}
-                    dropActive={dropTarget === `sentence:${sentence.id}`}
-                    searchQuery={searchQuery}
-                    activeMatchKey={activeMatchKey}
-                    registerMatchRef={registerMatchRef}
-                    splitOffset={splitArm?.sentenceId === sentence.id ? splitArm.offset : null}
-                    onArmSplit={(offset) => armSplit(sentence.id, offset)}
-                    onConfirmSplit={confirmSplit}
-                    onCancelSplit={cancelSplit}
-                  />
-                ))}
-              </div>
-            </DroppableStill>
-            <StillDivider insertIndex={index + 1} active={dropTarget === `divider:${index + 1}`} />
-          </div>;
+        {sections.map((section, sectionIndex) => {
+          const scene = section.scene;
+          const collapsed = Boolean(scene && !scene.expanded);
+          const sceneMembers = scene
+            ? scene.sentenceIds.map((id) => plan.sentences.find((sentence) => sentence.id === id)).filter((sentence): sentence is NonNullable<typeof sentence> => Boolean(sentence)).sort((a, b) => a.ordinal - b.ordinal)
+            : [];
+          return (
+            <div className="plan-scene-section" key={scene?.id ?? `no-scene-${sectionIndex}`}>
+              {scene && sceneMembers.length > 0 && (
+                <SceneStrip
+                  scene={scene}
+                  stillCount={section.groups.length}
+                  startSeconds={sceneMembers[0].startSeconds}
+                  endSeconds={sceneMembers.at(-1)!.endSeconds}
+                  onToggle={() => void setSceneExpanded(scene.id, !scene.expanded)}
+                />
+              )}
+              {!collapsed && section.groups.map((group) => {
+                const index = groupIndexById.get(group.id) ?? 0;
+                const members = group.sentenceIds.map((id) => plan.sentences.find((sentence) => sentence.id === id)).filter((sentence): sentence is NonNullable<typeof sentence> => Boolean(sentence)).sort((a,b) => a.ordinal-b.ordinal);
+                const timing = { startSeconds: members[0].startSeconds, endSeconds: members.at(-1)!.endSeconds, durationSeconds: members.at(-1)!.endSeconds-members[0].startSeconds, members };
+                return <div className="plan-group-shell" key={group.id}>
+                  <DroppableStill groupId={group.id} active={dropTarget === `group:${group.id}`}>
+                    <span className="plan-index">{String(index + 1).padStart(2, "0")}</span>
+                    <div className="timing"><strong>{formatTimeShort(timing.startSeconds)} – {formatTimeShort(timing.endSeconds)}</strong><small>{timing.durationSeconds.toFixed(1)} sec</small></div>
+                    <div className="sentences">
+                      {timing.members.map((sentence) => (
+                        <DraggableSentence
+                          key={sentence.id}
+                          sentence={sentence}
+                          active={draggedSentenceId === sentence.id}
+                          dropActive={dropTarget === `sentence:${sentence.id}`}
+                          searchQuery={searchQuery}
+                          activeMatchKey={activeMatchKey}
+                          registerMatchRef={registerMatchRef}
+                          splitOffset={splitArm?.sentenceId === sentence.id ? splitArm.offset : null}
+                          onArmSplit={(offset) => armSplit(sentence.id, offset)}
+                          onConfirmSplit={confirmSplit}
+                          onCancelSplit={cancelSplit}
+                        />
+                      ))}
+                    </div>
+                  </DroppableStill>
+                  <StillDivider insertIndex={index + 1} active={dropTarget === `divider:${index + 1}`} />
+                </div>;
+              })}
+            </div>
+          );
         })}
       </div>
       </DndContext></div></>}
@@ -1392,6 +1443,188 @@ function DroppableStill({ groupId, active, children }: { groupId: string; active
 function StillDivider({ insertIndex, active }: { insertIndex: number; active: boolean }) {
   const { setNodeRef, isOver } = useDroppable({ id: `divider:${insertIndex}` });
   return <div ref={setNodeRef} className={active || isOver ? "drop-divider drag-over" : "drop-divider"} />;
+}
+
+/** The collapsed-by-default scene header row — a sibling of the still cards
+ * in the same flat .plan-list, not a wrapper around them (see the Visual
+ * Scene Segmentor plan). Not itself a drop target: dragging a sentence
+ * toward a collapsed scene is a no-op in v1, the user expands it first. */
+function SceneStrip({ scene, stillCount, startSeconds, endSeconds, onToggle }: {
+  scene: VisualPlanRecord["scenes"][number];
+  stillCount: number;
+  startSeconds: number;
+  endSeconds: number;
+  onToggle: () => void;
+}) {
+  const hasContext = Boolean(scene.narrativeRole || scene.coreIdea || scene.emotionalState || scene.visualOpportunities.length);
+  return (
+    <div className={scene.expanded ? "plan-scene-strip expanded" : "plan-scene-strip"}>
+      <button type="button" className="plan-scene-toggle" onClick={onToggle} aria-expanded={scene.expanded}>
+        {scene.expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        <span className="plan-scene-title">Scene {scene.ordinal} · {scene.label}</span>
+        <span className="plan-scene-meta">{stillCount} still{stillCount === 1 ? "" : "s"} · {formatTimeShort(startSeconds)}–{formatTimeShort(endSeconds)}</span>
+      </button>
+      {scene.expanded && (
+        <div className="plan-scene-context">
+          {hasContext ? (
+            <>
+              {scene.narrativeRole && <span><strong>Role:</strong> {scene.narrativeRole}</span>}
+              {scene.coreIdea && <span><strong>Idea:</strong> {scene.coreIdea}</span>}
+              {scene.emotionalState && <span><strong>Emotion:</strong> {scene.emotionalState}</span>}
+              {scene.visualOpportunities.length > 0 && <span><strong>Visual ideas:</strong> {scene.visualOpportunities.join(", ")}</span>}
+            </>
+          ) : (
+            <span className="muted">No detailed scene analysis available.</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The Images tab left pane's compact scene header row — same underlying
+ * expand flag as SceneStrip (both read/write visual_plan_scenes.expanded
+ * via setPlanSceneExpanded), sized for the narrow ~240px sidebar rather
+ * than the wide plan list: no timing range, and only a single truncated
+ * line of context when expanded — the full detail is one click away on the
+ * Visual Plan tab. Also reused by the Bulk Generation panel's scene rows. */
+function LeftPaneSceneStrip({ scene, stillCount, onToggle }: {
+  scene: PlanSceneRecord;
+  stillCount: number;
+  onToggle: () => void;
+}) {
+  const subtitle = scene.narrativeRole || scene.coreIdea || "";
+  return (
+    <div className={scene.expanded ? "stills-scene-strip expanded" : "stills-scene-strip"}>
+      <button type="button" className="stills-scene-toggle" onClick={onToggle} aria-expanded={scene.expanded}>
+        {scene.expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        <span className="stills-scene-title">Scene {scene.ordinal}</span>
+        <span className="stills-scene-meta">{stillCount} still{stillCount === 1 ? "" : "s"}</span>
+      </button>
+      {scene.expanded && subtitle && <div className="stills-scene-subtitle">{subtitle}</div>}
+    </div>
+  );
+}
+
+/** One scene's row in the Bulk Generation panel: a tri-state select-all
+ * checkbox, the same shared expand/collapse chevron as LeftPaneSceneStrip
+ * (scene is null for the legacy "no scene" fallback section — no header,
+ * no override affordance, no collapse, just the still grid), an inline
+ * "Customize" override mini-form, and — when expanded — a grid of
+ * individually selectable still thumbnails reusing the left pane's
+ * .still-thumb visual language. */
+function SceneBulkRow({
+  scene, groups, selection, aspectRatio, renderUrls,
+  onToggleScene, onToggleStill, onToggleExpanded,
+  override, overrideOpen, onToggleOverrideOpen, onSaveOverride, onImportReference,
+}: {
+  scene: PlanSceneRecord | null;
+  groups: (ImageWorkspaceGroupRecord & { sceneId: string | null })[];
+  selection: Set<string>;
+  aspectRatio: string;
+  renderUrls: Record<string, string>;
+  onToggleScene: () => void;
+  onToggleStill: (groupId: string) => void;
+  onToggleExpanded?: () => void;
+  override: BulkSceneSettingsRecord | null;
+  overrideOpen: boolean;
+  onToggleOverrideOpen: () => void;
+  onSaveOverride: (patch: Partial<Omit<BulkSceneSettingsRecord, "sceneId">>) => void;
+  onImportReference: () => void;
+}) {
+  const groupIds = groups.map((group) => group.group.id);
+  const state = sceneSelectionState(groupIds, selection);
+  const selectedCount = groupIds.filter((id) => selection.has(id)).length;
+  const collapsed = Boolean(scene && !scene.expanded);
+  return (
+    <div className="bulk-scene-row">
+      <div className="bulk-scene-row-header">
+        <input
+          type="checkbox"
+          className="bulk-scene-checkbox"
+          checked={state === "all"}
+          ref={(el) => { if (el) el.indeterminate = state === "some"; }}
+          onChange={onToggleScene}
+          aria-label={scene ? `Select all stills in Scene ${scene.ordinal}` : "Select all unassigned stills"}
+        />
+        {scene ? (
+          <button type="button" className="bulk-scene-toggle" onClick={onToggleExpanded} aria-expanded={scene.expanded}>
+            {scene.expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            <span className="bulk-scene-title">Scene {scene.ordinal} · {scene.label}</span>
+          </button>
+        ) : (
+          <span className="bulk-scene-title no-scene">Unassigned stills</span>
+        )}
+        <span className="bulk-scene-meta">{selectedCount}/{groupIds.length} stills</span>
+        {scene && (
+          <button type="button" className="bulk-scene-override-toggle" onClick={onToggleOverrideOpen} aria-expanded={overrideOpen}>
+            <Settings size={12} />Customize
+          </button>
+        )}
+      </div>
+      {scene && overrideOpen && (
+        <div className="bulk-scene-override-form">
+          <label>
+            <span>Style Directive override</span>
+            <textarea rows={2} placeholder="Inherit global" value={override?.styleDirective ?? ""} onChange={(event) => onSaveOverride({ styleDirective: event.target.value || null })} />
+          </label>
+          <label>
+            <span>Creative Instructions override</span>
+            <textarea rows={2} placeholder="Inherit global" value={override?.creativeInstruction ?? ""} onChange={(event) => onSaveOverride({ creativeInstruction: event.target.value || null })} />
+          </label>
+          <div className="bulk-scene-override-row">
+            <label>
+              <span>Character Consistency</span>
+              <select
+                value={override?.characterConsistency == null ? "inherit" : override.characterConsistency ? "on" : "off"}
+                onChange={(event) => onSaveOverride({ characterConsistency: event.target.value === "inherit" ? null : event.target.value === "on" })}
+              >
+                <option value="inherit">Inherit global</option>
+                <option value="on">On</option>
+                <option value="off">Off</option>
+              </select>
+            </label>
+            <div className="bulk-scene-reference">
+              <span>Reference image</span>
+              {override?.referenceAssetId ? (
+                <>
+                  <span className="bulk-scene-reference-set">Custom reference set</span>
+                  <button type="button" className="link-button" onClick={() => onSaveOverride({ referenceAssetId: null })}>Remove</button>
+                </>
+              ) : (
+                <button type="button" className="secondary" onClick={onImportReference}><Plus size={12} />Upload</button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      {!collapsed && (
+        <div className="bulk-still-grid">
+          {groups.map((group) => {
+            const newestRender = group.imageRenders[0];
+            const thumbUrl = newestRender ? renderUrls[newestRender.id] : undefined;
+            const isSelected = selection.has(group.group.id);
+            return (
+              <button
+                type="button"
+                key={group.group.id}
+                className={`bulk-still-thumb-button${isSelected ? " selected" : ""}`}
+                onClick={() => onToggleStill(group.group.id)}
+                aria-pressed={isSelected}
+                title={`Still ${group.group.ordinal}${isSelected ? " — selected" : ""}`}
+              >
+                <div className={`still-thumb ${aspectRatio === "9:16" ? "portrait" : "landscape"}${thumbUrl ? "" : " empty"}`}>
+                  {thumbUrl ? <img src={thumbUrl} alt={`Still ${group.group.ordinal} preview`} /> : <div className="still-thumb-empty"><Image size={16} /></div>}
+                  <span className="still-number">{group.group.ordinal}</span>
+                </div>
+                <span className={`bulk-still-checkbox${isSelected ? " checked" : ""}`} aria-hidden="true">{isSelected && <Check size={12} />}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function LoadingOverlay({ label }: { label: string }) {
@@ -1576,11 +1809,35 @@ function ImagesView() {
   const promptPrepTask = useRef<{ items: ImageWorkspaceRecord["groups"]; index: number } | null>(null);
   const [bulkPlanStatus, setBulkPlanStatus] = useState<"running" | "paused" | null>(null);
   const bulkPlanControl = useRef<"running" | "paused" | "stopped">("stopped");
-  type BulkPlanTask = { total: number; index: number; styleDirective: string; baseSettingsJson: string; creativeInstruction: string; characterConsistency: boolean };
+  type BulkPlanTask = { total: number; index: number; styleDirective: string; baseSettingsJson: string; creativeInstruction: string; characterConsistency: boolean; groupIds: string[] };
   const bulkPlanTask = useRef<BulkPlanTask | null>(null);
   const [referenceUrl, setReferenceUrl] = useState("");
   const promptPrepSettingKey = activeVideoId ? `prompt_prep.${activeVideoId}` : "";
   const bulkPlanSettingKey = activeVideoId ? `bulk_plan.${activeVideoId}` : "";
+  // The old flat "Generate All Stills" modal became a scene-sectioned
+  // selection panel — bulkOpen still controls that panel; bulkGlobalOpen is
+  // the nested dialog holding the same Style Directive/Reference Image/
+  // Character Consistency/Creative Instructions form the panel used to be.
+  const [bulkGlobalOpen, setBulkGlobalOpen] = useState(false);
+  const [bulkSelection, setBulkSelection] = useState<Set<string>>(new Set());
+  const [bulkSceneSettings, setBulkSceneSettings] = useState<BulkSceneSettingsRecord[]>([]);
+  const [bulkOverrideOpenSceneId, setBulkOverrideOpenSceneId] = useState<string | null>(null);
+
+  // Same helper, same scene data as the Visual Plan tab's SceneStrip
+  // sections — this is what sections the left pane's still list (and the
+  // Bulk Generation panel) by scene. sectionGroupsByScene wants sceneId at
+  // the top level, so each workspace group is enriched with its nested
+  // group.sceneId rather than sectioning bare PlanGroupRecords and losing
+  // the prompt/render data every section item needs to render.
+  const stillSections = useMemo(
+    () => (workspace
+      ? sectionGroupsByScene(
+          workspace.groups.map((item) => ({ ...item, sceneId: item.group.sceneId })),
+          workspace.scenes,
+        )
+      : []),
+    [workspace],
+  );
 
   const selectedGroup = useMemo(
     () => workspace?.groups.find((group) => group.group.id === selectedGroupId) ?? null,
@@ -1676,14 +1933,14 @@ function ImagesView() {
         if (savedBulkPlan) {
           try {
             const saved = JSON.parse(savedBulkPlan) as BulkPlanTask & { status: string };
-            if (saved.status === "paused" && saved.index < saved.total) {
+            if (saved.status === "paused" && saved.index < saved.total && saved.groupIds?.length) {
               setSystemPrompt(saved.styleDirective);
               setBulkInstruction(saved.creativeInstruction);
               setCharacterConsistency(saved.characterConsistency);
               bulkPlanTask.current = {
                 total: saved.total, index: saved.index, styleDirective: saved.styleDirective,
                 baseSettingsJson: saved.baseSettingsJson, creativeInstruction: saved.creativeInstruction,
-                characterConsistency: saved.characterConsistency,
+                characterConsistency: saved.characterConsistency, groupIds: saved.groupIds,
               };
               bulkPlanControl.current = "paused";
               setBulkPlanStatus("paused");
@@ -1809,7 +2066,20 @@ function ImagesView() {
     setSelectedRenderId(latestRender?.id ?? null);
   }
 
-
+  // Same underlying flag as VisualPlanView's setSceneExpanded (both read/
+  // write visual_plan_scenes.expanded via the same command) — toggling a
+  // scene here is reflected on the Visual Plan tab and vice versa. Splices
+  // the returned plan's scenes into local workspace state rather than
+  // refetching the whole workspace.
+  async function setImageSceneExpanded(sceneId: string, expanded: boolean) {
+    if (!activeVideoId) return;
+    try {
+      const plan = await projectsClient.setPlanSceneExpanded(activeVideoId, sceneId, expanded);
+      setWorkspace((current) => (current ? { ...current, scenes: plan.scenes } : current));
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
 
   async function runPromptPreparation() {
     if (!activeVideoId || !promptPrepTask.current) return;
@@ -1861,7 +2131,7 @@ function ImagesView() {
       const finalControl = promptPrepControl.current as "running" | "paused" | "stopped";
       if (finalControl === "running" && task.index >= task.items.length) {
         setBulkProgress({ current: task.items.length, total: task.items.length, label: "Starting image generation" });
-        setJob(await projectsClient.createImageJob(activeVideoId));
+        setJob(await projectsClient.createImageJob(activeVideoId, task.items.map((item) => item.group.id)));
         promptPrepTask.current = null;
         promptPrepControl.current = "stopped";
         setPromptPrepStatus(null);
@@ -1941,7 +2211,7 @@ function ImagesView() {
         if (bulkPlanControl.current !== "running") break;
         setBulkProgress({ current: task.index, total: task.total, label: `Planning still ${task.index + 1} of ${task.total}` });
         const result = await projectsClient.planBulkVisualsBatch(
-          activeVideoId, task.styleDirective, task.baseSettingsJson, task.creativeInstruction, task.characterConsistency, task.index,
+          activeVideoId, task.styleDirective, task.baseSettingsJson, task.creativeInstruction, task.characterConsistency, task.groupIds, task.index,
         );
         if (bulkPlanControl.current !== "running") break;
         // Guard against a batch that somehow made no progress — never spin forever.
@@ -1966,7 +2236,7 @@ function ImagesView() {
             setSystemPrompt(videoDirective ?? pv.systemPrompt ?? systemPrompt);
           }
         }
-        const newJob = await projectsClient.createImageJob(activeVideoId);
+        const newJob = await projectsClient.createImageJob(activeVideoId, task.groupIds);
         setJob(newJob);
         bulkPlanTask.current = null;
         bulkPlanControl.current = "stopped";
@@ -2007,17 +2277,91 @@ function ImagesView() {
     }
   }
 
+  // Ordered scene-then-ordinal (matching stillSections' render order, which
+  // Rust's plan_bulk_visuals_batch relies on for its scene-bounded
+  // chunking) — not Array.from(bulkSelection)'s arbitrary insertion order.
+  const orderedBulkSelection = stillSections
+    .flatMap((section) => section.groups)
+    .map((group) => group.group.id)
+    .filter((id) => bulkSelection.has(id));
+
+  async function openBulkPanel() {
+    if (!activeVideoId) return;
+    setBulkOpen(true);
+    setError(null);
+    try {
+      const [pending, sceneSettings] = await Promise.all([
+        projectsClient.pendingStillIds(activeVideoId),
+        projectsClient.getBulkSceneSettings(activeVideoId),
+      ]);
+      setBulkSelection(new Set(pending));
+      setBulkSceneSettings(sceneSettings);
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
   async function runBulkPlan() {
-    if (!activeVideoId || !workspace?.groups.length || bulkPlanTask.current) return;
+    if (!activeVideoId || !orderedBulkSelection.length || bulkPlanTask.current) return;
     setBulkOpen(false);
     setError(null);
     await projectsClient.saveAppSetting(`system_prompt.${activeVideoId}`, systemPrompt);
     bulkPlanTask.current = {
-      total: workspace.groups.length, index: 0,
+      total: orderedBulkSelection.length, index: 0,
       styleDirective: systemPrompt, baseSettingsJson: settingsJson,
       creativeInstruction: bulkInstruction, characterConsistency,
+      groupIds: orderedBulkSelection,
     };
     void runBulkPlanLoop();
+  }
+
+  async function saveSceneOverride(sceneId: string, patch: Partial<Omit<BulkSceneSettingsRecord, "sceneId">>) {
+    if (!activeVideoId) return;
+    const current = bulkSceneSettings.find((item) => item.sceneId === sceneId);
+    const next: BulkSceneSettingsRecord = {
+      sceneId,
+      styleDirective: current?.styleDirective ?? null,
+      creativeInstruction: current?.creativeInstruction ?? null,
+      characterConsistency: current?.characterConsistency ?? null,
+      referenceAssetId: current?.referenceAssetId ?? null,
+      ...patch,
+    };
+    setBulkSceneSettings((items) => [...items.filter((item) => item.sceneId !== sceneId), next]);
+    try {
+      await projectsClient.saveBulkSceneSettings(
+        activeVideoId, sceneId, next.styleDirective, next.creativeInstruction, next.characterConsistency, next.referenceAssetId,
+      );
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  function toggleBulkStill(groupId: string) {
+    setBulkSelection((current) => {
+      const next = new Set(current);
+      if (next.has(groupId)) next.delete(groupId); else next.add(groupId);
+      return next;
+    });
+  }
+
+  function toggleBulkScene(groupIds: string[]) {
+    setBulkSelection((current) => toggleScene(groupIds, current));
+  }
+
+  // Unlike importReference (the global reference), this never evicts an
+  // existing asset first — a scene's reference can coexist with the global
+  // one and every other scene's. "Remove" only clears the override back to
+  // "inherit the global reference," it doesn't delete the uploaded file
+  // (harmless to leave behind, and safer than deleting something another
+  // scene might still point at).
+  async function importSceneReference(sceneId: string) {
+    if (!activeVideoId) return;
+    try {
+      const asset = await projectsClient.pickAndImportAsset(activeVideoId, "reference");
+      if (asset) await saveSceneOverride(sceneId, { referenceAssetId: asset.id });
+    } catch (caught) {
+      setError(String(caught));
+    }
   }
 
   function updateImageSetting<K extends keyof ImageSettings>(key: K, value: ImageSettings[K]) {
@@ -2263,7 +2607,7 @@ function ImagesView() {
           <h1>Image generation</h1>
           <p>Select a still, review prompt versions, and generate render outputs.</p>
         </div>
-        <div className="heading-actions"><button className="secondary" onClick={() => setBulkOpen(true)} disabled={!workspace?.groups.length || loading}><WandSparkles size={17} />Bulk Generation</button><button className="primary" onClick={() => setStage("animate")} disabled={!workspace?.groups.length}><Film size={17} />Continue to Animate →</button></div>
+        <div className="heading-actions"><button className="secondary" onClick={() => void openBulkPanel()} disabled={!workspace?.groups.length || loading}><WandSparkles size={17} />Bulk Generation</button><button className="primary" onClick={() => setStage("animate")} disabled={!workspace?.groups.length}><Film size={17} />Continue to Animate →</button></div>
       </div>
       {error && <div className="error-toast" role="alert"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
       <div className="image-workspace">
@@ -2279,39 +2623,54 @@ function ImagesView() {
             </div>
           </div>
           <div className="still-list">
-            {(workspace?.groups ?? []).map((group) => {
-              const newestPrompt = group.promptVersions[0];
-              const newestRender = group.imageRenders[0];
-              const isSelectedGroup = group.group.id === selectedGroupId;
-              const thumbUrl = isSelectedGroup && selectedRenderId
-                ? renderUrls[selectedRenderId]
-                : newestRender ? renderUrls[newestRender.id] : undefined;
-              const item = job?.items.find((candidate) => candidate.groupId === group.group.id);
-              const isPreparing = preparingGroupIds.has(group.group.id);
-              const isGenerating = item?.status === "running" || generatingGroupId === group.group.id;
-              const statusKey = isPreparing || isGenerating ? "generating" : item?.status === "failed" ? "failed" : newestRender && newestPrompt && newestRender.promptVersionId !== newestPrompt.id ? "outdated" : newestRender ? "generated" : newestPrompt ? "ready" : "empty";
-              const statusLabel = isPreparing ? "Preparing prompt" : isGenerating ? "Generating" : statusKey === "failed" ? "Failed" : statusKey === "outdated" ? "Outdated — regenerate" : statusKey === "generated" ? "Generated" : statusKey === "ready" ? "Prompt ready" : "No prompt yet";
+            {stillSections.map((section, sectionIndex) => {
+              const scene = section.scene;
+              const collapsed = Boolean(scene && !scene.expanded);
               return (
-                <button
-                  key={group.group.id}
-                  className={`still-select${group.group.id === selectedGroupId ? " active" : ""}`}
-                  title={statusLabel}
-                  onClick={() => selectGroup(group.group.id)}
-                >
-                  <div className={`still-thumb ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}${thumbUrl ? "" : " empty"}`}>
-                    {thumbUrl ? <img src={thumbUrl} alt={`Still ${group.group.ordinal} preview`} /> : <div className="still-thumb-empty"><Image size={18} /><span>No image generated yet</span></div>}
-                    <span className="still-number">{group.group.ordinal}</span>
-                    {statusKey !== "empty" && (
-                      <span className={`still-status-badge ${statusKey}`} aria-label={statusLabel}>
-                        {statusKey === "generated" && <Check size={11} />}
-                        {statusKey === "ready" && <Sparkles size={11} />}
-                        {statusKey === "generating" && <LoaderCircle size={11} className="spin" />}
-                        {statusKey === "failed" && <X size={11} />}
-                        {statusKey === "outdated" && <Undo2 size={11} />}
-                      </span>
-                    )}
-                  </div>
-                </button>
+                <div className="stills-scene-section" key={scene?.id ?? `no-scene-${sectionIndex}`}>
+                  {scene && (
+                    <LeftPaneSceneStrip
+                      scene={scene}
+                      stillCount={section.groups.length}
+                      onToggle={() => void setImageSceneExpanded(scene.id, !scene.expanded)}
+                    />
+                  )}
+                  {!collapsed && section.groups.map((group) => {
+                    const newestPrompt = group.promptVersions[0];
+                    const newestRender = group.imageRenders[0];
+                    const isSelectedGroup = group.group.id === selectedGroupId;
+                    const thumbUrl = isSelectedGroup && selectedRenderId
+                      ? renderUrls[selectedRenderId]
+                      : newestRender ? renderUrls[newestRender.id] : undefined;
+                    const item = job?.items.find((candidate) => candidate.groupId === group.group.id);
+                    const isPreparing = preparingGroupIds.has(group.group.id);
+                    const isGenerating = item?.status === "running" || generatingGroupId === group.group.id;
+                    const statusKey = isPreparing || isGenerating ? "generating" : item?.status === "failed" ? "failed" : newestRender && newestPrompt && newestRender.promptVersionId !== newestPrompt.id ? "outdated" : newestRender ? "generated" : newestPrompt ? "ready" : "empty";
+                    const statusLabel = isPreparing ? "Preparing prompt" : isGenerating ? "Generating" : statusKey === "failed" ? "Failed" : statusKey === "outdated" ? "Outdated — regenerate" : statusKey === "generated" ? "Generated" : statusKey === "ready" ? "Prompt ready" : "No prompt yet";
+                    return (
+                      <button
+                        key={group.group.id}
+                        className={`still-select${group.group.id === selectedGroupId ? " active" : ""}`}
+                        title={statusLabel}
+                        onClick={() => selectGroup(group.group.id)}
+                      >
+                        <div className={`still-thumb ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}${thumbUrl ? "" : " empty"}`}>
+                          {thumbUrl ? <img src={thumbUrl} alt={`Still ${group.group.ordinal} preview`} /> : <div className="still-thumb-empty"><Image size={18} /><span>No image generated yet</span></div>}
+                          <span className="still-number">{group.group.ordinal}</span>
+                          {statusKey !== "empty" && (
+                            <span className={`still-status-badge ${statusKey}`} aria-label={statusLabel}>
+                              {statusKey === "generated" && <Check size={11} />}
+                              {statusKey === "ready" && <Sparkles size={11} />}
+                              {statusKey === "generating" && <LoaderCircle size={11} className="spin" />}
+                              {statusKey === "failed" && <X size={11} />}
+                              {statusKey === "outdated" && <Undo2 size={11} />}
+                            </span>
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
               );
             })}
           </div>
@@ -2464,7 +2823,54 @@ function ImagesView() {
       </div>}
       {bulkOpen && <div className="modal-backdrop" role="presentation" onMouseDown={() => setBulkOpen(false)}>
         <div className="modal bulk-modal" onMouseDown={(e) => e.stopPropagation()}>
-          <div className="modal-heading-row"><h2>Bulk Generation Settings</h2><button type="button" className="icon-button" aria-label="Close" onClick={() => setBulkOpen(false)}><X size={16} /></button></div>
+          <div className="modal-heading-row">
+            <h2>Bulk Generation</h2>
+            <div className="bulk-modal-heading-actions">
+              <button type="button" className="secondary" onClick={() => setBulkGlobalOpen(true)}><Settings size={14} />Global Settings</button>
+              <button type="button" className="icon-button" aria-label="Close" onClick={() => setBulkOpen(false)}><X size={16} /></button>
+            </div>
+          </div>
+          <div className="bulk-selection-summary">
+            <span>{bulkSelection.size} of {stillCount} still{stillCount === 1 ? "" : "s"} selected across {stillSections.filter((section) => section.scene).length} scene{stillSections.filter((section) => section.scene).length === 1 ? "" : "s"}</span>
+            <div>
+              <button type="button" className="link-button" onClick={() => setBulkSelection(new Set(stillSections.flatMap((section) => section.groups).map((group) => group.group.id)))}>Select all</button>
+              <button type="button" className="link-button" onClick={() => setBulkSelection(new Set())}>Clear</button>
+            </div>
+          </div>
+          <div className="bulk-scene-list">
+            {stillSections.map((section, sectionIndex) => {
+              const groupIds = section.groups.map((group) => group.group.id);
+              const scene = section.scene;
+              return (
+                <SceneBulkRow
+                  key={scene?.id ?? `no-scene-${sectionIndex}`}
+                  scene={scene}
+                  groups={section.groups}
+                  selection={bulkSelection}
+                  aspectRatio={imageSettings.aspectRatio}
+                  renderUrls={renderUrls}
+                  onToggleScene={() => toggleBulkScene(groupIds)}
+                  onToggleStill={toggleBulkStill}
+                  onToggleExpanded={scene ? () => void setImageSceneExpanded(scene.id, !scene.expanded) : undefined}
+                  override={scene ? bulkSceneSettings.find((item) => item.sceneId === scene.id) ?? null : null}
+                  overrideOpen={Boolean(scene) && bulkOverrideOpenSceneId === scene?.id}
+                  onToggleOverrideOpen={() => setBulkOverrideOpenSceneId((current) => (scene && current !== scene.id ? scene.id : null))}
+                  onSaveOverride={(patch) => scene && void saveSceneOverride(scene.id, patch)}
+                  onImportReference={() => scene && void importSceneReference(scene.id)}
+                />
+              );
+            })}
+          </div>
+          <button className="primary full" style={{marginTop:"10px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanStatus !== null || !orderedBulkSelection.length || bulkProgress !== null || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>
+            <WandSparkles size={16} />Generate Selected ({bulkSelection.size})
+          </button>
+          <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans and generates the selected stills in one pausable run — no separate review step. {Boolean(job && ["queued", "running", "paused"].includes(job.status)) && "Stop the active job to re-plan."}</p>
+        </div>
+      </div>}
+
+      {bulkGlobalOpen && <div className="modal-backdrop" role="presentation" onMouseDown={() => setBulkGlobalOpen(false)}>
+        <div className="modal bulk-modal" onMouseDown={(e) => e.stopPropagation()}>
+          <div className="modal-heading-row"><h2>Global Bulk Settings</h2><button type="button" className="icon-button" aria-label="Close" onClick={() => setBulkGlobalOpen(false)}><X size={16} /></button></div>
           <div className="panel-section-heading" style={{marginTop:"4px"}}><h3>Style Directive</h3><small>Global visual style</small></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Describe overall cinematography and visual language. Avoid scene-specific details — the AI will handle those per still.</p>
           <textarea className="bulk-directive" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="e.g. Cinematic documentary style, shallow depth of field, warm color grade, soft natural lighting…" rows={4} />
@@ -2496,12 +2902,9 @@ function ImagesView() {
             <p style={{fontSize:"11px",color:"var(--muted)",margin:"2px 0 0"}}>Upload a reference image above — Character Consistency needs one to work from.</p>
           )}
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
-          <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still. Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
+          <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still (unless a scene overrides them below in the main panel). Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
           <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cat as the main character. Show visible emotions and varied body language. Avoid showing text, labels, or close-ups on faces." rows={4} />
-          <button className="primary full" style={{marginTop:"10px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanStatus !== null || !workspace?.groups.length || bulkProgress !== null || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>
-            <WandSparkles size={16} />Generate All Stills
-          </button>
-          <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans and generates every still in one pausable run — no separate review step. {Boolean(job && ["queued", "running", "paused"].includes(job.status)) && "Stop the active job to re-plan."}</p>
+          <button className="primary full" style={{marginTop:"10px"}} onClick={() => setBulkGlobalOpen(false)}>Done</button>
         </div>
       </div>}
     </section>

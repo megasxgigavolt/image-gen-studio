@@ -13,10 +13,23 @@ Pipeline:
 2. Script sentences are aligned to Whisper timestamps.
 3. AI Pass 1 extracts sentence level visual metadata.
 4. AI Pass 2 evaluates every consecutive transition with Scene Boundary
-   Strength scoring and builds visual groups.
-5. Deterministic validation and duration optimization repair coverage,nd the moment your shadow crosses the glass, your fish is already there.
+   Strength scoring and builds visual groups (stills). Duration/pacing is
+   NOT part of this decision — see 5 below.
+5. Deterministic validation and duration optimization repair coverage,
    ordering, minimum duration, and maximum duration.
-6. Excel and JSON audit files are exported.
+6. Scenes (a coarser partition of the same sentences, one or more stills
+   each) are derived from Pass 2's own narrative_scene_boundary transitions
+   (a dedicated, explicitly-scoped field — see score_boundaries_pass2's
+   NARRATIVE SCENE BOUNDARY prompt section), then AI Pass 3 summarizes each
+   scene's narrative content.
+7. Excel and JSON audit files are exported.
+
+Provider order for all three AI passes: a locally logged-in Claude Code CLI
+is tried first (see `ai_client.parse_structured_with_fallback`) — it rides an
+existing Claude subscription instead of a metered API key, so this is the
+only provider with no per-call cost. OpenAI is the fallback if the CLI isn't
+installed/logged in or its call fails. Same order motion_graphics_engine.py
+uses for its vision passes.
 
 Install:
 
@@ -24,7 +37,7 @@ Install:
 
 FFmpeg must be available on PATH.
 
-Environment:
+Environment (only needed as a fallback — see provider order above):
 
     OPENAI_API_KEY=your_key
 
@@ -51,11 +64,11 @@ import os
 import re
 import sys
 import textwrap
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Literal, Sequence
 
-from ai_client import get_openai_client, parse_structured
+from ai_client import parse_structured_with_fallback
 
 try:
     from dotenv import load_dotenv
@@ -124,10 +137,27 @@ NORMALIZE_RE = re.compile(r"[^\w\s]", re.UNICODE)
 PASS2_BATCH_SIZE = 30
 PASS2_CONTEXT = 5
 PASS1_BATCH_SIZE = 60
+PASS3_BATCH_SIZE = 25
 AI_BATCH_WORKERS = 3
 
 TTS_TAG_RE = re.compile(r"<#[\d.]+#>")
 PROGRESS_PREFIX = "AUTOGEN_PROGRESS "
+
+# Shared story-beat vocabulary: Pass 1 tags every sentence with one of these,
+# Pass 3 tags every scene with one of these too, so a scene's narrative role
+# and its member sentences' story beats are always drawn from the same set.
+StoryBeat = Literal[
+    "hook",
+    "setup",
+    "development",
+    "explanation",
+    "conflict",
+    "escalation",
+    "climax",
+    "resolution",
+    "lesson",
+    "cta",
+]
 
 
 def report_progress(percent: int, stage: str, detail: str = "") -> None:
@@ -183,6 +213,25 @@ class VisualGroup:
     confidence: str
     reason: str
     hard_boundary_before: bool = False
+
+
+@dataclass(frozen=True)
+class VisualScene:
+    """
+    A larger narrative/visual unit that can span several VisualGroups
+    (stills). Boundaries come from normalize_scenes (Pass 2's hard_boundary
+    transitions only); the context fields below are filled in afterward by
+    analyze_scene_context (Pass 3) and are empty until then.
+    """
+
+    scene_id: int
+    start_sentence_id: int
+    end_sentence_id: int
+    title: str = ""
+    narrative_role: str = ""
+    core_idea: str = ""
+    emotional_state: str = ""
+    visual_opportunities: list[str] = field(default_factory=list)
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -520,19 +569,6 @@ def analyze_sentences_pass1(
         print("Run: pip install pydantic\n")
         sys.exit(1)
 
-    StoryBeat = Literal[
-        "hook",
-        "setup",
-        "development",
-        "explanation",
-        "conflict",
-        "escalation",
-        "climax",
-        "resolution",
-        "lesson",
-        "cta",
-    ]
-
     class SentenceAnalysis(BaseModel):
         sentence_id: int
         visual_anchor: str
@@ -675,12 +711,11 @@ Return exactly one analysis for every supplied sentence ID, in the same order.
                 for sentence in batch
             ],
         }
-        result = parse_structured(
-            client=get_openai_client(),
-            model=ai_model,
+        result = parse_structured_with_fallback(
             system_prompt=system_prompt,
             user_payload=payload,
             response_model=Pass1Result,
+            ai_model=ai_model,
         )
         expected_batch_ids = [sentence.sentence_id for sentence in batch]
         returned_batch_ids = [item.sentence_id for item in result.analyses]
@@ -749,8 +784,6 @@ def score_boundaries_pass2(
     sentences: list[TimedSentence],
     pass1_result,
     ai_model: str,
-    min_duration: float,
-    max_duration: float,
 ):
     try:
         from pydantic import BaseModel, Field
@@ -806,6 +839,13 @@ def score_boundaries_pass2(
         dynamic_reasoning: str
         final_action: Decision
 
+        # Independent of every still-level score above — see the NARRATIVE
+        # SCENE BOUNDARY prompt section. A still boundary (zone/final_action)
+        # fires on almost every transition; this must fire rarely, only at
+        # genuine scene changes, or the whole video collapses into one scene.
+        narrative_scene_boundary: bool
+        narrative_scene_boundary_reason: str
+
     class ProposedGroup(BaseModel):
         start_sentence_id: int
         end_sentence_id: int
@@ -819,7 +859,7 @@ def score_boundaries_pass2(
         transitions: list[TransitionAnalysis]
         groups: list[ProposedGroup]
 
-    system_prompt = f"""
+    system_prompt = """
 You are Pass 2 of an advanced Visual Scene Segmentation Engine for AI generated
 video production.
 
@@ -978,24 +1018,45 @@ DYNAMIC DECISION
 The formula is evidence, not a prison. You may override the default zone only
 when the visual reasoning is strong. Explain the override.
 
+NARRATIVE SCENE BOUNDARY
+
+Separate from every score above, and from the still (zone/final_action)
+decision for this same transition. A SCENE is a much larger unit than a
+still: it is the narrative/visual unit the stills above live inside, and a
+typical video should contain several scenes, each usually made of several
+stills.
+
+Decide narrative_scene_boundary independently of zone/final_action. Set it
+true only when sentence B begins a genuinely new scene, meaning at least one
+of:
+
+1. The dominant subject changes to a different subject, not a continuation,
+   elaboration, or different angle on the same subject.
+2. The environment or setting changes to a different physical or conceptual
+   place.
+3. A real time jump occurs, not "a moment later."
+4. Sentence B opens a new numbered item, reason, step, or section, such as
+   "Number 9," "Reason 8," "The next step is," or "Here's why."
+5. The topic or argument itself moves on, not just the story beat. A story
+   beat changing on the exact same topic is not enough by itself.
+
+A hard_boundary transition is always also a narrative_scene_boundary. The
+reverse is not required: a new scene does not need a visual hard cut.
+
+Most transitions are still boundaries only, inside the same scene. Expect a
+new scene roughly every several stills in a typical video, not one per still
+and not only a single scene for the whole video. Set
+narrative_scene_boundary_reason to a short phrase, such as "new countdown
+item," "same topic continues," or "location moves from office to street."
+
 NARRATIVE COMPRESSION
 
 Count visual ideas, not sentences. Several sentences describing the same
 subject, event, mechanism, or emotional moment may share one image.
 
-DURATION TARGETS
-
-Minimum group duration: {min_duration:.3f} seconds
-Maximum group duration: {max_duration:.3f} seconds
-
-First make visual decisions. Then consider duration.
-
-A group below minimum should normally merge across the lowest available boundary
-unless that boundary is hard or the merged image would be misleading.
-
-A group above maximum should split at the highest SBS inside that group.
-
-A single sentence longer than the maximum may remain alone.
+Make every boundary decision on visual/narrative grounds alone. Duration and
+pacing are handled entirely by a separate deterministic pass downstream — do
+not merge or split anything because of how long a group would run.
 
 OUTPUT REQUIREMENTS
 
@@ -1005,11 +1066,12 @@ OUTPUT REQUIREMENTS
 4. Never cross a hard boundary.
 5. Use sentence metadata from Pass 1 as evidence.
 6. Scene descriptions must describe one practical still image.
+7. narrative_scene_boundary must be true somewhere in a typical video unless
+   the whole video is genuinely one continuous scene — do not leave it false
+   for every single transition by default.
 """
 
     payload = {
-        "minimum_group_duration": min_duration,
-        "maximum_group_duration": max_duration,
         "hook_end_sentence_id": pass1_result.hook_end_sentence_id,
         "sentences": [
             {
@@ -1025,13 +1087,11 @@ OUTPUT REQUIREMENTS
         ],
     }
 
-    client = get_openai_client()
-    result = parse_structured(
-        client=client,
-        model=ai_model,
+    result = parse_structured_with_fallback(
         system_prompt=system_prompt,
         user_payload=payload,
         response_model=Pass2Result,
+        ai_model=ai_model,
     )
 
     expected_transitions = max(0, len(sentences) - 1)
@@ -1072,8 +1132,6 @@ def _batch_score_boundaries_pass2(
     sentences: list[TimedSentence],
     pass1_result,
     ai_model: str,
-    min_duration: float,
-    max_duration: float,
 ) -> _BatchedPass2Result:
     """
     Splits sentences into overlapping chunks and runs Pass 2 on each, then
@@ -1087,8 +1145,6 @@ def _batch_score_boundaries_pass2(
             sentences=sentences,
             pass1_result=pass1_result,
             ai_model=ai_model,
-            min_duration=min_duration,
-            max_duration=max_duration,
         )
 
     all_transitions: list = []
@@ -1114,8 +1170,6 @@ def _batch_score_boundaries_pass2(
             sentences=chunk_sentences,
             pass1_result=chunk_pass1,
             ai_model=ai_model,
-            min_duration=min_duration,
-            max_duration=max_duration,
         )
         return batch_num, batch_start, batch_end, chunk_result
 
@@ -1174,6 +1228,35 @@ def transition_map(pass2_result) -> dict[int, object]:
     }
 
 
+def build_ranges_from_boundaries(
+    sentences: list[TimedSentence],
+    boundary_ids: set[int],
+) -> list[tuple[int, int]]:
+    """
+    Turns a set of "a group/scene closes right after this sentence id" ids
+    into contiguous (start_sentence_id, end_sentence_id) ranges covering
+    every sentence exactly once. Shared by normalize_groups (still
+    boundaries: every split or hard boundary) and normalize_scenes (the
+    strictly coarser hard-boundary-only partition) so the two levels can
+    never disagree about where a range starts or ends.
+    """
+    if not sentences:
+        return []
+
+    ranges: list[tuple[int, int]] = []
+    start_id = sentences[0].sentence_id
+    final_id = sentences[-1].sentence_id
+
+    for sentence_id in range(start_id, final_id + 1):
+        closes_here = sentence_id in boundary_ids or sentence_id == final_id
+        if not closes_here:
+            continue
+        ranges.append((start_id, sentence_id))
+        start_id = sentence_id + 1
+
+    return ranges
+
+
 def normalize_groups(
     sentences: list[TimedSentence],
     pass2_result,
@@ -1187,20 +1270,19 @@ def normalize_groups(
         for group in pass2_result.groups
     }
 
-    boundaries: set[int] = set()
-    for transition in pass2_result.transitions:
-        if transition.final_action == "split" or transition.hard_boundary:
-            boundaries.add(transition.from_sentence_id)
+    # narrative_scene_boundary is included here too (not just in
+    # normalize_scenes) so a still boundary always exists wherever a scene
+    # boundary does — otherwise a still could straddle two scenes.
+    boundaries = {
+        transition.from_sentence_id
+        for transition in pass2_result.transitions
+        if transition.final_action == "split"
+        or transition.hard_boundary
+        or transition.narrative_scene_boundary
+    }
 
     groups: list[VisualGroup] = []
-    start_id = sentences[0].sentence_id
-    final_id = sentences[-1].sentence_id
-
-    for sentence_id in range(start_id, final_id + 1):
-        closes_here = sentence_id in boundaries or sentence_id == final_id
-        if not closes_here:
-            continue
-
+    for start_id, sentence_id in build_ranges_from_boundaries(sentences, boundaries):
         proposed = proposed_by_start.get(start_id)
         if proposed and proposed.end_sentence_id == sentence_id:
             scene_type = proposed.scene_type
@@ -1241,9 +1323,196 @@ def normalize_groups(
                 hard_boundary_before=hard_before,
             )
         )
-        start_id = sentence_id + 1
 
     return groups
+
+
+def normalize_scenes(
+    sentences: list[TimedSentence],
+    pass2_result,
+) -> list["VisualScene"]:
+    """
+    The coarser partition: a scene boundary is a transition Pass 2 explicitly
+    flagged narrative_scene_boundary (see that field's prompt section — a
+    genuinely new subject/location/time/topic, not just a new still), or
+    hard_boundary as a safety net (a visual hard cut is always also a scene
+    change even if the model forgot to also flag narrative_scene_boundary).
+    normalize_groups includes the same two fields in its own boundary set, so
+    every scene boundary is guaranteed to also be a still boundary — a still
+    can never straddle two scenes.
+    """
+    if not sentences:
+        return []
+
+    boundaries = {
+        transition.from_sentence_id
+        for transition in pass2_result.transitions
+        if transition.narrative_scene_boundary or transition.hard_boundary
+    }
+
+    return [
+        VisualScene(scene_id=index, start_sentence_id=start_id, end_sentence_id=end_id)
+        for index, (start_id, end_id) in enumerate(
+            build_ranges_from_boundaries(sentences, boundaries), start=1
+        )
+    ]
+
+
+def analyze_scene_context(
+    sentences: list[TimedSentence],
+    pass1_result,
+    scenes: list[VisualScene],
+    ai_model: str,
+) -> list[VisualScene]:
+    """
+    Pass 3: boundaries are already decided (normalize_scenes) — this only
+    summarizes what each scene is about, for a storyboard artist who will
+    illustrate it as several still images. Uses each scene's member
+    sentences and their Pass 1 analyses as evidence, the same evidence
+    Pass 2 already sees.
+    """
+    if not scenes:
+        return []
+
+    try:
+        from pydantic import BaseModel
+    except ImportError:
+        print("\nError: pydantic is not installed.")
+        print("Run: pip install pydantic\n")
+        sys.exit(1)
+
+    class SceneAnalysis(BaseModel):
+        scene_id: int
+        title: str
+        narrative_role: StoryBeat
+        core_idea: str
+        emotional_state: str
+        visual_opportunities: list[str]
+
+    class Pass3Result(BaseModel):
+        analyses: list[SceneAnalysis]
+
+    system_prompt = """
+You are Pass 3 of an advanced visual scene segmentation engine for faceless
+YouTube video production.
+
+Scene boundaries have already been decided. Your only job is to summarize
+what each scene is about, for a storyboard artist who will illustrate it as
+several still images.
+
+For every scene, read its member sentences and their Pass 1 analyses (the
+dominant subject, environment, emotion, and story beat already extracted for
+each sentence), then produce:
+
+Title:
+A short, human-readable label for the scene, 3 to 8 words, specific enough to
+tell this scene apart from its neighbors.
+
+Narrative role:
+hook, setup, development, explanation, conflict, escalation, climax,
+resolution, lesson, or cta - whichever single story beat this scene is
+primarily doing.
+
+Core idea:
+One sentence naming the single idea, situation, event, argument, or story
+beat this scene expresses.
+
+Emotional state:
+The dominant emotional tone of the scene, 1 to 4 words.
+
+Visual opportunities:
+2 to 5 short phrases naming concrete or conceptual visuals this scene could
+be illustrated with across its stills. These are options for a downstream
+visual director, not a shot list - do not number them or tie them to
+specific sentences.
+
+Return exactly one analysis for every supplied scene ID.
+"""
+
+    batches = [
+        scenes[index : index + PASS3_BATCH_SIZE]
+        for index in range(0, len(scenes), PASS3_BATCH_SIZE)
+    ]
+
+    def analyze_batch(batch_number: int, batch: list[VisualScene]):
+        payload = {
+            "script_context": {
+                "total_scenes": len(scenes),
+                "batch_number": batch_number,
+                "batch_count": len(batches),
+            },
+            "scenes": [
+                {
+                    "scene_id": scene.scene_id,
+                    "sentences": [
+                        {
+                            "sentence_id": sentence.sentence_id,
+                            "text": sentence.text,
+                            "analysis": pass1_result.analyses[sentence.sentence_id - 1].model_dump(),
+                        }
+                        for sentence in sentences[scene.start_sentence_id - 1 : scene.end_sentence_id]
+                    ],
+                }
+                for scene in batch
+            ],
+        }
+        result = parse_structured_with_fallback(
+            system_prompt=system_prompt,
+            user_payload=payload,
+            response_model=Pass3Result,
+            ai_model=ai_model,
+        )
+        expected_batch_ids = [scene.scene_id for scene in batch]
+        returned_batch_ids = [item.scene_id for item in result.analyses]
+        if returned_batch_ids != expected_batch_ids:
+            raise RuntimeError(
+                f"Pass 3 batch {batch_number} coverage is invalid. "
+                f"Expected {expected_batch_ids}, received {returned_batch_ids}."
+            )
+        return batch_number, result
+
+    results: dict[int, Pass3Result] = {}
+    completed = 0
+    with ThreadPoolExecutor(
+        max_workers=min(AI_BATCH_WORKERS, len(batches))
+    ) as executor:
+        futures = [
+            executor.submit(analyze_batch, batch_number, batch)
+            for batch_number, batch in enumerate(batches, start=1)
+        ]
+        for future in as_completed(futures):
+            batch_number, batch_result = future.result()
+            results[batch_number] = batch_result
+            completed += 1
+            report_progress(
+                95 + round(4 * completed / max(1, len(batches))),
+                "Summarizing scenes",
+                f"{completed} of {len(batches)} batches complete",
+            )
+
+    analyses: dict[int, SceneAnalysis] = {}
+    for batch_number in range(1, len(batches) + 1):
+        for analysis in results[batch_number].analyses:
+            analyses[analysis.scene_id] = analysis
+
+    expected_ids = [scene.scene_id for scene in scenes]
+    if sorted(analyses.keys()) != sorted(expected_ids):
+        raise RuntimeError(
+            f"Pass 3 scene coverage is invalid. Expected {expected_ids}, "
+            f"received {sorted(analyses.keys())}."
+        )
+
+    return [
+        replace(
+            scene,
+            title=analyses[scene.scene_id].title,
+            narrative_role=analyses[scene.scene_id].narrative_role,
+            core_idea=analyses[scene.scene_id].core_idea,
+            emotional_state=analyses[scene.scene_id].emotional_state,
+            visual_opportunities=list(analyses[scene.scene_id].visual_opportunities),
+        )
+        for scene in scenes
+    ]
 
 
 def group_duration(
@@ -1253,6 +1522,26 @@ def group_duration(
     start = sentences[group.start_sentence_id - 1].start
     end = sentences[group.end_sentence_id - 1].end
     return max(0.0, end - start)
+
+
+def scene_duration(
+    scene: VisualScene,
+    sentences: list[TimedSentence],
+) -> float:
+    start = sentences[scene.start_sentence_id - 1].start
+    end = sentences[scene.end_sentence_id - 1].end
+    return max(0.0, end - start)
+
+
+def scene_for_sentence(sentence_id: int, scenes: list[VisualScene]) -> VisualScene | None:
+    """The scene whose sentence range contains this sentence id, if any.
+    Every still's group.start_sentence_id is looked up this way to assign
+    that still its scene_id — safe because scene ranges are a coarser,
+    non-overlapping partition of the same sentence sequence groups use."""
+    for scene in scenes:
+        if scene.start_sentence_id <= sentence_id <= scene.end_sentence_id:
+            return scene
+    return None
 
 
 def rebuild_group(
@@ -1588,6 +1877,32 @@ def heuristic_fallback(
     return groups
 
 
+def paragraph_scenes(sentences: list[TimedSentence]) -> list[VisualScene]:
+    """
+    A cheap, AI-free scene partition used by the per-sentence pacing mode and
+    the AI-error fallback path, neither of which has Pass 1/2 data available
+    to derive a hard_boundary set from: one scene per paragraph, matching how
+    paragraph breaks are already treated elsewhere as a real structural
+    signal. Context fields (title, narrative_role, etc.) are left empty — the
+    UI shows a "no detailed scene analysis available" note for these instead
+    of an extra AI call these modes explicitly exist to avoid.
+    """
+    if not sentences:
+        return []
+
+    boundaries: set[int] = set()
+    for previous, current in zip(sentences, sentences[1:]):
+        if current.paragraph_id != previous.paragraph_id:
+            boundaries.add(previous.sentence_id)
+
+    return [
+        VisualScene(scene_id=index, start_sentence_id=start_id, end_sentence_id=end_id)
+        for index, (start_id, end_id) in enumerate(
+            build_ranges_from_boundaries(sentences, boundaries), start=1
+        )
+    ]
+
+
 def per_sentence_grouping(sentences: list[TimedSentence]) -> list[VisualGroup]:
     """One VisualGroup per sentence, no AI calls and no duration merging —
     the literal "every sentence becomes its own still" pacing mode. Modeled
@@ -1615,6 +1930,7 @@ def write_outputs(
     pass1_result,
     pass2_result,
     groups: list[VisualGroup],
+    scenes: list[VisualScene],
 ) -> None:
     try:
         import xlsxwriter
@@ -1807,6 +2123,8 @@ def write_outputs(
         "Hard Boundary",
         "Action",
         "Reasoning",
+        "Scene Boundary",
+        "Scene Boundary Reason",
     ]
     transition_sheet.write_row(0, 0, transition_headers, header)
 
@@ -1840,6 +2158,8 @@ def write_outputs(
             transition.hard_boundary,
             transition.final_action,
             transition.dynamic_reasoning,
+            transition.narrative_scene_boundary,
+            transition.narrative_scene_boundary_reason,
         ]
         for column, value in enumerate(values):
             transition_sheet.write(row_index, column, value, body)
@@ -1856,6 +2176,56 @@ def write_outputs(
     transition_sheet.set_column("P:R", 16)
     transition_sheet.set_column("S:Z", 14)
     transition_sheet.set_column("AA:AA", 70)
+    transition_sheet.set_column("AC:AC", 14)
+    transition_sheet.set_column("AD:AD", 45)
+
+    scene_sheet = workbook.add_worksheet("Scenes")
+    scene_headers = [
+        "Scene",
+        "Start Timestamp",
+        "End Timestamp",
+        "Duration(s)",
+        "Sentence IDs",
+        "Title",
+        "Narrative Role",
+        "Core Idea",
+        "Emotional State",
+        "Visual Opportunities",
+    ]
+    scene_sheet.write_row(0, 0, scene_headers, header)
+
+    for row_index, scene in enumerate(scenes, start=1):
+        start = sentences[scene.start_sentence_id - 1].start
+        end = sentences[scene.end_sentence_id - 1].end
+        values = [
+            scene.scene_id,
+            format_timestamp(start),
+            format_timestamp(end),
+            end - start,
+            f"{scene.start_sentence_id}-{scene.end_sentence_id}",
+            scene.title,
+            scene.narrative_role,
+            scene.core_idea,
+            scene.emotional_state,
+            ", ".join(scene.visual_opportunities),
+        ]
+        for column, value in enumerate(values):
+            scene_sheet.write(
+                row_index,
+                column,
+                value,
+                decimal if column == 3 else body,
+            )
+
+    scene_sheet.freeze_panes(1, 0)
+    scene_sheet.autofilter(0, 0, len(scenes), len(scene_headers) - 1)
+    scene_sheet.set_column("A:A", 8)
+    scene_sheet.set_column("B:C", 16)
+    scene_sheet.set_column("D:D", 12)
+    scene_sheet.set_column("E:E", 14)
+    scene_sheet.set_column("F:F", 30)
+    scene_sheet.set_column("G:G", 16)
+    scene_sheet.set_column("H:J", 45)
 
     workbook.close()
 
@@ -1883,8 +2253,26 @@ def write_outputs(
                     sentences[group.end_sentence_id - 1].end
                 ),
                 "duration": group_duration(group, sentences),
+                "scene_id": (
+                    scene_for_sentence(group.start_sentence_id, scenes).scene_id
+                    if scene_for_sentence(group.start_sentence_id, scenes)
+                    else None
+                ),
             }
             for group in groups
+        ],
+        "scenes": [
+            {
+                **asdict(scene),
+                "start_timestamp": format_timestamp(
+                    sentences[scene.start_sentence_id - 1].start
+                ),
+                "end_timestamp": format_timestamp(
+                    sentences[scene.end_sentence_id - 1].end
+                ),
+                "duration": scene_duration(scene, sentences),
+            }
+            for scene in scenes
         ],
     }
     output_json.write_text(
@@ -2063,10 +2451,11 @@ def run(args: argparse.Namespace) -> None:
         pass2_result = FallbackPass2()
         groups = per_sentence_grouping(sentences)
         validate_groups(groups, sentences)
+        scenes = paragraph_scenes(sentences)
 
     else:
         try:
-            report_progress(58, "Analyzing visual meaning", "AI pass 1 of 2")
+            report_progress(58, "Analyzing visual meaning", "AI pass 1 of 3")
             print("\nAI Pass 1: extracting sentence visual metadata", flush=True)
             pass1_result = analyze_sentences_pass1(
                 sentences=sentences,
@@ -2074,14 +2463,12 @@ def run(args: argparse.Namespace) -> None:
                 cache_path=output_dir / "visual-plan-pass1-cache.json",
             )
 
-            report_progress(68, "Scoring scene boundaries", "AI pass 2 of 2")
+            report_progress(68, "Scoring scene boundaries", "AI pass 2 of 3")
             print("AI Pass 2: scoring scene boundaries and proposing groups", flush=True)
             pass2_result = _batch_score_boundaries_pass2(
                 sentences=sentences,
                 pass1_result=pass1_result,
                 ai_model=args.ai_model,
-                min_duration=args.min_duration,
-                max_duration=args.max_duration,
             )
 
             groups = normalize_groups(
@@ -2101,6 +2488,16 @@ def run(args: argparse.Namespace) -> None:
                 max_duration=args.max_duration,
             )
             validate_groups(groups, sentences)
+
+            report_progress(92, "Summarizing scenes", "AI pass 3 of 3")
+            print("AI Pass 3: summarizing scene context", flush=True)
+            scenes = normalize_scenes(sentences=sentences, pass2_result=pass2_result)
+            scenes = analyze_scene_context(
+                sentences=sentences,
+                pass1_result=pass1_result,
+                scenes=scenes,
+                ai_model=args.ai_model,
+            )
 
         except Exception as exc:
             if not args.fallback_on_ai_error:
@@ -2157,11 +2554,12 @@ def run(args: argparse.Namespace) -> None:
                 max_duration=args.max_duration,
             )
             validate_groups(groups, sentences)
+            scenes = paragraph_scenes(sentences)
 
     if args.preview:
         preview_groups(groups, sentences)
 
-    report_progress(94, "Saving visual plan", f"{len(groups)} visual scenes")
+    report_progress(94, "Saving visual plan", f"{len(groups)} stills across {len(scenes)} scenes")
     write_outputs(
         output_xlsx=output_xlsx,
         output_json=output_json,
@@ -2169,11 +2567,12 @@ def run(args: argparse.Namespace) -> None:
         pass1_result=pass1_result,
         pass2_result=pass2_result,
         groups=groups,
+        scenes=scenes,
     )
 
     print(f"\nExcel plan: {output_xlsx}", flush=True)
     print(f"JSON audit: {output_json}", flush=True)
-    report_progress(100, "Visual plan ready", f"{len(groups)} scenes created")
+    report_progress(100, "Visual plan ready", f"{len(groups)} stills across {len(scenes)} scenes")
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -33,10 +33,10 @@ Provider order: a locally logged-in Claude Code CLI is tried FIRST (see
 subscription instead of a metered API key, so this is the only one of the
 three providers with no per-call cost. OpenAI is the fallback if the CLI
 isn't installed/logged in or its call fails, and Gemini is the last resort
-after that. The same order is used for the validator pass. This provider
-order is specific to this engine (motion graphics) — scene_grouping_engine.py
-and other AI passes in this app are unaffected and still go straight to
-OpenAI-then-Gemini.
+after that. The same order is used for the validator pass. scene_grouping_
+engine.py's text-only passes use the same Claude-CLI-first, OpenAI-fallback
+order (see `ai_client.parse_structured_with_fallback`), just without a Gemini
+rung — there's no text-only Gemini structured-output helper yet.
 
 Install:
 

@@ -2,9 +2,10 @@ mod projects;
 
 use base64::Engine;
 use projects::{
-    AnimationJob, CaptionSet, Channel, ExportJob, ExportResult, ExportSettings, ImageJob,
-    ImageRender, ImageWorkspace, InputAsset, MediaLibraryAsset, ProjectRepository, ProviderKeyStatus,
-    PromptVersion, ResumeState, Timeline, Video, VideoAsset, VideoInputs, VideoProgress, VisualPlan,
+    AnimationJob, BulkSceneSettings, CaptionSet, Channel, ExportJob, ExportResult, ExportSettings,
+    ImageJob, ImageRender, ImageWorkspace, InputAsset, MediaLibraryAsset, ProjectRepository,
+    ProviderKeyStatus, PromptVersion, ResumeState, Timeline, Video, VideoAsset, VideoInputs,
+    VideoProgress, VisualPlan,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -529,6 +530,7 @@ async fn plan_bulk_visuals_batch(
     base_settings_json: String,
     creative_instruction: String,
     character_consistency: bool,
+    selected_group_ids: Vec<String>,
     start_index: usize,
 ) -> Result<projects::BulkPlanBatchResult, String> {
     let (database_path, projects_dir) =
@@ -541,6 +543,7 @@ async fn plan_bulk_visuals_batch(
             &base_settings_json,
             &creative_instruction,
             character_consistency,
+            &selected_group_ids,
             start_index,
         )
     })
@@ -1682,13 +1685,22 @@ fn spawn_job_workers(
 fn create_image_job(
     state: State<'_, RepositoryState>,
     video_id: String,
+    group_ids: Vec<String>,
 ) -> Result<ImageJob, String> {
     let (job, paths) = with_repository(state, |repository| {
-        let job = repository.create_image_job(&video_id)?;
+        let job = repository.create_image_job(&video_id, &group_ids)?;
         Ok((job, repository.paths()))
     })?;
     spawn_job_workers(paths.0, paths.1, job.id.clone());
     Ok(job)
+}
+
+#[tauri::command]
+fn pending_still_ids(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Vec<String>, String> {
+    with_repository(state, |repository| repository.pending_still_ids(&video_id))
 }
 
 #[tauri::command]
@@ -2519,6 +2531,44 @@ fn reset_visual_plan(
 }
 
 #[tauri::command]
+fn set_plan_scene_expanded(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    scene_id: String,
+    expanded: bool,
+) -> Result<VisualPlan, String> {
+    with_repository(state, |repository| {
+        repository.set_plan_scene_expanded(&video_id, &scene_id, expanded)
+    })
+}
+
+#[tauri::command]
+fn get_bulk_scene_settings(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Vec<BulkSceneSettings>, String> {
+    with_repository(state, |repository| repository.get_bulk_scene_settings(&video_id))
+}
+
+#[tauri::command]
+fn save_bulk_scene_settings(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    scene_id: String,
+    style_directive: Option<String>,
+    creative_instruction: Option<String>,
+    character_consistency: Option<bool>,
+    reference_asset_id: Option<String>,
+) -> Result<BulkSceneSettings, String> {
+    with_repository(state, |repository| {
+        repository.save_bulk_scene_settings(
+            &video_id, &scene_id, style_directive, creative_instruction,
+            character_consistency, reference_asset_id,
+        )
+    })
+}
+
+#[tauri::command]
 fn update_plan_sentence_text(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -2763,6 +2813,9 @@ pub fn run() {
             move_plan_sentence,
             create_plan_group,
             reset_visual_plan,
+            set_plan_scene_expanded,
+            get_bulk_scene_settings,
+            save_bulk_scene_settings,
             update_plan_sentence_text,
             split_plan_sentence,
             merge_plan_sentences,
@@ -2775,6 +2828,7 @@ pub fn run() {
             generate_image_render,
             get_image_workspace,
             create_image_job,
+            pending_still_ids,
             get_latest_image_job,
             control_image_job,
             create_animation_job,

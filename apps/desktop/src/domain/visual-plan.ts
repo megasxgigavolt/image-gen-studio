@@ -36,6 +36,41 @@ export function deriveGroupTiming(
   };
 }
 
+/** One scene strip's worth of stills, in the flat `.plan-list` order the
+ * Visual Plan view renders — a section's `scene` is null for stills with no
+ * matching scene (plans generated before scenes existed, or a still whose
+ * sceneId doesn't resolve), which the view renders with no strip at all
+ * rather than treating as an error. Consecutive same-scene (or consecutive
+ * null-scene) groups collapse into one section, not one per group, so a
+ * scene's strip only ever renders once before its first still. */
+export type SceneSection<
+  TGroup extends { sceneId?: string | null },
+  TScene extends { id: string },
+> = {
+  scene: TScene | null;
+  groups: TGroup[];
+};
+
+export function sectionGroupsByScene<
+  TGroup extends { sceneId?: string | null },
+  TScene extends { id: string },
+>(groups: TGroup[], scenes: TScene[]): SceneSection<TGroup, TScene>[] {
+  const scenesById = new Map(scenes.map((scene) => [scene.id, scene]));
+  const sections: SceneSection<TGroup, TScene>[] = [];
+
+  for (const group of groups) {
+    const scene = (group.sceneId && scenesById.get(group.sceneId)) || null;
+    const current = sections.at(-1);
+    if (current && current.scene?.id === scene?.id) {
+      current.groups.push(group);
+    } else {
+      sections.push({ scene, groups: [group] });
+    }
+  }
+
+  return sections;
+}
+
 export function canMoveSentenceChronologically(
   sentenceId: string,
   targetGroupId: string,

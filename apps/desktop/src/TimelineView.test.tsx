@@ -10,6 +10,7 @@ const EMPTY_WORKSPACE: ImageWorkspaceRecord = {
   sentences: [],
   groups: [],
   settings: [],
+  scenes: [],
 };
 
 const EMPTY_INPUTS: VideoInputsRecord = {

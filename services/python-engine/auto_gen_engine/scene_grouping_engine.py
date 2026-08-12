@@ -784,6 +784,7 @@ def score_boundaries_pass2(
     sentences: list[TimedSentence],
     pass1_result,
     ai_model: str,
+    script_understanding: str = "",
 ):
     try:
         from pydantic import BaseModel, Field
@@ -1049,6 +1050,27 @@ and not only a single scene for the whole video. Set
 narrative_scene_boundary_reason to a short phrase, such as "new countdown
 item," "same topic continues," or "location moves from office to street."
 
+WHOLE-SCRIPT CONTEXT (if provided below): a transition can look like a
+plausible local break — a new sentence, a slightly different sentence,
+even a mild subject/environment shift — while still being part of the same
+scene once you know what the whole video is actually about and how it's
+built. Use the whole-script understanding to judge each candidate boundary
+against the story's real shape, not just its two neighboring sentences:
+- If the whole-script understanding describes the video as one sustained
+  argument or a single continuous demonstration, be more conservative —
+  local shifts that don't actually advance to a new idea, item, or step in
+  that structure are NOT a narrative_scene_boundary even if they'd look
+  like one in isolation.
+- If the whole-script understanding describes a structure with distinct
+  parts (a countdown, numbered reasons, chapters, a clear turning point),
+  use that structure to confirm or correct what the local signals suggest
+  — a transition the whole-script understanding identifies as the start of
+  a new part IS a narrative_scene_boundary even if the local signals alone
+  are only moderate.
+This is a check against the whole story's shape, not a replacement for the
+criteria above — narrative_scene_boundary must still satisfy at least one
+of them.
+
 NARRATIVE COMPRESSION
 
 Count visual ideas, not sentences. Several sentences describing the same
@@ -1086,6 +1108,8 @@ OUTPUT REQUIREMENTS
             for index, sentence in enumerate(sentences)
         ],
     }
+    if script_understanding.strip():
+        payload["whole_script_understanding"] = script_understanding.strip()
 
     result = parse_structured_with_fallback(
         system_prompt=system_prompt,
@@ -1132,6 +1156,7 @@ def _batch_score_boundaries_pass2(
     sentences: list[TimedSentence],
     pass1_result,
     ai_model: str,
+    script_understanding: str = "",
 ) -> _BatchedPass2Result:
     """
     Splits sentences into overlapping chunks and runs Pass 2 on each, then
@@ -1139,12 +1164,19 @@ def _batch_score_boundaries_pass2(
     PASS2_CONTEXT preceding sentences for context, and covers PASS2_BATCH_SIZE
     core sentences. The boundary transition at the end of each core is captured
     by including one extra sentence in the chunk.
+
+    `script_understanding`, when non-empty, is the SAME fixed whole-script
+    summary passed to every chunk regardless of batch — it's the one piece
+    of context here that ISN'T local, specifically so a locally-plausible
+    scene boundary can still be judged against the story's actual shape
+    rather than only against its own nearby sentences.
     """
     if len(sentences) <= PASS2_BATCH_SIZE + PASS2_CONTEXT + 1:
         return score_boundaries_pass2(
             sentences=sentences,
             pass1_result=pass1_result,
             ai_model=ai_model,
+            script_understanding=script_understanding,
         )
 
     all_transitions: list = []
@@ -1170,6 +1202,7 @@ def _batch_score_boundaries_pass2(
             sentences=chunk_sentences,
             pass1_result=chunk_pass1,
             ai_model=ai_model,
+            script_understanding=script_understanding,
         )
         return batch_num, batch_start, batch_end, chunk_result
 
@@ -1363,13 +1396,17 @@ def analyze_scene_context(
     pass1_result,
     scenes: list[VisualScene],
     ai_model: str,
+    script_understanding: str = "",
 ) -> list[VisualScene]:
     """
     Pass 3: boundaries are already decided (normalize_scenes) — this only
     summarizes what each scene is about, for a storyboard artist who will
     illustrate it as several still images. Uses each scene's member
     sentences and their Pass 1 analyses as evidence, the same evidence
-    Pass 2 already sees.
+    Pass 2 already sees. `script_understanding`, when non-empty, is the
+    same fixed whole-script summary passed to Pass 2 — added here so a
+    scene's own summary is framed as its role WITHIN the whole video (e.g.
+    "this is where the argument pivots"), not written in isolation.
     """
     if not scenes:
         return []
@@ -1426,6 +1463,12 @@ be illustrated with across its stills. These are options for a downstream
 visual director, not a shot list - do not number them or tie them to
 specific sentences.
 
+If a whole-script understanding is provided below, use it to frame this
+scene's role WITHIN the whole video, not just what its own sentences say in
+isolation - core_idea and emotional_state especially should reflect how
+this scene functions in the video's overall argument or arc, not merely
+restate its own content.
+
 Return exactly one analysis for every supplied scene ID.
 """
 
@@ -1440,6 +1483,7 @@ Return exactly one analysis for every supplied scene ID.
                 "total_scenes": len(scenes),
                 "batch_number": batch_number,
                 "batch_count": len(batches),
+                **({"whole_script_understanding": script_understanding.strip()} if script_understanding.strip() else {}),
             },
             "scenes": [
                 {
@@ -2379,6 +2423,18 @@ def run(args: argparse.Namespace) -> None:
     )
     output_json = output_xlsx.with_suffix(".json")
 
+    # Best-effort: this has no user-facing toggle of its own (it's produced
+    # by the Rust side once per video, see script_understanding_for_video),
+    # so a missing/unreadable file must never fail the whole run — it just
+    # means Pass 2/3 fall back to their existing local-context-only
+    # behavior, exactly as before this argument existed.
+    script_understanding = ""
+    if args.script_understanding:
+        try:
+            script_understanding = Path(args.script_understanding).expanduser().resolve().read_text(encoding="utf-8").strip()
+        except OSError:
+            script_understanding = ""
+
     script_sentences = read_script(script_path)
     print(f"Read {len(script_sentences)} script sentences", flush=True)
     report_progress(
@@ -2469,6 +2525,7 @@ def run(args: argparse.Namespace) -> None:
                 sentences=sentences,
                 pass1_result=pass1_result,
                 ai_model=args.ai_model,
+                script_understanding=script_understanding,
             )
 
             groups = normalize_groups(
@@ -2497,6 +2554,7 @@ def run(args: argparse.Namespace) -> None:
                 pass1_result=pass1_result,
                 scenes=scenes,
                 ai_model=args.ai_model,
+                script_understanding=script_understanding,
             )
 
         except Exception as exc:
@@ -2670,6 +2728,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--per-sentence",
         action="store_true",
         help="Skip AI grouping entirely; every sentence becomes its own still",
+    )
+    parser.add_argument(
+        "--script-understanding",
+        default=None,
+        metavar="FILE.txt",
+        help=(
+            "Optional path to a plain-text file containing a whole-script "
+            "understanding (what the video is about, its structure, tone, "
+            "and arc) computed once, up front, from the full script — "
+            "unlike this engine's own batched/parallel passes, which never "
+            "see the whole script at once. When given, this is fed into "
+            "Pass 2's scene-boundary decisions and Pass 3's scene "
+            "summaries as fixed background context."
+        ),
     )
     return parser
 

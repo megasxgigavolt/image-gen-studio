@@ -8985,6 +8985,25 @@ Return JSON only:
             let output_path = work_dir.join("visual-plan.xlsx");
             let (clean_script, _) = remove_tts_pause_markers(&inputs.script_text);
             fs::write(&script_path, clean_script).map_err(|e| e.to_string())?;
+            // Best-effort, computed once here so the Python engine's own
+            // scene-boundary and scene-summary passes can use the exact
+            // same whole-script understanding Bulk Generation's own
+            // planning prompt will later reuse from cache (see
+            // script_understanding_for_video) — one shared understanding
+            // grounding both, not two independently-computed ones. Never
+            // blocks visual plan generation: there's no user-facing toggle
+            // for this, so any failure (no AI credentials configured yet,
+            // a transient error) just means the engine falls back to its
+            // existing local-only boundary/summary behavior, unchanged
+            // from before this existed.
+            let gemini_auth = self.gemini_auth().ok();
+            let script_understanding_path = match self.script_understanding_for_video(video_id, &gemini_auth) {
+                Ok(understanding) if !understanding.trim().is_empty() => {
+                    let path = work_dir.join("script-understanding.txt");
+                    fs::write(&path, &understanding).ok().map(|_| path)
+                }
+                _ => None,
+            };
             let grouping_engine = engine_dir.join("auto_gen_engine/scene_grouping_engine.py");
             if !grouping_engine.exists() {
                 return Err(format!(
@@ -9013,7 +9032,11 @@ Return JSON only:
             command
                 .arg("--output")
                 .arg(&output_path)
-                .arg("--fallback-on-ai-error")
+                .arg("--fallback-on-ai-error");
+            if let Some(path) = &script_understanding_path {
+                command.arg("--script-understanding").arg(path);
+            }
+            command
                 .current_dir(&engine_dir)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());

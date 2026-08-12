@@ -66,6 +66,10 @@ import {
   type ImageRenderRecord,
   type PlanSceneRecord,
   type BulkSceneSettingsRecord,
+  type BulkGlobalVisualSettingsRecord,
+  type BulkVisualDialsRecord,
+  emptyBulkVisualDials,
+  emptyBulkGlobalVisualSettings,
 } from "./infrastructure/projects-client";
 import { TimelineView } from "./TimelineView";
 import { AnimateView } from "./AnimateView";
@@ -1584,6 +1588,7 @@ function SceneBulkRow({
   scene, groups, selection, aspectRatio, renderUrls,
   onToggleScene, onToggleStill, expanded, onToggleExpanded,
   override, overrideOpen, onToggleOverrideOpen, onSaveOverride, onImportReference,
+  onImportLocationReference, globalDials, globalMood,
 }: {
   scene: PlanSceneRecord | null;
   groups: (ImageWorkspaceGroupRecord & { sceneId: string | null })[];
@@ -1602,7 +1607,16 @@ function SceneBulkRow({
   onToggleOverrideOpen: () => void;
   onSaveOverride: (patch: Partial<Omit<BulkSceneSettingsRecord, "sceneId">>) => void;
   onImportReference: () => void;
+  onImportLocationReference: () => void;
+  // Resolved global dials/mood, purely for the "Inherit (X)" labels below —
+  // this scene's own overrides are read from `override.dials` as usual.
+  globalDials: BulkVisualDialsRecord;
+  globalMood: string | null;
 }) {
+  const dials = override?.dials ?? emptyBulkVisualDials();
+  function saveDial(patch: Partial<BulkVisualDialsRecord>) {
+    onSaveOverride({ dials: { ...dials, ...patch } });
+  }
   const groupIds = groups.map((group) => group.group.id);
   const state = sceneSelectionState(groupIds, selection);
   const selectedCount = groupIds.filter((id) => selection.has(id)).length;
@@ -1665,6 +1679,43 @@ function SceneBulkRow({
                 <button type="button" className="secondary" onClick={onImportReference}><Plus size={12} />Upload</button>
               )}
             </div>
+          </div>
+          <div className="bulk-scene-override-row">
+            <label>
+              <span>Location Consistency</span>
+              <select
+                value={override?.locationConsistency == null ? "inherit" : override.locationConsistency ? "on" : "off"}
+                onChange={(event) => onSaveOverride({ locationConsistency: event.target.value === "inherit" ? null : event.target.value === "on" })}
+              >
+                <option value="inherit">Inherit global</option>
+                <option value="on">On</option>
+                <option value="off">Off</option>
+              </select>
+            </label>
+            <div className="bulk-scene-reference">
+              <span>Location reference image</span>
+              {override?.locationReferenceAssetId ? (
+                <>
+                  <span className="bulk-scene-reference-set">Custom reference set</span>
+                  <button type="button" className="link-button" onClick={() => onSaveOverride({ locationReferenceAssetId: null })}>Remove</button>
+                </>
+              ) : (
+                <button type="button" className="secondary" onClick={onImportLocationReference}><Plus size={12} />Upload</button>
+              )}
+            </div>
+          </div>
+          <div className="dial-grid">
+            <SceneDialRow label="Visual Interpretation" hint="Literal ↔ Creative" value={dials.visualInterpretation} globalValue={globalDials.visualInterpretation} onChange={(value) => saveDial({ visualInterpretation: value })} />
+            <SceneDialRow label="Visual Metaphor" hint="Literal ↔ Symbolic" value={dials.visualMetaphor} globalValue={globalDials.visualMetaphor} onChange={(value) => saveDial({ visualMetaphor: value })} />
+            <SceneDialRow label="Cinematic Intensity" hint="Documentary ↔ Cinematic" value={dials.cinematicIntensity} globalValue={globalDials.cinematicIntensity} onChange={(value) => saveDial({ cinematicIntensity: value })} />
+            <SceneDialRow label="Prompt Creativity" hint="Strict script ↔ Highly creative" value={dials.promptCreativity} globalValue={globalDials.promptCreativity} onChange={(value) => saveDial({ promptCreativity: value })} />
+            <MoodRow level="scene" mood={dials.mood} moodMode={dials.moodMode} globalMood={globalMood} onChange={(mood, moodMode) => saveDial({ mood, moodMode })} />
+            <SceneDialRow label="Camera Angle Diversity" value={dials.diversityCamera} globalValue={globalDials.diversityCamera} onChange={(value) => saveDial({ diversityCamera: value })} />
+            <SceneDialRow label="Composition Diversity" value={dials.diversityComposition} globalValue={globalDials.diversityComposition} onChange={(value) => saveDial({ diversityComposition: value })} />
+            <SceneDialRow label="Shot Type Diversity" value={dials.diversityShotType} globalValue={globalDials.diversityShotType} onChange={(value) => saveDial({ diversityShotType: value })} />
+            <SceneDialRow label="Character Identity Strictness" value={dials.consistencyCharacter} globalValue={globalDials.consistencyCharacter} onChange={(value) => saveDial({ consistencyCharacter: value })} />
+            <SceneDialRow label="Location Identity Strictness" value={dials.consistencyLocation} globalValue={globalDials.consistencyLocation} onChange={(value) => saveDial({ consistencyLocation: value })} />
+            <SceneDialRow label="Style Strictness" value={dials.consistencyStyle} globalValue={globalDials.consistencyStyle} onChange={(value) => saveDial({ consistencyStyle: value })} />
           </div>
         </div>
       )}
@@ -1838,6 +1889,86 @@ function SettingSelect({ label, value, options, onChange }: { label: string; val
   );
 }
 
+const MOOD_DIAL_OPTIONS = ["Serene Peaceful", "Tense Anxious", "Dramatic Intense", "Warm and Cozy", "Cold Distant", "Mysterious", "Cheerful Upbeat", "Melancholic", "Hopeful", "Playful", "Triumphant"];
+
+/** One Visual Director / Diversity & Consistency dial at the GLOBAL level —
+ * always has a real value (defaults to 50 the first time it's touched);
+ * "Reset to AI" clears it back to null ("AI decides per still"). */
+function GlobalDialRow({ label, hint, value, onChange }: { label: string; hint?: string; value: number | null; onChange: (value: number | null) => void }) {
+  return (
+    <div className="dial-row">
+      <div className="dial-row-heading">
+        <span>{label}</span>
+        <button type="button" className="dial-mode-toggle" onClick={() => onChange(value === null ? 50 : null)}>
+          {value === null ? "AI decides" : "Reset to AI"}
+        </button>
+      </div>
+      <div className="dial-slider-row">
+        <input type="range" min={0} max={100} value={value ?? 50} onChange={(event) => onChange(Number(event.target.value))} aria-label={label} />
+        <span className="dial-value">{value ?? "AI"}</span>
+      </div>
+      {hint && <small className="dial-hint">{hint}</small>}
+    </div>
+  );
+}
+
+/** Same dial at the SCENE level — null means "inherit whatever the global
+ * value resolves to" (shown directly in the toggle label so the user always
+ * knows what they're inheriting); a value means this scene overrides it. */
+function SceneDialRow({ label, hint, value, onChange, globalValue }: { label: string; hint?: string; value: number | null; onChange: (value: number | null) => void; globalValue: number | null }) {
+  const overriding = value !== null;
+  return (
+    <div className="dial-row">
+      <div className="dial-row-heading">
+        <span>{label}</span>
+        <button type="button" className="dial-mode-toggle" onClick={() => onChange(overriding ? null : (globalValue ?? 50))}>
+          {overriding ? "Reset to inherit" : `Inherit (${globalValue == null ? "AI" : globalValue})`}
+        </button>
+      </div>
+      {overriding && (
+        <div className="dial-slider-row">
+          <input type="range" min={0} max={100} value={value} onChange={(event) => onChange(Number(event.target.value))} aria-label={label} />
+          <span className="dial-value">{value}</span>
+        </div>
+      )}
+      {hint && <small className="dial-hint">{hint}</small>}
+    </div>
+  );
+}
+
+/** Mood + its AI-hint/user-hold mode, at either level — `globalMood` (only
+ * passed at scene level) drives the "Inherit" label the same way
+ * SceneDialRow's globalValue does. */
+function MoodRow({ mood, moodMode, onChange, globalMood, level }: {
+  mood: string | null;
+  moodMode: string | null;
+  onChange: (mood: string | null, moodMode: string | null) => void;
+  globalMood?: string | null;
+  level: "global" | "scene";
+}) {
+  const inheriting = level === "scene" && mood === null;
+  return (
+    <div className="dial-row">
+      <div className="dial-row-heading"><span>Mood</span></div>
+      <div className="mood-row-controls">
+        <select
+          value={mood ?? ""}
+          onChange={(event) => onChange(event.target.value || null, event.target.value ? (moodMode ?? "ai") : null)}
+        >
+          <option value="">{level === "scene" ? `Inherit (${globalMood ?? "AI decides"})` : "AI decides per still"}</option>
+          {MOOD_DIAL_OPTIONS.map((option) => <option key={option} value={option}>{option}</option>)}
+        </select>
+        {!inheriting && mood && (
+          <select value={moodMode ?? "ai"} onChange={(event) => onChange(mood, event.target.value)}>
+            <option value="ai">Hint only — AI may still pick a different mood per still</option>
+            <option value="user">Hold to this mood unless narration clearly conflicts</option>
+          </select>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ImagesView() {
   const { activeVideoId, addToast, setStage } = useAppStore();
   const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
@@ -1891,6 +2022,7 @@ function ImagesView() {
   const [bulkGlobalOpen, setBulkGlobalOpen] = useState(false);
   const [bulkSelection, setBulkSelection] = useState<Set<string>>(new Set());
   const [bulkSceneSettings, setBulkSceneSettings] = useState<BulkSceneSettingsRecord[]>([]);
+  const [bulkGlobalVisualSettings, setBulkGlobalVisualSettings] = useState<BulkGlobalVisualSettingsRecord>(emptyBulkGlobalVisualSettings);
   const [bulkOverrideOpenSceneId, setBulkOverrideOpenSceneId] = useState<string | null>(null);
   // Deliberately NOT the shared visual_plan_scenes.expanded flag — the Bulk
   // Generation panel's collapse state is its own local, ephemeral thing,
@@ -2371,12 +2503,55 @@ function ImagesView() {
       stillSections.filter((section) => section.scene).map((section, index) => [section.scene!.id, index === 0]),
     ));
     try {
-      const [pending, sceneSettings] = await Promise.all([
+      const [pending, sceneSettings, globalVisual] = await Promise.all([
         projectsClient.pendingStillIds(activeVideoId),
         projectsClient.getBulkSceneSettings(activeVideoId),
+        projectsClient.getBulkGlobalSettings(activeVideoId),
       ]);
       setBulkSelection(new Set(pending));
       setBulkSceneSettings(sceneSettings);
+      setBulkGlobalVisualSettings(globalVisual);
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  async function saveGlobalVisualSettings(patch: Partial<BulkGlobalVisualSettingsRecord>) {
+    if (!activeVideoId) return;
+    const next: BulkGlobalVisualSettingsRecord = { ...bulkGlobalVisualSettings, ...patch };
+    setBulkGlobalVisualSettings(next);
+    try {
+      await projectsClient.saveBulkGlobalSettings(
+        activeVideoId, next.locationConsistency, next.locationReferenceAssetId, next.dials,
+      );
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  function updateGlobalDial(patch: Partial<BulkVisualDialsRecord>) {
+    void saveGlobalVisualSettings({ dials: { ...bulkGlobalVisualSettings.dials, ...patch } });
+  }
+
+  async function importGlobalLocationReference() {
+    if (!activeVideoId) return;
+    try {
+      const asset = await projectsClient.pickAndImportAsset(activeVideoId, "reference");
+      if (asset) await saveGlobalVisualSettings({ locationReferenceAssetId: asset.id });
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  // Mirrors importSceneReference above — a scene's location reference can
+  // coexist with the global one and every other scene's character/location
+  // reference; "Remove" only clears the override back to "inherit," it
+  // doesn't delete the uploaded file.
+  async function importSceneLocationReference(sceneId: string) {
+    if (!activeVideoId) return;
+    try {
+      const asset = await projectsClient.pickAndImportAsset(activeVideoId, "reference");
+      if (asset) await saveSceneOverride(sceneId, { locationReferenceAssetId: asset.id });
     } catch (caught) {
       setError(String(caught));
     }
@@ -2409,12 +2584,16 @@ function ImagesView() {
       creativeInstruction: current?.creativeInstruction ?? null,
       characterConsistency: current?.characterConsistency ?? null,
       referenceAssetId: current?.referenceAssetId ?? null,
+      locationConsistency: current?.locationConsistency ?? null,
+      locationReferenceAssetId: current?.locationReferenceAssetId ?? null,
+      dials: current?.dials ?? emptyBulkVisualDials(),
       ...patch,
     };
     setBulkSceneSettings((items) => [...items.filter((item) => item.sceneId !== sceneId), next]);
     try {
       await projectsClient.saveBulkSceneSettings(
         activeVideoId, sceneId, next.styleDirective, next.creativeInstruction, next.characterConsistency, next.referenceAssetId,
+        next.locationConsistency, next.locationReferenceAssetId, next.dials,
       );
     } catch (caught) {
       setError(String(caught));
@@ -2946,6 +3125,9 @@ function ImagesView() {
                   onToggleOverrideOpen={() => setBulkOverrideOpenSceneId((current) => (scene && current !== scene.id ? scene.id : null))}
                   onSaveOverride={(patch) => scene && void saveSceneOverride(scene.id, patch)}
                   onImportReference={() => scene && void importSceneReference(scene.id)}
+                  onImportLocationReference={() => scene && void importSceneLocationReference(scene.id)}
+                  globalDials={bulkGlobalVisualSettings.dials}
+                  globalMood={bulkGlobalVisualSettings.dials.mood}
                 />
               );
             })}
@@ -2990,6 +3172,49 @@ function ImagesView() {
           {characterConsistency && !references.length && (
             <p style={{fontSize:"11px",color:"var(--muted)",margin:"2px 0 0"}}>Upload a reference image above — Character Consistency needs one to work from.</p>
           )}
+          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Location Consistency</h3><small>Optional</small></div>
+          <label className="toggle-setting" style={{padding:"6px 0"}}>
+            <span>
+              Keep one location consistent across all stills
+              <small>AI derives a setting from a reference image and weaves it into every applicable still's prompt — independent of the Character reference above.</small>
+            </span>
+            <input
+              type="checkbox"
+              checked={bulkGlobalVisualSettings.locationConsistency ?? false}
+              onChange={(event) => void saveGlobalVisualSettings({ locationConsistency: event.target.checked })}
+            />
+          </label>
+          <div className="bulk-scene-reference" style={{marginTop:"6px"}}>
+            <span>Location reference image</span>
+            {bulkGlobalVisualSettings.locationReferenceAssetId ? (
+              <>
+                <span className="bulk-scene-reference-set">Custom reference set</span>
+                <button type="button" className="link-button" onClick={() => void saveGlobalVisualSettings({ locationReferenceAssetId: null })}>Remove</button>
+              </>
+            ) : (
+              <button type="button" className="secondary" onClick={() => void importGlobalLocationReference()}><Plus size={12} />Upload</button>
+            )}
+          </div>
+          {bulkGlobalVisualSettings.locationConsistency && !bulkGlobalVisualSettings.locationReferenceAssetId && (
+            <p style={{fontSize:"11px",color:"var(--muted)",margin:"2px 0 0"}}>Upload a reference image above — Location Consistency needs one to work from.</p>
+          )}
+          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Visual Direction</h3><small>Optional — leave any dial on "AI decides" to skip it</small></div>
+          <div className="dial-grid">
+            <GlobalDialRow label="Visual Interpretation" hint="Literal ↔ Creative" value={bulkGlobalVisualSettings.dials.visualInterpretation} onChange={(value) => updateGlobalDial({ visualInterpretation: value })} />
+            <GlobalDialRow label="Visual Metaphor" hint="Literal ↔ Symbolic" value={bulkGlobalVisualSettings.dials.visualMetaphor} onChange={(value) => updateGlobalDial({ visualMetaphor: value })} />
+            <GlobalDialRow label="Cinematic Intensity" hint="Documentary ↔ Cinematic" value={bulkGlobalVisualSettings.dials.cinematicIntensity} onChange={(value) => updateGlobalDial({ cinematicIntensity: value })} />
+            <GlobalDialRow label="Prompt Creativity" hint="Strict script ↔ Highly creative" value={bulkGlobalVisualSettings.dials.promptCreativity} onChange={(value) => updateGlobalDial({ promptCreativity: value })} />
+            <MoodRow level="global" mood={bulkGlobalVisualSettings.dials.mood} moodMode={bulkGlobalVisualSettings.dials.moodMode} onChange={(mood, moodMode) => updateGlobalDial({ mood, moodMode })} />
+          </div>
+          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Diversity &amp; Consistency</h3><small>Optional</small></div>
+          <div className="dial-grid">
+            <GlobalDialRow label="Camera Angle Diversity" value={bulkGlobalVisualSettings.dials.diversityCamera} onChange={(value) => updateGlobalDial({ diversityCamera: value })} />
+            <GlobalDialRow label="Composition Diversity" value={bulkGlobalVisualSettings.dials.diversityComposition} onChange={(value) => updateGlobalDial({ diversityComposition: value })} />
+            <GlobalDialRow label="Shot Type Diversity" value={bulkGlobalVisualSettings.dials.diversityShotType} onChange={(value) => updateGlobalDial({ diversityShotType: value })} />
+            <GlobalDialRow label="Character Identity Strictness" value={bulkGlobalVisualSettings.dials.consistencyCharacter} onChange={(value) => updateGlobalDial({ consistencyCharacter: value })} />
+            <GlobalDialRow label="Location Identity Strictness" value={bulkGlobalVisualSettings.dials.consistencyLocation} onChange={(value) => updateGlobalDial({ consistencyLocation: value })} />
+            <GlobalDialRow label="Style Strictness" value={bulkGlobalVisualSettings.dials.consistencyStyle} onChange={(value) => updateGlobalDial({ consistencyStyle: value })} />
+          </div>
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still (unless a scene overrides them below in the main panel). Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
           <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cat as the main character. Show visible emotions and varied body language. Avoid showing text, labels, or close-ups on faces." rows={4} />

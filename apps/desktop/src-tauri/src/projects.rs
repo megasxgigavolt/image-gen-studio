@@ -778,6 +778,33 @@ CREATE TABLE IF NOT EXISTS bulk_scene_settings (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_scene_settings_scene ON bulk_scene_settings(video_id, scene_id);
 "#;
 
+/// Adds Location Consistency (mirrors the existing Character Consistency
+/// columns exactly — a toggle plus a reference asset id, kept as real
+/// columns rather than folded into `dials_json` below specifically so
+/// `location_reference_asset_id` participates in the same id-remap system
+/// `reference_asset_id` already does on project bundle import) and
+/// `dials_json` — a single JSON blob holding the newer Visual Director /
+/// Diversity & Consistency dials (visual interpretation, visual metaphor,
+/// cinematic intensity, prompt creativity, mood + mood mode, and the
+/// per-dimension diversity/consistency sliders). Blobbed rather than given
+/// one column each because none of them are cross-row references (unlike
+/// the reference-asset ids) and the set is expected to keep growing —
+/// see `BulkVisualDials`. `bulk_global_settings` is the video-wide
+/// counterpart to `bulk_scene_settings`, structured identically, so the
+/// same resolver code can layer one on top of the other.
+const MIGRATION_039: &str = r#"
+ALTER TABLE bulk_scene_settings ADD COLUMN location_consistency INTEGER;
+ALTER TABLE bulk_scene_settings ADD COLUMN location_reference_asset_id TEXT;
+ALTER TABLE bulk_scene_settings ADD COLUMN dials_json TEXT;
+CREATE TABLE IF NOT EXISTS bulk_global_settings (
+    video_id TEXT PRIMARY KEY REFERENCES videos(id),
+    location_consistency INTEGER,
+    location_reference_asset_id TEXT,
+    dials_json TEXT,
+    updated_at TEXT NOT NULL
+);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -1066,6 +1093,7 @@ const PROJECT_TABLES: &[&str] = &[
     "visual_plan_groups",
     "visual_plan_meta",
     "bulk_scene_settings",
+    "bulk_global_settings",
     "prompt_versions",
     "image_renders",
     "media_library_assets",
@@ -1090,7 +1118,7 @@ const ATOMIC_ID_COLUMNS: &[&str] = &[
     "id", "video_id", "group_id", "render_id", "prompt_version_id", "parent_render_id",
     "source_render_id", "video_asset_id", "parent_video_asset_id", "media_library_asset_id",
     "still_id", "visual_plan_row_id", "audio_asset_id", "generation_audio_id", "clip_id",
-    "scene_id", "reference_asset_id",
+    "scene_id", "reference_asset_id", "location_reference_asset_id",
 ];
 
 /// `visual_plan_sentences.id` and `visual_plan_groups.id` are the only
@@ -1511,6 +1539,62 @@ pub struct PlanScene {
     pub expanded: bool,
 }
 
+/// The Visual Director / Diversity & Consistency Controller dials, layered
+/// the same way every other Bulk Generation setting is: `None` means
+/// "inherit," a concrete value means "this level overrides it." Every
+/// slider is 0-100 unless noted. Deliberately grouped into one JSON blob
+/// (see `MIGRATION_039`) rather than one column each — none of these are
+/// cross-row references, and resolving them is always all-or-nothing per
+/// level (global, then scene), so a blob keeps `resolve_effective_bulk_settings`
+/// simple: read the scene's blob, fall back field-by-field to the global
+/// blob, done.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkVisualDials {
+    /// Literal (0) <-> Creative (100): how directly the AI should translate
+    /// the sentence into an image vs. reach for a more conceptual take.
+    pub visual_interpretation: Option<i64>,
+    /// Literal (0) <-> Symbolic (100): how often/aggressively the AI should
+    /// reach for a visual metaphor instead of a direct depiction.
+    pub visual_metaphor: Option<i64>,
+    /// Documentary (0) <-> Cinematic (100): overall photographic/production
+    /// intensity of the imagery.
+    pub cinematic_intensity: Option<i64>,
+    /// Strict script interpretation (0) <-> Highly creative (100): how much
+    /// the prompt-writing step itself is allowed to elaborate beyond the
+    /// literal narration when describing the scene.
+    pub prompt_creativity: Option<i64>,
+    /// A specific mood word to bias toward, or `None` to let the AI decide
+    /// per still (only meaningful when `mood_mode` is `"user"`).
+    pub mood: Option<String>,
+    /// `"ai"` (default) or `"user"` — whether `mood` above is a hint the AI
+    /// can override per still, or a fixed target it should stay close to.
+    pub mood_mode: Option<String>,
+    /// Consistent (0) <-> Dynamic (100): how aggressively camera angle
+    /// should vary between stills, independent of the other diversity dials.
+    pub diversity_camera: Option<i64>,
+    /// Same idea, for composition (framing, subject placement, layout).
+    pub diversity_composition: Option<i64>,
+    /// Same idea, for shot type / visualType (wide, close-up, diagram...).
+    pub diversity_shot_type: Option<i64>,
+    /// Flexible (0) <-> Consistent (100): how strictly a recurring
+    /// character's identity must be held to versus loosely reinterpreted.
+    pub consistency_character: Option<i64>,
+    /// Same idea, for a recurring location.
+    pub consistency_location: Option<i64>,
+    /// Same idea, for how strictly the style directive should be followed
+    /// versus treated as loose inspiration.
+    pub consistency_style: Option<i64>,
+}
+
+impl BulkVisualDials {
+    /// True if every field is `None` — used to decide whether a scene's
+    /// dials blob is worth writing at all vs. just leaving the column null.
+    fn is_empty(&self) -> bool {
+        self == &BulkVisualDials::default()
+    }
+}
+
 /// Per-scene overrides for Bulk Generation, layered on top of the video's
 /// global bulk settings. Every field is nullable — `None` means "inherit
 /// the global value" for that one field; a scene with no row at all (see
@@ -1526,6 +1610,23 @@ pub struct BulkSceneSettings {
     pub creative_instruction: Option<String>,
     pub character_consistency: Option<bool>,
     pub reference_asset_id: Option<String>,
+    pub location_consistency: Option<bool>,
+    pub location_reference_asset_id: Option<String>,
+    #[serde(default)]
+    pub dials: BulkVisualDials,
+}
+
+/// The video-wide counterpart to `BulkSceneSettings` — structured
+/// identically (minus `scene_id`) so the exact same dials/consistency
+/// concepts resolve the same way at both levels; a scene layers its own
+/// version of this same shape on top.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkGlobalVisualSettings {
+    pub location_consistency: Option<bool>,
+    pub location_reference_asset_id: Option<String>,
+    #[serde(default)]
+    pub dials: BulkVisualDials,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2106,6 +2207,21 @@ impl ProjectRepository {
         self.connection.execute_batch(MIGRATION_038).map_err(|error| error.to_string())?;
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(38, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_location_consistency: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bulk_scene_settings') WHERE name='location_consistency')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_location_consistency {
+            self.connection.execute_batch(MIGRATION_039).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(39, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -3413,16 +3529,21 @@ Return exactly one plan for every supplied row, in the same order."#,
     /// present in this list, rather than a row of all-nulls.
     pub fn get_bulk_scene_settings(&self, video_id: &str) -> Result<Vec<BulkSceneSettings>, String> {
         let mut statement = self.connection.prepare(
-            "SELECT scene_id, style_directive, creative_instruction, character_consistency, reference_asset_id
+            "SELECT scene_id, style_directive, creative_instruction, character_consistency, reference_asset_id,
+                    location_consistency, location_reference_asset_id, dials_json
              FROM bulk_scene_settings WHERE video_id=?1 ORDER BY scene_id",
         ).map_err(|e| e.to_string())?;
         let rows = statement.query_map([video_id], |row| {
+            let dials_json: Option<String> = row.get(7)?;
             Ok(BulkSceneSettings {
                 scene_id: row.get(0)?,
                 style_directive: row.get(1)?,
                 creative_instruction: row.get(2)?,
                 character_consistency: row.get::<_, Option<i64>>(3)?.map(|v| v != 0),
                 reference_asset_id: row.get(4)?,
+                location_consistency: row.get::<_, Option<i64>>(5)?.map(|v| v != 0),
+                location_reference_asset_id: row.get(6)?,
+                dials: dials_json.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default(),
             })
         }).map_err(|e| e.to_string())?;
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
@@ -3430,9 +3551,9 @@ Return exactly one plan for every supplied row, in the same order."#,
 
     /// Upserts one scene's full override state — the caller (the Bulk
     /// Generation panel) always holds the complete current override record
-    /// in memory and re-sends every field, so this always writes all four
-    /// columns rather than patching individual ones. A scene whose fields
-    /// are all `None` still leaves a row behind (harmless — reads back
+    /// in memory and re-sends every field, so this always writes every
+    /// column rather than patching individual ones. A scene whose fields
+    /// are all `None`/empty still leaves a row behind (harmless — reads back
     /// identically to "no overrides"); the panel doesn't bother deleting it.
     pub fn save_bulk_scene_settings(
         &self,
@@ -3442,24 +3563,86 @@ Return exactly one plan for every supplied row, in the same order."#,
         creative_instruction: Option<String>,
         character_consistency: Option<bool>,
         reference_asset_id: Option<String>,
+        location_consistency: Option<bool>,
+        location_reference_asset_id: Option<String>,
+        dials: BulkVisualDials,
     ) -> Result<BulkSceneSettings, String> {
+        let dials_json = if dials.is_empty() { None } else { Some(serde_json::to_string(&dials).map_err(|e| e.to_string())?) };
         self.connection.execute(
-            "INSERT INTO bulk_scene_settings(id,video_id,scene_id,style_directive,creative_instruction,character_consistency,reference_asset_id,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+            "INSERT INTO bulk_scene_settings(id,video_id,scene_id,style_directive,creative_instruction,character_consistency,reference_asset_id,location_consistency,location_reference_asset_id,dials_json,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(video_id,scene_id) DO UPDATE SET
                 style_directive=excluded.style_directive,
                 creative_instruction=excluded.creative_instruction,
                 character_consistency=excluded.character_consistency,
                 reference_asset_id=excluded.reference_asset_id,
+                location_consistency=excluded.location_consistency,
+                location_reference_asset_id=excluded.location_reference_asset_id,
+                dials_json=excluded.dials_json,
                 updated_at=excluded.updated_at",
             params![
                 Uuid::new_v4().to_string(), video_id, scene_id,
                 style_directive, creative_instruction,
                 character_consistency.map(|v| v as i64), reference_asset_id,
+                location_consistency.map(|v| v as i64), location_reference_asset_id,
+                dials_json,
                 Utc::now().to_rfc3339(),
             ],
         ).map_err(|e| e.to_string())?;
-        Ok(BulkSceneSettings { scene_id: scene_id.to_string(), style_directive, creative_instruction, character_consistency, reference_asset_id })
+        Ok(BulkSceneSettings {
+            scene_id: scene_id.to_string(), style_directive, creative_instruction, character_consistency, reference_asset_id,
+            location_consistency, location_reference_asset_id, dials,
+        })
+    }
+
+    /// Video-wide defaults for the Visual Director / Diversity & Consistency
+    /// dials plus Location Consistency — the `bulk_global_settings`
+    /// counterpart to `get_bulk_scene_settings`. Returns the empty/default
+    /// shape for a video that has never saved anything here, exactly like
+    /// the existing global style directive / creative instruction (kept in
+    /// `app_settings`) already behave when unset.
+    pub fn get_bulk_global_settings(&self, video_id: &str) -> Result<BulkGlobalVisualSettings, String> {
+        let row: Option<(Option<i64>, Option<String>, Option<String>)> = self.connection.query_row(
+            "SELECT location_consistency, location_reference_asset_id, dials_json FROM bulk_global_settings WHERE video_id=?1",
+            [video_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((location_consistency, location_reference_asset_id, dials_json)) = row else {
+            return Ok(BulkGlobalVisualSettings::default());
+        };
+        Ok(BulkGlobalVisualSettings {
+            location_consistency: location_consistency.map(|v| v != 0),
+            location_reference_asset_id,
+            dials: dials_json.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default(),
+        })
+    }
+
+    /// Upserts the video's full global dials/Location Consistency state —
+    /// same full-replace convention as `save_bulk_scene_settings`.
+    pub fn save_bulk_global_settings(
+        &self,
+        video_id: &str,
+        location_consistency: Option<bool>,
+        location_reference_asset_id: Option<String>,
+        dials: BulkVisualDials,
+    ) -> Result<BulkGlobalVisualSettings, String> {
+        let dials_json = if dials.is_empty() { None } else { Some(serde_json::to_string(&dials).map_err(|e| e.to_string())?) };
+        self.connection.execute(
+            "INSERT INTO bulk_global_settings(video_id,location_consistency,location_reference_asset_id,dials_json,updated_at)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(video_id) DO UPDATE SET
+                location_consistency=excluded.location_consistency,
+                location_reference_asset_id=excluded.location_reference_asset_id,
+                dials_json=excluded.dials_json,
+                updated_at=excluded.updated_at",
+            params![
+                video_id,
+                location_consistency.map(|v| v as i64), location_reference_asset_id,
+                dials_json,
+                Utc::now().to_rfc3339(),
+            ],
+        ).map_err(|e| e.to_string())?;
+        Ok(BulkGlobalVisualSettings { location_consistency, location_reference_asset_id, dials })
     }
 
     pub fn extract_image_settings_from_directive(&self, directive: &str) -> Result<StyleExtraction, String> {
@@ -3597,6 +3780,42 @@ Return JSON only — no markdown, no explanation:
         )
     }
 
+    /// Location Consistency's counterpart to `character_description_for_video`
+    /// — same reference-image-to-reusable-description mechanism, same
+    /// Claude CLI first / Gemini fallback provider order, just pointed at
+    /// the environment instead of a subject. Callers cache the result the
+    /// same way (see the `location_description.{video_id}[.{scene_id}]`
+    /// cache key in `plan_bulk_visuals_batch`).
+    fn location_description_for_video(
+        &self,
+        video_id: &str,
+        gemini_auth: &Option<GeminiAuth>,
+        reference_asset_id: Option<&str>,
+    ) -> Result<String, String> {
+        let (media_type, bytes) = self.reference_image_bytes(video_id, reference_asset_id)?
+            .ok_or("Location Consistency requires a reference image — upload one in Bulk Gen Config first.")?;
+        let prompt = "Identify the single main location, environment, or setting shown in this reference image. Write a concise, reusable description of that place for an illustrator to redraw consistently across dozens of separate scenes. You MUST explicitly cover: type of space (interior/exterior, room type, or landscape type); architecture or geography; layout and scale; distinctive furniture, structures, or landmarks; and characteristic color palette/materials. Deliberately do NOT describe the people, weather, or time of day present in this specific reference photo, and do NOT describe lighting or camera angle — those must change scene-to-scene to match each still's own narration and mood, not stay fixed like the place's own physical identity. Describe only the location's inherent physical identity, in 4-6 sentences of plain prose. If no single clear location is identifiable, describe the closest candidate setting instead. Return only the description, no preamble, no labels, no markdown.";
+        #[cfg(not(test))]
+        let claude_cli = claude_cli_available();
+        #[cfg(test)]
+        let claude_cli = false;
+        if claude_cli {
+            match request_claude_cli_character_description(prompt, &media_type, &bytes) {
+                Ok(result) => return Ok(result),
+                Err(claude_error) => match gemini_auth.as_ref() {
+                    Some(auth) => return request_gemini_vision(auth, prompt, &media_type, &bytes).map_err(|gemini_error| {
+                        format!("Claude CLI: {claude_error} (Gemini fallback also failed: {gemini_error})")
+                    }),
+                    None => return Err(format!("Claude CLI: {claude_error}")),
+                },
+            }
+        }
+        request_gemini_vision(
+            gemini_auth.as_ref().ok_or("Configure a Gemini API key, or log in with the Claude Code CLI, to use Location Consistency.")?,
+            prompt, &media_type, &bytes,
+        )
+    }
+
     /// Reads back up to `limit` already-*persisted* stills immediately
     /// before `before_index` (in ordinal order) as the same diversity/
     /// continuity context shape `plan_bulk_visuals_batch`'s prompt expects
@@ -3636,6 +3855,29 @@ Return JSON only — no markdown, no explanation:
             }));
         }
         Ok(context)
+    }
+
+    /// Database-backed counterpart to `aggregate_video_visual_history` —
+    /// reads every already-planned still among `groups` (normally the
+    /// video's ENTIRE plan, not just the current batch/selection) and
+    /// tallies visual type and settings. This is the "whole script" half of
+    /// the diversity/repetition rules in `plan_bulk_visuals_batch`'s
+    /// prompt: `bulk_plan_prior_context` above only sees the last ~12
+    /// stills, which is fine for local continuity but can't actually tell
+    /// whether a "no more than 30% of the whole video" rule is being kept —
+    /// this can, because it looks at everything already planned, at a
+    /// bounded, compact size regardless of how long the video is.
+    fn video_visual_history(&self, video_id: &str, groups: &[PlanGroup]) -> Result<VideoVisualHistory, String> {
+        let mut entries = Vec::with_capacity(groups.len());
+        for group in groups {
+            let Some(latest) = self.list_prompt_versions(video_id, &group.id)?.into_iter().next() else {
+                continue;
+            };
+            let visual_type = self.get_educational_visual_plan(video_id, &group.id)?
+                .map(|plan| plan.visual_intent).unwrap_or_default();
+            entries.push((visual_type, latest.settings_json));
+        }
+        Ok(aggregate_video_visual_history(&entries))
     }
 
     /// Saves one AI-planned still (a prompt version + the `educational_visual_plans`
@@ -3848,13 +4090,17 @@ Return JSON only — no markdown, no explanation:
             Some(id) => self.get_bulk_scene_settings(video_id)?.into_iter().find(|s| &s.scene_id == id),
             None => None,
         };
+        let global_visual = self.get_bulk_global_settings(video_id)?;
         let EffectiveBulkSettings {
             style_directive: effective_style_directive,
             creative_instruction: effective_creative_instruction,
             character_consistency: effective_character_consistency,
             reference_asset_id: effective_reference_asset_id,
+            location_consistency: effective_location_consistency,
+            location_reference_asset_id: effective_location_reference_asset_id,
+            dials: effective_dials,
         } = resolve_effective_bulk_settings(
-            scene_settings.as_ref(), style_directive, creative_instruction, character_consistency,
+            scene_settings.as_ref(), style_directive, creative_instruction, character_consistency, &global_visual,
         );
         // Character description is a real vision API call — expensive enough
         // that it's worth caching across batches (a fresh function call per
@@ -3916,9 +4162,146 @@ Return JSON only — no markdown, no explanation:
             String::new()
         };
 
+        // Location Consistency's own cached-description block — same
+        // caching shape as character_block just above (per-scene cache key
+        // only when the scene overrides the location reference itself),
+        // but text-only: unlike the character reference, the location
+        // reference image is NOT attached to the actual generation call
+        // here (planning has no image output to condition), only used to
+        // derive this description. See generate_image_render for where a
+        // location reference image DOES get attached to the render itself.
+        let location_block = if effective_location_consistency {
+            let cache_key = match (&current_scene_id, &effective_location_reference_asset_id) {
+                (Some(scene_id), Some(_)) => format!("location_description.{video_id}.{scene_id}"),
+                _ => format!("location_description.{video_id}"),
+            };
+            let description = match self.get_app_setting(&cache_key)? {
+                Some(cached) if !cached.trim().is_empty() => cached,
+                _ => {
+                    let description = self.location_description_for_video(
+                        video_id, &gemini_auth, effective_location_reference_asset_id.as_deref(),
+                    )?;
+                    self.save_app_setting(&cache_key, &description)?;
+                    description
+                }
+            };
+            format!(
+                "\n\n════════════════════════════════════════\n\
+                 LOCATION CONSISTENCY\n\
+                 ════════════════════════════════════════\n\
+                 Whenever a still's narration places its subject in this recurring setting, depict THIS\n\
+                 EXACT location, described from the user's reference image:\n\n\
+                 {}\n\n\
+                 Keep architecture, layout, scale, and characteristic materials/colors consistent with this\n\
+                 description across every still set here. Weather, time of day, lighting, and who/what is\n\
+                 present may still vary freely per still — only the place's own physical identity is fixed.\n\
+                 Do not force this location into stills whose narration clearly belongs somewhere else.\n\
+                 ════════════════════════════════════════\n",
+                description.trim()
+            )
+        } else {
+            String::new()
+        };
+
         let chunk_end = bulk_batch_chunk_end(&selected_groups, start_index, chunk_size);
         let chunk = &row_data[start_index..chunk_end];
         let prior_context = self.bulk_plan_prior_context(video_id, &selected_groups, start_index, 12)?;
+        // The "whole script" half of continuity/diversity — bulk_plan_prior_context
+        // above only sees roughly the last 12 stills, which is enough for
+        // local B-roll-style continuity but not enough to know whether a
+        // "no more than 30% of the whole video" rule (see SETTINGS
+        // DIVERSITY below) is actually being kept on a long video.
+        let video_history = self.video_visual_history(video_id, &visual_plan.groups)?;
+        let video_history_block = if video_history.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nWHOLE-VIDEO SETTINGS TALLY SO FAR ({} stills already planned, not just this batch or the recent context above) — use this to actually check the SETTINGS DIVERSITY and ANTI-REPETITION rules below, which are measured across the WHOLE video, not just what you can see nearby:\n{}\n",
+                video_history.total_planned,
+                video_history.summary_text(),
+            )
+        };
+        // Visual Director dials (WHAT this batch should show) and Diversity
+        // & Consistency Controller dials (HOW it should differ from or
+        // match what's already been generated) — user-set levels resolved
+        // through the same Global -> Scene hierarchy as everything else
+        // above. Absent/unset dials render no line at all, so a video that
+        // never touches these controls gets a prompt identical to before
+        // they existed.
+        let mut director_dial_lines = Vec::new();
+        if let Some(value) = effective_dials.visual_interpretation {
+            director_dial_lines.push(format!(
+                "- Visual interpretation: {value}/100 (0 = depict the narration literally, 100 = favor a conceptual/creative take over a literal one)."
+            ));
+        }
+        if let Some(value) = effective_dials.visual_metaphor {
+            director_dial_lines.push(format!(
+                "- Visual metaphor: {value}/100 (0 = avoid metaphor, depict things directly, 100 = actively reach for symbolic/metaphorical imagery where the narration supports it)."
+            ));
+        }
+        if let Some(value) = effective_dials.cinematic_intensity {
+            director_dial_lines.push(format!(
+                "- Cinematic intensity: {value}/100 (0 = documentary/plain photographic framing, 100 = heightened, dramatic, Hollywood-style cinematography)."
+            ));
+        }
+        if let Some(value) = effective_dials.prompt_creativity {
+            director_dial_lines.push(format!(
+                "- Prompt creativity: {value}/100 (0 = describe only what the narration states, plainly, 100 = elaborate the scene substantially beyond the literal sentence — added sensory/environmental detail, richer staging)."
+            ));
+        }
+        if let Some(mood) = effective_dials.mood.as_deref().filter(|m| !m.trim().is_empty()) {
+            let mode = effective_dials.mood_mode.as_deref().unwrap_or("ai");
+            if mode == "user" {
+                director_dial_lines.push(format!(
+                    "- Mood: hold close to \"{mood}\" for every still in this batch unless a still's own narration genuinely conflicts with it."
+                ));
+            } else {
+                director_dial_lines.push(format!(
+                    "- Mood: \"{mood}\" is the user's preferred default — lean toward it, but you may still choose a different mood per still where the narration clearly calls for one."
+                ));
+            }
+        }
+        let visual_director_block = if director_dial_lines.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nVISUAL DIRECTOR SETTINGS — WHAT these stills should show (user-set):\n{}\n",
+                director_dial_lines.join("\n"),
+            )
+        };
+        fn diversity_word(value: i64) -> &'static str {
+            if value >= 75 { "very high" } else if value >= 55 { "high" } else if value >= 35 { "moderate" } else if value >= 15 { "low" } else { "very low" }
+        }
+        fn consistency_word(value: i64) -> &'static str {
+            if value >= 75 { "very strict" } else if value >= 55 { "strict" } else if value >= 35 { "moderate" } else if value >= 15 { "loose" } else { "very loose" }
+        }
+        let mut diversity_dial_lines = Vec::new();
+        if let Some(value) = effective_dials.diversity_camera {
+            diversity_dial_lines.push(format!("- Camera angle diversity: {} ({value}/100) — vary cameraAngle between stills accordingly, independent of the other settings diversity rules below.", diversity_word(value)));
+        }
+        if let Some(value) = effective_dials.diversity_composition {
+            diversity_dial_lines.push(format!("- Composition diversity: {} ({value}/100) — vary composition/framing/subject placement between stills accordingly.", diversity_word(value)));
+        }
+        if let Some(value) = effective_dials.diversity_shot_type {
+            diversity_dial_lines.push(format!("- Shot type diversity: {} ({value}/100) — vary visualType/shot scale between stills accordingly, on top of (not instead of) the ANTI-REPETITION rule below.", diversity_word(value)));
+        }
+        if let Some(value) = effective_dials.consistency_character {
+            diversity_dial_lines.push(format!("- Character identity strictness: {} ({value}/100) — how tightly the character description above must be followed when the character does appear (higher = must match precisely; lower = the description is loose inspiration, more variation is acceptable).", consistency_word(value)));
+        }
+        if let Some(value) = effective_dials.consistency_location {
+            diversity_dial_lines.push(format!("- Location identity strictness: {} ({value}/100) — how tightly the location description above must be followed when that setting appears.", consistency_word(value)));
+        }
+        if let Some(value) = effective_dials.consistency_style {
+            diversity_dial_lines.push(format!("- Style directive strictness: {} ({value}/100) — how tightly the Style directive above should be followed versus treated as loose inspiration.", consistency_word(value)));
+        }
+        let diversity_controller_block = if diversity_dial_lines.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nDIVERSITY & CONSISTENCY CONTROLLER SETTINGS — HOW these stills should differ from (or match) what's already been generated (user-set):\n{}\n",
+                diversity_dial_lines.join("\n"),
+            )
+        };
         let director_note = if effective_creative_instruction.trim().is_empty() {
             String::new()
         } else {
@@ -3947,13 +4330,16 @@ Return JSON only — no markdown, no explanation:
             r#"You are an Educational Visual Director planning an entire video, not isolated stills.
 
 Style directive: {effective_style_directive}
-Base image settings: {base_settings_json}{director_note}{character_block}
+Base image settings: {base_settings_json}{director_note}{character_block}{location_block}{visual_director_block}{diversity_controller_block}
 Total stills in video: {total}. This batch covers stills {} of {total} (selected for this run).
-Previously planned context (chronological; includes earlier batches and must guide continuity, emotional variety, and non-repetition): {}
+Previously planned context (chronological; includes earlier batches and must guide continuity, emotional variety, and non-repetition): {}{video_history_block}
 
 Current batch rows to plan:
 {}
 
+════════════════════════════════════════
+VISUAL DIRECTOR — decide WHAT each still shows
+════════════════════════════════════════
 CORE GOAL: Ask "What image best helps the viewer understand this concept?" — never "What literally matches the sentence?"
 
 LITERAL-TRANSLATION TRAP (the most common planning mistake — watch for this specifically):
@@ -3979,6 +4365,9 @@ NEW VISUAL TYPE DEFINITIONS (use these exact meanings):
 - Title / Statement Card: a still composed to carry a short on-screen punchline or chapter statement — generous negative space, low visual complexity, uncluttered background so a caption overlay has room. Also covers a posed question or an unrelated relatable analogy scene standing in for an abstract idea.
 - Family Tree / Lineage Diagram: a branching ancestry/relationship diagram — distinct from a generic Scientific Diagram.
 
+════════════════════════════════════════
+DIVERSITY & CONSISTENCY CONTROLLER — decide HOW each still should differ from, or match, the others
+════════════════════════════════════════
 ANTI-REPETITION (enforce strictly):
 - Never assign the same visualType to more than 3 consecutive stills.
 - Vary subject framing, environment structure, and subject count across stills.
@@ -4976,37 +5365,69 @@ Return JSON only:
         } else {
             None
         };
+        // Location Consistency's own reference image, attached the same
+        // way — but only when there's no character reference already
+        // occupying this call's one "attached reference image" input. A
+        // specific character's identity is generally harder for the model
+        // to hold onto from text alone than an environment is, so
+        // character wins the slot when both are enabled for the same
+        // still; location still gets its text description woven into the
+        // prompt either way (see plan_bulk_visuals_batch's location_block),
+        // just without image conditioning on top in that combined case.
+        let global_visual = self.get_bulk_global_settings(video_id)?;
+        let location_consistency_enabled = reference_for_generation.is_none()
+            && scene_settings.as_ref().and_then(|s| s.location_consistency)
+                .unwrap_or_else(|| global_visual.location_consistency.unwrap_or(false));
+        let location_reference_asset_id = scene_settings.as_ref().and_then(|s| s.location_reference_asset_id.clone())
+            .or_else(|| global_visual.location_reference_asset_id.clone());
+        let location_reference_for_generation = if location_consistency_enabled {
+            self.reference_image_bytes(video_id, location_reference_asset_id.as_deref())?
+        } else {
+            None
+        };
         let render_once = || -> Result<(Vec<u8>, &'static str), String> {
-            match reference_for_generation.as_ref() {
-                Some((reference_mime, reference_bytes)) => {
-                    // request_gemini_image_with_source is otherwise only used for
-                    // in-place edits (edit_render/edit_thumbnail), where the source
-                    // image IS the thing being modified and the prompt says to
-                    // preserve it. That's the opposite of what we want here — the
-                    // attached image is a CHARACTER REFERENCE for an entirely new
-                    // scene, not an image to edit — so this framing is mandatory,
-                    // not optional, or the model tends to keep the reference's
-                    // background/pose instead of generating the new scene.
-                    let character_reference_prompt = format!(
-                        "The attached image is a CHARACTER REFERENCE ONLY. Reproduce that character's exact \
-                         physical appearance (hair, coloring, build, distinguishing features) — but IGNORE the \
-                         reference image's background, pose, camera angle, composition, and clothing entirely. \
-                         Dress the character in whatever outfit fits the new scene described below (do not copy \
-                         the reference image's outfit unless that scene independently calls for the same \
-                         clothing). Generate a completely new scene as described below, featuring that \
-                         character:\n\n{prompt}"
-                    );
-                    request_gemini_image_with_source(
-                        &auth, &model, &character_reference_prompt, reference_bytes, reference_mime, None,
-                        requested_aspect_ratio(&settings),
-                    )
-                }
-                // character_consistency_enabled but no reference found (e.g. removed
+            if let Some((reference_mime, reference_bytes)) = reference_for_generation.as_ref() {
+                // request_gemini_image_with_source is otherwise only used for
+                // in-place edits (edit_render/edit_thumbnail), where the source
+                // image IS the thing being modified and the prompt says to
+                // preserve it. That's the opposite of what we want here — the
+                // attached image is a CHARACTER REFERENCE for an entirely new
+                // scene, not an image to edit — so this framing is mandatory,
+                // not optional, or the model tends to keep the reference's
+                // background/pose instead of generating the new scene.
+                let character_reference_prompt = format!(
+                    "The attached image is a CHARACTER REFERENCE ONLY. Reproduce that character's exact \
+                     physical appearance (hair, coloring, build, distinguishing features) — but IGNORE the \
+                     reference image's background, pose, camera angle, composition, and clothing entirely. \
+                     Dress the character in whatever outfit fits the new scene described below (do not copy \
+                     the reference image's outfit unless that scene independently calls for the same \
+                     clothing). Generate a completely new scene as described below, featuring that \
+                     character:\n\n{prompt}"
+                );
+                request_gemini_image_with_source(
+                    &auth, &model, &character_reference_prompt, reference_bytes, reference_mime, None,
+                    requested_aspect_ratio(&settings),
+                )
+            } else if let Some((location_mime, location_bytes)) = location_reference_for_generation.as_ref() {
+                let location_reference_prompt = format!(
+                    "The attached image is a LOCATION REFERENCE ONLY. Reproduce that setting's exact \
+                     architecture, layout, scale, and characteristic materials/colors — but IGNORE the \
+                     reference image's weather, time of day, lighting, and any people or objects present \
+                     in it. Populate the scene with whatever the description below actually calls for. \
+                     Generate a completely new moment as described below, set in that same \
+                     location:\n\n{prompt}"
+                );
+                request_gemini_image_with_source(
+                    &auth, &model, &location_reference_prompt, location_bytes, location_mime, None,
+                    requested_aspect_ratio(&settings),
+                )
+            } else {
+                // Either consistency flag but no reference found (e.g. removed
                 // after planning) falls back to text-only rather than blocking
                 // generation entirely.
-                None => request_gemini_image(
+                request_gemini_image(
                     &auth, &model, &prompt, requested_aspect_ratio(&settings),
-                ),
+                )
             }
         };
         let (mut image_bytes, mut extension) = render_once()?;
@@ -10781,18 +11202,35 @@ fn bulk_batch_chunk_end(groups: &[PlanGroup], start_index: usize, chunk_size: us
     end
 }
 
-/// The four Bulk Generation settings resolved for one AI planning call, after
+/// The Bulk Generation settings resolved for one AI planning call, after
 /// layering a scene's `bulk_scene_settings` override (if any) on top of the
 /// video's global params. An override field only wins if it's `Some` and
 /// (for the two string fields) non-blank — an empty-string override is
 /// treated the same as "not overridden," matching how the frontend clears a
 /// field back to "inherit" by leaving it blank rather than needing a
-/// separate clear action.
+/// separate clear action. `style_directive`/`creative_instruction`/
+/// `character_consistency`/`reference_asset_id` are unchanged from before —
+/// still resolved against the raw scalar globals the caller already had on
+/// hand (backed by `app_settings`, not `bulk_global_settings`). Location
+/// Consistency and the dials are newer and DO have a proper structured
+/// global source (`BulkGlobalVisualSettings`), passed in as `global_visual`.
 struct EffectiveBulkSettings {
     style_directive: String,
     creative_instruction: String,
     character_consistency: bool,
     reference_asset_id: Option<String>,
+    location_consistency: bool,
+    /// Unlike `reference_asset_id` above, this DOES fall back to a global
+    /// value inside this function (`global_visual.location_reference_asset_id`)
+    /// rather than relying on `reference_image_bytes`'s own built-in
+    /// fallback — that fallback is hard-coded to the CHARACTER's global
+    /// reference (`global_reference_asset.{video_id}`), which would be
+    /// wrong for location. Callers must therefore never pass `None` here
+    /// into `reference_image_bytes` expecting a location-appropriate
+    /// fallback; `None` here means "genuinely no location reference set at
+    /// either level."
+    location_reference_asset_id: Option<String>,
+    dials: BulkVisualDials,
 }
 
 fn resolve_effective_bulk_settings(
@@ -10800,6 +11238,7 @@ fn resolve_effective_bulk_settings(
     style_directive: &str,
     creative_instruction: &str,
     character_consistency: bool,
+    global_visual: &BulkGlobalVisualSettings,
 ) -> EffectiveBulkSettings {
     EffectiveBulkSettings {
         style_directive: scene_settings
@@ -10814,7 +11253,121 @@ fn resolve_effective_bulk_settings(
             .and_then(|s| s.character_consistency)
             .unwrap_or(character_consistency),
         reference_asset_id: scene_settings.and_then(|s| s.reference_asset_id.clone()),
+        location_consistency: scene_settings
+            .and_then(|s| s.location_consistency)
+            .unwrap_or_else(|| global_visual.location_consistency.unwrap_or(false)),
+        location_reference_asset_id: scene_settings
+            .and_then(|s| s.location_reference_asset_id.clone())
+            .or_else(|| global_visual.location_reference_asset_id.clone()),
+        dials: resolve_effective_dials(scene_settings.map(|s| &s.dials), &global_visual.dials),
     }
+}
+
+/// Field-by-field layering for `BulkVisualDials`, same "scene wins if set,
+/// else fall back to global" rule as every other Bulk Generation setting.
+fn resolve_effective_dials(scene: Option<&BulkVisualDials>, global: &BulkVisualDials) -> BulkVisualDials {
+    BulkVisualDials {
+        visual_interpretation: scene.and_then(|d| d.visual_interpretation).or(global.visual_interpretation),
+        visual_metaphor: scene.and_then(|d| d.visual_metaphor).or(global.visual_metaphor),
+        cinematic_intensity: scene.and_then(|d| d.cinematic_intensity).or(global.cinematic_intensity),
+        prompt_creativity: scene.and_then(|d| d.prompt_creativity).or(global.prompt_creativity),
+        mood: scene.and_then(|d| d.mood.clone()).or_else(|| global.mood.clone()),
+        mood_mode: scene.and_then(|d| d.mood_mode.clone()).or_else(|| global.mood_mode.clone()),
+        diversity_camera: scene.and_then(|d| d.diversity_camera).or(global.diversity_camera),
+        diversity_composition: scene.and_then(|d| d.diversity_composition).or(global.diversity_composition),
+        diversity_shot_type: scene.and_then(|d| d.diversity_shot_type).or(global.diversity_shot_type),
+        consistency_character: scene.and_then(|d| d.consistency_character).or(global.consistency_character),
+        consistency_location: scene.and_then(|d| d.consistency_location).or(global.consistency_location),
+        consistency_style: scene.and_then(|d| d.consistency_style).or(global.consistency_style),
+    }
+}
+
+/// Compact whole-video tally of what's already been decided for every
+/// already-planned still — the "whole script" half of the diversity/
+/// repetition rules already baked into the planning prompt (see SETTINGS
+/// DIVERSITY in `plan_bulk_visuals_batch`), which previously only had
+/// visibility into the last ~12 stills via `bulk_plan_prior_context`. A
+/// "no single value in more than 30% of stills" rule is unenforceable
+/// without knowing the true whole-video percentages; this is what supplies
+/// them. Deliberately a compact set of counts, not a full per-still dump —
+/// stays small regardless of how long the video is.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct VideoVisualHistory {
+    total_planned: usize,
+    visual_type_counts: std::collections::BTreeMap<String, usize>,
+    camera_angle_counts: std::collections::BTreeMap<String, usize>,
+    lighting_counts: std::collections::BTreeMap<String, usize>,
+    color_temperature_counts: std::collections::BTreeMap<String, usize>,
+    weather_atmosphere_counts: std::collections::BTreeMap<String, usize>,
+    mood_counts: std::collections::BTreeMap<String, usize>,
+}
+
+impl VideoVisualHistory {
+    fn is_empty(&self) -> bool {
+        self.total_planned == 0
+    }
+
+    /// Renders the tally as a compact text block for the planning prompt —
+    /// percentages (matching how the SETTINGS DIVERSITY rule is phrased),
+    /// sorted most-common-first. Only dimensions with at least one tallied
+    /// value produce a line; an empty history renders as an empty string,
+    /// so the caller can skip the whole section on a video's first batch.
+    fn summary_text(&self) -> String {
+        fn line(label: &str, counts: &std::collections::BTreeMap<String, usize>, total: usize) -> Option<String> {
+            if counts.is_empty() || total == 0 {
+                return None;
+            }
+            let mut entries: Vec<(&String, &usize)> = counts.iter().collect();
+            entries.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            let rendered = entries.iter()
+                .map(|(value, count)| format!("{value} {}%", (**count * 100) / total))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("- {label}: {rendered}"))
+        }
+        [
+            line("visualType", &self.visual_type_counts, self.total_planned),
+            line("lighting", &self.lighting_counts, self.total_planned),
+            line("colorTemperature", &self.color_temperature_counts, self.total_planned),
+            line("weatherAtmosphere", &self.weather_atmosphere_counts, self.total_planned),
+            line("cameraAngle", &self.camera_angle_counts, self.total_planned),
+            line("mood", &self.mood_counts, self.total_planned),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+}
+
+/// Pure aggregation behind `ProjectRepository::video_visual_history` —
+/// `entries` is (visualType, settingsJson) for every still that already has
+/// a saved prompt, in any order. Extracted as a free function (rather than
+/// left inline) so the tallying logic is unit-testable without a database.
+fn aggregate_video_visual_history(entries: &[(String, String)]) -> VideoVisualHistory {
+    let mut history = VideoVisualHistory::default();
+    for (visual_type, settings_json) in entries {
+        history.total_planned += 1;
+        if !visual_type.is_empty() {
+            *history.visual_type_counts.entry(visual_type.clone()).or_insert(0) += 1;
+        }
+        let settings: serde_json::Value = serde_json::from_str(settings_json).unwrap_or_else(|_| json!({}));
+        let fields: [(&str, &mut std::collections::BTreeMap<String, usize>); 5] = [
+            ("cameraAngle", &mut history.camera_angle_counts),
+            ("lighting", &mut history.lighting_counts),
+            ("colorTemperature", &mut history.color_temperature_counts),
+            ("weatherAtmosphere", &mut history.weather_atmosphere_counts),
+            ("mood", &mut history.mood_counts),
+        ];
+        for (key, map) in fields {
+            if let Some(value) = settings.get(key).and_then(|v| v.as_str()) {
+                if !value.is_empty() && value != "Undefined" {
+                    *map.entry(value.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    history
 }
 
 /// `seed_run_type`/`seed_run_len` let the caller carry a same-type run
@@ -13415,12 +13968,15 @@ mod tests {
 
     #[test]
     fn resolve_effective_bulk_settings_layers_scene_override_over_global() {
+        let global_visual = BulkGlobalVisualSettings::default();
         // No override at all — every field falls back to the global param.
-        let none = resolve_effective_bulk_settings(None, "global style", "global rule", false);
+        let none = resolve_effective_bulk_settings(None, "global style", "global rule", false, &global_visual);
         assert_eq!(none.style_directive, "global style");
         assert_eq!(none.creative_instruction, "global rule");
         assert!(!none.character_consistency);
         assert_eq!(none.reference_asset_id, None);
+        assert!(!none.location_consistency);
+        assert_eq!(none.location_reference_asset_id, None);
 
         // A partial override: only style_directive and character_consistency
         // are set, the rest stay null ("inherit").
@@ -13430,8 +13986,11 @@ mod tests {
             creative_instruction: None,
             character_consistency: Some(true),
             reference_asset_id: None,
+            location_consistency: None,
+            location_reference_asset_id: None,
+            dials: BulkVisualDials::default(),
         };
-        let resolved = resolve_effective_bulk_settings(Some(&partial), "global style", "global rule", false);
+        let resolved = resolve_effective_bulk_settings(Some(&partial), "global style", "global rule", false, &global_visual);
         assert_eq!(resolved.style_directive, "scene style");
         assert_eq!(resolved.creative_instruction, "global rule", "null override must inherit the global value");
         assert!(resolved.character_consistency);
@@ -13445,11 +14004,103 @@ mod tests {
             creative_instruction: None,
             character_consistency: None,
             reference_asset_id: Some("asset-1".into()),
+            location_consistency: None,
+            location_reference_asset_id: None,
+            dials: BulkVisualDials::default(),
         };
-        let resolved = resolve_effective_bulk_settings(Some(&blank), "global style", "global rule", true);
+        let resolved = resolve_effective_bulk_settings(Some(&blank), "global style", "global rule", true, &global_visual);
         assert_eq!(resolved.style_directive, "global style");
         assert!(resolved.character_consistency, "no override must fall back to the global param");
         assert_eq!(resolved.reference_asset_id, Some("asset-1".into()));
+    }
+
+    #[test]
+    fn resolve_effective_bulk_settings_layers_location_and_dials() {
+        let global_visual = BulkGlobalVisualSettings {
+            location_consistency: Some(true),
+            location_reference_asset_id: Some("global-location-asset".into()),
+            dials: BulkVisualDials { visual_interpretation: Some(40), diversity_camera: Some(70), mood: Some("Hopeful".into()), ..Default::default() },
+        };
+
+        // No scene override at all — everything inherits from global,
+        // including the location reference id (unlike the character
+        // reference, which relies on reference_image_bytes' own fallback).
+        let none = resolve_effective_bulk_settings(None, "style", "rule", false, &global_visual);
+        assert!(none.location_consistency);
+        assert_eq!(none.location_reference_asset_id.as_deref(), Some("global-location-asset"));
+        assert_eq!(none.dials.visual_interpretation, Some(40));
+        assert_eq!(none.dials.diversity_camera, Some(70));
+        assert_eq!(none.dials.mood.as_deref(), Some("Hopeful"));
+        assert_eq!(none.dials.visual_metaphor, None, "a dial never set at either level stays None");
+
+        // A scene overriding only ONE dial and its own location reference —
+        // every other dial, and location_consistency itself, still falls
+        // back to global.
+        let scene = BulkSceneSettings {
+            scene_id: "sc1".into(),
+            style_directive: None,
+            creative_instruction: None,
+            character_consistency: None,
+            reference_asset_id: None,
+            location_consistency: None,
+            location_reference_asset_id: Some("scene-location-asset".into()),
+            dials: BulkVisualDials { visual_interpretation: Some(90), ..Default::default() },
+        };
+        let resolved = resolve_effective_bulk_settings(Some(&scene), "style", "rule", false, &global_visual);
+        assert!(resolved.location_consistency, "location_consistency itself isn't overridden, so it inherits");
+        assert_eq!(resolved.location_reference_asset_id.as_deref(), Some("scene-location-asset"));
+        assert_eq!(resolved.dials.visual_interpretation, Some(90), "scene's override wins");
+        assert_eq!(resolved.dials.diversity_camera, Some(70), "un-overridden dial still inherits from global");
+        assert_eq!(resolved.dials.mood.as_deref(), Some("Hopeful"));
+    }
+
+    #[test]
+    fn aggregate_video_visual_history_tallies_percentages_across_the_whole_video() {
+        let entries: Vec<(String, String)> = vec![
+            ("Character Scene".into(), r#"{"lighting":"Golden Hour","colorTemperature":"Warm"}"#.into()),
+            ("Character Scene".into(), r#"{"lighting":"Golden Hour","colorTemperature":"Warm"}"#.into()),
+            ("Environmental Scene".into(), r#"{"lighting":"Natural Daylight","colorTemperature":"Neutral"}"#.into()),
+            ("Object Focus".into(), r#"{"lighting":"Undefined","colorTemperature":"Cool"}"#.into()),
+        ];
+        let history = aggregate_video_visual_history(&entries);
+        assert_eq!(history.total_planned, 4);
+        assert_eq!(history.visual_type_counts.get("Character Scene"), Some(&2));
+        assert_eq!(history.lighting_counts.get("Golden Hour"), Some(&2));
+        assert_eq!(
+            history.lighting_counts.get("Undefined"), None,
+            "the placeholder value 'Undefined' must never be tallied as a real choice",
+        );
+        let summary = history.summary_text();
+        assert!(summary.contains("visualType: Character Scene 50%"), "summary was: {summary}");
+        assert!(summary.contains("lighting: Golden Hour 50%"), "summary was: {summary}");
+
+        assert!(VideoVisualHistory::default().is_empty());
+        assert!(!history.is_empty());
+        assert_eq!(VideoVisualHistory::default().summary_text(), "");
+    }
+
+    #[test]
+    fn bulk_global_settings_round_trip_and_clear_back_to_default() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+
+        assert_eq!(repo.get_bulk_global_settings(&video.id).unwrap(), BulkGlobalVisualSettings::default());
+
+        let dials = BulkVisualDials { visual_interpretation: Some(65), mood: Some("Tense Anxious".into()), ..Default::default() };
+        let saved = repo.save_bulk_global_settings(&video.id, Some(true), Some("loc-asset".into()), dials.clone()).unwrap();
+        assert_eq!(saved.location_consistency, Some(true));
+        assert_eq!(saved.dials.visual_interpretation, Some(65));
+
+        let loaded = repo.get_bulk_global_settings(&video.id).unwrap();
+        assert_eq!(loaded, saved);
+
+        // Re-saving with an empty dials struct and location fields cleared
+        // rolls it all the way back to the default shape, and upserts in
+        // place rather than creating a second row.
+        let cleared = repo.save_bulk_global_settings(&video.id, None, None, BulkVisualDials::default()).unwrap();
+        assert_eq!(cleared, BulkGlobalVisualSettings::default());
+        assert_eq!(repo.get_bulk_global_settings(&video.id).unwrap(), BulkGlobalVisualSettings::default());
     }
 
     #[test]
@@ -13463,6 +14114,7 @@ mod tests {
         let saved = repo.save_bulk_scene_settings(
             &video.id, "sc1",
             Some("scene style".into()), Some("scene rule".into()), Some(true), Some("asset-1".into()),
+            None, None, BulkVisualDials::default(),
         ).unwrap();
         assert_eq!(saved.style_directive.as_deref(), Some("scene style"));
 
@@ -13475,7 +14127,7 @@ mod tests {
         // Re-saving with the same (video, scene) upserts in place, and a
         // field set back to None clears that override back to "inherit"
         // rather than leaving the old value behind.
-        let updated = repo.save_bulk_scene_settings(&video.id, "sc1", None, Some("scene rule".into()), None, None).unwrap();
+        let updated = repo.save_bulk_scene_settings(&video.id, "sc1", None, Some("scene rule".into()), None, None, None, None, BulkVisualDials::default()).unwrap();
         assert_eq!(updated.style_directive, None);
         assert_eq!(updated.character_consistency, None);
         assert_eq!(updated.reference_asset_id, None);

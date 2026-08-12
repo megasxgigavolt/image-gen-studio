@@ -74,6 +74,32 @@ export type PlanSceneRecord = {
 };
 export type VisualPlanRecord = { videoId: string; timingSource: string; sentences: PlanSentenceRecord[]; groups: PlanGroupRecord[]; scenes: PlanSceneRecord[]; updatedAt: string };
 
+// The Visual Director / Diversity & Consistency Controller dials — layered
+// the same way every other Bulk Generation setting is: null means
+// "inherit," a concrete value overrides. Sliders are 0-100 unless noted.
+export type BulkVisualDialsRecord = {
+  visualInterpretation: number | null;
+  visualMetaphor: number | null;
+  cinematicIntensity: number | null;
+  promptCreativity: number | null;
+  mood: string | null;
+  /** "ai" (default) or "user" — only meaningful when `mood` is set. */
+  moodMode: string | null;
+  diversityCamera: number | null;
+  diversityComposition: number | null;
+  diversityShotType: number | null;
+  consistencyCharacter: number | null;
+  consistencyLocation: number | null;
+  consistencyStyle: number | null;
+};
+export function emptyBulkVisualDials(): BulkVisualDialsRecord {
+  return {
+    visualInterpretation: null, visualMetaphor: null, cinematicIntensity: null, promptCreativity: null,
+    mood: null, moodMode: null, diversityCamera: null, diversityComposition: null, diversityShotType: null,
+    consistencyCharacter: null, consistencyLocation: null, consistencyStyle: null,
+  };
+}
+
 // Per-scene overrides for Bulk Generation, layered on top of the video's
 // global bulk settings. Every field is nullable — null means "inherit the
 // global value" for that one field. A scene with no saved overrides at all
@@ -85,7 +111,21 @@ export type BulkSceneSettingsRecord = {
   creativeInstruction: string | null;
   characterConsistency: boolean | null;
   referenceAssetId: string | null;
+  locationConsistency: boolean | null;
+  locationReferenceAssetId: string | null;
+  dials: BulkVisualDialsRecord;
 };
+
+// The video-wide counterpart to BulkSceneSettingsRecord — same shape minus
+// sceneId, since a scene layers its own version of this on top.
+export type BulkGlobalVisualSettingsRecord = {
+  locationConsistency: boolean | null;
+  locationReferenceAssetId: string | null;
+  dials: BulkVisualDialsRecord;
+};
+export function emptyBulkGlobalVisualSettings(): BulkGlobalVisualSettingsRecord {
+  return { locationConsistency: null, locationReferenceAssetId: null, dials: emptyBulkVisualDials() };
+}
 
 export type CaptionWordRecord = { text: string; startSeconds: number; endSeconds: number };
 export type CaptionChunkRecord = { index: number; text: string; startSeconds: number; endSeconds: number; words: CaptionWordRecord[] };
@@ -1508,17 +1548,39 @@ export const projectsClient = {
     videoId: string, sceneId: string,
     styleDirective: string | null, creativeInstruction: string | null,
     characterConsistency: boolean | null, referenceAssetId: string | null,
+    locationConsistency: boolean | null, locationReferenceAssetId: string | null,
+    dials: BulkVisualDialsRecord,
   ): Promise<BulkSceneSettingsRecord> {
     if (isTauri()) {
       return invoke("save_bulk_scene_settings", {
         videoId, sceneId, styleDirective, creativeInstruction, characterConsistency, referenceAssetId,
+        locationConsistency, locationReferenceAssetId, dials,
       });
     }
     const key = `${STORAGE_KEY}.bulkSceneSettings.${videoId}`;
     const all = await this.getBulkSceneSettings(videoId);
-    const record: BulkSceneSettingsRecord = { sceneId, styleDirective, creativeInstruction, characterConsistency, referenceAssetId };
+    const record: BulkSceneSettingsRecord = {
+      sceneId, styleDirective, creativeInstruction, characterConsistency, referenceAssetId,
+      locationConsistency, locationReferenceAssetId, dials,
+    };
     const next = [...all.filter((item) => item.sceneId !== sceneId), record];
     localStorage.setItem(key, JSON.stringify(next));
+    return record;
+  },
+  async getBulkGlobalSettings(videoId: string): Promise<BulkGlobalVisualSettingsRecord> {
+    if (isTauri()) return invoke("get_bulk_global_settings", { videoId });
+    const raw = localStorage.getItem(`${STORAGE_KEY}.bulkGlobalSettings.${videoId}`);
+    return raw ? (JSON.parse(raw) as BulkGlobalVisualSettingsRecord) : emptyBulkGlobalVisualSettings();
+  },
+  async saveBulkGlobalSettings(
+    videoId: string, locationConsistency: boolean | null, locationReferenceAssetId: string | null,
+    dials: BulkVisualDialsRecord,
+  ): Promise<BulkGlobalVisualSettingsRecord> {
+    if (isTauri()) {
+      return invoke("save_bulk_global_settings", { videoId, locationConsistency, locationReferenceAssetId, dials });
+    }
+    const record: BulkGlobalVisualSettingsRecord = { locationConsistency, locationReferenceAssetId, dials };
+    localStorage.setItem(`${STORAGE_KEY}.bulkGlobalSettings.${videoId}`, JSON.stringify(record));
     return record;
   },
   async updatePlanSentenceText(videoId: string, sentenceId: string, text: string): Promise<VisualPlanRecord> {

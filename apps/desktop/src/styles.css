@@ -844,3 +844,17 @@ textarea{text-align:justify!important}
    Settings icon shape. */
 .bulk-global-settings-button{display:grid;place-items:center;width:30px;height:30px;flex-shrink:0;border:1px solid color-mix(in srgb,var(--brand) 40%,var(--line));border-radius:6px;background:var(--brand-soft);color:var(--brand);cursor:pointer}
 .bulk-global-settings-button:hover{background:var(--brand);color:#fff;border-color:var(--brand)}
+
+/* Visual Director / Diversity & Consistency Controller dials — Global Bulk
+   Settings modal and the per-scene override drawer. */
+.dial-grid{display:grid;gap:10px;margin:6px 0 4px}
+.dial-row{padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2)}
+.dial-row-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600;color:var(--text)}
+.dial-mode-toggle{border:1px solid var(--line);background:var(--surface);color:var(--muted);font-size:10px;font-weight:600;padding:3px 9px;border-radius:20px;cursor:pointer;white-space:nowrap}
+.dial-mode-toggle:hover{border-color:var(--brand);color:var(--brand)}
+.dial-slider-row{display:flex;align-items:center;gap:10px;margin-top:6px}
+.dial-slider-row input[type="range"]{flex:1;accent-color:var(--brand)}
+.dial-value{font-size:11px;font-weight:700;color:var(--brand);min-width:22px;text-align:right}
+.dial-hint{display:block;font-size:10px;color:var(--muted);margin-top:4px}
+.mood-row-controls{display:grid;gap:6px;margin-top:6px}
+.mood-row-controls select{padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--text);font-size:12px}

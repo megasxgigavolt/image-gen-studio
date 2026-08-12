@@ -2,10 +2,10 @@ mod projects;
 
 use base64::Engine;
 use projects::{
-    AnimationJob, BulkSceneSettings, CaptionSet, Channel, ExportJob, ExportResult, ExportSettings,
-    ImageJob, ImageRender, ImageWorkspace, InputAsset, MediaLibraryAsset, ProjectRepository,
-    ProviderKeyStatus, PromptVersion, ResumeState, Timeline, Video, VideoAsset, VideoInputs,
-    VideoProgress, VisualPlan,
+    AnimationJob, BulkGlobalVisualSettings, BulkSceneSettings, BulkVisualDials, CaptionSet, Channel,
+    ExportJob, ExportResult, ExportSettings, ImageJob, ImageRender, ImageWorkspace, InputAsset,
+    MediaLibraryAsset, ProjectRepository, ProviderKeyStatus, PromptVersion, ResumeState, Timeline,
+    Video, VideoAsset, VideoInputs, VideoProgress, VisualPlan,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -2559,12 +2559,37 @@ fn save_bulk_scene_settings(
     creative_instruction: Option<String>,
     character_consistency: Option<bool>,
     reference_asset_id: Option<String>,
+    location_consistency: Option<bool>,
+    location_reference_asset_id: Option<String>,
+    dials: BulkVisualDials,
 ) -> Result<BulkSceneSettings, String> {
     with_repository(state, |repository| {
         repository.save_bulk_scene_settings(
             &video_id, &scene_id, style_directive, creative_instruction,
             character_consistency, reference_asset_id,
+            location_consistency, location_reference_asset_id, dials,
         )
+    })
+}
+
+#[tauri::command]
+fn get_bulk_global_settings(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<BulkGlobalVisualSettings, String> {
+    with_repository(state, |repository| repository.get_bulk_global_settings(&video_id))
+}
+
+#[tauri::command]
+fn save_bulk_global_settings(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    location_consistency: Option<bool>,
+    location_reference_asset_id: Option<String>,
+    dials: BulkVisualDials,
+) -> Result<BulkGlobalVisualSettings, String> {
+    with_repository(state, |repository| {
+        repository.save_bulk_global_settings(&video_id, location_consistency, location_reference_asset_id, dials)
     })
 }
 
@@ -2816,6 +2841,8 @@ pub fn run() {
             set_plan_scene_expanded,
             get_bulk_scene_settings,
             save_bulk_scene_settings,
+            get_bulk_global_settings,
+            save_bulk_global_settings,
             update_plan_sentence_text,
             split_plan_sentence,
             merge_plan_sentences,

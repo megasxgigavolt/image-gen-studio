@@ -3816,6 +3816,72 @@ Return JSON only — no markdown, no explanation:
         )
     }
 
+    /// A genuine whole-script comprehension pass for Bulk Generation's
+    /// planning prompt — reads the ENTIRE script in ONE call, unlike the
+    /// scene-segmentation engine's Pass 1 (which analyzes the script in
+    /// parallel batches with no shared context between them, despite being
+    /// told to "read the entire script first"). Produces a compact prose
+    /// summary of the video's actual throughline: what it's about, its
+    /// overall argument/structure, its tone, and how it's meant to build —
+    /// not a sentence-by-sentence recap. Cached per video (see
+    /// `script_understanding_source.{video_id}`, which stores the exact
+    /// script text the cached summary was derived from, so a script edit
+    /// invalidates it automatically without needing a hashing dependency).
+    /// Fully automatic — there's no user-facing toggle for this, so a
+    /// failure here degrades to "no whole-script context available" rather
+    /// than blocking planning entirely; see its one call site in
+    /// `plan_bulk_visuals_batch`.
+    fn script_understanding_for_video(&self, video_id: &str, gemini_auth: &Option<GeminiAuth>) -> Result<String, String> {
+        let inputs = self.get_video_inputs(video_id)?;
+        let (script_text, _) = remove_tts_pause_markers(&inputs.script_text);
+        if script_text.trim().is_empty() {
+            return Ok(String::new());
+        }
+        let source_key = format!("script_understanding_source.{video_id}");
+        let cache_key = format!("script_understanding.{video_id}");
+        if self.get_app_setting(&source_key)?.as_deref() == Some(script_text.as_str()) {
+            if let Some(cached) = self.get_app_setting(&cache_key)? {
+                if !cached.trim().is_empty() {
+                    return Ok(cached);
+                }
+            }
+        }
+        let prompt = format!(
+            "Read this ENTIRE video script and form a genuine understanding of it as a whole — not a \
+             sentence-by-sentence summary. Identify: (1) what the video is actually about and its \
+             central argument or claim, (2) its overall structure or shape (for example: a countdown, \
+             a single sustained argument, a narrative arc with a turning point, a comparison, a \
+             how-to sequence), (3) its overall tone, and (4) how it is meant to build or escalate from \
+             beginning to end. Write this as 4-8 sentences of plain prose that a visual director could \
+             use to keep every single image in the video faithful to the whole story, not just its own \
+             sentence in isolation. Return only the description, no preamble, no labels, no markdown.\n\n\
+             SCRIPT:\n{script_text}"
+        );
+        #[cfg(not(test))]
+        let claude_cli = claude_cli_available();
+        #[cfg(test)]
+        let claude_cli = false;
+        let description = if claude_cli {
+            match run_claude_cli(&prompt, &[]) {
+                Ok(result) => result,
+                Err(claude_error) => match gemini_auth.as_ref() {
+                    Some(auth) => request_gemini_text(auth, &prompt).map_err(|gemini_error| {
+                        format!("Claude CLI: {claude_error} (Gemini fallback also failed: {gemini_error})")
+                    })?,
+                    None => return Err(format!("Claude CLI: {claude_error}")),
+                },
+            }
+        } else {
+            request_gemini_text(
+                gemini_auth.as_ref().ok_or("Configure a Gemini API key, or log in with the Claude Code CLI, for whole-script understanding.")?,
+                &prompt,
+            )?
+        };
+        self.save_app_setting(&source_key, &script_text)?;
+        self.save_app_setting(&cache_key, &description)?;
+        Ok(description)
+    }
+
     /// Reads back up to `limit` already-*persisted* stills immediately
     /// before `before_index` (in ordinal order) as the same diversity/
     /// continuity context shape `plan_bulk_visuals_batch`'s prompt expects
@@ -4221,6 +4287,20 @@ Return JSON only — no markdown, no explanation:
                 video_history.summary_text(),
             )
         };
+        // Story context: a genuine whole-script understanding (computed
+        // once, cached, read the ENTIRE script — see
+        // script_understanding_for_video's doc comment for how this differs
+        // from the segmentation engine's own per-sentence passes) plus this
+        // batch's scene's own already-computed narrative summary, which
+        // existed in the database before this but was never read by
+        // planning until now. Best-effort: the whole-script half silently
+        // degrades to empty on any failure (no AI credentials, transient
+        // error) rather than blocking the batch — there's no user-facing
+        // toggle for this, so it should never be why a bulk run fails.
+        let script_understanding = self.script_understanding_for_video(video_id, &gemini_auth).unwrap_or_default();
+        let current_scene = current_scene_id.as_ref()
+            .and_then(|id| visual_plan.scenes.iter().find(|scene| &scene.id == id));
+        let story_context_block = format_story_context_block(&script_understanding, current_scene);
         // Visual Director dials (WHAT this batch should show) and Diversity
         // & Consistency Controller dials (HOW it should differ from or
         // match what's already been generated) — user-set levels resolved
@@ -4328,7 +4408,7 @@ Return JSON only — no markdown, no explanation:
         };
         let prompt = format!(
             r#"You are an Educational Visual Director planning an entire video, not isolated stills.
-
+{story_context_block}
 Style directive: {effective_style_directive}
 Base image settings: {base_settings_json}{director_note}{character_block}{location_block}{visual_director_block}{diversity_controller_block}
 Total stills in video: {total}. This batch covers stills {} of {total} (selected for this run).
@@ -11370,6 +11450,54 @@ fn aggregate_video_visual_history(entries: &[(String, String)]) -> VideoVisualHi
     history
 }
 
+/// Formats the STORY CONTEXT block injected into `plan_bulk_visuals_batch`'s
+/// prompt: the whole-script understanding (from `script_understanding_for_video`)
+/// plus this batch's scene's own already-computed narrative summary — title,
+/// narrative role, core idea, emotional tone, visual opportunities (from
+/// `scene_grouping_engine.py`'s Pass 3, saved to `visual_plan_scenes` but
+/// never read by planning before this). Either half can be legitimately
+/// empty — no whole-script understanding yet (first batch of a video, or
+/// the AI call failed), or a scene with no AI analysis at all (e.g. one
+/// created by a manual scene-boundary drag, which ships with empty
+/// context) — without breaking the other. Returns an empty string only
+/// when BOTH are empty, so the caller can skip the section header entirely
+/// rather than show an empty block.
+fn format_story_context_block(script_understanding: &str, scene: Option<&PlanScene>) -> String {
+    let mut sections = Vec::new();
+    if !script_understanding.trim().is_empty() {
+        sections.push(format!("WHOLE VIDEO: {}", script_understanding.trim()));
+    }
+    if let Some(scene) = scene {
+        let mut scene_lines = Vec::new();
+        if let Some(role) = scene.narrative_role.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            scene_lines.push(format!("Narrative role: {role}"));
+        }
+        if let Some(idea) = scene.core_idea.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            scene_lines.push(format!("Core idea: {idea}"));
+        }
+        if let Some(mood) = scene.emotional_state.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            scene_lines.push(format!("Emotional tone: {mood}"));
+        }
+        if !scene.visual_opportunities.is_empty() {
+            scene_lines.push(format!("Visual opportunities to consider: {}", scene.visual_opportunities.join(", ")));
+        }
+        if !scene_lines.is_empty() {
+            sections.push(format!("THIS SCENE — \"{}\":\n{}", scene.label, scene_lines.join("\n")));
+        }
+    }
+    if sections.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n════════════════════════════════════════\n\
+         STORY CONTEXT — read this before deciding what each still shows\n\
+         ════════════════════════════════════════\n\
+         {}\n\
+         ════════════════════════════════════════\n",
+        sections.join("\n\n"),
+    )
+}
+
 /// `seed_run_type`/`seed_run_len` let the caller carry a same-type run
 /// already in progress at the END of whatever came immediately before
 /// `planned` (e.g. the tail of `bulk_plan_prior_context`, when `planned` is
@@ -14077,6 +14205,50 @@ mod tests {
         assert!(VideoVisualHistory::default().is_empty());
         assert!(!history.is_empty());
         assert_eq!(VideoVisualHistory::default().summary_text(), "");
+    }
+
+    #[test]
+    fn format_story_context_block_combines_whole_video_and_scene_understanding() {
+        let analyzed_scene = PlanScene {
+            id: "sc1".into(), ordinal: 1, label: "Why Familiar Feels Safe".into(),
+            narrative_role: Some("explanation".into()),
+            core_idea: Some("Familiarity gets mistaken for actual safety.".into()),
+            emotional_state: Some("uneasy".into()),
+            visual_opportunities: vec!["comfort zones".into(), "invisible walls".into()],
+            sentence_ids: vec!["s1".into()], expanded: true,
+        };
+
+        // Both halves present.
+        let block = format_story_context_block("This video argues that comfort is often mistaken for safety.", Some(&analyzed_scene));
+        assert!(block.contains("STORY CONTEXT"));
+        assert!(block.contains("WHOLE VIDEO: This video argues that comfort is often mistaken for safety."));
+        assert!(block.contains("THIS SCENE — \"Why Familiar Feels Safe\":"));
+        assert!(block.contains("Narrative role: explanation"));
+        assert!(block.contains("Core idea: Familiarity gets mistaken for actual safety."));
+        assert!(block.contains("Emotional tone: uneasy"));
+        assert!(block.contains("Visual opportunities to consider: comfort zones, invisible walls"));
+
+        // Whole-video half only (e.g. this scene was never AI-analyzed —
+        // created by a manual scene-boundary drag, which ships with empty
+        // context per create_plan_group).
+        let unanalyzed_scene = PlanScene {
+            id: "sc2".into(), ordinal: 2, label: "Scene".into(),
+            narrative_role: None, core_idea: None, emotional_state: None, visual_opportunities: Vec::new(),
+            sentence_ids: vec!["s2".into()], expanded: true,
+        };
+        let whole_video_only = format_story_context_block("This video argues that comfort is often mistaken for safety.", Some(&unanalyzed_scene));
+        assert!(whole_video_only.contains("WHOLE VIDEO:"));
+        assert!(!whole_video_only.contains("THIS SCENE"), "an unanalyzed scene must not render an empty section: {whole_video_only}");
+
+        // Scene half only (whole-script understanding not yet available —
+        // first batch of a video, or the AI call failed).
+        let scene_only = format_story_context_block("", Some(&analyzed_scene));
+        assert!(!scene_only.contains("WHOLE VIDEO"));
+        assert!(scene_only.contains("THIS SCENE"));
+
+        // Neither half available at all — no section, not even an empty header.
+        assert_eq!(format_story_context_block("", None), "");
+        assert_eq!(format_story_context_block("   ", Some(&unanalyzed_scene)), "");
     }
 
     #[test]

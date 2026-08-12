@@ -1210,6 +1210,13 @@ function VisualPlanView() {
   // group's true position in the full plan.groups array, not its position
   // among currently-visible rows.
   const groupIndexById = useMemo(() => new Map(plan?.groups.map((group, index) => [group.id, index]) ?? []), [plan]);
+  // null while nothing is being dragged (every divider renders normally);
+  // a Set of the specific insertIndex values valid for the sentence
+  // currently being dragged once a drag starts — see StillDivider below.
+  const validDividerIndexes = useMemo(
+    () => (plan && draggedSentenceId ? new Set(validDividerIndexesForSentence(plan, draggedSentenceId)) : null),
+    [plan, draggedSentenceId],
+  );
 
   return (
     <section className="view">
@@ -1255,7 +1262,7 @@ function VisualPlanView() {
         onDragEnd={finishDrag}
       >
       <div className="plan-list">
-        <StillDivider insertIndex={0} active={dropTarget === "divider:0"} />
+        <StillDivider insertIndex={0} active={dropTarget === "divider:0"} eligible={validDividerIndexes ? validDividerIndexes.has(0) : undefined} />
         {sections.map((section, sectionIndex) => {
           const scene = section.scene;
           const collapsed = Boolean(scene && !scene.expanded);
@@ -1313,7 +1320,7 @@ function VisualPlanView() {
                     </DroppableStill>
                     {/* The last still's divider moves outside the card (below) — every
                         other divider is a normal same-scene split point and stays here. */}
-                    {!isLastInSection && <StillDivider insertIndex={index + 1} active={dropTarget === `divider:${index + 1}`} />}
+                    {!isLastInSection && <StillDivider insertIndex={index + 1} active={dropTarget === `divider:${index + 1}`} eligible={validDividerIndexes ? validDividerIndexes.has(index + 1) : undefined} />}
                   </div>;
                 })}
               </div>
@@ -1324,6 +1331,7 @@ function VisualPlanView() {
                     insertIndex={lastIndex + 1}
                     active={dropTarget === `divider:${lastIndex + 1}`}
                     sceneSeam={hasSeamAfter}
+                    eligible={validDividerIndexes ? validDividerIndexes.has(lastIndex + 1) : undefined}
                   />
                 );
               })()}
@@ -1472,12 +1480,24 @@ function DroppableStill({ groupId, active, children }: { groupId: string; active
   return <article ref={setNodeRef} className={active || isOver ? "plan-row drag-over" : "plan-row"}>{children}</article>;
 }
 
-function StillDivider({ insertIndex, active, sceneSeam }: { insertIndex: number; active: boolean; sceneSeam?: boolean }) {
-  const { setNodeRef, isOver } = useDroppable({ id: `divider:${insertIndex}` });
+function StillDivider({ insertIndex, active, sceneSeam, eligible }: { insertIndex: number; active: boolean; sceneSeam?: boolean; eligible?: boolean }) {
+  // eligible is undefined when no sentence is currently being dragged (a
+  // divider is never "ineligible" at rest, only relative to whichever
+  // sentence is actively in the air) — see validDividerIndexesForSentence.
+  const ineligible = eligible === false;
+  const { setNodeRef, isOver } = useDroppable({ id: `divider:${insertIndex}`, disabled: ineligible });
   const classes = ["drop-divider"];
   if (sceneSeam) classes.push("scene-seam");
-  if (active || isOver) classes.push("drag-over");
-  return <div ref={setNodeRef} className={classes.join(" ")} data-seam-hint={sceneSeam ? "Drop here to start a new scene" : undefined} />;
+  if (ineligible) classes.push("ineligible");
+  if (!ineligible && (active || isOver)) classes.push("drag-over");
+  return (
+    <div
+      ref={setNodeRef}
+      className={classes.join(" ")}
+      data-seam-hint={sceneSeam ? "Drop here to start a new scene" : undefined}
+      title={ineligible ? "Not a valid drop point for this sentence — it can only become a new still at its own chronological boundary" : undefined}
+    />
+  );
 }
 
 /** The collapsed-by-default scene header row — a sibling of the still cards
@@ -1488,6 +1508,25 @@ function StillDivider({ insertIndex, active, sceneSeam }: { insertIndex: number;
  * information — the AI-derived label falls back to the literal word "Scene"
  * (no real title available, e.g. per-sentence/fallback-mode plans), which
  * used to render as the redundant "Scene 1 · Scene". */
+/** Mirrors create_plan_group's is_first/is_last validation (projects.rs)
+ * so the frontend can tell, WHILE a sentence is being dragged, exactly
+ * which divider(s) it can legally be dropped on to create a new still —
+ * only the one(s) at that sentence's own chronological boundary. A middle
+ * sentence of a multi-sentence still has none. Used to visually grey out
+ * every other divider during that drag, instead of letting the user drop
+ * on an invalid one and get a rejection banner that's easy to miss. */
+function validDividerIndexesForSentence(plan: VisualPlanRecord, sentenceId: string): number[] {
+  const source = plan.groups.findIndex((group) => group.sentenceIds.includes(sentenceId));
+  if (source === -1) return [];
+  const ids = plan.groups[source].sentenceIds;
+  const isFirst = ids[0] === sentenceId;
+  const isLast = ids[ids.length - 1] === sentenceId;
+  if (isFirst && isLast) return [source, source + 1];
+  if (isFirst) return [source];
+  if (isLast) return [source + 1];
+  return [];
+}
+
 function sceneDisplayTitle(scene: { ordinal: number; label: string }): string {
   const label = scene.label.trim();
   const isGeneric = !label || label.toLowerCase() === "scene" || label.toLowerCase() === `scene ${scene.ordinal}`;

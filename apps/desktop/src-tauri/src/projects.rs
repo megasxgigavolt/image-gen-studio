@@ -723,12 +723,13 @@ ALTER TABLE timeline_clips ADD COLUMN motion_graphic_ai_snapshot_json TEXT;
 /// that can span several `visual_plan_groups` (stills). `is_original`
 /// mirrors `visual_plan_groups`' own snapshot pattern (a generated-at-plan-
 /// time copy that `reset_visual_plan` restores from, and a live copy that
-/// edits apply to). `expanded` is written explicitly per scene at generation
-/// time (and again on reset) — only the first scene starts expanded, the
-/// rest start collapsed (see the scene-building code in `generate_visual_
-/// plan`/`build_scenes_range`) — and this same flag is shared by the Visual
-/// Plan tab, the Images tab's left pane, and its Bulk Generation panel, so a
-/// collapse/expand in any one of them is reflected in the others.
+/// edits apply to). `expanded` defaults to true so every scene reads as
+/// expanded immediately after generation (and again after a reset), per the
+/// product decision that only later manual collapses should persist. This
+/// same flag is shared by the Visual Plan tab and the Images tab's left
+/// pane, so a collapse/expand in one is reflected in the other — the Bulk
+/// Generation panel's own scene collapse state is intentionally NOT tied to
+/// this flag (see SceneBulkRow's local expand state in App.tsx).
 const MIGRATION_036: &str = r#"
 CREATE TABLE IF NOT EXISTS visual_plan_scenes (
     id TEXT PRIMARY KEY,
@@ -7535,8 +7536,19 @@ Return JSON only:
         let plan = self.get_visual_plan(video_id)?;
         let mut pending = Vec::new();
         for group in plan.groups {
-            let prompt = self.list_prompt_versions(video_id, &group.id)?.into_iter().next()
-                .ok_or_else(|| format!("{} needs a saved prompt before bulk generation.", group.label))?;
+            // A still with no prompt at all yet (never planned — the normal
+            // state for a fresh/never-bulk-planned project, and the whole
+            // reason this panel exists) is simply pending, not an error.
+            // This used to hard-fail here (inherited from create_image_job's
+            // OLD internal check, which only ever ran AFTER planning had
+            // already produced a prompt for every still) — which broke
+            // opening the Bulk Generation panel at all on any project with
+            // an unplanned still, well before the user ever gets a chance
+            // to plan one.
+            let Some(prompt) = self.list_prompt_versions(video_id, &group.id)?.into_iter().next() else {
+                pending.push(group.id);
+                continue;
+            };
             let renders = self.list_image_renders(video_id, &group.id)?;
             let educational_updated_at = self.get_educational_visual_plan(video_id, &group.id)?
                 .map(|plan| plan.updated_at);
@@ -8644,8 +8656,7 @@ Return JSON only:
                 .as_array()
                 .ok_or("Visual-plan audit contained no scenes.")?
                 .iter()
-                .enumerate()
-                .map(|(index, item)| {
+                .map(|item| {
                     let start = item["start_sentence_id"].as_i64().unwrap_or(1);
                     let end = item["end_sentence_id"].as_i64().unwrap_or(start);
                     PlanScene {
@@ -8675,13 +8686,7 @@ Return JSON only:
                             })
                             .unwrap_or_default(),
                         sentence_ids: (start..=end).map(|id| format!("s{id}")).collect(),
-                        // Only the first scene starts expanded — this flag is
-                        // shared with the Images tab's left pane (and its Bulk
-                        // Generation panel), which wants "collapsed except
-                        // scene 1" by default. An intentional, accepted change
-                        // from the earlier "every scene starts expanded"
-                        // behavior (see the Bulk Generation redesign plan).
-                        expanded: index == 0,
+                        expanded: true,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -9807,6 +9812,12 @@ Return JSON only:
             );
         }
         groups[source].sentence_ids.retain(|id| id != sentence_id);
+        // Captured before the push (any sentence already in the target
+        // group other than the one we're about to add) — used below to
+        // resolve which scene the target group belongs to, without relying
+        // on `target`'s index still being valid after groups.retain() may
+        // remove the now-possibly-empty source group and shift indices.
+        let target_anchor_sentence = groups[target].sentence_ids.first().cloned();
         groups[target].sentence_ids.push(sentence_id.into());
         groups[target]
             .sentence_ids
@@ -9817,8 +9828,25 @@ Return JSON only:
         }
         validate_group_chronology(&groups)?;
         let plan = self.get_visual_plan(video_id)?;
-        assign_scene_ids(&mut groups, &plan.scenes);
-        self.save_plan(video_id, &plan.sentences, &groups, &plan.scenes, false, &plan.timing_source)?;
+        let mut scenes = plan.scenes.clone();
+        // A boundary-crossing move — "drag a sentence into the scene above
+        // or below" — shifts the scene boundary itself: the departing
+        // scene's range shrinks, the receiving scene's grows. Only the
+        // scenes' own `sentence_ids` change here; assign_scene_ids below
+        // re-derives every group's scene_id from the result.
+        if let (Some(source_scene), Some(target_scene)) = (
+            scene_containing_sentence(&scenes, sentence_id),
+            target_anchor_sentence.as_deref().and_then(|anchor| scene_containing_sentence(&scenes, anchor)),
+        ) {
+            if source_scene != target_scene {
+                scenes[source_scene].sentence_ids.retain(|id| id != sentence_id);
+                scenes[target_scene].sentence_ids.push(sentence_id.into());
+                scenes[target_scene].sentence_ids.sort_by_key(|id| sentence_number(id));
+                rebalance_scene_ordinals(&mut scenes);
+            }
+        }
+        assign_scene_ids(&mut groups, &scenes);
+        self.save_plan(video_id, &plan.sentences, &groups, &scenes, false, &plan.timing_source)?;
         self.get_visual_plan(video_id)
     }
 
@@ -9847,9 +9875,9 @@ Return JSON only:
         // both gated by the same `original: bool` — writing original_groups
         // and original_scenes back over themselves here is a harmless no-op,
         // it's what unlocks restoring sentences without a separate write
-        // path. Scenes restored this way also naturally come back to their
-        // generation-time expand state (only scene 1 expanded, per the
-        // original snapshot), which is the intended "reset = fresh start"
+        // path. Scenes restored this way also naturally come back expanded
+        // (the original snapshot was always written with expanded=true at
+        // generation time), which is the intended "reset = fresh start"
         // behavior rather than something specially engineered here.
         self.save_plan(video_id, &original_sentences, &original_groups, &original_scenes, true, &plan.timing_source)?;
         self.save_plan(video_id, &original_sentences, &original_groups, &original_scenes, false, &plan.timing_source)?;
@@ -9868,19 +9896,41 @@ Return JSON only:
             .position(|group| group.sentence_ids.contains(&sentence_id.to_string()))
             .ok_or("Sentence was not found.")?;
         let source_ids = &groups[source].sentence_ids;
-        let expected_insert_index = if source_ids.first().map(String::as_str) == Some(sentence_id) {
-            source
-        } else if source_ids.last().map(String::as_str) == Some(sentence_id) {
-            source + 1
-        } else {
+        let is_first = source_ids.first().map(String::as_str) == Some(sentence_id);
+        let is_last = source_ids.last().map(String::as_str) == Some(sentence_id);
+        if !is_first && !is_last {
             return Err(
                 "A new still can only be created from the first or last sentence of an existing still."
                     .into(),
             );
+        }
+        // A still with exactly one sentence is simultaneously its own first
+        // AND last sentence — so both the divider immediately before it and
+        // the one immediately after are equally valid, zero-distance
+        // chronological boundaries (e.g. peeling an already-solo still off
+        // into a brand new scene right after it, one of the most common
+        // cases for the "drag across a scene seam" feature, since scenes
+        // built from fast/per-sentence pacing are mostly solo-sentence
+        // stills). A multi-sentence still still only allows the one side
+        // its dragged sentence actually sits on.
+        let valid_insert_indexes: Vec<usize> = if is_first && is_last {
+            vec![source, source + 1]
+        } else if is_first {
+            vec![source]
+        } else {
+            vec![source + 1]
         };
-        if insert_index != expected_insert_index {
+        if !valid_insert_indexes.contains(&insert_index) {
             return Err("Drop at the sentence's chronological boundary to create a new still.".into());
         }
+        // Captured before mutating: if this sentence is its group's only
+        // one, that whole group is about to vanish from `groups` below —
+        // which shifts every later index down by one. `insert_index` was
+        // computed by the caller against the PRE-removal array, so it needs
+        // the same adjustment or the new group lands one slot too far right
+        // (silently wrong chronological order — see the seam test that
+        // covers this).
+        let source_group_disappears = groups[source].sentence_ids.len() == 1;
         groups[source].sentence_ids.retain(|id| id != sentence_id);
         groups.retain(|group| !group.sentence_ids.is_empty());
         let next_id = groups
@@ -9889,7 +9939,12 @@ Return JSON only:
             .max()
             .unwrap_or(0)
             + 1;
-        let target = insert_index.min(groups.len());
+        let adjusted_insert_index = if source_group_disappears && source < insert_index {
+            insert_index - 1
+        } else {
+            insert_index
+        };
+        let target = adjusted_insert_index.min(groups.len());
         groups.insert(
             target,
             PlanGroup {
@@ -9900,8 +9955,10 @@ Return JSON only:
                 sentence_ids: vec![sentence_id.into()],
                 settings_locked: false,
                 prompt_locked: false,
-                // Resolved below by assign_scene_ids — the new still keeps
-                // whichever scene already contained this sentence.
+                // Resolved below by assign_scene_ids, after scenes are
+                // rebalanced — usually the scene that already contained
+                // this sentence, or a brand new scene if the split lands
+                // exactly at an existing scene seam (see below).
                 scene_id: None,
             },
         );
@@ -9910,12 +9967,51 @@ Return JSON only:
         }
         validate_group_chronology(&groups)?;
         let current = self.get_visual_plan(video_id)?;
-        assign_scene_ids(&mut groups, &current.scenes);
+        let mut scenes = current.scenes.clone();
+        // "Drag a sentence into the gap between two stills" only becomes a
+        // NEW scene when that gap sits exactly at a pre-existing scene seam
+        // — i.e. the new solo still's two neighbors already belong to two
+        // DIFFERENT scenes. Splitting a still in the middle of one scene
+        // (both neighbors share a scene, or the split is at the very start/
+        // end of the video with only one neighbor) just joins the ambient
+        // scene, unchanged from before this feature existed.
+        let before_scene = target.checked_sub(1)
+            .and_then(|index| groups.get(index))
+            .and_then(|group| group.sentence_ids.first())
+            .and_then(|id| scene_containing_sentence(&scenes, id));
+        let after_scene = groups.get(target + 1)
+            .and_then(|group| group.sentence_ids.first())
+            .and_then(|id| scene_containing_sentence(&scenes, id));
+        if let (Some(before_scene), Some(after_scene)) = (before_scene, after_scene) {
+            if before_scene != after_scene {
+                if let Some(departing_scene) = scene_containing_sentence(&scenes, sentence_id) {
+                    scenes[departing_scene].sentence_ids.retain(|id| id != sentence_id);
+                }
+                let next_scene_id = scenes.iter()
+                    .map(|scene| sentence_number(scene.id.trim_start_matches("sc")))
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                scenes.push(PlanScene {
+                    id: format!("sc{next_scene_id}"),
+                    ordinal: 0,
+                    label: "Scene".into(),
+                    narrative_role: None,
+                    core_idea: None,
+                    emotional_state: None,
+                    visual_opportunities: Vec::new(),
+                    sentence_ids: vec![sentence_id.into()],
+                    expanded: true,
+                });
+                rebalance_scene_ordinals(&mut scenes);
+            }
+        }
+        assign_scene_ids(&mut groups, &scenes);
         self.save_plan(
             video_id,
             &current.sentences,
             &groups,
-            &current.scenes,
+            &scenes,
             false,
             &current.timing_source,
         )?;
@@ -9923,16 +10019,18 @@ Return JSON only:
     }
 
     /// Persists a scene's collapsed/expanded state — shared by the Visual
-    /// Plan tab, the Images tab's left pane, and its Bulk Generation panel
-    /// (all three read/write the same `visual_plan_scenes.expanded` column,
-    /// so toggling a scene in any one of them is reflected in the others).
-    /// Reshaping scene boundaries themselves still isn't a user action (see
-    /// the Visual Scene Segmentor plan's "explicitly out of scope" list).
-    /// Only ever touches the current (`is_original=0`) snapshot — expand
-    /// state isn't part of what `reset_visual_plan` restores from the
-    /// original snapshot, it naturally comes back to each scene's
-    /// generation-time default (only scene 1 expanded) on reset, same as
-    /// everything else in that snapshot.
+    /// Plan tab and the Images tab's left pane (both read/write the same
+    /// `visual_plan_scenes.expanded` column, so toggling a scene in one is
+    /// reflected in the other). The Bulk Generation panel's own scene
+    /// collapse state is intentionally NOT tied to this — it's local
+    /// component state in App.tsx, not persisted here. Reshaping scene
+    /// boundaries themselves still isn't a user action (see the Visual
+    /// Scene Segmentor plan's "explicitly out of scope" list). Only ever
+    /// touches the current (`is_original=0`) snapshot — expand state isn't
+    /// part of what `reset_visual_plan` restores from the original
+    /// snapshot, it naturally comes back to every scene's generation-time
+    /// default (expanded) on reset, same as everything else in that
+    /// snapshot.
     pub fn set_plan_scene_expanded(
         &self,
         video_id: &str,
@@ -11788,9 +11886,7 @@ fn build_scenes_range(groups: &[PlanGroup]) -> Vec<PlanScene> {
                     .iter()
                     .flat_map(|group| group.sentence_ids.iter().cloned())
                     .collect(),
-                // Only the first scene starts expanded — see the matching
-                // `expanded: index == 0` in the real generation path.
-                expanded: index == 0,
+                expanded: true,
             }
         })
         .collect()
@@ -11798,9 +11894,11 @@ fn build_scenes_range(groups: &[PlanGroup]) -> Vec<PlanScene> {
 
 /// Recomputes every group's `scene_id` by containment against `scenes` (a
 /// group belongs to whichever scene's sentence range contains its first
-/// sentence). Scene ranges themselves don't change from still-level edits in
-/// v1 — this just keeps a still's scene membership correct after
-/// move/split/merge/create reshuffle which sentences a still contains.
+/// sentence). Callers that need a move/split to actually cross a scene
+/// boundary (see `scene_containing_sentence`/`rebalance_scene_ordinals`)
+/// must update `scenes`' own `sentence_ids` themselves *before* calling
+/// this — it only ever re-derives `scene_id` from whatever `scenes` already
+/// says, it never changes a scene's range on its own.
 fn assign_scene_ids(groups: &mut [PlanGroup], scenes: &[PlanScene]) {
     for group in groups.iter_mut() {
         group.scene_id = group.sentence_ids.first().and_then(|first_sentence_id| {
@@ -11809,6 +11907,28 @@ fn assign_scene_ids(groups: &mut [PlanGroup], scenes: &[PlanScene]) {
                 .find(|scene| scene.sentence_ids.iter().any(|id| id == first_sentence_id))
                 .map(|scene| scene.id.clone())
         });
+    }
+}
+
+/// Index of whichever scene's `sentence_ids` currently lists `sentence_id`.
+fn scene_containing_sentence(scenes: &[PlanScene], sentence_id: &str) -> Option<usize> {
+    scenes.iter().position(|scene| scene.sentence_ids.iter().any(|id| id == sentence_id))
+}
+
+/// After a boundary-crossing move/split has already added/removed sentence
+/// ids on the affected scenes' `sentence_ids`, this: drops any scene that's
+/// now empty (its one sentence just left), re-sorts scenes into chronological
+/// order by each one's earliest sentence (so a freshly-inserted scene lands
+/// in the right slot without the caller needing to compute an insert index),
+/// and renumbers `ordinal` to match — the same drop-empty-then-renumber
+/// pattern `split_plan_sentence`/`merge_plan_sentences` already use.
+fn rebalance_scene_ordinals(scenes: &mut Vec<PlanScene>) {
+    scenes.retain(|scene| !scene.sentence_ids.is_empty());
+    scenes.sort_by_key(|scene| {
+        scene.sentence_ids.iter().map(|id| sentence_number(id)).min().unwrap_or(i64::MAX)
+    });
+    for (index, scene) in scenes.iter_mut().enumerate() {
+        scene.ordinal = index as i64 + 1;
     }
 }
 
@@ -12199,12 +12319,8 @@ mod tests {
         assert!(!original.groups.is_empty());
         assert!(!original.scenes.is_empty(), "generation must always produce at least one scene");
         assert!(
-            original.scenes[0].expanded,
-            "the first scene must start expanded right after generation"
-        );
-        assert!(
-            original.scenes[1..].iter().all(|scene| !scene.expanded),
-            "every scene after the first must start collapsed right after generation"
+            original.scenes.iter().all(|scene| scene.expanded),
+            "every scene must start expanded right after generation"
         );
         assert!(
             original.groups.iter().all(|group| group.scene_id.is_some()),
@@ -12220,6 +12336,271 @@ mod tests {
                 original.groups
             );
         }
+    }
+
+    /// Seeds a plan with one sentence per still (simplest fixture for
+    /// boundary tests — every sentence is both first and last of its own
+    /// group, so any of them is a valid drag-boundary candidate) and one
+    /// scene per entry in `scene_sentence_counts`, in chronological order.
+    /// e.g. `&[2, 2]` builds scenes sc1={s1,s2}/sc2={s3,s4} over groups
+    /// g1..g4. Writes both snapshots (original + current), same as real
+    /// generation, so `save_plan`'s invariants hold.
+    fn seed_plan_with_scenes(repo: &ProjectRepository, video_id: &str, scene_sentence_counts: &[usize]) {
+        let mut sentences = Vec::new();
+        let mut groups = Vec::new();
+        let mut scenes = Vec::new();
+        let mut next_sentence = 1i64;
+        for (scene_index, &count) in scene_sentence_counts.iter().enumerate() {
+            let mut scene_sentence_ids = Vec::new();
+            for _ in 0..count {
+                let id = format!("s{next_sentence}");
+                sentences.push(PlanSentence {
+                    id: id.clone(),
+                    ordinal: next_sentence,
+                    text: format!("Sentence {next_sentence}."),
+                    start_seconds: next_sentence as f64,
+                    end_seconds: next_sentence as f64 + 1.0,
+                });
+                groups.push(PlanGroup {
+                    id: format!("g{next_sentence}"),
+                    ordinal: next_sentence,
+                    label: format!("Still {next_sentence}"),
+                    kind: "custom".into(),
+                    sentence_ids: vec![id.clone()],
+                    settings_locked: false,
+                    prompt_locked: false,
+                    scene_id: None,
+                });
+                scene_sentence_ids.push(id);
+                next_sentence += 1;
+            }
+            scenes.push(PlanScene {
+                id: format!("sc{}", scene_index + 1),
+                ordinal: scene_index as i64 + 1,
+                label: "Scene".into(),
+                narrative_role: None,
+                core_idea: None,
+                emotional_state: None,
+                visual_opportunities: Vec::new(),
+                sentence_ids: scene_sentence_ids,
+                expanded: true,
+            });
+        }
+        assign_scene_ids(&mut groups, &scenes);
+        repo.save_plan(video_id, &sentences, &groups, &scenes, true, "test").unwrap();
+        repo.save_plan(video_id, &sentences, &groups, &scenes, false, "test").unwrap();
+    }
+
+    /// A still's sentences must all belong to the SAME scene's sentence_ids
+    /// — a stronger check than production's `assign_scene_ids`, which only
+    /// ever inspects a group's first sentence. Boundary-editing bugs would
+    /// otherwise hide behind that leniency.
+    fn assert_no_group_straddles_two_scenes(plan: &VisualPlan) {
+        for group in &plan.groups {
+            let owning_scenes: std::collections::HashSet<&str> = group.sentence_ids.iter()
+                .filter_map(|id| plan.scenes.iter().find(|scene| scene.sentence_ids.contains(id)))
+                .map(|scene| scene.id.as_str())
+                .collect();
+            assert!(
+                owning_scenes.len() <= 1,
+                "still {} straddles multiple scenes: {owning_scenes:?}",
+                group.id
+            );
+        }
+    }
+
+    #[test]
+    fn move_plan_sentence_across_a_scene_boundary_shifts_the_boundary() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        seed_plan_with_scenes(&repo, &video.id, &[3, 3]); // sc1={s1,s2,s3}, sc2={s4,s5,s6}
+
+        // s3 is the last sentence of g3 (scene 1's last still) — drag it
+        // into g4 (scene 2's first still, adjacent).
+        let plan = repo.move_plan_sentence(&video.id, "s3", "g4").unwrap();
+
+        let scene1 = plan.scenes.iter().find(|s| s.ordinal == 1).unwrap();
+        let scene2 = plan.scenes.iter().find(|s| s.ordinal == 2).unwrap();
+        assert_eq!(scene1.sentence_ids, vec!["s1", "s2"], "scene 1 must lose s3");
+        assert_eq!(scene2.sentence_ids, vec!["s3", "s4", "s5", "s6"], "scene 2 must gain s3, in chronological order");
+
+        let merged_group = plan.groups.iter().find(|g| g.sentence_ids.contains(&"s3".to_string())).unwrap();
+        assert_eq!(merged_group.scene_id.as_deref(), Some(scene2.id.as_str()));
+        assert_no_group_straddles_two_scenes(&plan);
+    }
+
+    #[test]
+    fn move_plan_sentence_that_empties_a_scene_drops_and_renumbers_it() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        seed_plan_with_scenes(&repo, &video.id, &[1, 3]); // sc1={s1} (single-still scene), sc2={s2,s3,s4}
+
+        // s1 is scene 1's only sentence — moving it into scene 2 must leave
+        // scene 1 empty and it should disappear entirely, not linger as a
+        // 0-sentence scene.
+        let plan = repo.move_plan_sentence(&video.id, "s1", "g2").unwrap();
+
+        assert_eq!(plan.scenes.len(), 1, "the emptied scene must be dropped");
+        let remaining = &plan.scenes[0];
+        assert_eq!(remaining.ordinal, 1, "the sole remaining scene must renumber to ordinal 1");
+        assert_eq!(remaining.sentence_ids, vec!["s1", "s2", "s3", "s4"]);
+        assert!(plan.groups.iter().all(|g| g.scene_id.as_deref() == Some(remaining.id.as_str())));
+        assert_no_group_straddles_two_scenes(&plan);
+    }
+
+    #[test]
+    fn create_plan_group_at_a_scene_seam_inserts_a_new_scene() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        // sc1={s1,s2,s3} over g1(s1),g2(s2,s3); sc2={s4} over g3(s4). Use a
+        // 2-sentence g2 (not a solo still) so removing just its last
+        // sentence doesn't empty/remove it — keeps group indices stable
+        // and isolates the "insert a new scene" behavior being tested.
+        let mut sentences = vec![
+            PlanSentence { id: "s1".into(), ordinal: 1, text: "One.".into(), start_seconds: 1.0, end_seconds: 2.0 },
+            PlanSentence { id: "s2".into(), ordinal: 2, text: "Two.".into(), start_seconds: 2.0, end_seconds: 3.0 },
+            PlanSentence { id: "s3".into(), ordinal: 3, text: "Three.".into(), start_seconds: 3.0, end_seconds: 4.0 },
+            PlanSentence { id: "s4".into(), ordinal: 4, text: "Four.".into(), start_seconds: 4.0, end_seconds: 5.0 },
+        ];
+        sentences.sort_by_key(|s| s.ordinal);
+        let mut groups = vec![
+            PlanGroup { id: "g1".into(), ordinal: 1, label: "Still 1".into(), kind: "custom".into(), sentence_ids: vec!["s1".into()], settings_locked: false, prompt_locked: false, scene_id: None },
+            PlanGroup { id: "g2".into(), ordinal: 2, label: "Still 2".into(), kind: "custom".into(), sentence_ids: vec!["s2".into(), "s3".into()], settings_locked: false, prompt_locked: false, scene_id: None },
+            PlanGroup { id: "g3".into(), ordinal: 3, label: "Still 3".into(), kind: "custom".into(), sentence_ids: vec!["s4".into()], settings_locked: false, prompt_locked: false, scene_id: None },
+        ];
+        let mut scenes = vec![
+            PlanScene { id: "sc1".into(), ordinal: 1, label: "Scene".into(), narrative_role: None, core_idea: None, emotional_state: None, visual_opportunities: Vec::new(), sentence_ids: vec!["s1".into(), "s2".into(), "s3".into()], expanded: true },
+            PlanScene { id: "sc2".into(), ordinal: 2, label: "Scene".into(), narrative_role: None, core_idea: None, emotional_state: None, visual_opportunities: Vec::new(), sentence_ids: vec!["s4".into()], expanded: true },
+        ];
+        assign_scene_ids(&mut groups, &scenes);
+        repo.save_plan(&video.id, &sentences, &groups, &scenes, true, "test").unwrap();
+        repo.save_plan(&video.id, &sentences, &groups, &scenes, false, "test").unwrap();
+
+        // s3 is the last sentence of g2 (scene 1's last still) — drop it at
+        // the divider immediately after g2, which is also exactly the seam
+        // between scene 1 and scene 2.
+        let plan = repo.create_plan_group(&video.id, "s3", 2).unwrap();
+
+        assert_eq!(plan.scenes.len(), 3, "a new scene must be inserted at the seam");
+        let new_scene = plan.scenes.iter().find(|s| s.ordinal == 2).unwrap();
+        assert_eq!(new_scene.sentence_ids, vec!["s3"]);
+        let old_scene1 = plan.scenes.iter().find(|s| s.ordinal == 1).unwrap();
+        assert_eq!(old_scene1.sentence_ids, vec!["s1", "s2"], "scene 1 must lose s3 to the new scene");
+        let old_scene2 = plan.scenes.iter().find(|s| s.ordinal == 3).unwrap();
+        assert_eq!(old_scene2.sentence_ids, vec!["s4"], "the old scene 2 must renumber to ordinal 3");
+        let new_group = plan.groups.iter().find(|g| g.sentence_ids == vec!["s3".to_string()]).unwrap();
+        assert_eq!(new_group.scene_id.as_deref(), Some(new_scene.id.as_str()));
+        assert_no_group_straddles_two_scenes(&plan);
+    }
+
+    #[test]
+    fn create_plan_group_from_a_solo_sentence_still_at_a_scene_seam_inserts_a_new_scene() {
+        // Regression test: a still with exactly ONE sentence is simultaneously
+        // its own first AND last sentence. The original boundary check picked
+        // the "first" branch before ever considering "last", computing
+        // expected_insert_index = source (the divider BEFORE the still) even
+        // when the frontend correctly sent source+1 (the divider AFTER it,
+        // which is where the seam divider between two scenes actually sits)
+        // — surfacing as "Drop at the sentence's chronological boundary to
+        // create a new still." on the exact drag this feature exists for,
+        // since fast/per-sentence pacing produces mostly solo-sentence stills.
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        seed_plan_with_scenes(&repo, &video.id, &[2, 2]); // sc1={s1,s2} g1(s1),g2(s2); sc2={s3,s4} g3(s3),g4(s4)
+
+        // s2 is g2's only sentence (both first and last) and scene 1's last
+        // still. Drop it at insert_index = source+1 = 2 — the divider AFTER
+        // g2, exactly where the real seam divider sits — not source (1).
+        let plan = repo.create_plan_group(&video.id, "s2", 2).unwrap();
+
+        assert_eq!(plan.scenes.len(), 3, "a new scene must be inserted at the seam");
+        let scene1 = plan.scenes.iter().find(|s| s.ordinal == 1).unwrap();
+        let new_scene = plan.scenes.iter().find(|s| s.ordinal == 2).unwrap();
+        let scene2 = plan.scenes.iter().find(|s| s.ordinal == 3).unwrap();
+        assert_eq!(scene1.sentence_ids, vec!["s1"], "scene 1 must lose s2 to the new scene");
+        assert_eq!(new_scene.sentence_ids, vec!["s2"]);
+        assert_eq!(scene2.sentence_ids, vec!["s3", "s4"], "scene 2 must renumber to ordinal 3, unchanged otherwise");
+        // Chronological order must be preserved: s1, s2, s3, s4 in that order
+        // across the resulting stills — this is exactly what the index-shift
+        // bug (inserting one slot too far right once the solo still's own
+        // group vanished) would have violated.
+        let flattened: Vec<&str> = plan.groups.iter().flat_map(|g| g.sentence_ids.iter().map(String::as_str)).collect();
+        assert_eq!(flattened, vec!["s1", "s2", "s3", "s4"]);
+        assert_no_group_straddles_two_scenes(&plan);
+    }
+
+    #[test]
+    fn create_plan_group_inside_a_scene_does_not_create_a_new_scene() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        // One scene spanning g1(s1), g2(s2,s3), g3(s4) — splitting inside it
+        // must not create a new scene, since both neighbors of the split
+        // already share the same scene. g2 starts with 2 sentences (not a
+        // solo still) so removing just its last one doesn't empty/remove
+        // the group, keeping indices stable.
+        let sentences: Vec<PlanSentence> = (1..=4).map(|n| PlanSentence {
+            id: format!("s{n}"), ordinal: n, text: format!("Sentence {n}."),
+            start_seconds: n as f64, end_seconds: n as f64 + 1.0,
+        }).collect();
+        let mut groups = vec![
+            PlanGroup { id: "g1".into(), ordinal: 1, label: "Still 1".into(), kind: "custom".into(), sentence_ids: vec!["s1".into()], settings_locked: false, prompt_locked: false, scene_id: None },
+            PlanGroup { id: "g2".into(), ordinal: 2, label: "Still 2".into(), kind: "custom".into(), sentence_ids: vec!["s2".into(), "s3".into()], settings_locked: false, prompt_locked: false, scene_id: None },
+            PlanGroup { id: "g3".into(), ordinal: 3, label: "Still 3".into(), kind: "custom".into(), sentence_ids: vec!["s4".into()], settings_locked: false, prompt_locked: false, scene_id: None },
+        ];
+        let mut scenes = vec![
+            PlanScene { id: "sc1".into(), ordinal: 1, label: "Scene".into(), narrative_role: None, core_idea: None, emotional_state: None, visual_opportunities: Vec::new(), sentence_ids: vec!["s1".into(), "s2".into(), "s3".into(), "s4".into()], expanded: true },
+        ];
+        assign_scene_ids(&mut groups, &scenes);
+        repo.save_plan(&video.id, &sentences, &groups, &scenes, true, "test").unwrap();
+        repo.save_plan(&video.id, &sentences, &groups, &scenes, false, "test").unwrap();
+        let scene_before = scenes[0].clone();
+
+        // s3 is the last sentence of g2 — drop it at the divider right
+        // after g2 (between g2 and g3, both already inside the one scene).
+        let plan = repo.create_plan_group(&video.id, "s3", 2).unwrap();
+
+        assert_eq!(plan.scenes.len(), 1, "splitting inside one scene must not create a new scene");
+        assert_eq!(plan.scenes[0].sentence_ids, scene_before.sentence_ids, "the scene's own range is unchanged by an intra-scene split");
+        let new_group = plan.groups.iter().find(|g| g.sentence_ids == vec!["s3".to_string()]).unwrap();
+        assert_eq!(new_group.scene_id.as_deref(), Some(plan.scenes[0].id.as_str()));
+        assert_no_group_straddles_two_scenes(&plan);
+    }
+
+    #[test]
+    fn scene_boundaries_stay_consistent_across_a_sequence_of_boundary_edits() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        seed_plan_with_scenes(&repo, &video.id, &[2, 2, 2]); // sc1={s1,s2} sc2={s3,s4} sc3={s5,s6}
+
+        // Move the boundary between scene 1 and scene 2 forward by one
+        // sentence (s2 crosses into scene 2)...
+        let after_first_move = repo.move_plan_sentence(&video.id, "s2", "g3").unwrap();
+        assert_no_group_straddles_two_scenes(&after_first_move);
+        assert_eq!(after_first_move.scenes.len(), 3, "no scene emptied out yet");
+        let scene1 = after_first_move.scenes.iter().find(|s| s.ordinal == 1).unwrap();
+        let scene2 = after_first_move.scenes.iter().find(|s| s.ordinal == 2).unwrap();
+        assert_eq!(scene1.sentence_ids, vec!["s1"]);
+        assert_eq!(scene2.sentence_ids, vec!["s2", "s3", "s4"]);
+
+        // ...then move the boundary between scene 2 and scene 3 backward by
+        // one sentence (s4 crosses back out of scene 2, into scene 3) —
+        // two independent boundary edits in a row must both leave every
+        // still cleanly inside exactly one scene.
+        let group_containing_s5 = after_first_move.groups.iter()
+            .find(|g| g.sentence_ids.contains(&"s5".to_string())).unwrap().id.clone();
+        let after_second_move = repo.move_plan_sentence(&video.id, "s4", &group_containing_s5).unwrap();
+        assert_no_group_straddles_two_scenes(&after_second_move);
+        assert_eq!(after_second_move.scenes.len(), 3);
+        let scene2_final = after_second_move.scenes.iter().find(|s| s.ordinal == 2).unwrap();
+        let scene3_final = after_second_move.scenes.iter().find(|s| s.ordinal == 3).unwrap();
+        assert_eq!(scene2_final.sentence_ids, vec!["s2", "s3"]);
+        assert_eq!(scene3_final.sentence_ids, vec!["s4", "s5", "s6"]);
     }
 
     #[test]
@@ -13126,6 +13507,34 @@ mod tests {
         assert!(!pending.contains(&up_to_date_group.id), "an up-to-date still must not be pending");
         for group in plan.groups.iter().skip(1) {
             assert!(pending.contains(&group.id), "a still with no render must be pending");
+        }
+    }
+
+    #[test]
+    fn pending_still_ids_treats_a_never_planned_still_as_pending_not_an_error() {
+        // Regression test: a still with no prompt version AT ALL (the normal
+        // state for a project right after generation, before Bulk Generation
+        // has ever run) used to hard-error out of pending_still_ids entirely
+        // — inherited from create_image_job's OLD internal check, which only
+        // ever ran after planning had already produced a prompt for every
+        // still. Since pending_still_ids now also runs the moment the Bulk
+        // Generation panel opens (to compute its default selection), that
+        // made the panel itself fail to open on any project with an
+        // unplanned still — i.e. almost every fresh project.
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        assert!(!plan.groups.is_empty());
+
+        // No create_prompt_version call at all — every still is unplanned.
+        let pending = repo.pending_still_ids(&video.id).unwrap();
+        for group in &plan.groups {
+            assert!(pending.contains(&group.id), "an unplanned still must be pending, not an error");
         }
     }
 

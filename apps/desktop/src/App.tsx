@@ -46,7 +46,7 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { type ChangeEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type ChangeEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { type AppStage, lastSelectedStill, useAppStore } from "./store/app-store";
 import { log } from "./infrastructure/logger";
@@ -963,7 +963,7 @@ function InputsView() {
           <footer><span>{wordCount.toLocaleString()} words</span><span>Approx. {Math.ceil(wordCount / 150)} min</span></footer>
         </article>
         <div className="panel-stack">
-          <article className="panel"><div className="panel-heading"><div><h2>Narration audio</h2><p>Used for word-level timing.</p></div><button className="secondary" onClick={() => void importAsset("audio")}><Upload size={15} />{audio ? "Replace" : "Import"}</button></div>{audio ? <div className="file-row"><span>♪</span><div><strong>{audio.originalName}</strong><small>{(audio.sizeBytes / 1024 / 1024).toFixed(1)} MB</small></div><button className="icon-button" onClick={() => void removeAsset(audio.id)}><X size={15} /></button></div> : <div className="asset-empty">WAV, MP3, M4A, AAC, or FLAC</div>}</article>
+          <article className="panel"><div className="panel-heading"><div><h2>Narration audio</h2><p>Used for word-level timing.</p></div>{!audio && <button className="secondary" onClick={() => void importAsset("audio")}><Upload size={15} />Import</button>}</div>{audio ? <div className="file-row"><span>♪</span><div><strong>{audio.originalName}</strong><small>{(audio.sizeBytes / 1024 / 1024).toFixed(1)} MB</small></div><button className="icon-button" onClick={() => void removeAsset(audio.id)}><X size={15} /></button></div> : <div className="asset-empty">WAV, MP3, M4A, AAC, or FLAC</div>}</article>
           <article className="panel pacing-panel">
             <div className="pacing-heading">
               <div><h2>Scene pacing</h2><p>Preferred duration range per still</p></div>
@@ -1165,10 +1165,10 @@ function VisualPlanView() {
     }
   }
 
-  // Clicking inside a sentence's text only ever arms a split point — never
-  // edits the wording itself. Re-arming (clicking elsewhere in the same or
-  // a different sentence) just moves the marker; nothing is committed until
-  // confirmSplit.
+  // Double-clicking inside a sentence's text only ever arms a split point —
+  // never edits the wording itself. Re-arming (double-clicking elsewhere in
+  // the same or a different sentence) just moves the marker; nothing is
+  // committed until confirmSplit.
   function armSplit(sentenceId: string, offset: number) {
     setSplitArm({ sentenceId, offset });
   }
@@ -1235,7 +1235,7 @@ function VisualPlanView() {
           <button type="button" onClick={closeSearch} aria-label="Close search"><X size={15} /></button>
         </div>
       )}
-      {error && <div className="inline-error">{error}</div>}
+      {error && <div className="inline-error dismissible"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss">×</button></div>}
       {!plan && !error && <div className="empty-state">Loading visual plan…</div>}
       {confirmReset && <ConfirmDialog title="Reset visual plan?" message="This restores everything to exactly how it was right after generation — groupings, and any sentence edits, splits, or merges. Everything you've changed since then will be lost." confirmLabel="Reset" onConfirm={() => { setConfirmReset(false); void resetPlan(); }} onCancel={() => setConfirmReset(false)} />}
       {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{formatTimeShort(plan.sentences.at(-1)?.endSeconds ?? 0)} total · Average {((plan.sentences.at(-1)?.endSeconds ?? 0) / plan.groups.length).toFixed(1)} sec · {plan.scenes.length} scene{plan.scenes.length === 1 ? "" : "s"}</span></div>
@@ -1262,47 +1262,72 @@ function VisualPlanView() {
           const sceneMembers = scene
             ? scene.sentenceIds.map((id) => plan.sentences.find((sentence) => sentence.id === id)).filter((sentence): sentence is NonNullable<typeof sentence> => Boolean(sentence)).sort((a, b) => a.ordinal - b.ordinal)
             : [];
+          const lastGroupIndexInSection = section.groups.length - 1;
+          // Every section boundary is a real scene transition (sectionGroupsByScene
+          // already merges consecutive same-scene groups into one section) — so
+          // whenever there's a next section at all, this section's trailing
+          // divider sits exactly at a scene seam. It's rendered as a SIBLING of
+          // (not nested inside) .plan-scene-section below specifically so it
+          // isn't buried inside the card's own padding/border, invisible dead
+          // space between two cards that a "drop here to create a new scene"
+          // drag would otherwise miss entirely.
+          const hasSeamAfter = sectionIndex < sections.length - 1;
           return (
-            <div className="plan-scene-section" key={scene?.id ?? `no-scene-${sectionIndex}`}>
-              {scene && sceneMembers.length > 0 && (
-                <SceneStrip
-                  scene={scene}
-                  stillCount={section.groups.length}
-                  startSeconds={sceneMembers[0].startSeconds}
-                  endSeconds={sceneMembers.at(-1)!.endSeconds}
-                  onToggle={() => void setSceneExpanded(scene.id, !scene.expanded)}
-                />
-              )}
-              {!collapsed && section.groups.map((group) => {
-                const index = groupIndexById.get(group.id) ?? 0;
-                const members = group.sentenceIds.map((id) => plan.sentences.find((sentence) => sentence.id === id)).filter((sentence): sentence is NonNullable<typeof sentence> => Boolean(sentence)).sort((a,b) => a.ordinal-b.ordinal);
-                const timing = { startSeconds: members[0].startSeconds, endSeconds: members.at(-1)!.endSeconds, durationSeconds: members.at(-1)!.endSeconds-members[0].startSeconds, members };
-                return <div className="plan-group-shell" key={group.id}>
-                  <DroppableStill groupId={group.id} active={dropTarget === `group:${group.id}`}>
-                    <span className="plan-index">{String(index + 1).padStart(2, "0")}</span>
-                    <div className="timing"><strong>{formatTimeShort(timing.startSeconds)} – {formatTimeShort(timing.endSeconds)}</strong><small>{timing.durationSeconds.toFixed(1)} sec</small></div>
-                    <div className="sentences">
-                      {timing.members.map((sentence) => (
-                        <DraggableSentence
-                          key={sentence.id}
-                          sentence={sentence}
-                          active={draggedSentenceId === sentence.id}
-                          dropActive={dropTarget === `sentence:${sentence.id}`}
-                          searchQuery={searchQuery}
-                          activeMatchKey={activeMatchKey}
-                          registerMatchRef={registerMatchRef}
-                          splitOffset={splitArm?.sentenceId === sentence.id ? splitArm.offset : null}
-                          onArmSplit={(offset) => armSplit(sentence.id, offset)}
-                          onConfirmSplit={confirmSplit}
-                          onCancelSplit={cancelSplit}
-                        />
-                      ))}
-                    </div>
-                  </DroppableStill>
-                  <StillDivider insertIndex={index + 1} active={dropTarget === `divider:${index + 1}`} />
-                </div>;
-              })}
-            </div>
+            <Fragment key={scene?.id ?? `no-scene-${sectionIndex}`}>
+              <div className="plan-scene-section">
+                {scene && sceneMembers.length > 0 && (
+                  <SceneStrip
+                    scene={scene}
+                    stillCount={section.groups.length}
+                    startSeconds={sceneMembers[0].startSeconds}
+                    endSeconds={sceneMembers.at(-1)!.endSeconds}
+                    onToggle={() => void setSceneExpanded(scene.id, !scene.expanded)}
+                  />
+                )}
+                {!collapsed && section.groups.map((group, groupIndexInSection) => {
+                  const index = groupIndexById.get(group.id) ?? 0;
+                  const members = group.sentenceIds.map((id) => plan.sentences.find((sentence) => sentence.id === id)).filter((sentence): sentence is NonNullable<typeof sentence> => Boolean(sentence)).sort((a,b) => a.ordinal-b.ordinal);
+                  const timing = { startSeconds: members[0].startSeconds, endSeconds: members.at(-1)!.endSeconds, durationSeconds: members.at(-1)!.endSeconds-members[0].startSeconds, members };
+                  const isLastInSection = groupIndexInSection === lastGroupIndexInSection;
+                  return <div className="plan-group-shell" key={group.id}>
+                    <DroppableStill groupId={group.id} active={dropTarget === `group:${group.id}`}>
+                      <span className="plan-index">{String(index + 1).padStart(2, "0")}</span>
+                      <div className="timing"><strong>{formatTimeShort(timing.startSeconds)} – {formatTimeShort(timing.endSeconds)}</strong><small>{timing.durationSeconds.toFixed(1)} sec</small></div>
+                      <div className="sentences">
+                        {timing.members.map((sentence) => (
+                          <DraggableSentence
+                            key={sentence.id}
+                            sentence={sentence}
+                            active={draggedSentenceId === sentence.id}
+                            dropActive={dropTarget === `sentence:${sentence.id}`}
+                            searchQuery={searchQuery}
+                            activeMatchKey={activeMatchKey}
+                            registerMatchRef={registerMatchRef}
+                            splitOffset={splitArm?.sentenceId === sentence.id ? splitArm.offset : null}
+                            onArmSplit={(offset) => armSplit(sentence.id, offset)}
+                            onConfirmSplit={confirmSplit}
+                            onCancelSplit={cancelSplit}
+                          />
+                        ))}
+                      </div>
+                    </DroppableStill>
+                    {/* The last still's divider moves outside the card (below) — every
+                        other divider is a normal same-scene split point and stays here. */}
+                    {!isLastInSection && <StillDivider insertIndex={index + 1} active={dropTarget === `divider:${index + 1}`} />}
+                  </div>;
+                })}
+              </div>
+              {!collapsed && section.groups.length > 0 && (() => {
+                const lastIndex = groupIndexById.get(section.groups[lastGroupIndexInSection].id) ?? 0;
+                return (
+                  <StillDivider
+                    insertIndex={lastIndex + 1}
+                    active={dropTarget === `divider:${lastIndex + 1}`}
+                    sceneSeam={hasSeamAfter}
+                  />
+                );
+              })()}
+            </Fragment>
           );
         })}
       </div>
@@ -1400,7 +1425,14 @@ function DraggableSentence({
   const textRef = useRef<HTMLSpanElement>(null);
   const mergeTargetActive = dropActive || isMergeOver;
 
-  function handleTextClick(event: ReactPointerEvent<HTMLSpanElement>) {
+  // Double-click only — a plain single pointerup/click must NOT arm a split.
+  // This used to be a single onPointerUp handler, which meant the pointerup
+  // that ENDS a drag-and-drop (releasing a dragged sentence right on/near
+  // its own or another sentence's text, which the new scene-seam drop zone
+  // makes easy to do) also armed an unwanted split as a side effect, every
+  // time. dblclick only ever fires on a genuine double-click gesture, never
+  // as part of a drag release.
+  function handleTextDoubleClick(event: ReactMouseEvent<HTMLSpanElement>) {
     if (!textRef.current) return;
     const pointFn = (document as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null }).caretRangeFromPoint;
     const range = pointFn?.call(document, event.clientX, event.clientY);
@@ -1410,7 +1442,7 @@ function DraggableSentence({
 
   return <div
     ref={setRefs}
-    className={[active && "dragging", mergeTargetActive && "merge-target", "sentence"].filter(Boolean).join(" ")}
+    className={[active && "dragging", mergeTargetActive && "merge-target", armed && "split-armed", "sentence"].filter(Boolean).join(" ")}
     style={{ transform: CSS.Translate.toString(transform), touchAction: "none" }}
     {...(armed ? {} : listeners)}
     {...(armed ? {} : attributes)}
@@ -1418,16 +1450,16 @@ function DraggableSentence({
     <b className="merge-handle" title="Drag onto another sentence to merge it with this one"><GripVertical size={18} /></b>
     {armed ? (
       <span className="sentence-split-armed">
-        <span ref={textRef} onPointerUp={handleTextClick}>{sentence.text.slice(0, splitOffset)}</span>
+        <span ref={textRef} onDoubleClick={handleTextDoubleClick}>{sentence.text.slice(0, splitOffset)}</span>
         <span className="split-caret" aria-hidden="true" />
-        <span onPointerUp={handleTextClick}>{sentence.text.slice(splitOffset)}</span>
+        <span onDoubleClick={handleTextDoubleClick}>{sentence.text.slice(splitOffset)}</span>
         <span className="split-controls">
-          <button type="button" className="icon-button" title="Split here (Enter)" onClick={onConfirmSplit}><Scissors size={13} /></button>
-          <button type="button" className="icon-button" title="Cancel (Esc)" onClick={onCancelSplit}><X size={13} /></button>
+          <button type="button" className="split-confirm" title="Split here (Enter)" onClick={onConfirmSplit}><Scissors size={13} /><span>Split</span></button>
+          <button type="button" className="split-cancel" title="Cancel (Esc)" onClick={onCancelSplit}><X size={14} /></button>
         </span>
       </span>
     ) : (
-      <span ref={textRef} onPointerUp={handleTextClick} title="Click to mark where this sentence should split">
+      <span ref={textRef} onDoubleClick={handleTextDoubleClick} title="Double-click to mark where this sentence should split">
         {highlightSentenceText(sentence.text, searchQuery, sentence.id, activeMatchKey, registerMatchRef)}
       </span>
     )}
@@ -1440,15 +1472,28 @@ function DroppableStill({ groupId, active, children }: { groupId: string; active
   return <article ref={setNodeRef} className={active || isOver ? "plan-row drag-over" : "plan-row"}>{children}</article>;
 }
 
-function StillDivider({ insertIndex, active }: { insertIndex: number; active: boolean }) {
+function StillDivider({ insertIndex, active, sceneSeam }: { insertIndex: number; active: boolean; sceneSeam?: boolean }) {
   const { setNodeRef, isOver } = useDroppable({ id: `divider:${insertIndex}` });
-  return <div ref={setNodeRef} className={active || isOver ? "drop-divider drag-over" : "drop-divider"} />;
+  const classes = ["drop-divider"];
+  if (sceneSeam) classes.push("scene-seam");
+  if (active || isOver) classes.push("drag-over");
+  return <div ref={setNodeRef} className={classes.join(" ")} data-seam-hint={sceneSeam ? "Drop here to start a new scene" : undefined} />;
 }
 
 /** The collapsed-by-default scene header row — a sibling of the still cards
  * in the same flat .plan-list, not a wrapper around them (see the Visual
  * Scene Segmentor plan). Not itself a drop target: dragging a sentence
  * toward a collapsed scene is a no-op in v1, the user expands it first. */
+/** "Scene {ordinal}", plus " · {label}" only when the label actually adds
+ * information — the AI-derived label falls back to the literal word "Scene"
+ * (no real title available, e.g. per-sentence/fallback-mode plans), which
+ * used to render as the redundant "Scene 1 · Scene". */
+function sceneDisplayTitle(scene: { ordinal: number; label: string }): string {
+  const label = scene.label.trim();
+  const isGeneric = !label || label.toLowerCase() === "scene" || label.toLowerCase() === `scene ${scene.ordinal}`;
+  return isGeneric ? `Scene ${scene.ordinal}` : `Scene ${scene.ordinal} · ${label}`;
+}
+
 function SceneStrip({ scene, stillCount, startSeconds, endSeconds, onToggle }: {
   scene: VisualPlanRecord["scenes"][number];
   stillCount: number;
@@ -1456,44 +1501,28 @@ function SceneStrip({ scene, stillCount, startSeconds, endSeconds, onToggle }: {
   endSeconds: number;
   onToggle: () => void;
 }) {
-  const hasContext = Boolean(scene.narrativeRole || scene.coreIdea || scene.emotionalState || scene.visualOpportunities.length);
   return (
     <div className={scene.expanded ? "plan-scene-strip expanded" : "plan-scene-strip"}>
       <button type="button" className="plan-scene-toggle" onClick={onToggle} aria-expanded={scene.expanded}>
         {scene.expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-        <span className="plan-scene-title">Scene {scene.ordinal} · {scene.label}</span>
+        <span className="plan-scene-title">{sceneDisplayTitle(scene)}</span>
         <span className="plan-scene-meta">{stillCount} still{stillCount === 1 ? "" : "s"} · {formatTimeShort(startSeconds)}–{formatTimeShort(endSeconds)}</span>
       </button>
-      {scene.expanded && (
-        <div className="plan-scene-context">
-          {hasContext ? (
-            <>
-              {scene.narrativeRole && <span><strong>Role:</strong> {scene.narrativeRole}</span>}
-              {scene.coreIdea && <span><strong>Idea:</strong> {scene.coreIdea}</span>}
-              {scene.emotionalState && <span><strong>Emotion:</strong> {scene.emotionalState}</span>}
-              {scene.visualOpportunities.length > 0 && <span><strong>Visual ideas:</strong> {scene.visualOpportunities.join(", ")}</span>}
-            </>
-          ) : (
-            <span className="muted">No detailed scene analysis available.</span>
-          )}
-        </div>
-      )}
     </div>
   );
 }
 
 /** The Images tab left pane's compact scene header row — same underlying
  * expand flag as SceneStrip (both read/write visual_plan_scenes.expanded
- * via setPlanSceneExpanded), sized for the narrow ~240px sidebar rather
- * than the wide plan list: no timing range, and only a single truncated
- * line of context when expanded — the full detail is one click away on the
- * Visual Plan tab. Also reused by the Bulk Generation panel's scene rows. */
+ * via setPlanSceneExpanded), full breadth of the filmstrip and minimal
+ * length: just a chevron, the scene number, and its still count — no
+ * narrative context, the full detail is one click away on the Visual Plan
+ * tab. */
 function LeftPaneSceneStrip({ scene, stillCount, onToggle }: {
   scene: PlanSceneRecord;
   stillCount: number;
   onToggle: () => void;
 }) {
-  const subtitle = scene.narrativeRole || scene.coreIdea || "";
   return (
     <div className={scene.expanded ? "stills-scene-strip expanded" : "stills-scene-strip"}>
       <button type="button" className="stills-scene-toggle" onClick={onToggle} aria-expanded={scene.expanded}>
@@ -1501,7 +1530,6 @@ function LeftPaneSceneStrip({ scene, stillCount, onToggle }: {
         <span className="stills-scene-title">Scene {scene.ordinal}</span>
         <span className="stills-scene-meta">{stillCount} still{stillCount === 1 ? "" : "s"}</span>
       </button>
-      {scene.expanded && subtitle && <div className="stills-scene-subtitle">{subtitle}</div>}
     </div>
   );
 }
@@ -1515,7 +1543,7 @@ function LeftPaneSceneStrip({ scene, stillCount, onToggle }: {
  * .still-thumb visual language. */
 function SceneBulkRow({
   scene, groups, selection, aspectRatio, renderUrls,
-  onToggleScene, onToggleStill, onToggleExpanded,
+  onToggleScene, onToggleStill, expanded, onToggleExpanded,
   override, overrideOpen, onToggleOverrideOpen, onSaveOverride, onImportReference,
 }: {
   scene: PlanSceneRecord | null;
@@ -1525,6 +1553,10 @@ function SceneBulkRow({
   renderUrls: Record<string, string>;
   onToggleScene: () => void;
   onToggleStill: (groupId: string) => void;
+  // Local to the Bulk Generation panel (bulkExpandedScenes in ImagesView),
+  // deliberately not scene.expanded — see the panel's own note on why its
+  // collapse state isn't tied to the Visual Plan / Images-pane toggle.
+  expanded: boolean;
   onToggleExpanded?: () => void;
   override: BulkSceneSettingsRecord | null;
   overrideOpen: boolean;
@@ -1535,7 +1567,6 @@ function SceneBulkRow({
   const groupIds = groups.map((group) => group.group.id);
   const state = sceneSelectionState(groupIds, selection);
   const selectedCount = groupIds.filter((id) => selection.has(id)).length;
-  const collapsed = Boolean(scene && !scene.expanded);
   return (
     <div className="bulk-scene-row">
       <div className="bulk-scene-row-header">
@@ -1548,17 +1579,17 @@ function SceneBulkRow({
           aria-label={scene ? `Select all stills in Scene ${scene.ordinal}` : "Select all unassigned stills"}
         />
         {scene ? (
-          <button type="button" className="bulk-scene-toggle" onClick={onToggleExpanded} aria-expanded={scene.expanded}>
-            {scene.expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-            <span className="bulk-scene-title">Scene {scene.ordinal} · {scene.label}</span>
+          <button type="button" className="bulk-scene-toggle" onClick={onToggleExpanded} aria-expanded={expanded}>
+            {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            <span className="bulk-scene-title">{sceneDisplayTitle(scene)}</span>
           </button>
         ) : (
           <span className="bulk-scene-title no-scene">Unassigned stills</span>
         )}
         <span className="bulk-scene-meta">{selectedCount}/{groupIds.length} stills</span>
         {scene && (
-          <button type="button" className="bulk-scene-override-toggle" onClick={onToggleOverrideOpen} aria-expanded={overrideOpen}>
-            <Settings size={12} />Customize
+          <button type="button" className="bulk-scene-override-toggle" onClick={onToggleOverrideOpen} aria-expanded={overrideOpen} aria-label="Customize this scene's bulk settings" title="Customize">
+            <Settings size={13} />
           </button>
         )}
       </div>
@@ -1598,7 +1629,7 @@ function SceneBulkRow({
           </div>
         </div>
       )}
-      {!collapsed && (
+      {expanded && (
         <div className="bulk-still-grid">
           {groups.map((group) => {
             const newestRender = group.imageRenders[0];
@@ -1822,6 +1853,11 @@ function ImagesView() {
   const [bulkSelection, setBulkSelection] = useState<Set<string>>(new Set());
   const [bulkSceneSettings, setBulkSceneSettings] = useState<BulkSceneSettingsRecord[]>([]);
   const [bulkOverrideOpenSceneId, setBulkOverrideOpenSceneId] = useState<string | null>(null);
+  // Deliberately NOT the shared visual_plan_scenes.expanded flag — the Bulk
+  // Generation panel's collapse state is its own local, ephemeral thing,
+  // independent of the Visual Plan tab / Images left pane's toggle. Reset
+  // fresh (first scene open, rest collapsed) every time the panel opens.
+  const [bulkExpandedScenes, setBulkExpandedScenes] = useState<Record<string, boolean>>({});
 
   // Same helper, same scene data as the Visual Plan tab's SceneStrip
   // sections — this is what sections the left pane's still list (and the
@@ -2289,6 +2325,12 @@ function ImagesView() {
     if (!activeVideoId) return;
     setBulkOpen(true);
     setError(null);
+    // Local, ephemeral collapse state — first scene open, rest collapsed —
+    // reset fresh every time the panel opens, independent of the shared
+    // Visual Plan / Images-pane expand flag.
+    setBulkExpandedScenes(Object.fromEntries(
+      stillSections.filter((section) => section.scene).map((section, index) => [section.scene!.id, index === 0]),
+    ));
     try {
       const [pending, sceneSettings] = await Promise.all([
         projectsClient.pendingStillIds(activeVideoId),
@@ -2299,6 +2341,10 @@ function ImagesView() {
     } catch (caught) {
       setError(String(caught));
     }
+  }
+
+  function toggleBulkSceneExpanded(sceneId: string) {
+    setBulkExpandedScenes((current) => ({ ...current, [sceneId]: !current[sceneId] }));
   }
 
   async function runBulkPlan() {
@@ -2826,7 +2872,7 @@ function ImagesView() {
           <div className="modal-heading-row">
             <h2>Bulk Generation</h2>
             <div className="bulk-modal-heading-actions">
-              <button type="button" className="secondary" onClick={() => setBulkGlobalOpen(true)}><Settings size={14} />Global Settings</button>
+              <button type="button" className="bulk-global-settings-button" onClick={() => setBulkGlobalOpen(true)} aria-label="Global Settings" title="Global Settings"><Settings size={16} /></button>
               <button type="button" className="icon-button" aria-label="Close" onClick={() => setBulkOpen(false)}><X size={16} /></button>
             </div>
           </div>
@@ -2841,6 +2887,9 @@ function ImagesView() {
             {stillSections.map((section, sectionIndex) => {
               const groupIds = section.groups.map((group) => group.group.id);
               const scene = section.scene;
+              // Local bulkExpandedScenes state, not scene.expanded — see the
+              // Bulk Generation panel's own collapse-state note above.
+              const expanded = !scene || (bulkExpandedScenes[scene.id] ?? true);
               return (
                 <SceneBulkRow
                   key={scene?.id ?? `no-scene-${sectionIndex}`}
@@ -2851,7 +2900,8 @@ function ImagesView() {
                   renderUrls={renderUrls}
                   onToggleScene={() => toggleBulkScene(groupIds)}
                   onToggleStill={toggleBulkStill}
-                  onToggleExpanded={scene ? () => void setImageSceneExpanded(scene.id, !scene.expanded) : undefined}
+                  expanded={expanded}
+                  onToggleExpanded={scene ? () => toggleBulkSceneExpanded(scene.id) : undefined}
                   override={scene ? bulkSceneSettings.find((item) => item.sceneId === scene.id) ?? null : null}
                   overrideOpen={Boolean(scene) && bulkOverrideOpenSceneId === scene?.id}
                   onToggleOverrideOpen={() => setBulkOverrideOpenSceneId((current) => (scene && current !== scene.id ? scene.id : null))}

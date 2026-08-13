@@ -18,6 +18,7 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $TauriConf = Join-Path $RepoRoot "apps\desktop\src-tauri\tauri.conf.json"
+$Repo = "megasxgigavolt/image-gen-studio"
 
 if (-not $Version) {
     $conf = Get-Content $TauriConf | ConvertFrom-Json
@@ -56,11 +57,44 @@ if (-not $existingTag) {
     Write-Host "Created and pushed tag $Tag" -ForegroundColor Yellow
 }
 
-# Build latest.json - the manifest the updater plugin fetches.
+# Create the release (installer + signature) if it doesn't exist yet,
+# otherwise just refresh those two assets.
+$releaseExists = $false
+try {
+    gh release view $Tag --repo $Repo *> $null
+    $releaseExists = $true
+} catch {
+    $releaseExists = $false
+}
+
+if ($releaseExists) {
+    Write-Host "Release $Tag already exists - updating its assets." -ForegroundColor Yellow
+    gh release upload $Tag $Installer.FullName $SigFile --repo $Repo --clobber
+} else {
+    gh release create $Tag $Installer.FullName $SigFile `
+        --repo $Repo `
+        --title "Auto Gen Studio v$Version" `
+        --notes $Notes
+}
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "gh release command failed with exit code $LASTEXITCODE"
+    exit $LASTEXITCODE
+}
+
+# GitHub sanitizes asset filenames (e.g. spaces become periods), so the
+# real download URL can differ from the local filename - ask GitHub for it
+# rather than guessing, or the updater's download step 404s.
+$assetsJson = gh release view $Tag --repo $Repo --json assets | ConvertFrom-Json
+$installerAsset = $assetsJson.assets | Where-Object { $_.name -like "*setup.exe" } | Select-Object -First 1
+if (-not $installerAsset) {
+    Write-Error "Could not find the uploaded installer asset on release $Tag."
+    exit 1
+}
+$DownloadUrl = $installerAsset.url
+
+# Build and upload latest.json - the manifest the updater plugin fetches.
 $Signature = Get-Content $SigFile -Raw
 $PubDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-$AssetName = $Installer.Name
-$DownloadUrl = "https://github.com/megasxgigavolt/image-gen-studio/releases/download/$Tag/$AssetName"
 
 $LatestJson = [ordered]@{
     version   = $Version
@@ -75,34 +109,20 @@ $LatestJson = [ordered]@{
 } | ConvertTo-Json -Depth 5
 
 $LatestJsonPath = Join-Path $OutDir "latest.json"
-Set-Content -Path $LatestJsonPath -Value $LatestJson -Encoding utf8NoBOM
+# Write without a BOM (in a way that works on both Windows PowerShell 5.1
+# and PowerShell 7+ - their -Encoding parameter accepts different names).
+[System.IO.File]::WriteAllText($LatestJsonPath, $LatestJson, (New-Object System.Text.UTF8Encoding $false))
 
-# Create the release if it doesn't exist yet, otherwise just refresh assets.
-$releaseExists = $false
-try {
-    gh release view $Tag --repo megasxgigavolt/image-gen-studio *> $null
-    $releaseExists = $true
-} catch {
-    $releaseExists = $false
-}
-
-if ($releaseExists) {
-    Write-Host "Release $Tag already exists - updating its assets." -ForegroundColor Yellow
-    gh release upload $Tag $Installer.FullName $SigFile $LatestJsonPath --repo megasxgigavolt/image-gen-studio --clobber
-} else {
-    gh release create $Tag $Installer.FullName $SigFile $LatestJsonPath `
-        --repo megasxgigavolt/image-gen-studio `
-        --title "Auto Gen Studio v$Version" `
-        --notes $Notes
-}
+gh release upload $Tag $LatestJsonPath --repo $Repo --clobber
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "gh release command failed with exit code $LASTEXITCODE"
+    Write-Error "Failed to upload latest.json with exit code $LASTEXITCODE"
     exit $LASTEXITCODE
 }
 
 Write-Host ""
 Write-Host "Done! Published:" -ForegroundColor Green
 Write-Host "  https://github.com/megasxgigavolt/image-gen-studio/releases/tag/$Tag" -ForegroundColor White
+Write-Host "  Installer URL used in latest.json: $DownloadUrl" -ForegroundColor White
 Write-Host ""
 Write-Host "Existing installs will pick this up automatically the next time they launch" -ForegroundColor Green
 Write-Host "(checked once on startup via the updater endpoint's 'latest' redirect)." -ForegroundColor Green

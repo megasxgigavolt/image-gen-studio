@@ -575,7 +575,7 @@ type BrowserData = {
 };
 
 const STORAGE_KEY = "auto-gen-studio.dev-projects";
-const isTauri = () => "__TAURI_INTERNALS__" in window;
+export const isTauri = () => "__TAURI_INTERNALS__" in window;
 const now = () => new Date().toISOString();
 const id = () => crypto.randomUUID();
 

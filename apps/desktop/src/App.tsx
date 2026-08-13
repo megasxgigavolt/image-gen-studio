@@ -35,6 +35,8 @@ import {
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { check as checkForUpdate, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
   DndContext,
   PointerSensor,
@@ -56,6 +58,7 @@ import { sectionGroupsByScene } from "./domain/visual-plan";
 import { sceneSelectionState, toggleScene } from "./domain/bulk-selection";
 import {
   projectsClient,
+  isTauri,
   type ChannelRecord,
   type ResumeRecord,
   type VideoRecord,
@@ -147,6 +150,62 @@ export function ConfirmDialog({
           <button className={danger ? "primary danger" : "primary"} onClick={onConfirm}>{confirmLabel}</button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// Best-effort, invisible-until-relevant background update check: looks once
+// on launch for a newer signed release published to GitHub Releases (see
+// tauri.conf.json's plugins.updater.endpoints and releases/publish-release.ps1).
+// Never blocks or interrupts the user — a failed/absent check just means no
+// banner ever appears, same soft-fail convention used elsewhere in this app.
+function UpdateBanner() {
+  const [update, setUpdate] = useState<Update | null>(null);
+  const [status, setStatus] = useState<"idle" | "downloading" | "restarting">("idle");
+  const [progress, setProgress] = useState<{ downloaded: number; total: number } | null>(null);
+  const [dismissed, setDismissed] = useState(false);
+  useEffect(() => {
+    if (!isTauri()) return;
+    checkForUpdate()
+      .then((found) => { if (found?.available) setUpdate(found); })
+      .catch((error) => log("warn", "update_check_failed", { error: String(error) }));
+  }, []);
+  if (!update || dismissed) return null;
+  const installUpdate = () => {
+    setStatus("downloading");
+    let total = 0;
+    let downloaded = 0;
+    update
+      .downloadAndInstall((event) => {
+        if (event.event === "Started") total = event.data.contentLength ?? 0;
+        if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          setProgress({ downloaded, total });
+        }
+      })
+      .then(() => { setStatus("restarting"); return relaunch(); })
+      .catch((error) => {
+        log("warn", "update_install_failed", { error: String(error) });
+        setStatus("idle");
+        setDismissed(true);
+      });
+  };
+  const percent = progress && progress.total > 0 ? Math.round((progress.downloaded / progress.total) * 100) : null;
+  return (
+    <div className="update-notice">
+      {status === "idle" && (
+        <>
+          <span><Download size={15} /> Update available: v{update.version}</span>
+          <div className="update-notice-actions">
+            <button type="button" onClick={installUpdate}>Update &amp; Restart</button>
+            <button type="button" className="ghost" onClick={() => setDismissed(true)}>Later</button>
+          </div>
+        </>
+      )}
+      {status === "downloading" && (
+        <span><LoaderCircle size={15} className="spin" /> Downloading update{percent !== null ? ` — ${percent}%` : "…"}</span>
+      )}
+      {status === "restarting" && <span><LoaderCircle size={15} className="spin" /> Restarting…</span>}
     </div>
   );
 }
@@ -3294,7 +3353,7 @@ export function App() {
     <div className={stage === "home" ? "app-shell app-shell-home" : "app-shell"}>
       <TitleBar />
       {stage !== "home" && <Sidebar />}
-      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "animate" && <AnimateView />}{stage === "timeline" && <TimelineView />}</main>
+      <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}<UpdateBanner />{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "animate" && <AnimateView />}{stage === "timeline" && <TimelineView />}</main>
       <ToastDisplay />
     </div>
   );

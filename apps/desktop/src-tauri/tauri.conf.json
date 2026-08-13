@@ -36,6 +36,7 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
+    "createUpdaterArtifacts": true,
     "resources": {
       "../../../services/python-engine/auto_gen_engine/*.py": "python-engine/auto_gen_engine/",
       "../../../services/python-engine/google-service-account.json": "google-service-account.json"
@@ -47,6 +48,17 @@
       },
       "nsis": {
         "installerHooks": "installer-hooks.nsi"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg4NUJCNUM3N0RENUQwRDIKUldUUzBOVjl4N1ZiaUk4Yk1uYXM5alVRSlh3RmVFQ042V0w3eWRqc21RdEFNeURIMThRWFdlVzAK",
+      "endpoints": [
+        "https://github.com/megasxgigavolt/image-gen-studio/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

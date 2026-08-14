@@ -104,28 +104,49 @@ export function emptyBulkVisualDials(): BulkVisualDialsRecord {
 // global bulk settings. Every field is nullable — null means "inherit the
 // global value" for that one field. A scene with no saved overrides at all
 // simply has no entry in getBulkSceneSettings' result, rather than a record
-// of all-nulls.
+// of all-nulls. Character/location identity used to live here too — see
+// RosterCharacterRecord/RosterLocationRecord/SceneCastAssignmentRecord.
 export type BulkSceneSettingsRecord = {
   sceneId: string;
   styleDirective: string | null;
   creativeInstruction: string | null;
-  characterConsistency: boolean | null;
-  referenceAssetId: string | null;
-  locationConsistency: boolean | null;
-  locationReferenceAssetId: string | null;
   dials: BulkVisualDialsRecord;
 };
 
 // The video-wide counterpart to BulkSceneSettingsRecord — same shape minus
 // sceneId, since a scene layers its own version of this on top.
 export type BulkGlobalVisualSettingsRecord = {
-  locationConsistency: boolean | null;
-  locationReferenceAssetId: string | null;
   dials: BulkVisualDialsRecord;
 };
 export function emptyBulkGlobalVisualSettings(): BulkGlobalVisualSettingsRecord {
-  return { locationConsistency: null, locationReferenceAssetId: null, dials: emptyBulkVisualDials() };
+  return { dials: emptyBulkVisualDials() };
 }
+
+// One named entry in a video's character or location roster — replaces the
+// old single global/scene character+location reference model. Characters
+// and locations share this exact shape.
+export type RosterCharacterRecord = {
+  id: string; videoId: string; ordinal: number; name: string;
+  referenceAssetId: string | null; description: string | null;
+};
+export type RosterLocationRecord = {
+  id: string; videoId: string; ordinal: number; name: string;
+  referenceAssetId: string | null; description: string | null;
+};
+
+// Which roster characters/location a scene should draw on. assignedX is
+// what generation/planning actually uses; aiSuggestedX is kept alongside
+// purely so the UI can tell "AI suggested this, untouched" apart from "the
+// user chose this" — compare the two rather than a separate flag.
+export type SceneCastAssignmentRecord = {
+  sceneId: string;
+  aiSuggestedCharacterIds: string[];
+  assignedCharacterIds: string[];
+  aiSuggestedLocationId: string | null;
+  assignedLocationId: string | null;
+};
+
+export type StyleAspectRecord = { key: string; label: string; description: string };
 
 export type CaptionWordRecord = { text: string; startSeconds: number; endSeconds: number };
 export type CaptionChunkRecord = { index: number; text: string; startSeconds: number; endSeconds: number; words: CaptionWordRecord[] };
@@ -1302,7 +1323,7 @@ export const projectsClient = {
     writeBrowserData(data);
     return inputs;
   },
-  async pickAndImportAsset(videoId: string, kind: "audio" | "reference") {
+  async pickAndImportAsset(videoId: string, kind: "audio" | "reference" | "roster-reference") {
     if (isTauri()) return invoke<InputAssetRecord | null>("pick_and_import_asset", { videoId, kind });
     return null;
   },
@@ -1381,9 +1402,9 @@ export const projectsClient = {
    * closing. */
   async planBulkVisualsBatch(
     videoId: string, styleDirective: string, baseSettingsJson: string, creativeInstruction: string,
-    characterConsistency: boolean, selectedGroupIds: string[], startIndex: number,
+    selectedGroupIds: string[], startIndex: number,
   ): Promise<BulkPlanBatchResultRecord> {
-    if (isTauri()) return invoke("plan_bulk_visuals_batch", { videoId, styleDirective, baseSettingsJson, creativeInstruction, characterConsistency, selectedGroupIds, startIndex });
+    if (isTauri()) return invoke("plan_bulk_visuals_batch", { videoId, styleDirective, baseSettingsJson, creativeInstruction, selectedGroupIds, startIndex });
     throw new Error("Bulk planning requires the native application.");
   },
   /** Runs the fully backend-owned "Auto motion" pass on the next batch of
@@ -1562,22 +1583,14 @@ export const projectsClient = {
   async saveBulkSceneSettings(
     videoId: string, sceneId: string,
     styleDirective: string | null, creativeInstruction: string | null,
-    characterConsistency: boolean | null, referenceAssetId: string | null,
-    locationConsistency: boolean | null, locationReferenceAssetId: string | null,
     dials: BulkVisualDialsRecord,
   ): Promise<BulkSceneSettingsRecord> {
     if (isTauri()) {
-      return invoke("save_bulk_scene_settings", {
-        videoId, sceneId, styleDirective, creativeInstruction, characterConsistency, referenceAssetId,
-        locationConsistency, locationReferenceAssetId, dials,
-      });
+      return invoke("save_bulk_scene_settings", { videoId, sceneId, styleDirective, creativeInstruction, dials });
     }
     const key = `${STORAGE_KEY}.bulkSceneSettings.${videoId}`;
     const all = await this.getBulkSceneSettings(videoId);
-    const record: BulkSceneSettingsRecord = {
-      sceneId, styleDirective, creativeInstruction, characterConsistency, referenceAssetId,
-      locationConsistency, locationReferenceAssetId, dials,
-    };
+    const record: BulkSceneSettingsRecord = { sceneId, styleDirective, creativeInstruction, dials };
     const next = [...all.filter((item) => item.sceneId !== sceneId), record];
     localStorage.setItem(key, JSON.stringify(next));
     return record;
@@ -1587,16 +1600,60 @@ export const projectsClient = {
     const raw = localStorage.getItem(`${STORAGE_KEY}.bulkGlobalSettings.${videoId}`);
     return raw ? (JSON.parse(raw) as BulkGlobalVisualSettingsRecord) : emptyBulkGlobalVisualSettings();
   },
-  async saveBulkGlobalSettings(
-    videoId: string, locationConsistency: boolean | null, locationReferenceAssetId: string | null,
-    dials: BulkVisualDialsRecord,
-  ): Promise<BulkGlobalVisualSettingsRecord> {
-    if (isTauri()) {
-      return invoke("save_bulk_global_settings", { videoId, locationConsistency, locationReferenceAssetId, dials });
-    }
-    const record: BulkGlobalVisualSettingsRecord = { locationConsistency, locationReferenceAssetId, dials };
+  async saveBulkGlobalSettings(videoId: string, dials: BulkVisualDialsRecord): Promise<BulkGlobalVisualSettingsRecord> {
+    if (isTauri()) return invoke("save_bulk_global_settings", { videoId, dials });
+    const record: BulkGlobalVisualSettingsRecord = { dials };
     localStorage.setItem(`${STORAGE_KEY}.bulkGlobalSettings.${videoId}`, JSON.stringify(record));
     return record;
+  },
+  // Character/location roster — replaces the old single global/scene
+  // reference model. No browser/dev localStorage fallback for these (the
+  // roster + cast-assignment feature is Tauri-only, same as several other
+  // AI-backed bulk-generation features already are); calling these outside
+  // Tauri throws, matching how e.g. suggestImagePrompt already behaves.
+  async listRosterCharacters(videoId: string): Promise<RosterCharacterRecord[]> {
+    return invoke("list_roster_characters", { videoId });
+  },
+  async createRosterCharacter(videoId: string, name: string): Promise<RosterCharacterRecord> {
+    return invoke("create_roster_character", { videoId, name });
+  },
+  async renameRosterCharacter(characterId: string, name: string): Promise<RosterCharacterRecord> {
+    return invoke("rename_roster_character", { characterId, name });
+  },
+  async setRosterCharacterReference(characterId: string, assetId: string | null): Promise<RosterCharacterRecord> {
+    return invoke("set_roster_character_reference", { characterId, assetId });
+  },
+  async deleteRosterCharacter(characterId: string): Promise<void> {
+    return invoke("delete_roster_character", { characterId });
+  },
+  async listRosterLocations(videoId: string): Promise<RosterLocationRecord[]> {
+    return invoke("list_roster_locations", { videoId });
+  },
+  async createRosterLocation(videoId: string, name: string): Promise<RosterLocationRecord> {
+    return invoke("create_roster_location", { videoId, name });
+  },
+  async renameRosterLocation(locationId: string, name: string): Promise<RosterLocationRecord> {
+    return invoke("rename_roster_location", { locationId, name });
+  },
+  async setRosterLocationReference(locationId: string, assetId: string | null): Promise<RosterLocationRecord> {
+    return invoke("set_roster_location_reference", { locationId, assetId });
+  },
+  async deleteRosterLocation(locationId: string): Promise<void> {
+    return invoke("delete_roster_location", { locationId });
+  },
+  async getSceneCastAssignments(videoId: string): Promise<SceneCastAssignmentRecord[]> {
+    return invoke("get_scene_cast_assignments", { videoId });
+  },
+  async saveSceneCastAssignment(
+    videoId: string, sceneId: string, assignedCharacterIds: string[], assignedLocationId: string | null,
+  ): Promise<SceneCastAssignmentRecord> {
+    return invoke("save_scene_cast_assignment", { videoId, sceneId, assignedCharacterIds, assignedLocationId });
+  },
+  async suggestSceneCastBatch(videoId: string, sceneIds: string[]): Promise<SceneCastAssignmentRecord[]> {
+    return invoke("suggest_scene_cast_batch", { videoId, sceneIds });
+  },
+  async listExtractableStyleAspects(): Promise<StyleAspectRecord[]> {
+    return invoke("list_extractable_style_aspects", {});
   },
   async updatePlanSentenceText(videoId: string, sentenceId: string, text: string): Promise<VisualPlanRecord> {
     if (isTauri()) return invoke("update_plan_sentence_text", { videoId, sentenceId, text });

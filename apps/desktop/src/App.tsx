@@ -31,6 +31,8 @@ import {
   ChevronUp,
   ChevronDown,
   Scissors,
+  Users,
+  MapPin,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -72,6 +74,10 @@ import {
   type BulkSceneSettingsRecord,
   type BulkGlobalVisualSettingsRecord,
   type BulkVisualDialsRecord,
+  type RosterCharacterRecord,
+  type RosterLocationRecord,
+  type SceneCastAssignmentRecord,
+  type StyleAspectRecord,
   emptyBulkVisualDials,
   emptyBulkGlobalVisualSettings,
 } from "./infrastructure/projects-client";
@@ -1715,11 +1721,69 @@ function LeftPaneSceneStrip({ scene, stillCount, onToggle }: {
  * "Customize" override mini-form, and — when expanded — a grid of
  * individually selectable still thumbnails reusing the left pane's
  * .still-thumb visual language. */
+/** Lets a scene pick which roster character(s)/location it uses — chips
+ * (multi-select) for characters, a dropdown (single-select) for location.
+ * Ported from the ui/visual-director-mockup branch's SceneCastPicker, now
+ * wired to the real backend instead of localStorage. The "AI suggested"
+ * badge is purely derived — the assignment is untouched-since-suggested
+ * exactly when assignedCharacterIds/assignedLocationId still match
+ * aiSuggestedCharacterIds/aiSuggestedLocationId, no separate flag needed
+ * (see SceneCastAssignment's doc comment on the Rust side). */
+function SceneCastPicker({ characters, locations, assignment, onSave }: {
+  characters: RosterCharacterRecord[];
+  locations: RosterLocationRecord[];
+  assignment: SceneCastAssignmentRecord | null;
+  onSave: (characterIds: string[], locationId: string | null) => void;
+}) {
+  if (!characters.length && !locations.length) {
+    return <p className="scene-cast-empty">No characters or locations in the roster yet.</p>;
+  }
+  const assignedCharacterIds = assignment?.assignedCharacterIds ?? [];
+  const assignedLocationId = assignment?.assignedLocationId ?? null;
+  const hasAnyAssignment = assignedCharacterIds.length > 0 || assignedLocationId !== null;
+  const isUnchangedFromAiSuggestion = hasAnyAssignment
+    && JSON.stringify(assignedCharacterIds) === JSON.stringify(assignment?.aiSuggestedCharacterIds ?? [])
+    && assignedLocationId === (assignment?.aiSuggestedLocationId ?? null);
+
+  function toggleCharacter(id: string) {
+    const next = assignedCharacterIds.includes(id) ? assignedCharacterIds.filter((existing) => existing !== id) : [...assignedCharacterIds, id];
+    onSave(next, assignedLocationId);
+  }
+
+  return (
+    <div className="scene-cast-picker">
+      {isUnchangedFromAiSuggestion && <span className="scene-cast-ai-badge"><Sparkles size={11} />AI suggested</span>}
+      {characters.length > 0 && (
+        <div className="scene-cast-group">
+          <span className="scene-cast-label"><Users size={12} />Characters</span>
+          <div className="tag-list">
+            {characters.map((character) => (
+              <button type="button" key={character.id} className={`tag-chip selectable${assignedCharacterIds.includes(character.id) ? " selected" : ""}`} onClick={() => toggleCharacter(character.id)}>
+                {character.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      {locations.length > 0 && (
+        <div className="scene-cast-group">
+          <span className="scene-cast-label"><MapPin size={12} />Location</span>
+          <select value={assignedLocationId ?? ""} onChange={(event) => onSave(assignedCharacterIds, event.target.value || null)}>
+            <option value="">None</option>
+            {locations.map((location) => <option key={location.id} value={location.id}>{location.name}</option>)}
+          </select>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SceneBulkRow({
   scene, groups, selection, aspectRatio, renderUrls,
   onToggleScene, onToggleStill, expanded, onToggleExpanded,
-  override, overrideOpen, onToggleOverrideOpen, onSaveOverride, onImportReference,
-  onImportLocationReference, globalDials, globalMood,
+  override, overrideOpen, onToggleOverrideOpen, onSaveOverride,
+  rosterCharacters, rosterLocations, castAssignment, onSaveCast,
+  globalDials, globalMood,
 }: {
   scene: PlanSceneRecord | null;
   groups: (ImageWorkspaceGroupRecord & { sceneId: string | null })[];
@@ -1737,8 +1801,10 @@ function SceneBulkRow({
   overrideOpen: boolean;
   onToggleOverrideOpen: () => void;
   onSaveOverride: (patch: Partial<Omit<BulkSceneSettingsRecord, "sceneId">>) => void;
-  onImportReference: () => void;
-  onImportLocationReference: () => void;
+  rosterCharacters: RosterCharacterRecord[];
+  rosterLocations: RosterLocationRecord[];
+  castAssignment: SceneCastAssignmentRecord | null;
+  onSaveCast: (characterIds: string[], locationId: string | null) => void;
   // Resolved global dials/mood, purely for the "Inherit (X)" labels below —
   // this scene's own overrides are read from `override.dials` as usual.
   globalDials: BulkVisualDialsRecord;
@@ -1787,67 +1853,29 @@ function SceneBulkRow({
             <span>Creative Instructions override</span>
             <textarea rows={2} placeholder="Inherit global" value={override?.creativeInstruction ?? ""} onChange={(event) => onSaveOverride({ creativeInstruction: event.target.value || null })} />
           </label>
-          <div className="bulk-scene-override-row">
-            <label>
-              <span>Character Consistency</span>
-              <select
-                value={override?.characterConsistency == null ? "inherit" : override.characterConsistency ? "on" : "off"}
-                onChange={(event) => onSaveOverride({ characterConsistency: event.target.value === "inherit" ? null : event.target.value === "on" })}
-              >
-                <option value="inherit">Inherit global</option>
-                <option value="on">On</option>
-                <option value="off">Off</option>
-              </select>
-            </label>
-            <div className="bulk-scene-reference">
-              <span>Reference image</span>
-              {override?.referenceAssetId ? (
-                <>
-                  <span className="bulk-scene-reference-set">Custom reference set</span>
-                  <button type="button" className="link-button" onClick={() => onSaveOverride({ referenceAssetId: null })}>Remove</button>
-                </>
-              ) : (
-                <button type="button" className="secondary" onClick={onImportReference}><Plus size={12} />Upload</button>
-              )}
-            </div>
-          </div>
-          <div className="bulk-scene-override-row">
-            <label>
-              <span>Location Consistency</span>
-              <select
-                value={override?.locationConsistency == null ? "inherit" : override.locationConsistency ? "on" : "off"}
-                onChange={(event) => onSaveOverride({ locationConsistency: event.target.value === "inherit" ? null : event.target.value === "on" })}
-              >
-                <option value="inherit">Inherit global</option>
-                <option value="on">On</option>
-                <option value="off">Off</option>
-              </select>
-            </label>
-            <div className="bulk-scene-reference">
-              <span>Location reference image</span>
-              {override?.locationReferenceAssetId ? (
-                <>
-                  <span className="bulk-scene-reference-set">Custom reference set</span>
-                  <button type="button" className="link-button" onClick={() => onSaveOverride({ locationReferenceAssetId: null })}>Remove</button>
-                </>
-              ) : (
-                <button type="button" className="secondary" onClick={onImportLocationReference}><Plus size={12} />Upload</button>
-              )}
-            </div>
-          </div>
+          <div className="bulk-modal-group scene-cast-heading">Cast &amp; Locations</div>
+          <SceneCastPicker
+            characters={rosterCharacters}
+            locations={rosterLocations}
+            assignment={castAssignment}
+            onSave={onSaveCast}
+          />
+          <div className="bulk-modal-group">Visual Direction</div>
           <div className="dial-grid">
             <SceneDialRow label="Visual Interpretation" hint="Literal ↔ Creative" value={dials.visualInterpretation} globalValue={globalDials.visualInterpretation} onChange={(value) => saveDial({ visualInterpretation: value })} />
             <SceneDialRow label="Visual Metaphor" hint="Literal ↔ Symbolic" value={dials.visualMetaphor} globalValue={globalDials.visualMetaphor} onChange={(value) => saveDial({ visualMetaphor: value })} />
             <SceneDialRow label="Cinematic Intensity" hint="Documentary ↔ Cinematic" value={dials.cinematicIntensity} globalValue={globalDials.cinematicIntensity} onChange={(value) => saveDial({ cinematicIntensity: value })} />
             <SceneDialRow label="Prompt Creativity" hint="Strict script ↔ Highly creative" value={dials.promptCreativity} globalValue={globalDials.promptCreativity} onChange={(value) => saveDial({ promptCreativity: value })} />
             <MoodRow level="scene" mood={dials.mood} moodMode={dials.moodMode} globalMood={globalMood} onChange={(mood, moodMode) => saveDial({ mood, moodMode })} />
-            <SceneDialRow label="Camera Angle Diversity" value={dials.diversityCamera} globalValue={globalDials.diversityCamera} onChange={(value) => saveDial({ diversityCamera: value })} />
-            <SceneDialRow label="Composition Diversity" value={dials.diversityComposition} globalValue={globalDials.diversityComposition} onChange={(value) => saveDial({ diversityComposition: value })} />
-            <SceneDialRow label="Shot Type Diversity" value={dials.diversityShotType} globalValue={globalDials.diversityShotType} onChange={(value) => saveDial({ diversityShotType: value })} />
-            <SceneDialRow label="Character Identity Strictness" value={dials.consistencyCharacter} globalValue={globalDials.consistencyCharacter} onChange={(value) => saveDial({ consistencyCharacter: value })} />
-            <SceneDialRow label="Location Identity Strictness" value={dials.consistencyLocation} globalValue={globalDials.consistencyLocation} onChange={(value) => saveDial({ consistencyLocation: value })} />
-            <SceneDialRow label="Style Strictness" value={dials.consistencyStyle} globalValue={globalDials.consistencyStyle} onChange={(value) => saveDial({ consistencyStyle: value })} />
           </div>
+          <details className="advanced-settings"><summary><span><strong>Diversity &amp; Consistency</strong><small>How stills should differ from, or match, each other</small></span><b>＋</b></summary><div className="dial-grid">
+            <SceneDialRow label="Camera Angle Diversity" hint="Consistent ↔ Dynamic" value={dials.diversityCamera} globalValue={globalDials.diversityCamera} onChange={(value) => saveDial({ diversityCamera: value })} />
+            <SceneDialRow label="Composition Diversity" hint="Consistent ↔ Dynamic" value={dials.diversityComposition} globalValue={globalDials.diversityComposition} onChange={(value) => saveDial({ diversityComposition: value })} />
+            <SceneDialRow label="Shot Type Diversity" hint="Consistent ↔ Dynamic" value={dials.diversityShotType} globalValue={globalDials.diversityShotType} onChange={(value) => saveDial({ diversityShotType: value })} />
+            <SceneDialRow label="Character Identity Strictness" hint="Flexible ↔ Strict" value={dials.consistencyCharacter} globalValue={globalDials.consistencyCharacter} onChange={(value) => saveDial({ consistencyCharacter: value })} />
+            <SceneDialRow label="Location Identity Strictness" hint="Flexible ↔ Strict" value={dials.consistencyLocation} globalValue={globalDials.consistencyLocation} onChange={(value) => saveDial({ consistencyLocation: value })} />
+            <SceneDialRow label="Style Strictness" hint="Flexible ↔ Strict" value={dials.consistencyStyle} globalValue={globalDials.consistencyStyle} onChange={(value) => saveDial({ consistencyStyle: value })} />
+          </div></details>
         </div>
       )}
       {expanded && (
@@ -2100,6 +2128,156 @@ function MoodRow({ mood, moodMode, onChange, globalMood, level }: {
   );
 }
 
+/** One removable roster card — name input, reference-image thumbnail or
+ * upload button, remove button. Characters and locations use the exact
+ * same shape (reuses `.reference-item`'s removable-card visual language,
+ * same idea as the mockup branch's VisualBibleModal cards, now wired to
+ * the real backend). */
+function RosterCard({ name, hasReference, onRename, onImportReference, onRemove }: {
+  name: string;
+  hasReference: boolean;
+  onRename: (name: string) => void;
+  onImportReference: () => void;
+  onRemove: () => void;
+}) {
+  return (
+    <div className="roster-card">
+      <input value={name} onChange={(event) => onRename(event.target.value)} placeholder="Name" />
+      {hasReference ? (
+        <span className="bulk-scene-reference-set">Reference set</span>
+      ) : (
+        <button type="button" className="secondary" onClick={onImportReference}><Plus size={12} />Upload reference</button>
+      )}
+      <button type="button" className="icon-button danger-action" aria-label={`Remove ${name || "entry"}`} onClick={onRemove}><Trash2 size={13} /></button>
+    </div>
+  );
+}
+
+/** The character/location roster's management surface — a dedicated modal
+ * (not folded into Global Bulk Settings, which already reuses this
+ * decision from the earlier ui/visual-director-mockup branch's
+ * VisualBibleModal split). */
+function RosterModal({
+  characters, locations, onClose, onAddCharacter, onAddLocation,
+  onRenameCharacter, onRenameLocation, onRemoveCharacter, onRemoveLocation,
+  onImportCharacterReference, onImportLocationReference, onSuggestCast, suggesting,
+}: {
+  characters: RosterCharacterRecord[];
+  locations: RosterLocationRecord[];
+  onClose: () => void;
+  onAddCharacter: () => void;
+  onAddLocation: () => void;
+  onRenameCharacter: (id: string, name: string) => void;
+  onRenameLocation: (id: string, name: string) => void;
+  onRemoveCharacter: (id: string) => void;
+  onRemoveLocation: (id: string) => void;
+  onImportCharacterReference: (id: string) => void;
+  onImportLocationReference: (id: string) => void;
+  onSuggestCast: () => void;
+  suggesting: boolean;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="modal bulk-modal roster-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-heading-row"><h2><Users size={18} />Characters &amp; Locations</h2><button type="button" className="icon-button" aria-label="Close" onClick={onClose}><X size={16} /></button></div>
+        <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 12px"}}>Each entry's reference image is what generation actually conditions on when a scene uses it — pick which ones apply per scene in the Bulk Generation panel.</p>
+
+        <div className="panel-section-heading" style={{marginTop:"4px"}}><h3><Users size={14} />Characters</h3><small>{characters.length}</small></div>
+        <div className="roster-cards">
+          {characters.map((character) => (
+            <RosterCard
+              key={character.id}
+              name={character.name}
+              hasReference={Boolean(character.referenceAssetId)}
+              onRename={(name) => onRenameCharacter(character.id, name)}
+              onImportReference={() => onImportCharacterReference(character.id)}
+              onRemove={() => onRemoveCharacter(character.id)}
+            />
+          ))}
+          {!characters.length && <p className="scene-cast-empty">No characters yet.</p>}
+        </div>
+        <button type="button" className="secondary" onClick={onAddCharacter}><Plus size={14} />Add character</button>
+
+        <div className="panel-section-heading" style={{marginTop:"18px"}}><h3><MapPin size={14} />Locations</h3><small>{locations.length}</small></div>
+        <div className="roster-cards">
+          {locations.map((location) => (
+            <RosterCard
+              key={location.id}
+              name={location.name}
+              hasReference={Boolean(location.referenceAssetId)}
+              onRename={(name) => onRenameLocation(location.id, name)}
+              onImportReference={() => onImportLocationReference(location.id)}
+              onRemove={() => onRemoveLocation(location.id)}
+            />
+          ))}
+          {!locations.length && <p className="scene-cast-empty">No locations yet.</p>}
+        </div>
+        <button type="button" className="secondary" onClick={onAddLocation}><Plus size={14} />Add location</button>
+
+        <button type="button" className="secondary full" style={{marginTop:"18px"}} onClick={onSuggestCast} disabled={suggesting || (!characters.length && !locations.length)}>
+          {suggesting ? <><LoaderCircle className="spin" size={14} />Suggesting cast…</> : <><Sparkles size={14} />Suggest cast for every scene</>}
+        </button>
+        <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0"}}>Reads each scene's narration and picks which of the above it's likely about — re-run this any time after editing the roster; it won't overwrite a scene you've already corrected by hand.</p>
+
+        <button className="primary full" style={{marginTop:"14px"}} onClick={onClose}>Done</button>
+      </div>
+    </div>
+  );
+}
+
+/** Extract Style's "which aspects to focus on" popup — grouped checkboxes
+ * over the static 29-item EXTRACTABLE_STYLE_ASPECTS list from the backend. */
+const STYLE_ASPECT_GROUPS: { label: string; keys: string[] }[] = [
+  { label: "Overall Style", keys: ["STY", "REN", "STYLE_SIG"] },
+  { label: "Subjects & Character", keys: ["SUB", "COST", "FAC", "GEST", "EXP"] },
+  { label: "Setting", keys: ["ENV", "ARCH", "MAT", "PROP"] },
+  { label: "Color & Light", keys: ["CLR", "LGT", "ATM"] },
+  { label: "Camera & Composition", keys: ["CAM", "LENS", "CMP", "FRM", "PERS", "DEPTH"] },
+  { label: "Structure & Detail", keys: ["STR", "HIER", "GEO", "LINE", "TEXT", "EDGE", "DETAIL"] },
+  { label: "Effects", keys: ["FX"] },
+];
+
+function ExtractStyleAspectsModal({ aspects, selectedKeys, onToggle, onSelectAll, onSelectNone, onClose }: {
+  aspects: StyleAspectRecord[];
+  selectedKeys: Set<string>;
+  onToggle: (key: string) => void;
+  onSelectAll: () => void;
+  onSelectNone: () => void;
+  onClose: () => void;
+}) {
+  const byKey = new Map(aspects.map((aspect) => [aspect.key, aspect]));
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="modal bulk-modal aspects-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-heading-row"><h2>Extract Style — Aspects to Focus On</h2><button type="button" className="icon-button" aria-label="Close" onClick={onClose}><X size={16} /></button></div>
+        <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px"}}>Choose exactly what Extract Style should pull from a reference image when writing the style directive. Everything selected by default.</p>
+        <div className="aspects-select-all">
+          <button type="button" className="link-button" onClick={onSelectAll}>Select all</button>
+          <button type="button" className="link-button" onClick={onSelectNone}>Select none</button>
+        </div>
+        {STYLE_ASPECT_GROUPS.map((group) => (
+          <div key={group.label} className="aspects-group">
+            <div className="panel-section-heading" style={{marginTop:"14px"}}><h3>{group.label}</h3></div>
+            <div className="aspects-checklist">
+              {group.keys.map((key) => {
+                const aspect = byKey.get(key);
+                if (!aspect) return null;
+                return (
+                  <label key={key} className="aspects-checkbox-row" title={aspect.description}>
+                    <input type="checkbox" checked={selectedKeys.has(key)} onChange={() => onToggle(key)} />
+                    <span>{aspect.label}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+        <button className="primary full" style={{marginTop:"18px"}} onClick={onClose}>Done</button>
+      </div>
+    </div>
+  );
+}
+
 function ImagesView() {
   const { activeVideoId, addToast, setStage } = useAppStore();
   const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
@@ -2133,7 +2311,6 @@ function ImagesView() {
   const [references, setReferences] = useState<import("./infrastructure/projects-client").InputAssetRecord[]>([]);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkInstruction, setBulkInstruction] = useState(() => localStorage.getItem("bulk_creative_instruction") ?? "");
-  const [characterConsistency, setCharacterConsistency] = useState(() => localStorage.getItem("bulk_character_consistency") === "true");
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null);
   const [preparingGroupIds, setPreparingGroupIds] = useState<Set<string>>(new Set());
   const [promptPrepStatus, setPromptPrepStatus] = useState<"running" | "paused" | null>(null);
@@ -2141,8 +2318,20 @@ function ImagesView() {
   const promptPrepTask = useRef<{ items: ImageWorkspaceRecord["groups"]; index: number } | null>(null);
   const [bulkPlanStatus, setBulkPlanStatus] = useState<"running" | "paused" | null>(null);
   const bulkPlanControl = useRef<"running" | "paused" | "stopped">("stopped");
-  type BulkPlanTask = { total: number; index: number; styleDirective: string; baseSettingsJson: string; creativeInstruction: string; characterConsistency: boolean; groupIds: string[] };
+  type BulkPlanTask = { total: number; index: number; styleDirective: string; baseSettingsJson: string; creativeInstruction: string; groupIds: string[] };
   const bulkPlanTask = useRef<BulkPlanTask | null>(null);
+  // Character/location roster + per-scene casting — replaces the old
+  // single global/scene character+location reference model.
+  const [rosterCharacters, setRosterCharacters] = useState<RosterCharacterRecord[]>([]);
+  const [rosterLocations, setRosterLocations] = useState<RosterLocationRecord[]>([]);
+  const [sceneCastAssignments, setSceneCastAssignments] = useState<SceneCastAssignmentRecord[]>([]);
+  const [rosterModalOpen, setRosterModalOpen] = useState(false);
+  const [suggestingCast, setSuggestingCast] = useState(false);
+  // Extract Style's selectable-aspects popup — the 29-item list is static,
+  // fetched once; the user's selection persists per video via app_settings.
+  const [extractStyleAspects, setExtractStyleAspects] = useState<StyleAspectRecord[]>([]);
+  const [extractStyleAspectsOpen, setExtractStyleAspectsOpen] = useState(false);
+  const [selectedAspectKeys, setSelectedAspectKeys] = useState<Set<string> | null>(null);
   const [referenceUrl, setReferenceUrl] = useState("");
   const promptPrepSettingKey = activeVideoId ? `prompt_prep.${activeVideoId}` : "";
   const bulkPlanSettingKey = activeVideoId ? `bulk_plan.${activeVideoId}` : "";
@@ -2274,11 +2463,10 @@ function ImagesView() {
             if (saved.status === "paused" && saved.index < saved.total && saved.groupIds?.length) {
               setSystemPrompt(saved.styleDirective);
               setBulkInstruction(saved.creativeInstruction);
-              setCharacterConsistency(saved.characterConsistency);
               bulkPlanTask.current = {
                 total: saved.total, index: saved.index, styleDirective: saved.styleDirective,
                 baseSettingsJson: saved.baseSettingsJson, creativeInstruction: saved.creativeInstruction,
-                characterConsistency: saved.characterConsistency, groupIds: saved.groupIds,
+                groupIds: saved.groupIds,
               };
               bulkPlanControl.current = "paused";
               setBulkPlanStatus("paused");
@@ -2549,7 +2737,7 @@ function ImagesView() {
         if (bulkPlanControl.current !== "running") break;
         setBulkProgress({ current: task.index, total: task.total, label: `Planning still ${task.index + 1} of ${task.total}` });
         const result = await projectsClient.planBulkVisualsBatch(
-          activeVideoId, task.styleDirective, task.baseSettingsJson, task.creativeInstruction, task.characterConsistency, task.groupIds, task.index,
+          activeVideoId, task.styleDirective, task.baseSettingsJson, task.creativeInstruction, task.groupIds, task.index,
         );
         if (bulkPlanControl.current !== "running") break;
         // Guard against a batch that somehow made no progress — never spin forever.
@@ -2634,14 +2822,27 @@ function ImagesView() {
       stillSections.filter((section) => section.scene).map((section, index) => [section.scene!.id, index === 0]),
     ));
     try {
-      const [pending, sceneSettings, globalVisual] = await Promise.all([
+      const [pending, sceneSettings, globalVisual, characters, locations, assignments] = await Promise.all([
         projectsClient.pendingStillIds(activeVideoId),
         projectsClient.getBulkSceneSettings(activeVideoId),
         projectsClient.getBulkGlobalSettings(activeVideoId),
+        projectsClient.listRosterCharacters(activeVideoId),
+        projectsClient.listRosterLocations(activeVideoId),
+        projectsClient.getSceneCastAssignments(activeVideoId),
       ]);
       setBulkSelection(new Set(pending));
       setBulkSceneSettings(sceneSettings);
       setBulkGlobalVisualSettings(globalVisual);
+      setRosterCharacters(characters);
+      setRosterLocations(locations);
+      setSceneCastAssignments(assignments);
+      // Auto-suggest cast once per video: only when there's a roster to
+      // cast against and no scene has ever had a suggestion run yet — a
+      // later manual "Suggest cast" click re-runs it deliberately.
+      if ((characters.length || locations.length) && assignments.length === 0) {
+        const sceneIds = stillSections.map((section) => section.scene?.id).filter((id): id is string => Boolean(id));
+        if (sceneIds.length) void suggestCast(sceneIds);
+      }
     } catch (caught) {
       setError(String(caught));
     }
@@ -2652,9 +2853,7 @@ function ImagesView() {
     const next: BulkGlobalVisualSettingsRecord = { ...bulkGlobalVisualSettings, ...patch };
     setBulkGlobalVisualSettings(next);
     try {
-      await projectsClient.saveBulkGlobalSettings(
-        activeVideoId, next.locationConsistency, next.locationReferenceAssetId, next.dials,
-      );
+      await projectsClient.saveBulkGlobalSettings(activeVideoId, next.dials);
     } catch (caught) {
       setError(String(caught));
     }
@@ -2664,28 +2863,137 @@ function ImagesView() {
     void saveGlobalVisualSettings({ dials: { ...bulkGlobalVisualSettings.dials, ...patch } });
   }
 
-  async function importGlobalLocationReference() {
+  async function refreshRoster() {
+    if (!activeVideoId) return;
+    const [characters, locations] = await Promise.all([
+      projectsClient.listRosterCharacters(activeVideoId),
+      projectsClient.listRosterLocations(activeVideoId),
+    ]);
+    setRosterCharacters(characters);
+    setRosterLocations(locations);
+  }
+
+  async function addRosterCharacter() {
+    if (!activeVideoId) return;
+    try { await projectsClient.createRosterCharacter(activeVideoId, `Character ${rosterCharacters.length + 1}`); await refreshRoster(); }
+    catch (caught) { setError(String(caught)); }
+  }
+
+  async function addRosterLocation() {
+    if (!activeVideoId) return;
+    try { await projectsClient.createRosterLocation(activeVideoId, `Location ${rosterLocations.length + 1}`); await refreshRoster(); }
+    catch (caught) { setError(String(caught)); }
+  }
+
+  async function renameRosterCharacter(id: string, name: string) {
+    try { await projectsClient.renameRosterCharacter(id, name); await refreshRoster(); }
+    catch (caught) { setError(String(caught)); }
+  }
+
+  async function renameRosterLocation(id: string, name: string) {
+    try { await projectsClient.renameRosterLocation(id, name); await refreshRoster(); }
+    catch (caught) { setError(String(caught)); }
+  }
+
+  async function removeRosterCharacter(id: string) {
+    try { await projectsClient.deleteRosterCharacter(id); await refreshRoster(); }
+    catch (caught) { setError(String(caught)); }
+  }
+
+  async function removeRosterLocation(id: string) {
+    try { await projectsClient.deleteRosterLocation(id); await refreshRoster(); }
+    catch (caught) { setError(String(caught)); }
+  }
+
+  async function importRosterCharacterReference(characterId: string) {
     if (!activeVideoId) return;
     try {
-      const asset = await projectsClient.pickAndImportAsset(activeVideoId, "reference");
-      if (asset) await saveGlobalVisualSettings({ locationReferenceAssetId: asset.id });
+      const asset = await projectsClient.pickAndImportAsset(activeVideoId, "roster-reference");
+      if (asset) { await projectsClient.setRosterCharacterReference(characterId, asset.id); await refreshRoster(); }
     } catch (caught) {
       setError(String(caught));
     }
   }
 
-  // Mirrors importSceneReference above — a scene's location reference can
-  // coexist with the global one and every other scene's character/location
-  // reference; "Remove" only clears the override back to "inherit," it
-  // doesn't delete the uploaded file.
-  async function importSceneLocationReference(sceneId: string) {
+  async function importRosterLocationReference(locationId: string) {
     if (!activeVideoId) return;
     try {
-      const asset = await projectsClient.pickAndImportAsset(activeVideoId, "reference");
-      if (asset) await saveSceneOverride(sceneId, { locationReferenceAssetId: asset.id });
+      const asset = await projectsClient.pickAndImportAsset(activeVideoId, "roster-reference");
+      if (asset) { await projectsClient.setRosterLocationReference(locationId, asset.id); await refreshRoster(); }
     } catch (caught) {
       setError(String(caught));
     }
+  }
+
+  async function saveCastAssignment(sceneId: string, characterIds: string[], locationId: string | null) {
+    if (!activeVideoId) return;
+    try {
+      const saved = await projectsClient.saveSceneCastAssignment(activeVideoId, sceneId, characterIds, locationId);
+      setSceneCastAssignments((items) => [...items.filter((item) => item.sceneId !== sceneId), saved]);
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  async function suggestCast(sceneIds: string[]) {
+    if (!activeVideoId || !sceneIds.length) return;
+    setSuggestingCast(true);
+    try {
+      const suggested = await projectsClient.suggestSceneCastBatch(activeVideoId, sceneIds);
+      setSceneCastAssignments((items) => {
+        const suggestedIds = new Set(suggested.map((item) => item.sceneId));
+        return [...items.filter((item) => !suggestedIds.has(item.sceneId)), ...suggested];
+      });
+    } catch (caught) {
+      setError(String(caught));
+    } finally {
+      setSuggestingCast(false);
+    }
+  }
+
+  // Extract Style's aspects popup — the 29-item list is static (fetched
+  // once and cached in state); the user's selection persists per video via
+  // the generic app_settings key extract_style_aspects.{videoId}, same
+  // pattern as system_prompt.{videoId}. No selection saved yet, or an
+  // empty selection, both mean "focus on everything" (matching the
+  // backend's own safeguard against a degenerate empty-focus prompt).
+  async function openExtractStyleAspects() {
+    if (!activeVideoId) return;
+    try {
+      let aspects = extractStyleAspects;
+      if (!aspects.length) {
+        aspects = await projectsClient.listExtractableStyleAspects();
+        setExtractStyleAspects(aspects);
+      }
+      const saved = await projectsClient.getAppSetting(`extract_style_aspects.${activeVideoId}`);
+      let keys: string[] = [];
+      if (saved) {
+        try { keys = JSON.parse(saved) as string[]; } catch { keys = []; }
+      }
+      setSelectedAspectKeys(new Set(keys.length ? keys : aspects.map((aspect) => aspect.key)));
+      setExtractStyleAspectsOpen(true);
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  async function persistSelectedAspects(keys: Set<string>) {
+    if (!activeVideoId) return;
+    await projectsClient.saveAppSetting(`extract_style_aspects.${activeVideoId}`, JSON.stringify(Array.from(keys)));
+  }
+
+  async function toggleExtractStyleAspect(key: string) {
+    if (!selectedAspectKeys) return;
+    const next = new Set(selectedAspectKeys);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    setSelectedAspectKeys(next);
+    await persistSelectedAspects(next);
+  }
+
+  async function setAllExtractStyleAspects(all: boolean) {
+    const next = all ? new Set(extractStyleAspects.map((aspect) => aspect.key)) : new Set<string>();
+    setSelectedAspectKeys(next);
+    await persistSelectedAspects(next);
   }
 
   function toggleBulkSceneExpanded(sceneId: string) {
@@ -2693,14 +3001,14 @@ function ImagesView() {
   }
 
   async function runBulkPlan() {
-    if (!activeVideoId || !orderedBulkSelection.length || bulkPlanTask.current) return;
+    if (!activeVideoId || !orderedBulkSelection.length || bulkPlanTask.current || !systemPrompt.trim()) return;
     setBulkOpen(false);
     setError(null);
     await projectsClient.saveAppSetting(`system_prompt.${activeVideoId}`, systemPrompt);
     bulkPlanTask.current = {
       total: orderedBulkSelection.length, index: 0,
       styleDirective: systemPrompt, baseSettingsJson: settingsJson,
-      creativeInstruction: bulkInstruction, characterConsistency,
+      creativeInstruction: bulkInstruction,
       groupIds: orderedBulkSelection,
     };
     void runBulkPlanLoop();
@@ -2713,19 +3021,12 @@ function ImagesView() {
       sceneId,
       styleDirective: current?.styleDirective ?? null,
       creativeInstruction: current?.creativeInstruction ?? null,
-      characterConsistency: current?.characterConsistency ?? null,
-      referenceAssetId: current?.referenceAssetId ?? null,
-      locationConsistency: current?.locationConsistency ?? null,
-      locationReferenceAssetId: current?.locationReferenceAssetId ?? null,
       dials: current?.dials ?? emptyBulkVisualDials(),
       ...patch,
     };
     setBulkSceneSettings((items) => [...items.filter((item) => item.sceneId !== sceneId), next]);
     try {
-      await projectsClient.saveBulkSceneSettings(
-        activeVideoId, sceneId, next.styleDirective, next.creativeInstruction, next.characterConsistency, next.referenceAssetId,
-        next.locationConsistency, next.locationReferenceAssetId, next.dials,
-      );
+      await projectsClient.saveBulkSceneSettings(activeVideoId, sceneId, next.styleDirective, next.creativeInstruction, next.dials);
     } catch (caught) {
       setError(String(caught));
     }
@@ -2741,22 +3042,6 @@ function ImagesView() {
 
   function toggleBulkScene(groupIds: string[]) {
     setBulkSelection((current) => toggleScene(groupIds, current));
-  }
-
-  // Unlike importReference (the global reference), this never evicts an
-  // existing asset first — a scene's reference can coexist with the global
-  // one and every other scene's. "Remove" only clears the override back to
-  // "inherit the global reference," it doesn't delete the uploaded file
-  // (harmless to leave behind, and safer than deleting something another
-  // scene might still point at).
-  async function importSceneReference(sceneId: string) {
-    if (!activeVideoId) return;
-    try {
-      const asset = await projectsClient.pickAndImportAsset(activeVideoId, "reference");
-      if (asset) await saveSceneOverride(sceneId, { referenceAssetId: asset.id });
-    } catch (caught) {
-      setError(String(caught));
-    }
   }
 
   function updateImageSetting<K extends keyof ImageSettings>(key: K, value: ImageSettings[K]) {
@@ -3176,7 +3461,7 @@ function ImagesView() {
               <div className="reference-manager">
                 <div><strong>Visual references</strong><span>Style or subject guidance — Extract Style updates the Style Directive.</span></div>
                 {!references.length && <button className="secondary" onClick={() => void importReference()}><Plus size={14} />Add image</button>}
-                {references.map((reference) => <div className="reference-item" key={reference.id}>{referenceUrl ? <img src={referenceUrl} alt="Visual reference" /> : <span>IMG</span>}<button title="Extract Style" onClick={() => void extractStyle(reference.id)} disabled={aiLoading}><Sparkles size={13} />Extract Style</button><button onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button></div>)}
+                {references.map((reference) => <div className="reference-item" key={reference.id}>{referenceUrl ? <img src={referenceUrl} alt="Visual reference" /> : <span>IMG</span>}<button title="Extract Style" onClick={() => void extractStyle(reference.id)} disabled={aiLoading}><Sparkles size={13} />Extract Style</button><div className="reference-item-actions"><button type="button" className="icon-button" aria-label="Choose which aspects Extract Style focuses on" title="Extract Style aspects" onClick={() => void openExtractStyleAspects()}><Settings size={13} /></button><button type="button" className="icon-button" onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button></div></div>)}
               </div>
             </>
           ) : (
@@ -3255,27 +3540,35 @@ function ImagesView() {
                   overrideOpen={Boolean(scene) && bulkOverrideOpenSceneId === scene?.id}
                   onToggleOverrideOpen={() => setBulkOverrideOpenSceneId((current) => (scene && current !== scene.id ? scene.id : null))}
                   onSaveOverride={(patch) => scene && void saveSceneOverride(scene.id, patch)}
-                  onImportReference={() => scene && void importSceneReference(scene.id)}
-                  onImportLocationReference={() => scene && void importSceneLocationReference(scene.id)}
+                  rosterCharacters={rosterCharacters}
+                  rosterLocations={rosterLocations}
+                  castAssignment={scene ? sceneCastAssignments.find((item) => item.sceneId === scene.id) ?? null : null}
+                  onSaveCast={(characterIds, locationId) => scene && void saveCastAssignment(scene.id, characterIds, locationId)}
                   globalDials={bulkGlobalVisualSettings.dials}
                   globalMood={bulkGlobalVisualSettings.dials.mood}
                 />
               );
             })}
           </div>
-          <button className="primary full" style={{marginTop:"10px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanStatus !== null || !orderedBulkSelection.length || bulkProgress !== null || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>
+          <button className="primary full" style={{marginTop:"10px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanStatus !== null || !orderedBulkSelection.length || bulkProgress !== null || !systemPrompt.trim() || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>
             <WandSparkles size={16} />Generate Selected ({bulkSelection.size})
           </button>
-          <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans and generates the selected stills in one pausable run — no separate review step. {Boolean(job && ["queued", "running", "paused"].includes(job.status)) && "Stop the active job to re-plan."}</p>
+          {!systemPrompt.trim() ? (
+            <p style={{fontSize:"11px",color:"#c77a26",margin:"6px 0 0",textAlign:"center"}}>Write a style directive in Global Settings above, or use Extract Style on a reference image, before generating.</p>
+          ) : (
+            <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans and generates the selected stills in one pausable run — no separate review step. {Boolean(job && ["queued", "running", "paused"].includes(job.status)) && "Stop the active job to re-plan."}</p>
+          )}
         </div>
       </div>}
 
       {bulkGlobalOpen && <div className="modal-backdrop" role="presentation" onMouseDown={() => setBulkGlobalOpen(false)}>
         <div className="modal bulk-modal" onMouseDown={(e) => e.stopPropagation()}>
           <div className="modal-heading-row"><h2>Global Bulk Settings</h2><button type="button" className="icon-button" aria-label="Close" onClick={() => setBulkGlobalOpen(false)}><X size={16} /></button></div>
-          <div className="panel-section-heading" style={{marginTop:"4px"}}><h3>Style Directive</h3><small>Global visual style</small></div>
+
+          <div className="bulk-modal-group">Style</div>
+          <div className="panel-section-heading required" style={{marginTop:"4px"}}><h3>Style Directive<span className="required-badge">Required</span></h3></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Describe overall cinematography and visual language. Avoid scene-specific details — the AI will handle those per still.</p>
-          <textarea className="bulk-directive" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="e.g. Cinematic documentary style, shallow depth of field, warm color grade, soft natural lighting…" rows={4} />
+          <textarea className={`bulk-directive${systemPrompt.trim() ? "" : " needs-attention"}`} value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="e.g. Cinematic documentary style, shallow depth of field, warm color grade, soft natural lighting…" rows={4} />
           <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Reference Image</h3><small>Optional</small></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Upload a reference to extract visual style and populate the directive automatically.</p>
           <div className="reference-list bulk-ref-list">
@@ -3283,53 +3576,27 @@ function ImagesView() {
               <div className="reference-item" key={reference.id}>
                 {referenceUrl ? <img src={referenceUrl} alt="Visual reference" /> : <span>IMG</span>}
                 <button onClick={() => void extractStyle(reference.id)} disabled={aiLoading}><Sparkles size={13} />Extract Style</button>
-                <button onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button>
+                <div className="reference-item-actions">
+                  <button type="button" className="icon-button" aria-label="Choose which aspects Extract Style focuses on" title="Extract Style aspects" onClick={() => void openExtractStyleAspects()}><Settings size={13} /></button>
+                  <button type="button" className="icon-button" onClick={() => void removeReference(reference.id)} aria-label={`Remove ${reference.originalName}`}><X size={13} /></button>
+                </div>
               </div>
             ))}
             {!references.length && <button className="secondary" onClick={() => void importReference()}><Plus size={14} />Upload reference image</button>}
           </div>
-          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Character Consistency</h3><small>Optional</small></div>
-          <label className="toggle-setting" style={{padding:"6px 0"}}>
-            <span>
-              Keep one character consistent across all stills
-              <small>AI derives a character from your reference image and weaves it into every applicable still's prompt.</small>
-            </span>
-            <input
-              type="checkbox"
-              checked={characterConsistency}
-              onChange={(event) => { setCharacterConsistency(event.target.checked); localStorage.setItem("bulk_character_consistency", String(event.target.checked)); }}
-            />
-          </label>
-          {characterConsistency && !references.length && (
-            <p style={{fontSize:"11px",color:"var(--muted)",margin:"2px 0 0"}}>Upload a reference image above — Character Consistency needs one to work from.</p>
-          )}
-          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Location Consistency</h3><small>Optional</small></div>
-          <label className="toggle-setting" style={{padding:"6px 0"}}>
-            <span>
-              Keep one location consistent across all stills
-              <small>AI derives a setting from a reference image and weaves it into every applicable still's prompt — independent of the Character reference above.</small>
-            </span>
-            <input
-              type="checkbox"
-              checked={bulkGlobalVisualSettings.locationConsistency ?? false}
-              onChange={(event) => void saveGlobalVisualSettings({ locationConsistency: event.target.checked })}
-            />
-          </label>
-          <div className="bulk-scene-reference" style={{marginTop:"6px"}}>
-            <span>Location reference image</span>
-            {bulkGlobalVisualSettings.locationReferenceAssetId ? (
-              <>
-                <span className="bulk-scene-reference-set">Custom reference set</span>
-                <button type="button" className="link-button" onClick={() => void saveGlobalVisualSettings({ locationReferenceAssetId: null })}>Remove</button>
-              </>
-            ) : (
-              <button type="button" className="secondary" onClick={() => void importGlobalLocationReference()}><Plus size={12} />Upload</button>
-            )}
+          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
+          <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still (unless a scene overrides them below in the main panel). Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
+          <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cat as the main character. Show visible emotions and varied body language. Avoid showing text, labels, or close-ups on faces." rows={4} />
+
+          <div className="bulk-modal-group">Cast &amp; Locations</div>
+          <div className="bulk-scene-reference roster-launcher">
+            <span>{rosterCharacters.length} character{rosterCharacters.length === 1 ? "" : "s"} · {rosterLocations.length} location{rosterLocations.length === 1 ? "" : "s"}</span>
+            <button type="button" className="secondary" onClick={() => setRosterModalOpen(true)}><Users size={12} />Manage roster</button>
           </div>
-          {bulkGlobalVisualSettings.locationConsistency && !bulkGlobalVisualSettings.locationReferenceAssetId && (
-            <p style={{fontSize:"11px",color:"var(--muted)",margin:"2px 0 0"}}>Upload a reference image above — Location Consistency needs one to work from.</p>
-          )}
-          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Visual Direction</h3><small>Optional — leave any dial on "AI decides" to skip it</small></div>
+          <p style={{fontSize:"12px",color:"var(--muted)",margin:"6px 0 0"}}>Add named characters/locations with reference images here, then pick which ones each scene uses in the panel behind this one.</p>
+
+          <div className="bulk-modal-group">Visual Direction</div>
+          <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 10px"}}>Leave any dial on "AI decides" to skip it — an untouched dial never sends anything to the AI.</p>
           <div className="dial-grid">
             <GlobalDialRow label="Visual Interpretation" hint="Literal ↔ Creative" value={bulkGlobalVisualSettings.dials.visualInterpretation} onChange={(value) => updateGlobalDial({ visualInterpretation: value })} />
             <GlobalDialRow label="Visual Metaphor" hint="Literal ↔ Symbolic" value={bulkGlobalVisualSettings.dials.visualMetaphor} onChange={(value) => updateGlobalDial({ visualMetaphor: value })} />
@@ -3337,21 +3604,47 @@ function ImagesView() {
             <GlobalDialRow label="Prompt Creativity" hint="Strict script ↔ Highly creative" value={bulkGlobalVisualSettings.dials.promptCreativity} onChange={(value) => updateGlobalDial({ promptCreativity: value })} />
             <MoodRow level="global" mood={bulkGlobalVisualSettings.dials.mood} moodMode={bulkGlobalVisualSettings.dials.moodMode} onChange={(mood, moodMode) => updateGlobalDial({ mood, moodMode })} />
           </div>
-          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Diversity &amp; Consistency</h3><small>Optional</small></div>
-          <div className="dial-grid">
-            <GlobalDialRow label="Camera Angle Diversity" value={bulkGlobalVisualSettings.dials.diversityCamera} onChange={(value) => updateGlobalDial({ diversityCamera: value })} />
-            <GlobalDialRow label="Composition Diversity" value={bulkGlobalVisualSettings.dials.diversityComposition} onChange={(value) => updateGlobalDial({ diversityComposition: value })} />
-            <GlobalDialRow label="Shot Type Diversity" value={bulkGlobalVisualSettings.dials.diversityShotType} onChange={(value) => updateGlobalDial({ diversityShotType: value })} />
-            <GlobalDialRow label="Character Identity Strictness" value={bulkGlobalVisualSettings.dials.consistencyCharacter} onChange={(value) => updateGlobalDial({ consistencyCharacter: value })} />
-            <GlobalDialRow label="Location Identity Strictness" value={bulkGlobalVisualSettings.dials.consistencyLocation} onChange={(value) => updateGlobalDial({ consistencyLocation: value })} />
-            <GlobalDialRow label="Style Strictness" value={bulkGlobalVisualSettings.dials.consistencyStyle} onChange={(value) => updateGlobalDial({ consistencyStyle: value })} />
-          </div>
-          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
-          <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still (unless a scene overrides them below in the main panel). Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
-          <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cat as the main character. Show visible emotions and varied body language. Avoid showing text, labels, or close-ups on faces." rows={4} />
-          <button className="primary full" style={{marginTop:"10px"}} onClick={() => setBulkGlobalOpen(false)}>Done</button>
+          <details className="advanced-settings"><summary><span><strong>Diversity &amp; Consistency</strong><small>How stills should differ from, or match, each other</small></span><b>＋</b></summary><div className="dial-grid">
+            <GlobalDialRow label="Camera Angle Diversity" hint="Consistent ↔ Dynamic" value={bulkGlobalVisualSettings.dials.diversityCamera} onChange={(value) => updateGlobalDial({ diversityCamera: value })} />
+            <GlobalDialRow label="Composition Diversity" hint="Consistent ↔ Dynamic" value={bulkGlobalVisualSettings.dials.diversityComposition} onChange={(value) => updateGlobalDial({ diversityComposition: value })} />
+            <GlobalDialRow label="Shot Type Diversity" hint="Consistent ↔ Dynamic" value={bulkGlobalVisualSettings.dials.diversityShotType} onChange={(value) => updateGlobalDial({ diversityShotType: value })} />
+            <GlobalDialRow label="Character Identity Strictness" hint="Flexible ↔ Strict" value={bulkGlobalVisualSettings.dials.consistencyCharacter} onChange={(value) => updateGlobalDial({ consistencyCharacter: value })} />
+            <GlobalDialRow label="Location Identity Strictness" hint="Flexible ↔ Strict" value={bulkGlobalVisualSettings.dials.consistencyLocation} onChange={(value) => updateGlobalDial({ consistencyLocation: value })} />
+            <GlobalDialRow label="Style Strictness" hint="Flexible ↔ Strict" value={bulkGlobalVisualSettings.dials.consistencyStyle} onChange={(value) => updateGlobalDial({ consistencyStyle: value })} />
+          </div></details>
+
+          <button className="primary full" style={{marginTop:"18px"}} onClick={() => setBulkGlobalOpen(false)}>Done</button>
         </div>
       </div>}
+
+      {rosterModalOpen && (
+        <RosterModal
+          characters={rosterCharacters}
+          locations={rosterLocations}
+          onClose={() => setRosterModalOpen(false)}
+          onAddCharacter={() => void addRosterCharacter()}
+          onAddLocation={() => void addRosterLocation()}
+          onRenameCharacter={(id, name) => void renameRosterCharacter(id, name)}
+          onRenameLocation={(id, name) => void renameRosterLocation(id, name)}
+          onRemoveCharacter={(id) => void removeRosterCharacter(id)}
+          onRemoveLocation={(id) => void removeRosterLocation(id)}
+          onImportCharacterReference={(id) => void importRosterCharacterReference(id)}
+          onImportLocationReference={(id) => void importRosterLocationReference(id)}
+          onSuggestCast={() => void suggestCast(stillSections.map((section) => section.scene?.id).filter((id): id is string => Boolean(id)))}
+          suggesting={suggestingCast}
+        />
+      )}
+
+      {extractStyleAspectsOpen && selectedAspectKeys && (
+        <ExtractStyleAspectsModal
+          aspects={extractStyleAspects}
+          selectedKeys={selectedAspectKeys}
+          onToggle={(key) => void toggleExtractStyleAspect(key)}
+          onSelectAll={() => void setAllExtractStyleAspects(true)}
+          onSelectNone={() => void setAllExtractStyleAspects(false)}
+          onClose={() => setExtractStyleAspectsOpen(false)}
+        />
+      )}
     </section>
   );
 }

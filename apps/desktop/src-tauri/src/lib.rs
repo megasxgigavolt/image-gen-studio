@@ -4,7 +4,8 @@ use base64::Engine;
 use projects::{
     AnimationJob, BulkGlobalVisualSettings, BulkSceneSettings, BulkVisualDials, CaptionSet, Channel,
     ExportJob, ExportResult, ExportSettings, ImageJob, ImageRender, ImageWorkspace, InputAsset,
-    MediaLibraryAsset, ProjectRepository, ProviderKeyStatus, PromptVersion, ResumeState, Timeline,
+    MediaLibraryAsset, ProjectRepository, ProviderKeyStatus, PromptVersion, ResumeState,
+    RosterCharacter, RosterLocation, SceneCastAssignment, StyleAspect, Timeline,
     Video, VideoAsset, VideoInputs, VideoProgress, VisualPlan,
 };
 use serde_json::json;
@@ -482,6 +483,95 @@ fn extract_reference_style(
 }
 
 #[tauri::command]
+fn list_extractable_style_aspects() -> Vec<StyleAspect> {
+    ProjectRepository::list_extractable_style_aspects()
+}
+
+#[tauri::command]
+fn list_roster_characters(state: State<'_, RepositoryState>, video_id: String) -> Result<Vec<RosterCharacter>, String> {
+    with_repository(state, |repository| repository.list_roster_characters(&video_id))
+}
+
+#[tauri::command]
+fn create_roster_character(state: State<'_, RepositoryState>, video_id: String, name: String) -> Result<RosterCharacter, String> {
+    with_repository(state, |repository| repository.create_roster_character(&video_id, &name))
+}
+
+#[tauri::command]
+fn rename_roster_character(state: State<'_, RepositoryState>, character_id: String, name: String) -> Result<RosterCharacter, String> {
+    with_repository(state, |repository| repository.rename_roster_character(&character_id, &name))
+}
+
+#[tauri::command]
+fn set_roster_character_reference(state: State<'_, RepositoryState>, character_id: String, asset_id: Option<String>) -> Result<RosterCharacter, String> {
+    with_repository(state, |repository| repository.set_roster_character_reference(&character_id, asset_id.as_deref()))
+}
+
+#[tauri::command]
+fn delete_roster_character(state: State<'_, RepositoryState>, character_id: String) -> Result<(), String> {
+    with_repository(state, |repository| repository.delete_roster_character(&character_id))
+}
+
+#[tauri::command]
+fn list_roster_locations(state: State<'_, RepositoryState>, video_id: String) -> Result<Vec<RosterLocation>, String> {
+    with_repository(state, |repository| repository.list_roster_locations(&video_id))
+}
+
+#[tauri::command]
+fn create_roster_location(state: State<'_, RepositoryState>, video_id: String, name: String) -> Result<RosterLocation, String> {
+    with_repository(state, |repository| repository.create_roster_location(&video_id, &name))
+}
+
+#[tauri::command]
+fn rename_roster_location(state: State<'_, RepositoryState>, location_id: String, name: String) -> Result<RosterLocation, String> {
+    with_repository(state, |repository| repository.rename_roster_location(&location_id, &name))
+}
+
+#[tauri::command]
+fn set_roster_location_reference(state: State<'_, RepositoryState>, location_id: String, asset_id: Option<String>) -> Result<RosterLocation, String> {
+    with_repository(state, |repository| repository.set_roster_location_reference(&location_id, asset_id.as_deref()))
+}
+
+#[tauri::command]
+fn delete_roster_location(state: State<'_, RepositoryState>, location_id: String) -> Result<(), String> {
+    with_repository(state, |repository| repository.delete_roster_location(&location_id))
+}
+
+#[tauri::command]
+fn get_scene_cast_assignments(state: State<'_, RepositoryState>, video_id: String) -> Result<Vec<SceneCastAssignment>, String> {
+    with_repository(state, |repository| repository.get_scene_cast_assignments(&video_id))
+}
+
+#[tauri::command]
+fn save_scene_cast_assignment(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    scene_id: String,
+    assigned_character_ids: Vec<String>,
+    assigned_location_id: Option<String>,
+) -> Result<SceneCastAssignment, String> {
+    with_repository(state, |repository| {
+        repository.save_scene_cast_assignment(&video_id, &scene_id, &assigned_character_ids, assigned_location_id.as_deref())
+    })
+}
+
+#[tauri::command]
+async fn suggest_scene_cast_batch(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    scene_ids: Vec<String>,
+) -> Result<Vec<SceneCastAssignment>, String> {
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        repository.suggest_scene_cast_batch(&video_id, &scene_ids)
+    })
+    .await
+    .map_err(|e| format!("Cast suggestion stopped unexpectedly: {e}"))?
+}
+
+#[tauri::command]
 fn set_still_lock(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -529,7 +619,6 @@ async fn plan_bulk_visuals_batch(
     style_directive: String,
     base_settings_json: String,
     creative_instruction: String,
-    character_consistency: bool,
     selected_group_ids: Vec<String>,
     start_index: usize,
 ) -> Result<projects::BulkPlanBatchResult, String> {
@@ -542,7 +631,6 @@ async fn plan_bulk_visuals_batch(
             &style_directive,
             &base_settings_json,
             &creative_instruction,
-            character_consistency,
             &selected_group_ids,
             start_index,
         )
@@ -2569,18 +2657,10 @@ fn save_bulk_scene_settings(
     scene_id: String,
     style_directive: Option<String>,
     creative_instruction: Option<String>,
-    character_consistency: Option<bool>,
-    reference_asset_id: Option<String>,
-    location_consistency: Option<bool>,
-    location_reference_asset_id: Option<String>,
     dials: BulkVisualDials,
 ) -> Result<BulkSceneSettings, String> {
     with_repository(state, |repository| {
-        repository.save_bulk_scene_settings(
-            &video_id, &scene_id, style_directive, creative_instruction,
-            character_consistency, reference_asset_id,
-            location_consistency, location_reference_asset_id, dials,
-        )
+        repository.save_bulk_scene_settings(&video_id, &scene_id, style_directive, creative_instruction, dials)
     })
 }
 
@@ -2596,13 +2676,9 @@ fn get_bulk_global_settings(
 fn save_bulk_global_settings(
     state: State<'_, RepositoryState>,
     video_id: String,
-    location_consistency: Option<bool>,
-    location_reference_asset_id: Option<String>,
     dials: BulkVisualDials,
 ) -> Result<BulkGlobalVisualSettings, String> {
-    with_repository(state, |repository| {
-        repository.save_bulk_global_settings(&video_id, location_consistency, location_reference_asset_id, dials)
-    })
+    with_repository(state, |repository| repository.save_bulk_global_settings(&video_id, dials))
 }
 
 #[tauri::command]
@@ -2858,6 +2934,19 @@ pub fn run() {
             save_bulk_scene_settings,
             get_bulk_global_settings,
             save_bulk_global_settings,
+            list_roster_characters,
+            create_roster_character,
+            rename_roster_character,
+            set_roster_character_reference,
+            delete_roster_character,
+            list_roster_locations,
+            create_roster_location,
+            rename_roster_location,
+            set_roster_location_reference,
+            delete_roster_location,
+            get_scene_cast_assignments,
+            save_scene_cast_assignment,
+            suggest_scene_cast_batch,
             update_plan_sentence_text,
             split_plan_sentence,
             merge_plan_sentences,
@@ -2897,6 +2986,7 @@ pub fn run() {
             plan_educational_visual,
             plan_whole_video_educational_visuals,
             extract_reference_style,
+            list_extractable_style_aspects,
             set_still_lock,
             extract_image_settings_from_directive,
             suggest_still_prompt,

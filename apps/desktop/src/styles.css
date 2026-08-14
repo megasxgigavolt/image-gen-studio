@@ -860,3 +860,49 @@ textarea{text-align:justify!important}
 .dial-hint{display:block;font-size:10px;color:var(--muted);margin-top:4px}
 .mood-row-controls{display:grid;gap:6px;margin-top:6px}
 .mood-row-controls select{padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--text);font-size:12px}
+
+/* .reference-item's grid (image | Extract Style | auto) only has 3
+   columns — the aspects gear button and the remove/X button are grouped
+   into this single flex wrapper so they share that 3rd column as a pair
+   (gear, then X rightmost) instead of the gear pushing X into a
+   non-existent 4th column. */
+.reference-item-actions{display:flex;align-items:center;gap:2px}
+.reference-item-actions .icon-button{width:26px;height:26px}
+
+/* Global Bulk Settings modal restructure — group-level cluster labels
+   (bolder/larger than .panel-section-heading h3), a "Required" badge for
+   Style Directive, and the roster launcher row. */
+.bulk-modal-group{margin:22px 0 10px;font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.07em;color:var(--brand)}
+.bulk-modal-group:first-of-type{margin-top:4px}
+.panel-section-heading.required h3{display:flex;align-items:center;gap:8px}
+.required-badge{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:#c77a26;border:1px solid #c77a26;border-radius:999px;padding:2px 7px}
+.bulk-directive.needs-attention{border-color:#c77a26;background:color-mix(in srgb,#c77a26 6%,var(--surface))}
+.roster-launcher{border:1px solid var(--line);border-radius:6px;padding:10px 12px;justify-content:space-between}
+
+/* Character/location roster — card list (RosterModal) and the per-scene
+   cast picker (SceneCastPicker), ported from the ui/visual-director-mockup
+   branch's VisualBibleModal/SceneCastPicker, wired to the real backend. */
+.roster-modal{max-width:620px}
+.roster-cards{display:grid;gap:8px;margin-top:4px}
+.roster-card{display:grid;grid-template-columns:1fr auto auto;align-items:center;gap:8px;border:1px solid var(--line);border-radius:6px;padding:8px}
+.roster-card input{border:1px solid var(--line);border-radius:5px;padding:6px 8px;background:var(--surface);color:var(--text);font-size:12px;font-weight:600}
+.scene-cast-empty{font-size:12px;color:var(--muted);margin:4px 0}
+.scene-cast-heading{margin-top:14px}
+.scene-cast-picker{display:grid;gap:10px;margin-bottom:14px}
+.scene-cast-group{display:grid;gap:5px}
+.scene-cast-label{display:flex;align-items:center;gap:5px;font-size:11px;font-weight:700;color:var(--muted)}
+.scene-cast-group select{padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--text);font-size:12px}
+.scene-cast-ai-badge{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:700;color:var(--brand);background:var(--brand-soft);border-radius:999px;padding:3px 8px;width:fit-content}
+.tag-list{display:flex;flex-wrap:wrap;gap:6px}
+.tag-chip{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);border-radius:999px;padding:5px 11px;font-size:12px;font-weight:600;color:var(--text);background:var(--surface)}
+.tag-chip.selectable{cursor:pointer}
+.tag-chip.selectable:hover{border-color:var(--brand)}
+.tag-chip.selectable.selected{border-color:var(--brand);background:var(--brand-soft);color:var(--brand)}
+
+/* Extract Style aspects popup */
+.aspects-modal{max-width:640px;max-height:80vh;overflow-y:auto}
+.aspects-select-all{display:flex;gap:14px}
+.aspects-group .panel-section-heading{margin-bottom:6px}
+.aspects-checklist{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px}
+.aspects-checkbox-row{display:flex!important;align-items:center;gap:8px;font-size:12px;font-weight:500;cursor:pointer}
+.aspects-checkbox-row input{width:auto}

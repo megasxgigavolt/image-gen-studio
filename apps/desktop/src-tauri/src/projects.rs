@@ -805,6 +805,66 @@ CREATE TABLE IF NOT EXISTS bulk_global_settings (
 );
 "#;
 
+/// Replaces the single global/scene character+location reference model
+/// (`bulk_scene_settings.{character_consistency,reference_asset_id,
+/// location_consistency,location_reference_asset_id}` and
+/// `bulk_global_settings`'s location twins, plus the older
+/// `character_consistency.{video_id}`/`global_reference_asset.{video_id}`
+/// `app_settings` scalars) with a named roster: any number of characters
+/// and locations per video, each with its own reference image and
+/// AI-derived description, assigned per scene rather than fixed
+/// video-wide. The old columns/settings are deliberately left in place
+/// (never dropped) — `ensure_roster_seeded_from_legacy` reads them once
+/// per video to carry existing reference images forward as the roster's
+/// first entries, then they're simply never read/written again.
+///
+/// `description`/`description_asset_id` are real columns instead of the
+/// old `app_settings`-string-cache idiom — invalidated by comparing
+/// `description_asset_id != reference_asset_id`, the same idea as
+/// `script_understanding_for_video`'s source-comparison cache.
+///
+/// `scene_cast_assignments` distinguishes "AI suggested" from "user
+/// chose" without an extra boolean column: `assigned_*` starts as a copy
+/// of `ai_suggested_*` and only diverges once a human edits it, so the
+/// frontend derives which badge to show by comparing the two JSON blobs.
+const MIGRATION_040: &str = r#"
+CREATE TABLE IF NOT EXISTS roster_characters (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    ordinal INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    reference_asset_id TEXT,
+    description TEXT,
+    description_asset_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_roster_characters_video ON roster_characters(video_id, ordinal);
+CREATE TABLE IF NOT EXISTS roster_locations (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    ordinal INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    reference_asset_id TEXT,
+    description TEXT,
+    description_asset_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_roster_locations_video ON roster_locations(video_id, ordinal);
+CREATE TABLE IF NOT EXISTS scene_cast_assignments (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    scene_id TEXT NOT NULL,
+    ai_suggested_character_ids_json TEXT NOT NULL DEFAULT '[]',
+    assigned_character_ids_json TEXT NOT NULL DEFAULT '[]',
+    ai_suggested_location_id TEXT,
+    assigned_location_id TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scene_cast_assignments_scene ON scene_cast_assignments(video_id, scene_id);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -964,6 +1024,131 @@ pub struct StyleExtraction {
     pub image_settings: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleAspect {
+    pub key: String,
+    pub label: String,
+    pub description: String,
+}
+
+/// The full set of visual aspects Extract Style can be asked to focus on
+/// when analyzing a reference image — single source of truth in Rust so
+/// the frontend never hardcodes this English text (see
+/// `list_extractable_style_aspects`), exposed to the UI purely for
+/// checkbox rendering. Selection is persisted per video via the generic
+/// `app_settings` key `extract_style_aspects.{video_id}` (a JSON array of
+/// keys) rather than a dedicated table — see `extract_reference_style`.
+const EXTRACTABLE_STYLE_ASPECTS: &[(&str, &str, &str)] = &[
+    ("STY", "Art Style", "The overall artistic/visual language: cartoon, painterly, cinematic, anime, storybook, realistic, surreal, etc."),
+    ("REN", "Rendering", "How the image represents forms: flat color, cel shading, soft shading, realism, stylization, detail treatment, etc."),
+    ("SUB", "Subjects", "What entities are present: people, animals, vehicles, objects, characters, etc., including their basic physical characteristics."),
+    ("COST", "Clothing", "Clothing and wearable elements: garment type, silhouette, layering, colors, accessories, folds, construction, etc."),
+    ("ENV", "Environment", "The general setting/world: interior, exterior, urban, forest, fantasy, medieval, futuristic, domestic, etc."),
+    ("ARCH", "Architecture", "Built structures specifically: walls, arches, columns, windows, doors, roofs, masonry, architectural repetition, etc."),
+    ("MAT", "Materials", "What physical materials surfaces appear to be made from: stone, wood, metal, fabric, glass, leather, etc., plus their physical appearance."),
+    ("CLR", "Color", "The image's color system: palette, dominant colors, saturation, warmth/coolness, color relationships, muted/vibrant treatment, etc."),
+    ("LGT", "Lighting", "How light illuminates the scene: direction, softness, warmth, intensity, shadows, highlights, ambient light, rim light, etc."),
+    ("ATM", "Atmosphere", "What exists between the camera and subjects: fog, haze, mist, smoke, dust, rain, snow, particles, atmospheric depth, etc."),
+    ("CAM", "Camera", "The camera's physical viewpoint: height, angle, orientation, viewpoint, elevation, frontal/profile/three-quarter view, etc."),
+    ("LENS", "Optics", "The visual characteristics produced by the lens: wide-angle, telephoto, focal length, distortion, depth of field, bokeh, optical effects, etc."),
+    ("CMP", "Composition", "How visual elements are arranged within the frame: subject placement, balance, symmetry, negative space, leading lines, layering, etc."),
+    ("FRM", "Framing", "How tightly the scene is framed/cropped: close-up, medium shot, full body, wide shot, edge cropping, amount of environment visible, etc."),
+    ("STR", "Symmetry / Structure", "The underlying organizational geometry: symmetrical/asymmetrical arrangements, repetition, rhythm, geometric organization, balance, etc."),
+    ("HIER", "Visual Hierarchy", "What the viewer notices first, second, third, etc., based on size, contrast, placement, color, detail, and visual emphasis."),
+    ("FAC", "Facial Language", "The visual construction of faces: eye shape, eyebrow shape, mouth design, facial simplification, facial proportions, etc."),
+    ("GEST", "Gesture", "What bodies are physically communicating through pose and movement: raised arms, pointing, sitting, running, leaning, fighting, celebrating, etc."),
+    ("EXP", "Expression / Narrative", "Emotional and narrative information communicated by the subjects: happiness, fear, surprise, victory, confusion, tension, interaction, etc."),
+    ("FX", "Symbolic Effects", "Graphic/narrative visual symbols that aren't necessarily literal objects: stars around a dizzy character, speed lines, sparkles, comic symbols, magical effects, etc."),
+    ("PROP", "Props", "Distinct secondary objects that contribute to the scene: furniture, weapons, tools, plants, bags, hats, ornaments, cups, signs, etc."),
+    ("GEO", "Geometry", "The underlying shapes and forms of objects: circles, cylinders, rectangles, curves, proportions, volumes, simplified geometric construction, etc."),
+    ("LINE", "Line Characteristics", "The nature of drawn lines: thickness, color, smoothness, irregularity, organic vs geometric, line weight, contour strength, etc."),
+    ("TEXT", "Texture", "Surface-level visual detail: grain, roughness, brush texture, fabric weave, foliage detail, stone markings, noise, surface variation, etc."),
+    ("EDGE", "Edge Behavior", "How boundaries between forms are treated: hard edges, soft edges, lost edges, sharp contours, blurred transitions, hierarchy of edge definition, etc."),
+    ("DEPTH", "Depth Representation", "How the image creates a sense of foreground/midground/background and 3D space: overlap, scale, atmospheric depth, focus, shading, spatial recession, etc."),
+    ("PERS", "Perspective", "How 3D space is geometrically represented: linear perspective, convergence, spatial distortion, exaggerated perspective, stylized perspective, etc."),
+    ("DETAIL", "Detail Density", "Where and how much detail exists: highly detailed vs simplified areas, detail concentration, foreground/background detail distribution, selective detail, etc."),
+    ("STYLE_SIG", "Style Signature", "The compressed combination of the most defining visual characteristics that makes the image's particular aesthetic recognizable."),
+];
+
+/// Which `imageSettings` field belongs to which extractable aspect — a
+/// partial aspect selection must gate `imageSettings` the same way it
+/// gates `styleDirective`, or e.g. selecting only "Art Style" would still
+/// smuggle camera/lighting detail in through this side channel.
+const IMAGE_SETTINGS_ASPECT_MAP: &[(&str, &str)] = &[
+    ("cameraAngle", "CAM"),
+    ("lighting", "LGT"),
+    ("mood", "ATM"),
+    ("depthOfField", "LENS"),
+    ("colorTemperature", "CLR"),
+    ("weatherAtmosphere", "ATM"),
+    ("lensType", "LENS"),
+    ("lightDirection", "LGT"),
+    ("lightQuality", "LGT"),
+    ("shadowType", "LGT"),
+    ("contrast", "CLR"),
+    ("saturation", "CLR"),
+    ("composition", "CMP"),
+    ("motion", "GEST"),
+];
+
+/// Builds `extract_reference_style`'s prompt from a set of selected aspect
+/// keys — pulled out as a pure function so the actual restriction logic
+/// (not just the AI call around it) is unit-testable. A naive "focus on
+/// these aspects" instruction isn't enough — vision models default to
+/// describing whatever is visually salient (a depicted character, its
+/// setting) regardless of what was asked for, so this explicitly lists
+/// what's EXCLUDED too, tells the model not to name/describe excluded
+/// content even in passing, and gates `imageSettings`' own field list via
+/// `IMAGE_SETTINGS_ASPECT_MAP` so it can't reintroduce excluded detail
+/// through that side channel.
+fn build_extract_style_prompt(selected_keys: &[String]) -> String {
+    let selected: std::collections::HashSet<&str> = selected_keys.iter().map(String::as_str).collect();
+    let focus_lines: Vec<String> = EXTRACTABLE_STYLE_ASPECTS.iter()
+        .filter(|(key, _, _)| selected.contains(key))
+        .map(|(_, label, description)| format!("- {label}: {description}"))
+        .collect();
+    let excluded_labels: Vec<&str> = EXTRACTABLE_STYLE_ASPECTS.iter()
+        .filter(|(key, _, _)| !selected.contains(key))
+        .map(|(_, label, _)| *label)
+        .collect();
+    let exclusion_instruction = if excluded_labels.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nCRITICAL — EXCLUDED ASPECTS: {}. Do NOT mention, name, describe, or even allude to anything \
+             from these excluded aspects, even in passing while describing something else. In particular: if \
+             Subjects is excluded, do not identify, name, count, or describe any person, character, animal, \
+             or object depicted in the image at all. If Environment is excluded, do not describe the setting, \
+             location, or background. If Clothing is excluded, do not describe what any subject is wearing. \
+             Write styleDirective as if you were describing ONLY the included aspects in the abstract — it \
+             must remain equally true no matter what subject, character, or scene the style is later applied to.",
+            excluded_labels.join(", "),
+        )
+    };
+    let allowed_settings_fields: Vec<&str> = IMAGE_SETTINGS_ASPECT_MAP.iter()
+        .filter(|(_, aspect)| selected.contains(aspect))
+        .map(|(field, _)| *field)
+        .collect();
+    let settings_instruction = if allowed_settings_fields.is_empty() {
+        "imageSettings must be an empty object ({}) — none of the selected aspects above correspond to a settings field.".to_string()
+    } else {
+        format!(
+            "imageSettings may ONLY include these keys, and only when strongly supported by the image: {}. \
+             Do not include any other key, even if it would normally be relevant.",
+            allowed_settings_fields.join(", "),
+        )
+    };
+    format!(
+        "Analyze this image as a reusable production style reference. Your styleDirective must cover ONLY \
+         these selected visual aspects, nothing else:\n{}\n{exclusion_instruction}\n\n{settings_instruction}\n\n\
+         Return only JSON with styleDirective (a prose description strictly limited to the selected aspects \
+         above, written so it stays valid for dozens of separate generated images depicting different \
+         subjects/scenes) and imageSettings.",
+        focus_lines.join("\n"),
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EducationalVisualPlan {
@@ -1094,6 +1279,9 @@ const PROJECT_TABLES: &[&str] = &[
     "visual_plan_meta",
     "bulk_scene_settings",
     "bulk_global_settings",
+    "roster_characters",
+    "roster_locations",
+    "scene_cast_assignments",
     "prompt_versions",
     "image_renders",
     "media_library_assets",
@@ -1119,6 +1307,7 @@ const ATOMIC_ID_COLUMNS: &[&str] = &[
     "source_render_id", "video_asset_id", "parent_video_asset_id", "media_library_asset_id",
     "still_id", "visual_plan_row_id", "audio_asset_id", "generation_audio_id", "clip_id",
     "scene_id", "reference_asset_id", "location_reference_asset_id",
+    "ai_suggested_location_id", "assigned_location_id",
 ];
 
 /// `visual_plan_sentences.id` and `visual_plan_groups.id` are the only
@@ -1608,25 +1797,66 @@ pub struct BulkSceneSettings {
     pub scene_id: String,
     pub style_directive: Option<String>,
     pub creative_instruction: Option<String>,
-    pub character_consistency: Option<bool>,
-    pub reference_asset_id: Option<String>,
-    pub location_consistency: Option<bool>,
-    pub location_reference_asset_id: Option<String>,
     #[serde(default)]
     pub dials: BulkVisualDials,
 }
 
 /// The video-wide counterpart to `BulkSceneSettings` — structured
-/// identically (minus `scene_id`) so the exact same dials/consistency
-/// concepts resolve the same way at both levels; a scene layers its own
-/// version of this same shape on top.
+/// identically (minus `scene_id`) so the exact same dials concepts
+/// resolve the same way at both levels; a scene layers its own version of
+/// this same shape on top. Character/location identity used to live here
+/// too (`location_consistency`/`location_reference_asset_id`) — replaced
+/// by the roster (`RosterCharacter`/`RosterLocation`/
+/// `SceneCastAssignment`, see `ensure_roster_seeded_from_legacy` for how
+/// existing data here was carried forward).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BulkGlobalVisualSettings {
-    pub location_consistency: Option<bool>,
-    pub location_reference_asset_id: Option<String>,
     #[serde(default)]
     pub dials: BulkVisualDials,
+}
+
+/// One named entry in a video's character or location roster — see
+/// `MIGRATION_040`'s doc comment for the full design rationale. Characters
+/// and locations share this exact shape; kept as two distinct structs
+/// (rather than one generic `RosterEntry`) so call sites and Tauri
+/// commands stay unambiguous about which roster they're touching.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RosterCharacter {
+    pub id: String,
+    pub video_id: String,
+    pub ordinal: i64,
+    pub name: String,
+    pub reference_asset_id: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RosterLocation {
+    pub id: String,
+    pub video_id: String,
+    pub ordinal: i64,
+    pub name: String,
+    pub reference_asset_id: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Which roster characters/location a scene should draw on. `assigned_*`
+/// is what generation/planning actually uses; `ai_suggested_*` is kept
+/// alongside it purely so the frontend can tell "AI suggested this,
+/// untouched" apart from "the user chose this" by comparing the two
+/// (see `suggest_scene_cast_batch`/`save_scene_cast_assignment`) — no
+/// separate boolean flag needed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneCastAssignment {
+    pub scene_id: String,
+    pub ai_suggested_character_ids: Vec<String>,
+    pub assigned_character_ids: Vec<String>,
+    pub ai_suggested_location_id: Option<String>,
+    pub assigned_location_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2224,6 +2454,11 @@ impl ProjectRepository {
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(39, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
+        self.connection.execute_batch(MIGRATION_040).map_err(|error| error.to_string())?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(40, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -2707,7 +2942,13 @@ impl ProjectRepository {
             .to_ascii_lowercase();
         let allowed = match kind {
             "audio" => ["wav", "mp3", "m4a", "aac", "flac"].contains(&extension.as_str()),
-            "reference" => ["png", "jpg", "jpeg", "webp"].contains(&extension.as_str()),
+            // "roster-reference" deliberately does NOT trigger the eviction
+            // loop below (unlike "reference") — a roster entry's own
+            // upload must not delete every other entry's reference image.
+            // Re-uploading for the SAME roster row is handled at the
+            // set_roster_*_reference layer, which just overwrites that
+            // row's asset id; no eviction needed here either way.
+            "reference" | "roster-reference" => ["png", "jpg", "jpeg", "webp"].contains(&extension.as_str()),
             _ => false,
         };
         if !allowed {
@@ -3529,20 +3770,15 @@ Return exactly one plan for every supplied row, in the same order."#,
     /// present in this list, rather than a row of all-nulls.
     pub fn get_bulk_scene_settings(&self, video_id: &str) -> Result<Vec<BulkSceneSettings>, String> {
         let mut statement = self.connection.prepare(
-            "SELECT scene_id, style_directive, creative_instruction, character_consistency, reference_asset_id,
-                    location_consistency, location_reference_asset_id, dials_json
+            "SELECT scene_id, style_directive, creative_instruction, dials_json
              FROM bulk_scene_settings WHERE video_id=?1 ORDER BY scene_id",
         ).map_err(|e| e.to_string())?;
         let rows = statement.query_map([video_id], |row| {
-            let dials_json: Option<String> = row.get(7)?;
+            let dials_json: Option<String> = row.get(3)?;
             Ok(BulkSceneSettings {
                 scene_id: row.get(0)?,
                 style_directive: row.get(1)?,
                 creative_instruction: row.get(2)?,
-                character_consistency: row.get::<_, Option<i64>>(3)?.map(|v| v != 0),
-                reference_asset_id: row.get(4)?,
-                location_consistency: row.get::<_, Option<i64>>(5)?.map(|v| v != 0),
-                location_reference_asset_id: row.get(6)?,
                 dials: dials_json.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default(),
             })
         }).map_err(|e| e.to_string())?;
@@ -3555,94 +3791,71 @@ Return exactly one plan for every supplied row, in the same order."#,
     /// column rather than patching individual ones. A scene whose fields
     /// are all `None`/empty still leaves a row behind (harmless — reads back
     /// identically to "no overrides"); the panel doesn't bother deleting it.
+    /// Character/location identity is no longer part of this row — see
+    /// `save_scene_cast_assignment`.
     pub fn save_bulk_scene_settings(
         &self,
         video_id: &str,
         scene_id: &str,
         style_directive: Option<String>,
         creative_instruction: Option<String>,
-        character_consistency: Option<bool>,
-        reference_asset_id: Option<String>,
-        location_consistency: Option<bool>,
-        location_reference_asset_id: Option<String>,
         dials: BulkVisualDials,
     ) -> Result<BulkSceneSettings, String> {
         let dials_json = if dials.is_empty() { None } else { Some(serde_json::to_string(&dials).map_err(|e| e.to_string())?) };
         self.connection.execute(
-            "INSERT INTO bulk_scene_settings(id,video_id,scene_id,style_directive,creative_instruction,character_consistency,reference_asset_id,location_consistency,location_reference_asset_id,dials_json,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+            "INSERT INTO bulk_scene_settings(id,video_id,scene_id,style_directive,creative_instruction,dials_json,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(video_id,scene_id) DO UPDATE SET
                 style_directive=excluded.style_directive,
                 creative_instruction=excluded.creative_instruction,
-                character_consistency=excluded.character_consistency,
-                reference_asset_id=excluded.reference_asset_id,
-                location_consistency=excluded.location_consistency,
-                location_reference_asset_id=excluded.location_reference_asset_id,
                 dials_json=excluded.dials_json,
                 updated_at=excluded.updated_at",
             params![
                 Uuid::new_v4().to_string(), video_id, scene_id,
                 style_directive, creative_instruction,
-                character_consistency.map(|v| v as i64), reference_asset_id,
-                location_consistency.map(|v| v as i64), location_reference_asset_id,
                 dials_json,
                 Utc::now().to_rfc3339(),
             ],
         ).map_err(|e| e.to_string())?;
-        Ok(BulkSceneSettings {
-            scene_id: scene_id.to_string(), style_directive, creative_instruction, character_consistency, reference_asset_id,
-            location_consistency, location_reference_asset_id, dials,
-        })
+        Ok(BulkSceneSettings { scene_id: scene_id.to_string(), style_directive, creative_instruction, dials })
     }
 
     /// Video-wide defaults for the Visual Director / Diversity & Consistency
-    /// dials plus Location Consistency — the `bulk_global_settings`
-    /// counterpart to `get_bulk_scene_settings`. Returns the empty/default
-    /// shape for a video that has never saved anything here, exactly like
-    /// the existing global style directive / creative instruction (kept in
+    /// dials — the `bulk_global_settings` counterpart to
+    /// `get_bulk_scene_settings`. Returns the empty/default shape for a
+    /// video that has never saved anything here, exactly like the existing
+    /// global style directive / creative instruction (kept in
     /// `app_settings`) already behave when unset.
     pub fn get_bulk_global_settings(&self, video_id: &str) -> Result<BulkGlobalVisualSettings, String> {
-        let row: Option<(Option<i64>, Option<String>, Option<String>)> = self.connection.query_row(
-            "SELECT location_consistency, location_reference_asset_id, dials_json FROM bulk_global_settings WHERE video_id=?1",
+        let dials_json: Option<String> = self.connection.query_row(
+            "SELECT dials_json FROM bulk_global_settings WHERE video_id=?1",
             [video_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        ).optional().map_err(|e| e.to_string())?;
-        let Some((location_consistency, location_reference_asset_id, dials_json)) = row else {
-            return Ok(BulkGlobalVisualSettings::default());
-        };
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?.flatten();
         Ok(BulkGlobalVisualSettings {
-            location_consistency: location_consistency.map(|v| v != 0),
-            location_reference_asset_id,
             dials: dials_json.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default(),
         })
     }
 
-    /// Upserts the video's full global dials/Location Consistency state —
-    /// same full-replace convention as `save_bulk_scene_settings`.
+    /// Upserts the video's full global dials state — same full-replace
+    /// convention as `save_bulk_scene_settings`. Character/location
+    /// identity is no longer part of this row — see
+    /// `save_scene_cast_assignment`/the roster CRUD methods.
     pub fn save_bulk_global_settings(
         &self,
         video_id: &str,
-        location_consistency: Option<bool>,
-        location_reference_asset_id: Option<String>,
         dials: BulkVisualDials,
     ) -> Result<BulkGlobalVisualSettings, String> {
         let dials_json = if dials.is_empty() { None } else { Some(serde_json::to_string(&dials).map_err(|e| e.to_string())?) };
         self.connection.execute(
-            "INSERT INTO bulk_global_settings(video_id,location_consistency,location_reference_asset_id,dials_json,updated_at)
-             VALUES(?1,?2,?3,?4,?5)
+            "INSERT INTO bulk_global_settings(video_id,dials_json,updated_at)
+             VALUES(?1,?2,?3)
              ON CONFLICT(video_id) DO UPDATE SET
-                location_consistency=excluded.location_consistency,
-                location_reference_asset_id=excluded.location_reference_asset_id,
                 dials_json=excluded.dials_json,
                 updated_at=excluded.updated_at",
-            params![
-                video_id,
-                location_consistency.map(|v| v as i64), location_reference_asset_id,
-                dials_json,
-                Utc::now().to_rfc3339(),
-            ],
+            params![video_id, dials_json, Utc::now().to_rfc3339()],
         ).map_err(|e| e.to_string())?;
-        Ok(BulkGlobalVisualSettings { location_consistency, location_reference_asset_id, dials })
+        Ok(BulkGlobalVisualSettings { dials })
     }
 
     pub fn extract_image_settings_from_directive(&self, directive: &str) -> Result<StyleExtraction, String> {
@@ -3723,10 +3936,12 @@ Return JSON only — no markdown, no explanation:
     /// import behavior used to guarantee on its own. Scene references don't
     /// evict anything, so more than one `reference`-kind row can now coexist
     /// per video — `asset_id`/the setting are what keep the global path from
-    /// picking up a scene's reference by accident. Shared by
-    /// `character_description_for_video` (vision analysis) and
-    /// `generate_image_render` (passed as actual generation input, not just
-    /// description text — see that function's comment for why both matter).
+    /// picking up a scene's reference by accident. `asset_id` is always
+    /// given explicitly by the roster's own reference-image callers today
+    /// (`roster_character_description`/`roster_location_description`,
+    /// `generate_image_render`'s reference conditioning) — the `None`
+    /// fallback branch only still matters for videos with legacy,
+    /// not-yet-migrated single references.
     fn reference_image_bytes(&self, video_id: &str, asset_id: Option<&str>) -> Result<Option<(String, Vec<u8>)>, String> {
         let references = self.list_assets(video_id, "reference")?;
         let reference = match asset_id {
@@ -3750,70 +3965,469 @@ Return JSON only — no markdown, no explanation:
         Ok(Some((reference.media_type, bytes)))
     }
 
-    fn character_description_for_video(
-        &self,
-        video_id: &str,
-        gemini_auth: &Option<GeminiAuth>,
-        reference_asset_id: Option<&str>,
-    ) -> Result<String, String> {
-        let (media_type, bytes) = self.reference_image_bytes(video_id, reference_asset_id)?
-            .ok_or("Character Consistency requires a reference image — upload one in Bulk Gen Config first.")?;
-        let prompt = "Identify the single main character or protagonist in this reference image (a person, animal, or creature — not a background object or environment). Write a concise, reusable physical description of that character for an illustrator to redraw consistently across dozens of separate scenes. You MUST explicitly cover: species/type; approximate age; physical proportions and build; exact hair color, length, and style (or fur/feather coloring and pattern if not human) — this is the single most common detail illustrators get inconsistent, so describe it precisely; eye color; skin/fur tone; and any distinguishing marks or features. Deliberately do NOT describe clothing, outfit, or props — those must change scene-to-scene to match each still's own context, not stay fixed like the physical identity. Do not describe the pose, background, camera angle, or art/rendering style either — only the character's inherent physical identity, in 4-6 sentences of plain prose. If no clear single character is present, describe the closest candidate subject instead. Return only the description, no preamble, no labels, no markdown.";
-        #[cfg(not(test))]
-        let claude_cli = claude_cli_available();
-        #[cfg(test)]
-        let claude_cli = false;
-        if claude_cli {
-            match request_claude_cli_character_description(prompt, &media_type, &bytes) {
-                Ok(result) => return Ok(result),
-                Err(claude_error) => match gemini_auth.as_ref() {
-                    Some(auth) => return request_gemini_vision(auth, prompt, &media_type, &bytes).map_err(|gemini_error| {
-                        format!("Claude CLI: {claude_error} (Gemini fallback also failed: {gemini_error})")
-                    }),
-                    None => return Err(format!("Claude CLI: {claude_error}")),
-                },
-            }
+    /// One-time, lazy migration of a video's pre-roster single character/
+    /// location reference (if any) into the new roster's first entry — see
+    /// `MIGRATION_040`'s doc comment for the full design. Mirrors
+    /// `backfill_missing_clip_renders`'s shape: self-heals on every roster
+    /// read instead of needing a global startup pass. Reads the OLD
+    /// `app_settings`/`bulk_global_settings` columns directly via raw SQL —
+    /// the one deliberate exception to "never read these retired fields
+    /// again," since nothing else does this after the first call for a
+    /// given video (the `roster_migrated.{video_id}` marker is set either
+    /// way, even when there was nothing to carry forward).
+    fn ensure_roster_seeded_from_legacy(&self, video_id: &str) -> Result<(), String> {
+        let marker_key = format!("roster_migrated.{video_id}");
+        if self.get_app_setting(&marker_key)?.as_deref() == Some("true") {
+            return Ok(());
         }
-        request_gemini_vision(
-            gemini_auth.as_ref().ok_or("Configure a Gemini API key, or log in with the Claude Code CLI, to use Character Consistency.")?,
-            prompt, &media_type, &bytes,
-        )
+        if let Some(asset_id) = self.get_app_setting(&format!("global_reference_asset.{video_id}"))?
+            .filter(|id| !id.trim().is_empty())
+        {
+            let cached_description = self.get_app_setting(&format!("character_description.{video_id}"))?
+                .filter(|d| !d.trim().is_empty());
+            let now = Utc::now().to_rfc3339();
+            self.connection.execute(
+                "INSERT INTO roster_characters(id,video_id,ordinal,name,reference_asset_id,description,description_asset_id,created_at,updated_at)
+                 VALUES(?1,?2,1,'Character 1',?3,?4,?5,?6,?6)",
+                params![
+                    Uuid::new_v4().to_string(), video_id, asset_id.as_str(),
+                    cached_description.as_deref(),
+                    cached_description.as_ref().map(|_| asset_id.as_str()),
+                    now,
+                ],
+            ).map_err(|e| e.to_string())?;
+        }
+        let legacy_location_asset: Option<String> = self.connection.query_row(
+            "SELECT location_reference_asset_id FROM bulk_global_settings WHERE video_id=?1",
+            [video_id],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?.flatten();
+        if let Some(asset_id) = legacy_location_asset.filter(|id| !id.trim().is_empty()) {
+            let cached_description = self.get_app_setting(&format!("location_description.{video_id}"))?
+                .filter(|d| !d.trim().is_empty());
+            let now = Utc::now().to_rfc3339();
+            self.connection.execute(
+                "INSERT INTO roster_locations(id,video_id,ordinal,name,reference_asset_id,description,description_asset_id,created_at,updated_at)
+                 VALUES(?1,?2,1,'Location 1',?3,?4,?5,?6,?6)",
+                params![
+                    Uuid::new_v4().to_string(), video_id, asset_id.as_str(),
+                    cached_description.as_deref(),
+                    cached_description.as_ref().map(|_| asset_id.as_str()),
+                    now,
+                ],
+            ).map_err(|e| e.to_string())?;
+        }
+        self.save_app_setting(&marker_key, "true")?;
+        Ok(())
     }
 
-    /// Location Consistency's counterpart to `character_description_for_video`
-    /// — same reference-image-to-reusable-description mechanism, same
-    /// Claude CLI first / Gemini fallback provider order, just pointed at
-    /// the environment instead of a subject. Callers cache the result the
-    /// same way (see the `location_description.{video_id}[.{scene_id}]`
-    /// cache key in `plan_bulk_visuals_batch`).
-    fn location_description_for_video(
-        &self,
-        video_id: &str,
-        gemini_auth: &Option<GeminiAuth>,
-        reference_asset_id: Option<&str>,
-    ) -> Result<String, String> {
-        let (media_type, bytes) = self.reference_image_bytes(video_id, reference_asset_id)?
-            .ok_or("Location Consistency requires a reference image — upload one in Bulk Gen Config first.")?;
-        let prompt = "Identify the single main location, environment, or setting shown in this reference image. Write a concise, reusable description of that place for an illustrator to redraw consistently across dozens of separate scenes. You MUST explicitly cover: type of space (interior/exterior, room type, or landscape type); architecture or geography; layout and scale; distinctive furniture, structures, or landmarks; and characteristic color palette/materials. Deliberately do NOT describe the people, weather, or time of day present in this specific reference photo, and do NOT describe lighting or camera angle — those must change scene-to-scene to match each still's own narration and mood, not stay fixed like the place's own physical identity. Describe only the location's inherent physical identity, in 4-6 sentences of plain prose. If no single clear location is identifiable, describe the closest candidate setting instead. Return only the description, no preamble, no labels, no markdown.";
+    fn get_roster_character(&self, character_id: &str) -> Result<RosterCharacter, String> {
+        self.connection.query_row(
+            "SELECT id, video_id, ordinal, name, reference_asset_id, description FROM roster_characters WHERE id=?1",
+            [character_id],
+            |row| Ok(RosterCharacter {
+                id: row.get(0)?, video_id: row.get(1)?, ordinal: row.get(2)?, name: row.get(3)?,
+                reference_asset_id: row.get(4)?, description: row.get(5)?,
+            }),
+        ).map_err(|_| "Character was not found.".to_string())
+    }
+
+    pub fn list_roster_characters(&self, video_id: &str) -> Result<Vec<RosterCharacter>, String> {
+        self.ensure_roster_seeded_from_legacy(video_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, video_id, ordinal, name, reference_asset_id, description FROM roster_characters WHERE video_id=?1 ORDER BY ordinal",
+        ).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([video_id], |row| Ok(RosterCharacter {
+            id: row.get(0)?, video_id: row.get(1)?, ordinal: row.get(2)?, name: row.get(3)?,
+            reference_asset_id: row.get(4)?, description: row.get(5)?,
+        })).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    pub fn create_roster_character(&self, video_id: &str, name: &str) -> Result<RosterCharacter, String> {
+        self.ensure_roster_seeded_from_legacy(video_id)?;
+        let next_ordinal: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM roster_characters WHERE video_id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO roster_characters(id,video_id,ordinal,name,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5)",
+            params![id, video_id, next_ordinal, name, now],
+        ).map_err(|e| e.to_string())?;
+        Ok(RosterCharacter { id, video_id: video_id.to_string(), ordinal: next_ordinal, name: name.to_string(), reference_asset_id: None, description: None })
+    }
+
+    pub fn rename_roster_character(&self, character_id: &str, name: &str) -> Result<RosterCharacter, String> {
+        self.connection.execute(
+            "UPDATE roster_characters SET name=?1, updated_at=?2 WHERE id=?3",
+            params![name, Utc::now().to_rfc3339(), character_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_roster_character(character_id)
+    }
+
+    /// Clears the cached `description`/`description_asset_id` whenever the
+    /// reference asset actually changes, so the next planning call
+    /// regenerates it against the new image rather than serving a stale
+    /// description of the old one.
+    pub fn set_roster_character_reference(&self, character_id: &str, asset_id: Option<&str>) -> Result<RosterCharacter, String> {
+        let current = self.get_roster_character(character_id)?;
+        if current.reference_asset_id.as_deref() != asset_id {
+            self.connection.execute(
+                "UPDATE roster_characters SET reference_asset_id=?1, description=NULL, description_asset_id=NULL, updated_at=?2 WHERE id=?3",
+                params![asset_id, Utc::now().to_rfc3339(), character_id],
+            ).map_err(|e| e.to_string())?;
+        }
+        self.get_roster_character(character_id)
+    }
+
+    /// Deletes only the roster row — deliberately does not touch
+    /// `scene_cast_assignments` rows that may still reference this id (see
+    /// `MIGRATION_040`'s doc comment on stale-id tolerance);
+    /// `resolve_effective_scene_cast` filters those out defensively.
+    pub fn delete_roster_character(&self, character_id: &str) -> Result<(), String> {
+        self.connection.execute("DELETE FROM roster_characters WHERE id=?1", [character_id]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// The roster equivalent of `character_description_for_video`, scoped
+    /// to one roster row instead of one video. Cached directly on the row
+    /// rather than via an `app_settings` key — see
+    /// `set_roster_character_reference` for cache invalidation.
+    fn roster_character_description(&self, character_id: &str, gemini_auth: &Option<GeminiAuth>) -> Result<String, String> {
+        let character = self.get_roster_character(character_id)?;
+        if let Some(description) = character.description.as_ref().filter(|d| !d.trim().is_empty()) {
+            return Ok(description.clone());
+        }
+        let asset_id = character.reference_asset_id.as_deref()
+            .ok_or("This character needs a reference image before its description can be generated.")?;
+        let (media_type, bytes) = self.reference_image_bytes(&character.video_id, Some(asset_id))?
+            .ok_or("Reference image file is missing.")?;
+        let prompt = format!(
+            "Identify the character named \"{}\" in this reference image (a person, animal, or creature — not a background object or environment). Write a concise, reusable physical description of that character for an illustrator to redraw consistently across dozens of separate scenes. You MUST explicitly cover: species/type; approximate age; physical proportions and build; exact hair color, length, and style (or fur/feather coloring and pattern if not human) — this is the single most common detail illustrators get inconsistent, so describe it precisely; eye color; skin/fur tone; and any distinguishing marks or features. Deliberately do NOT describe clothing, outfit, or props — those must change scene-to-scene to match each still's own context, not stay fixed like the physical identity. Do not describe the pose, background, camera angle, or art/rendering style either — only the character's inherent physical identity, in 4-6 sentences of plain prose. Return only the description, no preamble, no labels, no markdown.",
+            character.name,
+        );
         #[cfg(not(test))]
         let claude_cli = claude_cli_available();
         #[cfg(test)]
         let claude_cli = false;
-        if claude_cli {
-            match request_claude_cli_character_description(prompt, &media_type, &bytes) {
-                Ok(result) => return Ok(result),
+        let description = if claude_cli {
+            match request_claude_cli_character_description(&prompt, &media_type, &bytes) {
+                Ok(result) => result,
                 Err(claude_error) => match gemini_auth.as_ref() {
-                    Some(auth) => return request_gemini_vision(auth, prompt, &media_type, &bytes).map_err(|gemini_error| {
+                    Some(auth) => request_gemini_vision(auth, &prompt, &media_type, &bytes).map_err(|gemini_error| {
                         format!("Claude CLI: {claude_error} (Gemini fallback also failed: {gemini_error})")
-                    }),
+                    })?,
                     None => return Err(format!("Claude CLI: {claude_error}")),
                 },
             }
+        } else {
+            request_gemini_vision(
+                gemini_auth.as_ref().ok_or("Configure a Gemini API key, or log in with the Claude Code CLI, to use character descriptions.")?,
+                &prompt, &media_type, &bytes,
+            )?
+        };
+        self.connection.execute(
+            "UPDATE roster_characters SET description=?1, description_asset_id=?2, updated_at=?3 WHERE id=?4",
+            params![description, asset_id, Utc::now().to_rfc3339(), character_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(description)
+    }
+
+    fn get_roster_location(&self, location_id: &str) -> Result<RosterLocation, String> {
+        self.connection.query_row(
+            "SELECT id, video_id, ordinal, name, reference_asset_id, description FROM roster_locations WHERE id=?1",
+            [location_id],
+            |row| Ok(RosterLocation {
+                id: row.get(0)?, video_id: row.get(1)?, ordinal: row.get(2)?, name: row.get(3)?,
+                reference_asset_id: row.get(4)?, description: row.get(5)?,
+            }),
+        ).map_err(|_| "Location was not found.".to_string())
+    }
+
+    pub fn list_roster_locations(&self, video_id: &str) -> Result<Vec<RosterLocation>, String> {
+        self.ensure_roster_seeded_from_legacy(video_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, video_id, ordinal, name, reference_asset_id, description FROM roster_locations WHERE video_id=?1 ORDER BY ordinal",
+        ).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([video_id], |row| Ok(RosterLocation {
+            id: row.get(0)?, video_id: row.get(1)?, ordinal: row.get(2)?, name: row.get(3)?,
+            reference_asset_id: row.get(4)?, description: row.get(5)?,
+        })).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    pub fn create_roster_location(&self, video_id: &str, name: &str) -> Result<RosterLocation, String> {
+        self.ensure_roster_seeded_from_legacy(video_id)?;
+        let next_ordinal: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM roster_locations WHERE video_id=?1", [video_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO roster_locations(id,video_id,ordinal,name,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5)",
+            params![id, video_id, next_ordinal, name, now],
+        ).map_err(|e| e.to_string())?;
+        Ok(RosterLocation { id, video_id: video_id.to_string(), ordinal: next_ordinal, name: name.to_string(), reference_asset_id: None, description: None })
+    }
+
+    pub fn rename_roster_location(&self, location_id: &str, name: &str) -> Result<RosterLocation, String> {
+        self.connection.execute(
+            "UPDATE roster_locations SET name=?1, updated_at=?2 WHERE id=?3",
+            params![name, Utc::now().to_rfc3339(), location_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_roster_location(location_id)
+    }
+
+    pub fn set_roster_location_reference(&self, location_id: &str, asset_id: Option<&str>) -> Result<RosterLocation, String> {
+        let current = self.get_roster_location(location_id)?;
+        if current.reference_asset_id.as_deref() != asset_id {
+            self.connection.execute(
+                "UPDATE roster_locations SET reference_asset_id=?1, description=NULL, description_asset_id=NULL, updated_at=?2 WHERE id=?3",
+                params![asset_id, Utc::now().to_rfc3339(), location_id],
+            ).map_err(|e| e.to_string())?;
         }
-        request_gemini_vision(
-            gemini_auth.as_ref().ok_or("Configure a Gemini API key, or log in with the Claude Code CLI, to use Location Consistency.")?,
-            prompt, &media_type, &bytes,
-        )
+        self.get_roster_location(location_id)
+    }
+
+    pub fn delete_roster_location(&self, location_id: &str) -> Result<(), String> {
+        self.connection.execute("DELETE FROM roster_locations WHERE id=?1", [location_id]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// `roster_character_description`'s location counterpart.
+    fn roster_location_description(&self, location_id: &str, gemini_auth: &Option<GeminiAuth>) -> Result<String, String> {
+        let location = self.get_roster_location(location_id)?;
+        if let Some(description) = location.description.as_ref().filter(|d| !d.trim().is_empty()) {
+            return Ok(description.clone());
+        }
+        let asset_id = location.reference_asset_id.as_deref()
+            .ok_or("This location needs a reference image before its description can be generated.")?;
+        let (media_type, bytes) = self.reference_image_bytes(&location.video_id, Some(asset_id))?
+            .ok_or("Reference image file is missing.")?;
+        let prompt = format!(
+            "Identify the location named \"{}\" shown in this reference image. Write a concise, reusable description of that place for an illustrator to redraw consistently across dozens of separate scenes. You MUST explicitly cover: type of space (interior/exterior, room type, or landscape type); architecture or geography; layout and scale; distinctive furniture, structures, or landmarks; and characteristic color palette/materials. Deliberately do NOT describe the people, weather, or time of day present in this specific reference photo, and do NOT describe lighting or camera angle — those must change scene-to-scene to match each still's own narration and mood, not stay fixed like the place's own physical identity. Describe only the location's inherent physical identity, in 4-6 sentences of plain prose. Return only the description, no preamble, no labels, no markdown.",
+            location.name,
+        );
+        #[cfg(not(test))]
+        let claude_cli = claude_cli_available();
+        #[cfg(test)]
+        let claude_cli = false;
+        let description = if claude_cli {
+            match request_claude_cli_character_description(&prompt, &media_type, &bytes) {
+                Ok(result) => result,
+                Err(claude_error) => match gemini_auth.as_ref() {
+                    Some(auth) => request_gemini_vision(auth, &prompt, &media_type, &bytes).map_err(|gemini_error| {
+                        format!("Claude CLI: {claude_error} (Gemini fallback also failed: {gemini_error})")
+                    })?,
+                    None => return Err(format!("Claude CLI: {claude_error}")),
+                },
+            }
+        } else {
+            request_gemini_vision(
+                gemini_auth.as_ref().ok_or("Configure a Gemini API key, or log in with the Claude Code CLI, to use location descriptions.")?,
+                &prompt, &media_type, &bytes,
+            )?
+        };
+        self.connection.execute(
+            "UPDATE roster_locations SET description=?1, description_asset_id=?2, updated_at=?3 WHERE id=?4",
+            params![description, asset_id, Utc::now().to_rfc3339(), location_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(description)
+    }
+
+    pub fn get_scene_cast_assignment(&self, video_id: &str, scene_id: &str) -> Result<Option<SceneCastAssignment>, String> {
+        self.connection.query_row(
+            "SELECT ai_suggested_character_ids_json, assigned_character_ids_json, ai_suggested_location_id, assigned_location_id
+             FROM scene_cast_assignments WHERE video_id=?1 AND scene_id=?2",
+            params![video_id, scene_id],
+            |row| {
+                let ai_json: String = row.get(0)?;
+                let assigned_json: String = row.get(1)?;
+                Ok(SceneCastAssignment {
+                    scene_id: scene_id.to_string(),
+                    ai_suggested_character_ids: serde_json::from_str(&ai_json).unwrap_or_default(),
+                    assigned_character_ids: serde_json::from_str(&assigned_json).unwrap_or_default(),
+                    ai_suggested_location_id: row.get(2)?,
+                    assigned_location_id: row.get(3)?,
+                })
+            },
+        ).optional().map_err(|e| e.to_string())
+    }
+
+    pub fn get_scene_cast_assignments(&self, video_id: &str) -> Result<Vec<SceneCastAssignment>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT scene_id, ai_suggested_character_ids_json, assigned_character_ids_json, ai_suggested_location_id, assigned_location_id
+             FROM scene_cast_assignments WHERE video_id=?1 ORDER BY scene_id",
+        ).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([video_id], |row| {
+            let scene_id: String = row.get(0)?;
+            let ai_json: String = row.get(1)?;
+            let assigned_json: String = row.get(2)?;
+            Ok(SceneCastAssignment {
+                scene_id,
+                ai_suggested_character_ids: serde_json::from_str(&ai_json).unwrap_or_default(),
+                assigned_character_ids: serde_json::from_str(&assigned_json).unwrap_or_default(),
+                ai_suggested_location_id: row.get(3)?,
+                assigned_location_id: row.get(4)?,
+            })
+        }).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// Upserts the user's manual cast pick for one scene. If no row exists
+    /// yet, `ai_suggested_*` is left empty (this scene has never had AI
+    /// suggestions run) and `assigned_*` is set to the given values. If a
+    /// row already exists, only `assigned_*` is overwritten —
+    /// `ai_suggested_*` is left exactly as it was, which is what lets the
+    /// frontend tell "AI suggested this, unedited" apart from "the user
+    /// chose this" by comparing the two columns.
+    pub fn save_scene_cast_assignment(
+        &self,
+        video_id: &str,
+        scene_id: &str,
+        assigned_character_ids: &[String],
+        assigned_location_id: Option<&str>,
+    ) -> Result<SceneCastAssignment, String> {
+        let assigned_json = serde_json::to_string(assigned_character_ids).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "INSERT INTO scene_cast_assignments(id,video_id,scene_id,assigned_character_ids_json,assigned_location_id,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(video_id,scene_id) DO UPDATE SET
+                assigned_character_ids_json=excluded.assigned_character_ids_json,
+                assigned_location_id=excluded.assigned_location_id,
+                updated_at=excluded.updated_at",
+            params![Uuid::new_v4().to_string(), video_id, scene_id, assigned_json, assigned_location_id, Utc::now().to_rfc3339()],
+        ).map_err(|e| e.to_string())?;
+        self.get_scene_cast_assignment(video_id, scene_id)?
+            .ok_or_else(|| "Scene cast assignment was not found after saving.".to_string())
+    }
+
+    /// The AI-suggestion pass for scene casting — a dedicated Rust-side
+    /// call, deliberately NOT slotted into the Python segmentation engine's
+    /// Pass 3 scene-context analysis (which runs during initial visual-plan
+    /// generation, before the roster exists; forcing roster creation before
+    /// segmentation would invert the workflow, and re-running Pass 3 on
+    /// every roster edit would redo unrelated narrative analysis). For each
+    /// scene, reads its sentence text plus the whole roster's
+    /// {id, name, description} and asks which characters/location it
+    /// should use; batched to bound total AI call count on long videos.
+    /// Write-back per scene: no existing row -> insert with
+    /// ai_suggested_* = assigned_* = the fresh suggestion; existing row
+    /// where the user never touched it (assigned_* == ai_suggested_*) ->
+    /// overwrite both; existing row the user has edited -> overwrite only
+    /// ai_suggested_*, leaving their own picks alone.
+    pub fn suggest_scene_cast_batch(
+        &self,
+        video_id: &str,
+        scene_ids: &[String],
+    ) -> Result<Vec<SceneCastAssignment>, String> {
+        let characters = self.list_roster_characters(video_id)?;
+        let locations = self.list_roster_locations(video_id)?;
+        if characters.is_empty() && locations.is_empty() {
+            return Err("Add at least one character or location before suggesting cast.".into());
+        }
+        #[cfg(not(test))]
+        let claude_cli_for_auth = claude_cli_available();
+        #[cfg(test)]
+        let claude_cli_for_auth = false;
+        let gemini_auth = if claude_cli_for_auth { self.gemini_auth().ok() } else { Some(self.gemini_auth()?) };
+        let gemini_auth = &gemini_auth;
+        let visual_plan = self.get_visual_plan(video_id)?;
+        let roster_json = json!({
+            "characters": characters.iter().map(|c| json!({"id": c.id, "name": c.name, "description": c.description})).collect::<Vec<_>>(),
+            "locations": locations.iter().map(|l| json!({"id": l.id, "name": l.name, "description": l.description})).collect::<Vec<_>>(),
+        });
+        const CAST_SUGGESTION_BATCH_SIZE: usize = 10;
+        #[derive(Deserialize)]
+        struct SuggestedCast {
+            #[serde(rename = "sceneId")] scene_id: String,
+            #[serde(rename = "characterIds", default)] character_ids: Vec<String>,
+            #[serde(rename = "locationId", default)] location_id: Option<String>,
+        }
+        let mut results = Vec::new();
+        for chunk in scene_ids.chunks(CAST_SUGGESTION_BATCH_SIZE) {
+            let scenes_payload: Vec<serde_json::Value> = chunk.iter().filter_map(|scene_id| {
+                let scene = visual_plan.scenes.iter().find(|s| &s.id == scene_id)?;
+                let text = scene.sentence_ids.iter()
+                    .filter_map(|id| visual_plan.sentences.iter().find(|s| &s.id == id))
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                Some(json!({"sceneId": scene_id, "text": text}))
+            }).collect();
+            if scenes_payload.is_empty() {
+                continue;
+            }
+            let prompt = format!(
+                "You are casting a video's scenes against a fixed roster of named characters and locations. \
+                 For each scene, decide which roster characters (zero, one, or several) appear in it, and which \
+                 single roster location (if any) it's set in — based only on its narration text and each roster \
+                 entry's name/description. Do not invent new characters or locations; only use ids from the roster \
+                 given. If a scene doesn't clearly involve any roster character or location, leave that scene's \
+                 list/id empty/null rather than guessing.\n\n\
+                 ROSTER:\n{}\n\n\
+                 SCENES:\n{}\n\n\
+                 Return only a JSON array, one object per scene, each shaped exactly like: \
+                 {{\"sceneId\": \"...\", \"characterIds\": [\"...\"], \"locationId\": \"...\" or null}}.",
+                serde_json::to_string_pretty(&roster_json).unwrap_or_default(),
+                serde_json::to_string_pretty(&scenes_payload).unwrap_or_default(),
+            );
+            #[cfg(not(test))]
+            let claude_cli = claude_cli_available();
+            #[cfg(test)]
+            let claude_cli = false;
+            let text = if claude_cli {
+                match run_claude_cli(&prompt, &[]) {
+                    Ok(result) => result,
+                    Err(claude_error) => match gemini_auth.as_ref() {
+                        Some(auth) => request_gemini_text(auth, &prompt).map_err(|gemini_error| {
+                            format!("Claude CLI: {claude_error} (Gemini fallback also failed: {gemini_error})")
+                        })?,
+                        None => return Err(format!("Claude CLI: {claude_error}")),
+                    },
+                }
+            } else {
+                request_gemini_text(
+                    gemini_auth.as_ref().ok_or("Configure a Gemini API key, or log in with the Claude Code CLI, to suggest cast.")?,
+                    &prompt,
+                )?
+            };
+            let cleaned = extract_json_from_text(&text);
+            let suggestions: Vec<SuggestedCast> = serde_json::from_str(cleaned).map_err(|_| {
+                format!("Cast suggestion response was not valid JSON. Raw response: {}", text.chars().take(300).collect::<String>())
+            })?;
+            for suggestion in suggestions {
+                let existing = self.get_scene_cast_assignment(video_id, &suggestion.scene_id)?;
+                let user_touched = existing.as_ref().is_some_and(|a| {
+                    a.assigned_character_ids != a.ai_suggested_character_ids || a.assigned_location_id != a.ai_suggested_location_id
+                });
+                let (assigned_character_ids, assigned_location_id): (Vec<String>, Option<String>) = match &existing {
+                    Some(a) if user_touched => (a.assigned_character_ids.clone(), a.assigned_location_id.clone()),
+                    _ => (suggestion.character_ids.clone(), suggestion.location_id.clone()),
+                };
+                let ai_json = serde_json::to_string(&suggestion.character_ids).map_err(|e| e.to_string())?;
+                let assigned_json = serde_json::to_string(&assigned_character_ids).map_err(|e| e.to_string())?;
+                self.connection.execute(
+                    "INSERT INTO scene_cast_assignments(id,video_id,scene_id,ai_suggested_character_ids_json,assigned_character_ids_json,ai_suggested_location_id,assigned_location_id,updated_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+                     ON CONFLICT(video_id,scene_id) DO UPDATE SET
+                        ai_suggested_character_ids_json=excluded.ai_suggested_character_ids_json,
+                        assigned_character_ids_json=excluded.assigned_character_ids_json,
+                        ai_suggested_location_id=excluded.ai_suggested_location_id,
+                        assigned_location_id=excluded.assigned_location_id,
+                        updated_at=excluded.updated_at",
+                    params![
+                        Uuid::new_v4().to_string(), video_id, suggestion.scene_id, ai_json, assigned_json,
+                        suggestion.location_id, assigned_location_id, Utc::now().to_rfc3339(),
+                    ],
+                ).map_err(|e| e.to_string())?;
+                if let Some(saved) = self.get_scene_cast_assignment(video_id, &suggestion.scene_id)? {
+                    results.push(saved);
+                }
+            }
+        }
+        Ok(results)
     }
 
     /// A genuine whole-script comprehension pass for Bulk Generation's
@@ -4079,7 +4693,6 @@ Return JSON only — no markdown, no explanation:
         style_directive: &str,
         base_settings_json: &str,
         creative_instruction: &str,
-        character_consistency: bool,
         selected_group_ids: &[String],
         start_index: usize,
     ) -> Result<BulkPlanBatchResult, String> {
@@ -4143,10 +4756,6 @@ Return JSON only — no markdown, no explanation:
                 "existingPrompt": existing_prompt.as_ref().map(|p| p.user_prompt.as_str()),
             }));
         }
-        self.save_app_setting(
-            &format!("character_consistency.{video_id}"),
-            if character_consistency { "true" } else { "false" },
-        )?;
         // A chunk never spans two scenes (see chunk_end below), so the scene
         // the still at start_index belongs to is this whole call's scene —
         // any bulk_scene_settings override for it replaces the matching
@@ -4160,113 +4769,104 @@ Return JSON only — no markdown, no explanation:
         let EffectiveBulkSettings {
             style_directive: effective_style_directive,
             creative_instruction: effective_creative_instruction,
-            character_consistency: effective_character_consistency,
-            reference_asset_id: effective_reference_asset_id,
-            location_consistency: effective_location_consistency,
-            location_reference_asset_id: effective_location_reference_asset_id,
             dials: effective_dials,
-        } = resolve_effective_bulk_settings(
-            scene_settings.as_ref(), style_directive, creative_instruction, character_consistency, &global_visual,
-        );
-        // Character description is a real vision API call — expensive enough
-        // that it's worth caching across batches (a fresh function call per
-        // batch has no in-memory way to reuse it otherwise). Invalidated by
-        // simply toggling Character Consistency off and back on with a new
-        // reference image (see the frontend), which is the only time the
-        // cached description would ever go stale. Scoped per-scene only when
-        // that scene actually overrides the reference image — a scene that
-        // only overrides character_consistency (on/off) still shares the
-        // global description/reference, so it shares the global cache entry
-        // too.
-        let character_block = if effective_character_consistency {
-            let cache_key = match (&current_scene_id, &effective_reference_asset_id) {
-                (Some(scene_id), Some(_)) => format!("character_description.{video_id}.{scene_id}"),
-                _ => format!("character_description.{video_id}"),
+        } = resolve_effective_bulk_settings(scene_settings.as_ref(), style_directive, creative_instruction, &global_visual);
+        // Defense-in-depth — the frontend already blocks starting Bulk
+        // Generation with an empty style directive (typed manually, or via
+        // Extract Style), but this holds the rule even if some other
+        // caller bypasses that gate. Same message convention as
+        // apply_style_directive_to_all's existing check.
+        if effective_style_directive.trim().is_empty() {
+            return Err("Style directive cannot be empty.".into());
+        }
+        // Which roster characters/location this scene actually uses — see
+        // resolve_effective_scene_cast. A batch with no current_scene_id
+        // (a still outside any scene) simply has no assignment, so both
+        // blocks below render empty, same as "consistency off" used to.
+        let cast = {
+            let assignment = match &current_scene_id {
+                Some(scene_id) => self.get_scene_cast_assignment(video_id, scene_id)?,
+                None => None,
             };
-            let description = match self.get_app_setting(&cache_key)? {
-                Some(cached) if !cached.trim().is_empty() => cached,
-                _ => {
-                    let description = self.character_description_for_video(
-                        video_id, &gemini_auth, effective_reference_asset_id.as_deref(),
-                    )?;
-                    self.save_app_setting(&cache_key, &description)?;
-                    description
-                }
+            let characters = self.list_roster_characters(video_id)?;
+            let locations = self.list_roster_locations(video_id)?;
+            resolve_effective_scene_cast(assignment.as_ref(), &characters, &locations)
+        };
+        // Character descriptions are real vision API calls — cached
+        // per-roster-row (see roster_character_description) so repeat
+        // batches across the same video never re-derive them.
+        let character_block = if cast.assigned_characters.is_empty() {
+            String::new()
+        } else {
+            let mut paragraphs = Vec::with_capacity(cast.assigned_characters.len());
+            for character in &cast.assigned_characters {
+                let description = self.roster_character_description(&character.id, &gemini_auth)?;
+                paragraphs.push(format!("{} — {}", character.name, description.trim()));
+            }
+            let multiple_note = if cast.assigned_characters.len() > 1 {
+                "\nMultiple characters are assigned to this scene — do NOT default to showing all of them together in every still. Include only the one(s) each specific still's narration actually calls for; a still can feature just one, several, or (per the omission rules below) none of them.\n"
+            } else {
+                ""
             };
             format!(
                 "\n\n════════════════════════════════════════\n\
                  MANDATORY CHARACTER CONSISTENCY — NON-NEGOTIABLE\n\
                  ════════════════════════════════════════\n\
-                 This rule governs IDENTITY ONLY — it does NOT mean the character must appear in every\n\
-                 still. IF a still genuinely depicts a character, protagonist, or narrator figure, THEN\n\
-                 that figure MUST be this EXACT same character, described from the user's reference image:\n\n\
-                 {}\n\n\
-                 Maintain this character's species/type, physical proportions, coloring, and distinguishing\n\
+                 This rule governs IDENTITY ONLY — it does NOT mean a character must appear in every\n\
+                 still. IF a still genuinely depicts one of the following characters, protagonists, or\n\
+                 narrator figures, THEN that figure MUST be this EXACT same character, described from the\n\
+                 user's reference image:\n\n\
+                 {}\n{}\n\
+                 Maintain each character's species/type, physical proportions, coloring, and distinguishing\n\
                  features consistently across every still that DOES include them — do not redesign or vary\n\
                  their physical identity between stills. Clothing/attire is the one exception: do NOT keep it\n\
                  fixed — design each still's outfit to fit that still's own narration, setting, weather, and\n\
                  activity (e.g. a coat in a cold-weather scene, workout clothes in an exercise scene), the\n\
                  same way you would for any other subject.\n\n\
-                 WHEN TO OMIT THE CHARACTER (do this deliberately, not as an afterthought):\n\
+                 WHEN TO OMIT A CHARACTER (do this deliberately, not as an afterthought):\n\
                  - Second-person (\"you\") narration describing an internal state, a fact, a process, a\n\
                    diagram, a statistic, an object, or an environment does NOT require a literal on-screen\n\
                    character — express it through the object/environment/diagram/abstraction alone instead.\n\
                  - For any visualType other than Character Scene or Character Close-Up / Reaction, do NOT\n\
-                   include this character at all — not even a partial glimpse (hand, silhouette, shadow,\n\
+                   include a character at all — not even a partial glimpse (hand, silhouette, shadow,\n\
                    reflection) — unless the still is literally impossible to plan without them.\n\
-                 - Budget: across the WHOLE video, this character should appear in roughly a THIRD of\n\
+                 - Budget: across the WHOLE video, each character should appear in roughly a THIRD of\n\
                    stills, not most or all of them. If the running share for this batch (accounting for\n\
                    prior batches in the context below) is already near or above that, plan the remaining\n\
-                   stills in this batch WITHOUT the character.\n\
-                 SELF-CHECK before finalizing this batch: count how many of your planned stills include the\n\
+                   stills in this batch WITHOUT that character.\n\
+                 SELF-CHECK before finalizing this batch: count how many of your planned stills include each\n\
                  character. If it is more than roughly a third, revise the weakest justifications — the ones\n\
                  where the character isn't doing anything the scene actually needs — to remove them.\n\
                  ════════════════════════════════════════\n",
-                description.trim()
+                paragraphs.join("\n\n"), multiple_note
             )
-        } else {
-            String::new()
         };
 
-        // Location Consistency's own cached-description block — same
-        // caching shape as character_block just above (per-scene cache key
-        // only when the scene overrides the location reference itself),
-        // but text-only: unlike the character reference, the location
-        // reference image is NOT attached to the actual generation call
-        // here (planning has no image output to condition), only used to
-        // derive this description. See generate_image_render for where a
-        // location reference image DOES get attached to the render itself.
-        let location_block = if effective_location_consistency {
-            let cache_key = match (&current_scene_id, &effective_location_reference_asset_id) {
-                (Some(scene_id), Some(_)) => format!("location_description.{video_id}.{scene_id}"),
-                _ => format!("location_description.{video_id}"),
-            };
-            let description = match self.get_app_setting(&cache_key)? {
-                Some(cached) if !cached.trim().is_empty() => cached,
-                _ => {
-                    let description = self.location_description_for_video(
-                        video_id, &gemini_auth, effective_location_reference_asset_id.as_deref(),
-                    )?;
-                    self.save_app_setting(&cache_key, &description)?;
-                    description
-                }
-            };
-            format!(
-                "\n\n════════════════════════════════════════\n\
-                 LOCATION CONSISTENCY\n\
-                 ════════════════════════════════════════\n\
-                 Whenever a still's narration places its subject in this recurring setting, depict THIS\n\
-                 EXACT location, described from the user's reference image:\n\n\
-                 {}\n\n\
-                 Keep architecture, layout, scale, and characteristic materials/colors consistent with this\n\
-                 description across every still set here. Weather, time of day, lighting, and who/what is\n\
-                 present may still vary freely per still — only the place's own physical identity is fixed.\n\
-                 Do not force this location into stills whose narration clearly belongs somewhere else.\n\
-                 ════════════════════════════════════════\n",
-                description.trim()
-            )
-        } else {
-            String::new()
+        // Location Consistency's own cached-description block — text-only:
+        // unlike the character reference, the location reference image is
+        // NOT attached to the actual generation call here (planning has no
+        // image output to condition), only used to derive this description.
+        // See generate_image_render for where a location reference image
+        // DOES get attached to the render itself.
+        let location_block = match &cast.assigned_location {
+            None => String::new(),
+            Some(location) => {
+                let description = self.roster_location_description(&location.id, &gemini_auth)?;
+                format!(
+                    "\n\n════════════════════════════════════════\n\
+                     LOCATION CONSISTENCY\n\
+                     ════════════════════════════════════════\n\
+                     Whenever a still's narration places its subject in this recurring setting, depict THIS\n\
+                     EXACT location, described from the user's reference image:\n\n\
+                     {}\n\n\
+                     Keep architecture, layout, scale, and characteristic materials/colors consistent with this\n\
+                     description across every still set here. Weather, time of day, lighting, and who/what is\n\
+                     present may still vary freely per still — only the place's own physical identity is fixed.\n\
+                     Do not force this location into stills whose narration clearly belongs somewhere else.\n\
+                     ════════════════════════════════════════\n",
+                    description.trim()
+                )
+            }
         };
 
         let chunk_end = bulk_batch_chunk_end(&selected_groups, start_index, chunk_size);
@@ -5219,16 +5819,37 @@ Return JSON only:
             "SELECT video_id,relative_path,media_type FROM input_assets WHERE id=?1 AND kind='reference'",
             [asset_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).map_err(|_| "Reference image was not found.".to_string())?;
+        // Which of the 29 extractable aspects to focus on — user-selected
+        // via the popup next to the Extract Style button, persisted as a
+        // JSON array of keys under this generic app_settings key (see
+        // EXTRACTABLE_STYLE_ASPECTS). Unset, empty, or unparseable all mean
+        // "focus on everything" — the same safeguard against a degenerate
+        // empty-focus prompt.
+        let selected_keys: Vec<String> = self.get_app_setting(&format!("extract_style_aspects.{video_id}"))?
+            .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+            .filter(|keys| !keys.is_empty())
+            .unwrap_or_else(|| EXTRACTABLE_STYLE_ASPECTS.iter().map(|(key, _, _)| key.to_string()).collect());
+        let prompt = build_extract_style_prompt(&selected_keys);
         let channel_id: String = self.connection.query_row(
             "SELECT channel_id FROM videos WHERE id=?1", [&video_id], |row| row.get(0),
         ).map_err(|e| e.to_string())?;
         let bytes = fs::read(self.projects_dir.join(channel_id).join(video_id).join(relative_path))
             .map_err(|_| "Reference image file is missing.".to_string())?;
         let auth = self.gemini_auth()?;
-        let prompt = "Analyze this image as a reusable production style reference. Return only JSON with styleDirective (string describing art style, rendering, color language, recurring subjects, and visual consistency rules) and imageSettings (object with any of: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, lensType, lightDirection, lightQuality, shadowType, contrast, saturation, composition, motion — use only values strongly supported by the image).";
-        let text = request_gemini_vision(&auth, prompt, &media_type, &bytes)?;
+        let text = request_gemini_vision(&auth, &prompt, &media_type, &bytes)?;
         let cleaned = extract_json_from_text(&text);
         serde_json::from_str(cleaned).map_err(|_| format!("Style analysis was not valid JSON. Raw response: {}", text.chars().take(300).collect::<String>()))
+    }
+
+    /// The static aspect list `extract_reference_style` can be told to
+    /// focus on — exposed to the frontend purely for checkbox rendering
+    /// (see EXTRACTABLE_STYLE_ASPECTS's doc comment).
+    pub fn list_extractable_style_aspects() -> Vec<StyleAspect> {
+        EXTRACTABLE_STYLE_ASPECTS.iter()
+            .map(|(key, label, description)| StyleAspect {
+                key: key.to_string(), label: label.to_string(), description: description.to_string(),
+            })
+            .collect()
     }
 
     /// Quick pre-generation check that this still's planned prompt/settings
@@ -5421,47 +6042,48 @@ Return JSON only:
         let settings: serde_json::Value = serde_json::from_str(&effective_settings_json)
             .map_err(|_| "Image settings must be valid JSON.".to_string())?;
         let prompt = assemble_image_prompt(system_prompt, &effective_user_prompt, &settings);
-        // When Character Consistency is on (flag set by plan_bulk_visuals),
-        // pass the actual reference image as generation input, not just the
-        // character description baked into user_prompt as text. A text
-        // description alone doesn't reliably reproduce fine visual details
-        // (hair color/style especially) across independent generations —
-        // conditioning on the real image is what actually anchors them.
-        // A scene override (see bulk_scene_settings) takes precedence over
-        // the video-global character_consistency.{video_id} flag/reference,
-        // the same way plan_bulk_visuals_batch already resolves it at
-        // planning time — generation has to agree with what was planned.
-        let scene_settings = match &scene_id {
-            Some(id) => self.get_bulk_scene_settings(video_id)?.into_iter().find(|s| &s.scene_id == id),
+        // When a character is assigned to this scene (see
+        // resolve_effective_scene_cast), pass the actual reference image as
+        // generation input, not just the character description baked into
+        // user_prompt as text. A text description alone doesn't reliably
+        // reproduce fine visual details (hair color/style especially)
+        // across independent generations — conditioning on the real image
+        // is what actually anchors them. Generation has to agree with what
+        // was planned, so this reads the same assignment
+        // plan_bulk_visuals_batch already resolved at planning time.
+        let cast = {
+            let assignment = match &scene_id {
+                Some(id) => self.get_scene_cast_assignment(video_id, id)?,
+                None => None,
+            };
+            let characters = self.list_roster_characters(video_id)?;
+            let locations = self.list_roster_locations(video_id)?;
+            resolve_effective_scene_cast(assignment.as_ref(), &characters, &locations)
+        };
+        // Only the FIRST assigned character gets the one "attached
+        // reference image" slot a generation call has — chip/list order in
+        // the cast picker is generation priority. Every assigned character
+        // still gets its text description woven into the planning prompt
+        // regardless (see plan_bulk_visuals_batch's character_block).
+        let winning_character = cast.assigned_characters.first();
+        let reference_for_generation = match winning_character {
+            Some(character) => self.reference_image_bytes(video_id, character.reference_asset_id.as_deref())?,
             None => None,
         };
-        let character_consistency_enabled = scene_settings.as_ref().and_then(|s| s.character_consistency)
-            .unwrap_or(
-                self.get_app_setting(&format!("character_consistency.{video_id}"))?.as_deref() == Some("true")
-            );
-        let reference_asset_id = scene_settings.as_ref().and_then(|s| s.reference_asset_id.clone());
-        let reference_for_generation = if character_consistency_enabled {
-            self.reference_image_bytes(video_id, reference_asset_id.as_deref())?
-        } else {
-            None
-        };
-        // Location Consistency's own reference image, attached the same
-        // way — but only when there's no character reference already
-        // occupying this call's one "attached reference image" input. A
-        // specific character's identity is generally harder for the model
-        // to hold onto from text alone than an environment is, so
-        // character wins the slot when both are enabled for the same
-        // still; location still gets its text description woven into the
-        // prompt either way (see plan_bulk_visuals_batch's location_block),
-        // just without image conditioning on top in that combined case.
-        let global_visual = self.get_bulk_global_settings(video_id)?;
-        let location_consistency_enabled = reference_for_generation.is_none()
-            && scene_settings.as_ref().and_then(|s| s.location_consistency)
-                .unwrap_or_else(|| global_visual.location_consistency.unwrap_or(false));
-        let location_reference_asset_id = scene_settings.as_ref().and_then(|s| s.location_reference_asset_id.clone())
-            .or_else(|| global_visual.location_reference_asset_id.clone());
-        let location_reference_for_generation = if location_consistency_enabled {
-            self.reference_image_bytes(video_id, location_reference_asset_id.as_deref())?
+        // Location's own reference image, attached the same way — but only
+        // when there's no character reference already occupying this
+        // call's one "attached reference image" input. A specific
+        // character's identity is generally harder for the model to hold
+        // onto from text alone than an environment is, so character wins
+        // the slot when both are assigned to the same still; location
+        // still gets its text description woven into the prompt either way
+        // (see plan_bulk_visuals_batch's location_block), just without
+        // image conditioning on top in that combined case.
+        let location_reference_for_generation = if reference_for_generation.is_none() {
+            match &cast.assigned_location {
+                Some(location) => self.reference_image_bytes(video_id, location.reference_asset_id.as_deref())?,
+                None => None,
+            }
         } else {
             None
         };
@@ -5475,14 +6097,15 @@ Return JSON only:
                 // scene, not an image to edit — so this framing is mandatory,
                 // not optional, or the model tends to keep the reference's
                 // background/pose instead of generating the new scene.
+                let character_name = winning_character.map(|c| c.name.as_str()).unwrap_or("this character");
                 let character_reference_prompt = format!(
-                    "The attached image is a CHARACTER REFERENCE ONLY. Reproduce that character's exact \
-                     physical appearance (hair, coloring, build, distinguishing features) — but IGNORE the \
-                     reference image's background, pose, camera angle, composition, and clothing entirely. \
-                     Dress the character in whatever outfit fits the new scene described below (do not copy \
-                     the reference image's outfit unless that scene independently calls for the same \
-                     clothing). Generate a completely new scene as described below, featuring that \
-                     character:\n\n{prompt}"
+                    "The attached image is a CHARACTER REFERENCE ONLY for {character_name}. Reproduce that \
+                     character's exact physical appearance (hair, coloring, build, distinguishing features) \
+                     — but IGNORE the reference image's background, pose, camera angle, composition, and \
+                     clothing entirely. Dress the character in whatever outfit fits the new scene described \
+                     below (do not copy the reference image's outfit unless that scene independently calls \
+                     for the same clothing). Generate a completely new scene as described below, featuring \
+                     that character:\n\n{prompt}"
                 );
                 request_gemini_image_with_source(
                     &auth, &model, &character_reference_prompt, reference_bytes, reference_mime, None,
@@ -11350,28 +11973,12 @@ fn bulk_batch_chunk_end(groups: &[PlanGroup], start_index: usize, chunk_size: us
 /// (for the two string fields) non-blank — an empty-string override is
 /// treated the same as "not overridden," matching how the frontend clears a
 /// field back to "inherit" by leaving it blank rather than needing a
-/// separate clear action. `style_directive`/`creative_instruction`/
-/// `character_consistency`/`reference_asset_id` are unchanged from before —
-/// still resolved against the raw scalar globals the caller already had on
-/// hand (backed by `app_settings`, not `bulk_global_settings`). Location
-/// Consistency and the dials are newer and DO have a proper structured
-/// global source (`BulkGlobalVisualSettings`), passed in as `global_visual`.
+/// separate clear action. Character/location identity used to be resolved
+/// here too — replaced by `resolve_effective_scene_cast`, which layers the
+/// roster + `SceneCastAssignment` instead.
 struct EffectiveBulkSettings {
     style_directive: String,
     creative_instruction: String,
-    character_consistency: bool,
-    reference_asset_id: Option<String>,
-    location_consistency: bool,
-    /// Unlike `reference_asset_id` above, this DOES fall back to a global
-    /// value inside this function (`global_visual.location_reference_asset_id`)
-    /// rather than relying on `reference_image_bytes`'s own built-in
-    /// fallback — that fallback is hard-coded to the CHARACTER's global
-    /// reference (`global_reference_asset.{video_id}`), which would be
-    /// wrong for location. Callers must therefore never pass `None` here
-    /// into `reference_image_bytes` expecting a location-appropriate
-    /// fallback; `None` here means "genuinely no location reference set at
-    /// either level."
-    location_reference_asset_id: Option<String>,
     dials: BulkVisualDials,
 }
 
@@ -11379,7 +11986,6 @@ fn resolve_effective_bulk_settings(
     scene_settings: Option<&BulkSceneSettings>,
     style_directive: &str,
     creative_instruction: &str,
-    character_consistency: bool,
     global_visual: &BulkGlobalVisualSettings,
 ) -> EffectiveBulkSettings {
     EffectiveBulkSettings {
@@ -11391,18 +11997,38 @@ fn resolve_effective_bulk_settings(
             .and_then(|s| s.creative_instruction.clone())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| creative_instruction.to_string()),
-        character_consistency: scene_settings
-            .and_then(|s| s.character_consistency)
-            .unwrap_or(character_consistency),
-        reference_asset_id: scene_settings.and_then(|s| s.reference_asset_id.clone()),
-        location_consistency: scene_settings
-            .and_then(|s| s.location_consistency)
-            .unwrap_or_else(|| global_visual.location_consistency.unwrap_or(false)),
-        location_reference_asset_id: scene_settings
-            .and_then(|s| s.location_reference_asset_id.clone())
-            .or_else(|| global_visual.location_reference_asset_id.clone()),
         dials: resolve_effective_dials(scene_settings.map(|s| &s.dials), &global_visual.dials),
     }
+}
+
+/// Which roster characters/location a scene should actually use, after
+/// layering `SceneCastAssignment.assigned_*` against the live roster —
+/// stale ids (a roster row deleted after being assigned) are silently
+/// dropped rather than erroring, matching this codebase's existing
+/// tolerance for stale ids elsewhere (e.g. `bulk_scene_settings` rows are
+/// never pruned when scenes are merged either).
+struct EffectiveSceneCast {
+    assigned_characters: Vec<RosterCharacter>,
+    assigned_location: Option<RosterLocation>,
+}
+
+fn resolve_effective_scene_cast(
+    assignment: Option<&SceneCastAssignment>,
+    characters: &[RosterCharacter],
+    locations: &[RosterLocation],
+) -> EffectiveSceneCast {
+    let assigned_characters = assignment
+        .map(|a| {
+            a.assigned_character_ids
+                .iter()
+                .filter_map(|id| characters.iter().find(|c| &c.id == id).cloned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let assigned_location = assignment
+        .and_then(|a| a.assigned_location_id.as_ref())
+        .and_then(|id| locations.iter().find(|l| &l.id == id).cloned());
+    EffectiveSceneCast { assigned_characters, assigned_location }
 }
 
 /// Field-by-field layering for `BulkVisualDials`, same "scene wins if set,
@@ -12877,6 +13503,17 @@ fn remap_row(
             row.insert("sentence_ids_json".to_string(), serde_json::Value::String(updated));
         }
     }
+    // scene_cast_assignments' two character-id-array columns — arrays of
+    // roster_characters.id, not covered by ATOMIC_ID_COLUMNS (single-string
+    // only), same reason sentence_ids_json needed its own case above.
+    for column in ["ai_suggested_character_ids_json", "assigned_character_ids_json"] {
+        if let Some(serde_json::Value::String(value)) = row.get(column) {
+            let updated = remap_id_array_json(value, id_map);
+            if &updated != value {
+                row.insert(column.to_string(), serde_json::Value::String(updated));
+            }
+        }
+    }
     if let Some(serde_json::Value::String(value)) = row.get("original_sentences_json") {
         let updated = remap_sentence_snapshot_json(value, id_map);
         if &updated != value {
@@ -14225,31 +14862,21 @@ mod tests {
     fn resolve_effective_bulk_settings_layers_scene_override_over_global() {
         let global_visual = BulkGlobalVisualSettings::default();
         // No override at all — every field falls back to the global param.
-        let none = resolve_effective_bulk_settings(None, "global style", "global rule", false, &global_visual);
+        let none = resolve_effective_bulk_settings(None, "global style", "global rule", &global_visual);
         assert_eq!(none.style_directive, "global style");
         assert_eq!(none.creative_instruction, "global rule");
-        assert!(!none.character_consistency);
-        assert_eq!(none.reference_asset_id, None);
-        assert!(!none.location_consistency);
-        assert_eq!(none.location_reference_asset_id, None);
 
-        // A partial override: only style_directive and character_consistency
-        // are set, the rest stay null ("inherit").
+        // A partial override: only style_directive is set, the rest stays
+        // null ("inherit").
         let partial = BulkSceneSettings {
             scene_id: "sc1".into(),
             style_directive: Some("scene style".into()),
             creative_instruction: None,
-            character_consistency: Some(true),
-            reference_asset_id: None,
-            location_consistency: None,
-            location_reference_asset_id: None,
             dials: BulkVisualDials::default(),
         };
-        let resolved = resolve_effective_bulk_settings(Some(&partial), "global style", "global rule", false, &global_visual);
+        let resolved = resolve_effective_bulk_settings(Some(&partial), "global style", "global rule", &global_visual);
         assert_eq!(resolved.style_directive, "scene style");
         assert_eq!(resolved.creative_instruction, "global rule", "null override must inherit the global value");
-        assert!(resolved.character_consistency);
-        assert_eq!(resolved.reference_asset_id, None);
 
         // A blank-string override is treated the same as "not overridden" —
         // the frontend clears a field back to inherit by leaving it blank.
@@ -14257,56 +14884,80 @@ mod tests {
             scene_id: "sc1".into(),
             style_directive: Some("   ".into()),
             creative_instruction: None,
-            character_consistency: None,
-            reference_asset_id: Some("asset-1".into()),
-            location_consistency: None,
-            location_reference_asset_id: None,
             dials: BulkVisualDials::default(),
         };
-        let resolved = resolve_effective_bulk_settings(Some(&blank), "global style", "global rule", true, &global_visual);
+        let resolved = resolve_effective_bulk_settings(Some(&blank), "global style", "global rule", &global_visual);
         assert_eq!(resolved.style_directive, "global style");
-        assert!(resolved.character_consistency, "no override must fall back to the global param");
-        assert_eq!(resolved.reference_asset_id, Some("asset-1".into()));
     }
 
     #[test]
-    fn resolve_effective_bulk_settings_layers_location_and_dials() {
+    fn resolve_effective_bulk_settings_layers_dials() {
         let global_visual = BulkGlobalVisualSettings {
-            location_consistency: Some(true),
-            location_reference_asset_id: Some("global-location-asset".into()),
             dials: BulkVisualDials { visual_interpretation: Some(40), diversity_camera: Some(70), mood: Some("Hopeful".into()), ..Default::default() },
         };
 
-        // No scene override at all — everything inherits from global,
-        // including the location reference id (unlike the character
-        // reference, which relies on reference_image_bytes' own fallback).
-        let none = resolve_effective_bulk_settings(None, "style", "rule", false, &global_visual);
-        assert!(none.location_consistency);
-        assert_eq!(none.location_reference_asset_id.as_deref(), Some("global-location-asset"));
+        // No scene override at all — every dial inherits from global.
+        let none = resolve_effective_bulk_settings(None, "style", "rule", &global_visual);
         assert_eq!(none.dials.visual_interpretation, Some(40));
         assert_eq!(none.dials.diversity_camera, Some(70));
         assert_eq!(none.dials.mood.as_deref(), Some("Hopeful"));
         assert_eq!(none.dials.visual_metaphor, None, "a dial never set at either level stays None");
 
-        // A scene overriding only ONE dial and its own location reference —
-        // every other dial, and location_consistency itself, still falls
+        // A scene overriding only ONE dial — every other dial still falls
         // back to global.
         let scene = BulkSceneSettings {
             scene_id: "sc1".into(),
             style_directive: None,
             creative_instruction: None,
-            character_consistency: None,
-            reference_asset_id: None,
-            location_consistency: None,
-            location_reference_asset_id: Some("scene-location-asset".into()),
             dials: BulkVisualDials { visual_interpretation: Some(90), ..Default::default() },
         };
-        let resolved = resolve_effective_bulk_settings(Some(&scene), "style", "rule", false, &global_visual);
-        assert!(resolved.location_consistency, "location_consistency itself isn't overridden, so it inherits");
-        assert_eq!(resolved.location_reference_asset_id.as_deref(), Some("scene-location-asset"));
+        let resolved = resolve_effective_bulk_settings(Some(&scene), "style", "rule", &global_visual);
         assert_eq!(resolved.dials.visual_interpretation, Some(90), "scene's override wins");
         assert_eq!(resolved.dials.diversity_camera, Some(70), "un-overridden dial still inherits from global");
         assert_eq!(resolved.dials.mood.as_deref(), Some("Hopeful"));
+    }
+
+    #[test]
+    fn resolve_effective_scene_cast_layers_assignment_over_roster_and_drops_stale_ids() {
+        let characters = vec![
+            RosterCharacter { id: "char1".into(), video_id: "v1".into(), ordinal: 1, name: "Mira".into(), reference_asset_id: Some("a1".into()), description: Some("d1".into()) },
+            RosterCharacter { id: "char2".into(), video_id: "v1".into(), ordinal: 2, name: "Kesh".into(), reference_asset_id: None, description: None },
+        ];
+        let locations = vec![
+            RosterLocation { id: "loc1".into(), video_id: "v1".into(), ordinal: 1, name: "Harbor".into(), reference_asset_id: Some("a2".into()), description: Some("d2".into()) },
+        ];
+
+        // No assignment at all — nothing is assigned.
+        let none = resolve_effective_scene_cast(None, &characters, &locations);
+        assert!(none.assigned_characters.is_empty());
+        assert!(none.assigned_location.is_none());
+
+        // An assignment naming both existing characters (order preserved —
+        // chip order is generation priority) plus the one location.
+        let assignment = SceneCastAssignment {
+            scene_id: "sc1".into(),
+            ai_suggested_character_ids: vec!["char1".into()],
+            assigned_character_ids: vec!["char2".into(), "char1".into()],
+            ai_suggested_location_id: None,
+            assigned_location_id: Some("loc1".into()),
+        };
+        let resolved = resolve_effective_scene_cast(Some(&assignment), &characters, &locations);
+        assert_eq!(resolved.assigned_characters.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["char2", "char1"]);
+        assert_eq!(resolved.assigned_location.as_ref().map(|l| l.id.as_str()), Some("loc1"));
+
+        // An assignment naming an id that no longer exists in the roster
+        // (the row was deleted after being assigned) is silently dropped,
+        // not an error.
+        let stale = SceneCastAssignment {
+            scene_id: "sc1".into(),
+            ai_suggested_character_ids: vec![],
+            assigned_character_ids: vec!["char1".into(), "deleted-char".into()],
+            ai_suggested_location_id: None,
+            assigned_location_id: Some("deleted-location".into()),
+        };
+        let resolved = resolve_effective_scene_cast(Some(&stale), &characters, &locations);
+        assert_eq!(resolved.assigned_characters.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["char1"]);
+        assert!(resolved.assigned_location.is_none());
     }
 
     #[test]
@@ -14387,17 +15038,16 @@ mod tests {
         assert_eq!(repo.get_bulk_global_settings(&video.id).unwrap(), BulkGlobalVisualSettings::default());
 
         let dials = BulkVisualDials { visual_interpretation: Some(65), mood: Some("Tense Anxious".into()), ..Default::default() };
-        let saved = repo.save_bulk_global_settings(&video.id, Some(true), Some("loc-asset".into()), dials.clone()).unwrap();
-        assert_eq!(saved.location_consistency, Some(true));
+        let saved = repo.save_bulk_global_settings(&video.id, dials.clone()).unwrap();
         assert_eq!(saved.dials.visual_interpretation, Some(65));
 
         let loaded = repo.get_bulk_global_settings(&video.id).unwrap();
         assert_eq!(loaded, saved);
 
-        // Re-saving with an empty dials struct and location fields cleared
-        // rolls it all the way back to the default shape, and upserts in
-        // place rather than creating a second row.
-        let cleared = repo.save_bulk_global_settings(&video.id, None, None, BulkVisualDials::default()).unwrap();
+        // Re-saving with an empty dials struct rolls it all the way back to
+        // the default shape, and upserts in place rather than creating a
+        // second row.
+        let cleared = repo.save_bulk_global_settings(&video.id, BulkVisualDials::default()).unwrap();
         assert_eq!(cleared, BulkGlobalVisualSettings::default());
         assert_eq!(repo.get_bulk_global_settings(&video.id).unwrap(), BulkGlobalVisualSettings::default());
     }
@@ -14412,25 +15062,207 @@ mod tests {
 
         let saved = repo.save_bulk_scene_settings(
             &video.id, "sc1",
-            Some("scene style".into()), Some("scene rule".into()), Some(true), Some("asset-1".into()),
-            None, None, BulkVisualDials::default(),
+            Some("scene style".into()), Some("scene rule".into()), BulkVisualDials::default(),
         ).unwrap();
         assert_eq!(saved.style_directive.as_deref(), Some("scene style"));
 
         let loaded = repo.get_bulk_scene_settings(&video.id).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].scene_id, "sc1");
-        assert_eq!(loaded[0].character_consistency, Some(true));
-        assert_eq!(loaded[0].reference_asset_id.as_deref(), Some("asset-1"));
+        assert_eq!(loaded[0].style_directive.as_deref(), Some("scene style"));
 
         // Re-saving with the same (video, scene) upserts in place, and a
         // field set back to None clears that override back to "inherit"
         // rather than leaving the old value behind.
-        let updated = repo.save_bulk_scene_settings(&video.id, "sc1", None, Some("scene rule".into()), None, None, None, None, BulkVisualDials::default()).unwrap();
+        let updated = repo.save_bulk_scene_settings(&video.id, "sc1", None, Some("scene rule".into()), BulkVisualDials::default()).unwrap();
         assert_eq!(updated.style_directive, None);
-        assert_eq!(updated.character_consistency, None);
-        assert_eq!(updated.reference_asset_id, None);
         assert_eq!(repo.get_bulk_scene_settings(&video.id).unwrap().len(), 1, "upsert must not create a second row");
+    }
+
+    #[test]
+    fn roster_character_crud_round_trip() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+
+        assert!(repo.list_roster_characters(&video.id).unwrap().is_empty());
+
+        let created = repo.create_roster_character(&video.id, "Mira").unwrap();
+        assert_eq!(created.name, "Mira");
+        assert_eq!(created.ordinal, 1);
+        assert_eq!(created.reference_asset_id, None);
+
+        let second = repo.create_roster_character(&video.id, "Kesh").unwrap();
+        assert_eq!(second.ordinal, 2, "ordinals increment per video, not globally");
+
+        let renamed = repo.rename_roster_character(&created.id, "Mira the Guide").unwrap();
+        assert_eq!(renamed.name, "Mira the Guide");
+
+        let referenced = repo.set_roster_character_reference(&created.id, Some("asset-1")).unwrap();
+        assert_eq!(referenced.reference_asset_id.as_deref(), Some("asset-1"));
+
+        let listed = repo.list_roster_characters(&video.id).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, created.id, "listed in ordinal order");
+        assert_eq!(listed[1].id, second.id);
+
+        repo.delete_roster_character(&created.id).unwrap();
+        let after_delete = repo.list_roster_characters(&video.id).unwrap();
+        assert_eq!(after_delete.len(), 1);
+        assert_eq!(after_delete[0].id, second.id);
+    }
+
+    #[test]
+    fn set_roster_character_reference_clears_cached_description_only_when_the_asset_actually_changes() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let character = repo.create_roster_character(&video.id, "Mira").unwrap();
+        repo.set_roster_character_reference(&character.id, Some("asset-1")).unwrap();
+        // Simulate a previously-cached description directly, the way
+        // roster_character_description would leave it.
+        repo.connection.execute(
+            "UPDATE roster_characters SET description='cached description', description_asset_id='asset-1' WHERE id=?1",
+            [&character.id],
+        ).unwrap();
+
+        // Re-setting the SAME asset id must not clear the cache.
+        let unchanged = repo.set_roster_character_reference(&character.id, Some("asset-1")).unwrap();
+        assert_eq!(unchanged.description.as_deref(), Some("cached description"));
+
+        // Setting a DIFFERENT asset id must clear it so it regenerates.
+        let changed = repo.set_roster_character_reference(&character.id, Some("asset-2")).unwrap();
+        assert_eq!(changed.description, None);
+    }
+
+    #[test]
+    fn ensure_roster_seeded_from_legacy_carries_forward_existing_single_reference_once() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+
+        // Simulate a video that already had the old single-reference model
+        // in use before the roster existed.
+        repo.save_app_setting(&format!("global_reference_asset.{}", video.id), "legacy-char-asset").unwrap();
+        repo.save_app_setting(&format!("character_description.{}", video.id), "a legacy character description").unwrap();
+        repo.save_bulk_global_settings(&video.id, BulkVisualDials::default()).unwrap();
+        repo.connection.execute(
+            "UPDATE bulk_global_settings SET location_reference_asset_id='legacy-loc-asset' WHERE video_id=?1",
+            [&video.id],
+        ).unwrap();
+        repo.save_app_setting(&format!("location_description.{}", video.id), "a legacy location description").unwrap();
+
+        let characters = repo.list_roster_characters(&video.id).unwrap();
+        assert_eq!(characters.len(), 1);
+        assert_eq!(characters[0].name, "Character 1");
+        assert_eq!(characters[0].reference_asset_id.as_deref(), Some("legacy-char-asset"));
+        assert_eq!(characters[0].description.as_deref(), Some("a legacy character description"), "the cached description is carried forward too, avoiding a wasted regeneration");
+
+        let locations = repo.list_roster_locations(&video.id).unwrap();
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].name, "Location 1");
+        assert_eq!(locations[0].reference_asset_id.as_deref(), Some("legacy-loc-asset"));
+        assert_eq!(locations[0].description.as_deref(), Some("a legacy location description"));
+
+        // Adding a second character afterward must not re-trigger the
+        // migration and duplicate "Character 1".
+        repo.create_roster_character(&video.id, "New Character").unwrap();
+        let after = repo.list_roster_characters(&video.id).unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(after.iter().filter(|c| c.name == "Character 1").count(), 1);
+    }
+
+    #[test]
+    fn ensure_roster_seeded_from_legacy_is_a_no_op_for_a_video_with_no_legacy_reference() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+
+        assert!(repo.list_roster_characters(&video.id).unwrap().is_empty());
+        assert!(repo.list_roster_locations(&video.id).unwrap().is_empty());
+        assert_eq!(repo.get_app_setting(&format!("roster_migrated.{}", video.id)).unwrap().as_deref(), Some("true"), "the marker is still set so this never re-checks");
+    }
+
+    #[test]
+    fn save_scene_cast_assignment_sets_assigned_without_touching_ai_suggested_on_a_fresh_scene() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let character = repo.create_roster_character(&video.id, "Mira").unwrap();
+
+        assert_eq!(repo.get_scene_cast_assignment(&video.id, "sc1").unwrap(), None);
+
+        let saved = repo.save_scene_cast_assignment(&video.id, "sc1", &[character.id.clone()], Some("loc1")).unwrap();
+        assert_eq!(saved.assigned_character_ids, vec![character.id.clone()]);
+        assert_eq!(saved.assigned_location_id.as_deref(), Some("loc1"));
+        assert!(saved.ai_suggested_character_ids.is_empty(), "no AI suggestion has run yet for this scene");
+        assert_eq!(saved.ai_suggested_location_id, None);
+
+        // Re-saving with different picks only overwrites assigned_*.
+        let updated = repo.save_scene_cast_assignment(&video.id, "sc1", &[], None).unwrap();
+        assert!(updated.assigned_character_ids.is_empty());
+        assert_eq!(updated.assigned_location_id, None);
+        assert!(updated.ai_suggested_character_ids.is_empty());
+
+        assert_eq!(repo.get_scene_cast_assignments(&video.id).unwrap().len(), 1, "upsert must not create a second row");
+    }
+
+    #[test]
+    fn suggest_scene_cast_batch_requires_a_non_empty_roster() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let error = repo.suggest_scene_cast_batch(&video.id, &["sc1".to_string()]).unwrap_err();
+        assert!(error.contains("Add at least one character or location"), "got: {error}");
+    }
+
+    #[test]
+    fn extractable_style_aspects_cover_the_full_29_item_list() {
+        let aspects = ProjectRepository::list_extractable_style_aspects();
+        assert_eq!(aspects.len(), 29);
+        assert!(aspects.iter().any(|a| a.key == "STY" && a.label == "Art Style"));
+        assert!(aspects.iter().any(|a| a.key == "STYLE_SIG" && a.label == "Style Signature"));
+        // Every key must be unique.
+        let mut keys: Vec<&str> = aspects.iter().map(|a| a.key.as_str()).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 29);
+    }
+
+    #[test]
+    fn build_extract_style_prompt_explicitly_excludes_unselected_aspects() {
+        // Regression test: selecting only Art Style must not let Subjects/
+        // Environment leak in — the actual bug reported (only "Art Style"
+        // selected, but the result still described character design and
+        // background).
+        let prompt = build_extract_style_prompt(&["STY".to_string()]);
+        assert!(prompt.contains("Art Style"), "the selected aspect's label must appear: {prompt}");
+        assert!(prompt.contains("EXCLUDED ASPECTS"), "must state there are excluded aspects: {prompt}");
+        assert!(prompt.contains("Subjects"), "Subjects must be named as excluded: {prompt}");
+        assert!(prompt.contains("do not identify, name, count, or describe any person, character, animal, \
+             or object"), "must explicitly forbid describing subjects: {prompt}");
+        // Art Style has no matching imageSettings field, so the prompt
+        // must tell the model to return an empty imageSettings object —
+        // otherwise camera/lighting detail sneaks in through that field
+        // even though styleDirective itself stayed on-topic.
+        assert!(prompt.contains("imageSettings must be an empty object"), "got: {prompt}");
+        assert!(!prompt.contains("cameraAngle"), "no settings field should be offered when nothing maps to it: {prompt}");
+    }
+
+    #[test]
+    fn build_extract_style_prompt_gates_image_settings_fields_by_selected_aspect() {
+        let prompt = build_extract_style_prompt(&["CAM".to_string(), "LGT".to_string()]);
+        assert!(prompt.contains("cameraAngle"), "CAM maps to cameraAngle: {prompt}");
+        assert!(prompt.contains("lighting"), "LGT maps to lighting: {prompt}");
+        assert!(prompt.contains("lightDirection"), "LGT also maps to lightDirection: {prompt}");
+        assert!(!prompt.contains("colorTemperature"), "CLR was not selected, its fields must not be offered: {prompt}");
+    }
+
+    #[test]
+    fn build_extract_style_prompt_selecting_everything_has_no_exclusion_clause() {
+        let all_keys: Vec<String> = EXTRACTABLE_STYLE_ASPECTS.iter().map(|(key, _, _)| key.to_string()).collect();
+        let prompt = build_extract_style_prompt(&all_keys);
+        assert!(!prompt.contains("EXCLUDED ASPECTS"), "nothing is excluded when everything is selected: {prompt}");
     }
 
     #[test]

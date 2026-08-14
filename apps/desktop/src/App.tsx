@@ -2225,6 +2225,60 @@ function RosterModal({
   );
 }
 
+/** Visual Direction's dials, moved out of the Global Bulk Settings modal
+ * into their own launcher-button modal (same "Manage roster" pattern as
+ * the character/location roster) — keeps the main modal from being
+ * dominated by sliders. */
+function VisualDirectionModal({ dials, onChange, onClose }: {
+  dials: BulkVisualDialsRecord;
+  onChange: (patch: Partial<BulkVisualDialsRecord>) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="modal bulk-modal dial-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-heading-row"><h2>Visual Direction</h2><button type="button" className="icon-button" aria-label="Close" onClick={onClose}><X size={16} /></button></div>
+        <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 10px"}}>Leave any dial on "AI decides" to skip it — an untouched dial never sends anything to the AI.</p>
+        <div className="dial-grid">
+          <GlobalDialRow label="Visual Interpretation" hint="Literal ↔ Creative" value={dials.visualInterpretation} onChange={(value) => onChange({ visualInterpretation: value })} />
+          <GlobalDialRow label="Visual Metaphor" hint="Literal ↔ Symbolic" value={dials.visualMetaphor} onChange={(value) => onChange({ visualMetaphor: value })} />
+          <GlobalDialRow label="Cinematic Intensity" hint="Documentary ↔ Cinematic" value={dials.cinematicIntensity} onChange={(value) => onChange({ cinematicIntensity: value })} />
+          <GlobalDialRow label="Prompt Creativity" hint="Strict script ↔ Highly creative" value={dials.promptCreativity} onChange={(value) => onChange({ promptCreativity: value })} />
+          <MoodRow level="global" mood={dials.mood} moodMode={dials.moodMode} onChange={(mood, moodMode) => onChange({ mood, moodMode })} />
+        </div>
+        <button className="primary full" style={{marginTop:"14px"}} onClick={onClose}>Done</button>
+      </div>
+    </div>
+  );
+}
+
+/** Diversity & Consistency's dials — same launcher-button-modal treatment
+ * as VisualDirectionModal, replacing the earlier collapsed-<details>
+ * approach. */
+function DiversityConsistencyModal({ dials, onChange, onClose }: {
+  dials: BulkVisualDialsRecord;
+  onChange: (patch: Partial<BulkVisualDialsRecord>) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="modal bulk-modal dial-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-heading-row"><h2>Diversity &amp; Consistency</h2><button type="button" className="icon-button" aria-label="Close" onClick={onClose}><X size={16} /></button></div>
+        <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 10px"}}>How stills should differ from, or match, each other.</p>
+        <div className="dial-grid">
+          <GlobalDialRow label="Camera Angle Diversity" hint="Consistent ↔ Dynamic" value={dials.diversityCamera} onChange={(value) => onChange({ diversityCamera: value })} />
+          <GlobalDialRow label="Composition Diversity" hint="Consistent ↔ Dynamic" value={dials.diversityComposition} onChange={(value) => onChange({ diversityComposition: value })} />
+          <GlobalDialRow label="Shot Type Diversity" hint="Consistent ↔ Dynamic" value={dials.diversityShotType} onChange={(value) => onChange({ diversityShotType: value })} />
+          <GlobalDialRow label="Character Identity Strictness" hint="Flexible ↔ Strict" value={dials.consistencyCharacter} onChange={(value) => onChange({ consistencyCharacter: value })} />
+          <GlobalDialRow label="Location Identity Strictness" hint="Flexible ↔ Strict" value={dials.consistencyLocation} onChange={(value) => onChange({ consistencyLocation: value })} />
+          <GlobalDialRow label="Style Strictness" hint="Flexible ↔ Strict" value={dials.consistencyStyle} onChange={(value) => onChange({ consistencyStyle: value })} />
+        </div>
+        <button className="primary full" style={{marginTop:"14px"}} onClick={onClose}>Done</button>
+      </div>
+    </div>
+  );
+}
+
 /** Extract Style's "which aspects to focus on" popup — grouped checkboxes
  * over the static 29-item EXTRACTABLE_STYLE_ASPECTS list from the backend. */
 const STYLE_ASPECT_GROUPS: { label: string; keys: string[] }[] = [
@@ -2326,6 +2380,8 @@ function ImagesView() {
   const [rosterLocations, setRosterLocations] = useState<RosterLocationRecord[]>([]);
   const [sceneCastAssignments, setSceneCastAssignments] = useState<SceneCastAssignmentRecord[]>([]);
   const [rosterModalOpen, setRosterModalOpen] = useState(false);
+  const [visualDirectionModalOpen, setVisualDirectionModalOpen] = useState(false);
+  const [diversityModalOpen, setDiversityModalOpen] = useState(false);
   const [suggestingCast, setSuggestingCast] = useState(false);
   // Extract Style's selectable-aspects popup — the 29-item list is static,
   // fetched once; the user's selection persists per video via app_settings.
@@ -3565,11 +3621,11 @@ function ImagesView() {
         <div className="modal bulk-modal" onMouseDown={(e) => e.stopPropagation()}>
           <div className="modal-heading-row"><h2>Global Bulk Settings</h2><button type="button" className="icon-button" aria-label="Close" onClick={() => setBulkGlobalOpen(false)}><X size={16} /></button></div>
 
-          <div className="bulk-modal-group">Style</div>
-          <div className="panel-section-heading required" style={{marginTop:"4px"}}><h3>Style Directive<span className="required-badge">Required</span></h3></div>
+          <div className="bulk-modal-group">Style Directive<span className="required-badge">Required</span></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Describe overall cinematography and visual language. Avoid scene-specific details — the AI will handle those per still.</p>
           <textarea className={`bulk-directive${systemPrompt.trim() ? "" : " needs-attention"}`} value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="e.g. Cinematic documentary style, shallow depth of field, warm color grade, soft natural lighting…" rows={4} />
-          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Reference Image</h3><small>Optional</small></div>
+
+          <div className="bulk-modal-group">Reference Image</div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Upload a reference to extract visual style and populate the directive automatically.</p>
           <div className="reference-list bulk-ref-list">
             {references.map((reference) => (
@@ -3584,7 +3640,8 @@ function ImagesView() {
             ))}
             {!references.length && <button className="secondary" onClick={() => void importReference()}><Plus size={14} />Upload reference image</button>}
           </div>
-          <div className="panel-section-heading" style={{marginTop:"18px"}}><h3>Creative Instructions</h3><small>Optional</small></div>
+
+          <div className="bulk-modal-group">Creative Instructions</div>
           <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still (unless a scene overrides them below in the main panel). Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
           <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cat as the main character. Show visible emotions and varied body language. Avoid showing text, labels, or close-ups on faces." rows={4} />
 
@@ -3593,29 +3650,38 @@ function ImagesView() {
             <span>{rosterCharacters.length} character{rosterCharacters.length === 1 ? "" : "s"} · {rosterLocations.length} location{rosterLocations.length === 1 ? "" : "s"}</span>
             <button type="button" className="secondary" onClick={() => setRosterModalOpen(true)}><Users size={12} />Manage roster</button>
           </div>
-          <p style={{fontSize:"12px",color:"var(--muted)",margin:"6px 0 0"}}>Add named characters/locations with reference images here, then pick which ones each scene uses in the panel behind this one.</p>
 
           <div className="bulk-modal-group">Visual Direction</div>
-          <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 10px"}}>Leave any dial on "AI decides" to skip it — an untouched dial never sends anything to the AI.</p>
-          <div className="dial-grid">
-            <GlobalDialRow label="Visual Interpretation" hint="Literal ↔ Creative" value={bulkGlobalVisualSettings.dials.visualInterpretation} onChange={(value) => updateGlobalDial({ visualInterpretation: value })} />
-            <GlobalDialRow label="Visual Metaphor" hint="Literal ↔ Symbolic" value={bulkGlobalVisualSettings.dials.visualMetaphor} onChange={(value) => updateGlobalDial({ visualMetaphor: value })} />
-            <GlobalDialRow label="Cinematic Intensity" hint="Documentary ↔ Cinematic" value={bulkGlobalVisualSettings.dials.cinematicIntensity} onChange={(value) => updateGlobalDial({ cinematicIntensity: value })} />
-            <GlobalDialRow label="Prompt Creativity" hint="Strict script ↔ Highly creative" value={bulkGlobalVisualSettings.dials.promptCreativity} onChange={(value) => updateGlobalDial({ promptCreativity: value })} />
-            <MoodRow level="global" mood={bulkGlobalVisualSettings.dials.mood} moodMode={bulkGlobalVisualSettings.dials.moodMode} onChange={(mood, moodMode) => updateGlobalDial({ mood, moodMode })} />
+          <div className="bulk-scene-reference roster-launcher">
+            <span>{[bulkGlobalVisualSettings.dials.visualInterpretation, bulkGlobalVisualSettings.dials.visualMetaphor, bulkGlobalVisualSettings.dials.cinematicIntensity, bulkGlobalVisualSettings.dials.promptCreativity, bulkGlobalVisualSettings.dials.mood].filter((value) => value !== null).length} of 5 customized</span>
+            <button type="button" className="secondary" onClick={() => setVisualDirectionModalOpen(true)}>Manage Visual Direction</button>
           </div>
-          <details className="advanced-settings"><summary><span><strong>Diversity &amp; Consistency</strong><small>How stills should differ from, or match, each other</small></span><b>＋</b></summary><div className="dial-grid">
-            <GlobalDialRow label="Camera Angle Diversity" hint="Consistent ↔ Dynamic" value={bulkGlobalVisualSettings.dials.diversityCamera} onChange={(value) => updateGlobalDial({ diversityCamera: value })} />
-            <GlobalDialRow label="Composition Diversity" hint="Consistent ↔ Dynamic" value={bulkGlobalVisualSettings.dials.diversityComposition} onChange={(value) => updateGlobalDial({ diversityComposition: value })} />
-            <GlobalDialRow label="Shot Type Diversity" hint="Consistent ↔ Dynamic" value={bulkGlobalVisualSettings.dials.diversityShotType} onChange={(value) => updateGlobalDial({ diversityShotType: value })} />
-            <GlobalDialRow label="Character Identity Strictness" hint="Flexible ↔ Strict" value={bulkGlobalVisualSettings.dials.consistencyCharacter} onChange={(value) => updateGlobalDial({ consistencyCharacter: value })} />
-            <GlobalDialRow label="Location Identity Strictness" hint="Flexible ↔ Strict" value={bulkGlobalVisualSettings.dials.consistencyLocation} onChange={(value) => updateGlobalDial({ consistencyLocation: value })} />
-            <GlobalDialRow label="Style Strictness" hint="Flexible ↔ Strict" value={bulkGlobalVisualSettings.dials.consistencyStyle} onChange={(value) => updateGlobalDial({ consistencyStyle: value })} />
-          </div></details>
+
+          <div className="bulk-modal-group">Diversity &amp; Consistency</div>
+          <div className="bulk-scene-reference roster-launcher">
+            <span>{[bulkGlobalVisualSettings.dials.diversityCamera, bulkGlobalVisualSettings.dials.diversityComposition, bulkGlobalVisualSettings.dials.diversityShotType, bulkGlobalVisualSettings.dials.consistencyCharacter, bulkGlobalVisualSettings.dials.consistencyLocation, bulkGlobalVisualSettings.dials.consistencyStyle].filter((value) => value !== null).length} of 6 customized</span>
+            <button type="button" className="secondary" onClick={() => setDiversityModalOpen(true)}>Manage Diversity &amp; Consistency</button>
+          </div>
 
           <button className="primary full" style={{marginTop:"18px"}} onClick={() => setBulkGlobalOpen(false)}>Done</button>
         </div>
       </div>}
+
+      {visualDirectionModalOpen && (
+        <VisualDirectionModal
+          dials={bulkGlobalVisualSettings.dials}
+          onChange={updateGlobalDial}
+          onClose={() => setVisualDirectionModalOpen(false)}
+        />
+      )}
+
+      {diversityModalOpen && (
+        <DiversityConsistencyModal
+          dials={bulkGlobalVisualSettings.dials}
+          onChange={updateGlobalDial}
+          onClose={() => setDiversityModalOpen(false)}
+        />
+      )}
 
       {rosterModalOpen && (
         <RosterModal

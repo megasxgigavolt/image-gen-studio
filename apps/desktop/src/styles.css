@@ -849,15 +849,18 @@ textarea{text-align:justify!important}
 
 /* Visual Director / Diversity & Consistency Controller dials — Global Bulk
    Settings modal and the per-scene override drawer. */
-.dial-grid{display:grid;gap:10px;margin:6px 0 4px}
-.dial-row{padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2)}
+/* Minimalistic dial rows — a plain divider-separated list, not boxed
+   cards: no border/background/padding per row, tight vertical rhythm. */
+.dial-grid{display:grid;gap:0;margin:4px 0}
+.dial-row{padding:7px 0;border-bottom:1px solid var(--line)}
+.dial-row:last-child{border-bottom:0}
 .dial-row-heading{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;font-weight:600;color:var(--text)}
-.dial-mode-toggle{border:1px solid var(--line);background:var(--surface);color:var(--muted);font-size:10px;font-weight:600;padding:3px 9px;border-radius:20px;cursor:pointer;white-space:nowrap}
-.dial-mode-toggle:hover{border-color:var(--brand);color:var(--brand)}
-.dial-slider-row{display:flex;align-items:center;gap:10px;margin-top:6px}
-.dial-slider-row input[type="range"]{flex:1;accent-color:var(--brand)}
-.dial-value{font-size:11px;font-weight:700;color:var(--brand);min-width:22px;text-align:right}
-.dial-hint{display:block;font-size:10px;color:var(--muted);margin-top:4px}
+.dial-mode-toggle{border:0;background:transparent;color:var(--muted);font-size:10px;font-weight:600;padding:2px 4px;cursor:pointer;white-space:nowrap}
+.dial-mode-toggle:hover{color:var(--brand)}
+.dial-slider-row{display:flex;align-items:center;gap:8px;margin-top:3px}
+.dial-slider-row input[type="range"]{flex:1;accent-color:var(--brand);height:14px}
+.dial-value{font-size:11px;font-weight:700;color:var(--brand);min-width:20px;text-align:right}
+.dial-hint{display:block;font-size:9px;color:var(--muted);margin-top:1px}
 .mood-row-controls{display:grid;gap:6px;margin-top:6px}
 .mood-row-controls select{padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--text);font-size:12px}
 
@@ -869,15 +872,16 @@ textarea{text-align:justify!important}
 .reference-item-actions{display:flex;align-items:center;gap:2px}
 .reference-item-actions .icon-button{width:26px;height:26px}
 
-/* Global Bulk Settings modal restructure — group-level cluster labels
-   (bolder/larger than .panel-section-heading h3), a "Required" badge for
-   Style Directive, and the roster launcher row. */
-.bulk-modal-group{margin:22px 0 10px;font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.07em;color:var(--brand)}
-.bulk-modal-group:first-of-type{margin-top:4px}
-.panel-section-heading.required h3{display:flex;align-items:center;gap:8px}
-.required-badge{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:#c77a26;border:1px solid #c77a26;border-radius:999px;padding:2px 7px}
+/* Global Bulk Settings modal restructure — every section heading (Style
+   Directive through Diversity & Consistency) uses this one uniform
+   format, no separate h3/.panel-section-heading treatment in this modal. */
+.bulk-modal h2{margin-bottom:10px}
+.bulk-modal-group{margin:20px 0 8px;font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.07em;color:var(--brand)}
+.bulk-modal-group:first-of-type{margin-top:0}
+.required-badge{margin-left:8px;vertical-align:middle;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:#c77a26;border:1px solid #c77a26;border-radius:999px;padding:2px 7px}
 .bulk-directive.needs-attention{border-color:#c77a26;background:color-mix(in srgb,#c77a26 6%,var(--surface))}
 .roster-launcher{border:1px solid var(--line);border-radius:6px;padding:10px 12px;justify-content:space-between}
+.dial-modal{max-width:520px}
 
 /* Character/location roster — card list (RosterModal) and the per-scene
    cast picker (SceneCastPicker), ported from the ui/visual-director-mockup

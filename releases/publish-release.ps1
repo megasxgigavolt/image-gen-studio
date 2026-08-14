@@ -59,13 +59,11 @@ if (-not $existingTag) {
 
 # Create the release (installer + signature) if it doesn't exist yet,
 # otherwise just refresh those two assets.
-$releaseExists = $false
-try {
-    gh release view $Tag --repo $Repo *> $null
-    $releaseExists = $true
-} catch {
-    $releaseExists = $false
-}
+# Note: `gh` is a native exe, so a non-zero exit code does NOT throw a
+# PowerShell terminating exception - try/catch around it is a no-op and
+# would always land in the try branch. Check $LASTEXITCODE explicitly.
+gh release view $Tag --repo $Repo *> $null
+$releaseExists = ($LASTEXITCODE -eq 0)
 
 if ($releaseExists) {
     Write-Host "Release $Tag already exists - updating its assets." -ForegroundColor Yellow

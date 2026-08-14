@@ -2516,10 +2516,10 @@ fn create_plan_group(
     video_id: String,
     sentence_id: String,
     insert_index: usize,
-    force_new_scene: bool,
+    keep_in_current_scene: bool,
 ) -> Result<VisualPlan, String> {
     with_repository(state, |repository| {
-        repository.create_plan_group(&video_id, &sentence_id, insert_index, force_new_scene)
+        repository.create_plan_group(&video_id, &sentence_id, insert_index, keep_in_current_scene)
     })
 }
 
@@ -2529,6 +2529,17 @@ fn reset_visual_plan(
     video_id: String,
 ) -> Result<VisualPlan, String> {
     with_repository(state, |repository| repository.reset_visual_plan(&video_id))
+}
+
+#[tauri::command]
+fn restore_visual_plan_snapshot(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    snapshot_json: String,
+) -> Result<VisualPlan, String> {
+    with_repository(state, |repository| {
+        repository.restore_visual_plan_snapshot(&video_id, &snapshot_json)
+    })
 }
 
 #[tauri::command]
@@ -2841,6 +2852,7 @@ pub fn run() {
             move_plan_sentence,
             create_plan_group,
             reset_visual_plan,
+            restore_visual_plan_snapshot,
             set_plan_scene_expanded,
             get_bulk_scene_settings,
             save_bulk_scene_settings,

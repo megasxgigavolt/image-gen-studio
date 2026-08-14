@@ -55,6 +55,7 @@ import { log } from "./infrastructure/logger";
 import { resolveAssetUrl, resolveRenderUrl } from "./infrastructure/media-cache";
 import { formatTimeShort } from "./domain/timecode";
 import { sectionGroupsByScene } from "./domain/visual-plan";
+import { isTypingTarget } from "./timeline/shortcut-resolver";
 import { sceneSelectionState, toggleScene } from "./domain/bulk-selection";
 import {
   projectsClient,
@@ -1073,10 +1074,9 @@ function VisualPlanView() {
   // Read (not state, so it doesn't re-render on every key press) at drop
   // time in finishDrag — dnd-kit's DragEndEvent doesn't carry the drop
   // moment's modifier-key state, only whichever event originally armed the
-  // drag. Holding Shift while dropping on a still's own boundary divider
-  // is the only way left to explicitly start a new scene there, now that
-  // a plain drop always just creates a new still in the current scene —
-  // see createGroup's forceNewScene parameter.
+  // drag. A plain drop at a scene's own edge starts a new scene there by
+  // default; holding Shift explicitly keeps the new still in the current
+  // scene instead — see createGroup's keepInCurrentScene parameter.
   const shiftHeldRef = useRef(false);
   useEffect(() => {
     const onKeyChange = (event: KeyboardEvent) => { if (event.key === "Shift") shiftHeldRef.current = event.type === "keydown"; };
@@ -1094,8 +1094,51 @@ function VisualPlanView() {
   // DraggableSentence's split-armed render branch.
   const [splitArm, setSplitArm] = useState<{ sentenceId: string; offset: number } | null>(null);
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+  // In-memory undo/redo — mirrors useTimelineData's undoStackRef/
+  // redoStackRef pattern: every mutation pushes the plan as it was right
+  // before onto undoStackRef, undo/redo pop between the two stacks and
+  // hand a whole snapshot back to restoreVisualPlanSnapshot. Session-only
+  // (a fresh stack per video, cleared on reload) and independent of
+  // "Reset original", which always targets the fixed generation-time
+  // snapshot rather than this edit history.
+  const undoStackRef = useRef<VisualPlanRecord[]>([]);
+  const redoStackRef = useRef<VisualPlanRecord[]>([]);
+  /** `skipHistory` is for mutations that shouldn't clutter undo — a scene
+   * expand/collapse toggle (fired on every click), and the undo/redo
+   * restore itself (which would otherwise re-push the state it's replacing). */
+  async function refresh(promise: Promise<VisualPlanRecord>, options?: { skipHistory?: boolean }) {
+    const before = plan;
+    try {
+      const next = await promise;
+      setPlan(next);
+      if (before && !options?.skipHistory) {
+        undoStackRef.current.push(before);
+        if (undoStackRef.current.length > 50) undoStackRef.current.shift();
+        redoStackRef.current = [];
+      }
+    } catch (caught) {
+      setError(String(caught));
+      throw caught;
+    }
+  }
+  async function undo() {
+    if (!activeVideoId || !plan || !undoStackRef.current.length) return;
+    const previous = undoStackRef.current.pop()!;
+    redoStackRef.current.push(plan);
+    if (redoStackRef.current.length > 50) redoStackRef.current.shift();
+    await refresh(projectsClient.restoreVisualPlanSnapshot(activeVideoId, previous), { skipHistory: true });
+  }
+  async function redo() {
+    if (!activeVideoId || !plan || !redoStackRef.current.length) return;
+    const next = redoStackRef.current.pop()!;
+    undoStackRef.current.push(plan);
+    if (undoStackRef.current.length > 50) undoStackRef.current.shift();
+    await refresh(projectsClient.restoreVisualPlanSnapshot(activeVideoId, next), { skipHistory: true });
+  }
   useEffect(() => {
     if (!activeVideoId) return;
+    undoStackRef.current = [];
+    redoStackRef.current = [];
     void projectsClient.getVisualPlan(activeVideoId).then(setPlan).catch((caught) => setError(String(caught)));
   }, [activeVideoId]);
 
@@ -1166,11 +1209,23 @@ function VisualPlanView() {
       }
       if (event.key === "Escape" && searchOpen) {
         setSearchOpen(false);
+        return;
+      }
+      // Undo/redo — Ctrl/Cmd+Z, Shift held = redo. Guarded so it never
+      // hijacks a text input's own native undo (e.g. the search box).
+      if (!isTypingTarget(document.activeElement) && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (event.shiftKey) void redo(); else void undo();
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [searchOpen]);
+    // undo/redo are intentionally omitted — they're plain functions
+    // redefined every render, so depending on activeVideoId/plan (what
+    // they actually close over) already re-subscribes with fresh ones
+    // after every mutation, same pattern as useTimelineData's undo/redo.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchOpen, activeVideoId, plan]);
 
   function closeSearch() {
     setSearchOpen(false);
@@ -1195,31 +1250,31 @@ function VisualPlanView() {
 
   async function moveSentence(sentenceId: string, targetGroupId: string) {
     if (!activeVideoId) return;
-    try { setPlan(await projectsClient.movePlanSentence(activeVideoId, sentenceId, targetGroupId)); }
-    catch (caught) { setError(String(caught)); }
+    try { await refresh(projectsClient.movePlanSentence(activeVideoId, sentenceId, targetGroupId)); }
+    catch { /* refresh already recorded the error */ }
   }
 
   async function resetPlan() {
     if (!activeVideoId) return;
-    setPlan(await projectsClient.resetVisualPlan(activeVideoId));
+    await refresh(projectsClient.resetVisualPlan(activeVideoId));
   }
 
-  async function createGroup(sentenceId: string, insertIndex: number, forceNewScene: boolean) {
+  async function createGroup(sentenceId: string, insertIndex: number, keepInCurrentScene: boolean) {
     if (!activeVideoId) return;
-    try { setPlan(await projectsClient.createPlanGroup(activeVideoId, sentenceId, insertIndex, forceNewScene)); }
-    catch (caught) { setError(String(caught)); }
+    try { await refresh(projectsClient.createPlanGroup(activeVideoId, sentenceId, insertIndex, keepInCurrentScene)); }
+    catch { /* refresh already recorded the error */ }
   }
 
   async function mergeSentences(firstSentenceId: string, secondSentenceId: string) {
     if (!activeVideoId) return;
-    try { setPlan(await projectsClient.mergePlanSentences(activeVideoId, firstSentenceId, secondSentenceId)); }
-    catch (caught) { setError(String(caught)); }
+    try { await refresh(projectsClient.mergePlanSentences(activeVideoId, firstSentenceId, secondSentenceId)); }
+    catch { /* refresh already recorded the error */ }
   }
 
   async function setSceneExpanded(sceneId: string, expanded: boolean) {
     if (!activeVideoId) return;
-    try { setPlan(await projectsClient.setPlanSceneExpanded(activeVideoId, sceneId, expanded)); }
-    catch (caught) { setError(String(caught)); }
+    try { await refresh(projectsClient.setPlanSceneExpanded(activeVideoId, sceneId, expanded), { skipHistory: true }); }
+    catch { /* refresh already recorded the error */ }
   }
 
   function finishDrag(event: DragEndEvent) {
@@ -1265,9 +1320,9 @@ function VisualPlanView() {
     const rightText = sentence.text.slice(splitArm.offset);
     setSplitArm(null);
     if (!leftText.trim() || !rightText.trim()) return;
-    projectsClient.splitPlanSentence(activeVideoId, splitArm.sentenceId, leftText, rightText)
-      .then(setPlan)
-      .catch((caught) => setError(String(caught)));
+    void refresh(projectsClient.splitPlanSentence(activeVideoId, splitArm.sentenceId, leftText, rightText)).catch(() => {
+      /* refresh already recorded the error */
+    });
   }
 
   useEffect(() => {
@@ -1301,7 +1356,7 @@ function VisualPlanView() {
   return (
     <section className="view">
       <div className="page-heading">
-        <div><h1>Visual plan</h1><p>Drag a sentence onto another to merge them, or into a still to regroup it. Drag it to a divider to split off a new still — hold Shift while dropping at a scene boundary to start a new scene there instead. Click inside a sentence to mark where it should split, then confirm. Chronological order remains enforced.</p></div>
+        <div><h1>Visual plan</h1><p>Drag a sentence onto another to merge them, or into a still to regroup it. Click inside a sentence to mark where it should split, then confirm. Chronological order remains enforced.</p></div>
         <div className="heading-actions"><button className="secondary" onClick={() => setStage("inputs")}>← Back</button><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
       </div>
       {searchOpen && (
@@ -1574,7 +1629,7 @@ function StillDivider({ insertIndex, active, sceneSeam, eligible }: { insertInde
     <div
       ref={setNodeRef}
       className={classes.join(" ")}
-      data-seam-hint={sceneSeam ? "Drop to add a new still here · hold Shift to start a new scene instead" : undefined}
+      data-seam-hint={sceneSeam ? "Drop here to start a new scene · hold Shift to add a still to the current scene instead" : undefined}
       title={ineligible ? "Not a valid drop point for this sentence — it can only become a new still at its own chronological boundary" : undefined}
     />
   );

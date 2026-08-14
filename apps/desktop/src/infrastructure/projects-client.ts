@@ -1504,8 +1504,8 @@ export const projectsClient = {
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
     return plan;
   },
-  async createPlanGroup(videoId: string, sentenceId: string, insertIndex: number, forceNewScene: boolean): Promise<VisualPlanRecord> {
-    if (isTauri()) return invoke("create_plan_group", { videoId, sentenceId, insertIndex, forceNewScene });
+  async createPlanGroup(videoId: string, sentenceId: string, insertIndex: number, keepInCurrentScene: boolean): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("create_plan_group", { videoId, sentenceId, insertIndex, keepInCurrentScene });
     const plan = await this.getVisualPlan(videoId);
     const source = plan.groups.findIndex((group) => group.sentenceIds.includes(sentenceId));
     if (source < 0) throw new Error("Sentence was not found.");
@@ -1517,9 +1517,9 @@ export const projectsClient = {
     plan.groups.sort((a, b) => Number(a.sentenceIds[0].slice(1)) - Number(b.sentenceIds[0].slice(1)));
     plan.groups.forEach((group, index) => { group.ordinal = index + 1; });
     // This browser/dev fallback never had the Tauri backend's "peel into a
-    // brand new scene" behavior — forceNewScene is a no-op here, matching
-    // (not regressing behind) the new default everywhere else: the split
-    // sentence just stays in whichever scene it already belonged to.
+    // brand new scene at a seam" behavior at all — it never auto-created a
+    // scene here, so it already matches keepInCurrentScene=true unconditionally;
+    // keepInCurrentScene is a no-op parameter in this fallback.
     assignSceneIds(plan.groups, plan.scenes);
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
     return plan;
@@ -1530,6 +1530,17 @@ export const projectsClient = {
     if (!original) throw new Error("Original visual plan was not found.");
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, original);
     return JSON.parse(original) as VisualPlanRecord;
+  },
+  /** The backend half of the Visual Plan tab's undo/redo (mirrors
+   * restoreTimelineSnapshot) — the frontend keeps its own in-memory stack
+   * of whole VisualPlanRecord snapshots from before each edit and hands
+   * one straight back here to undo/redo it. Independent of "Reset
+   * original" (resetVisualPlan), which always targets the fixed
+   * generation-time snapshot, not this session's edit history. */
+  async restoreVisualPlanSnapshot(videoId: string, snapshot: VisualPlanRecord): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("restore_visual_plan_snapshot", { videoId, snapshotJson: JSON.stringify(snapshot) });
+    localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(snapshot));
+    return snapshot;
   },
   async setPlanSceneExpanded(videoId: string, sceneId: string, expanded: boolean): Promise<VisualPlanRecord> {
     if (isTauri()) return invoke("set_plan_scene_expanded", { videoId, sceneId, expanded });

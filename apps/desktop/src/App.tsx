@@ -1783,7 +1783,7 @@ function SceneBulkRow({
   onToggleScene, onToggleStill, expanded, onToggleExpanded,
   override, overrideOpen, onToggleOverrideOpen, onSaveOverride,
   rosterCharacters, rosterLocations, castAssignment, onSaveCast,
-  globalDials, globalMood,
+  onOpenVisualDirection, onOpenDiversity,
 }: {
   scene: PlanSceneRecord | null;
   groups: (ImageWorkspaceGroupRecord & { sceneId: string | null })[];
@@ -1805,15 +1805,14 @@ function SceneBulkRow({
   rosterLocations: RosterLocationRecord[];
   castAssignment: SceneCastAssignmentRecord | null;
   onSaveCast: (characterIds: string[], locationId: string | null) => void;
-  // Resolved global dials/mood, purely for the "Inherit (X)" labels below —
-  // this scene's own overrides are read from `override.dials` as usual.
-  globalDials: BulkVisualDialsRecord;
-  globalMood: string | null;
+  // Dials themselves live in their own launcher-button modals now (same
+  // pattern as the global modal) — this row just opens them.
+  onOpenVisualDirection: () => void;
+  onOpenDiversity: () => void;
 }) {
   const dials = override?.dials ?? emptyBulkVisualDials();
-  function saveDial(patch: Partial<BulkVisualDialsRecord>) {
-    onSaveOverride({ dials: { ...dials, ...patch } });
-  }
+  const visualDirectionSetCount = [dials.visualInterpretation, dials.visualMetaphor, dials.cinematicIntensity, dials.promptCreativity, dials.mood].filter((value) => value !== null).length;
+  const diversitySetCount = [dials.diversityCamera, dials.diversityComposition, dials.diversityShotType, dials.consistencyCharacter, dials.consistencyLocation, dials.consistencyStyle].filter((value) => value !== null).length;
   const groupIds = groups.map((group) => group.group.id);
   const state = sceneSelectionState(groupIds, selection);
   const selectedCount = groupIds.filter((id) => selection.has(id)).length;
@@ -1845,15 +1844,11 @@ function SceneBulkRow({
       </div>
       {scene && overrideOpen && (
         <div className="bulk-scene-override-form">
-          <label>
-            <span>Style Directive override</span>
-            <textarea rows={2} placeholder="Inherit global" value={override?.styleDirective ?? ""} onChange={(event) => onSaveOverride({ styleDirective: event.target.value || null })} />
-          </label>
-          <label>
-            <span>Creative Instructions override</span>
-            <textarea rows={2} placeholder="Inherit global" value={override?.creativeInstruction ?? ""} onChange={(event) => onSaveOverride({ creativeInstruction: event.target.value || null })} />
-          </label>
-          <div className="bulk-modal-group scene-cast-heading">Cast &amp; Locations</div>
+          <div className="bulk-modal-group">Style Directive</div>
+          <textarea rows={2} placeholder="Inherit global" value={override?.styleDirective ?? ""} onChange={(event) => onSaveOverride({ styleDirective: event.target.value || null })} />
+          <div className="bulk-modal-group">Creative Instructions</div>
+          <textarea rows={2} placeholder="Inherit global" value={override?.creativeInstruction ?? ""} onChange={(event) => onSaveOverride({ creativeInstruction: event.target.value || null })} />
+          <div className="bulk-modal-group">Cast &amp; Locations</div>
           <SceneCastPicker
             characters={rosterCharacters}
             locations={rosterLocations}
@@ -1861,21 +1856,15 @@ function SceneBulkRow({
             onSave={onSaveCast}
           />
           <div className="bulk-modal-group">Visual Direction</div>
-          <div className="dial-grid">
-            <SceneDialRow label="Visual Interpretation" hint="Literal ↔ Creative" value={dials.visualInterpretation} globalValue={globalDials.visualInterpretation} onChange={(value) => saveDial({ visualInterpretation: value })} />
-            <SceneDialRow label="Visual Metaphor" hint="Literal ↔ Symbolic" value={dials.visualMetaphor} globalValue={globalDials.visualMetaphor} onChange={(value) => saveDial({ visualMetaphor: value })} />
-            <SceneDialRow label="Cinematic Intensity" hint="Documentary ↔ Cinematic" value={dials.cinematicIntensity} globalValue={globalDials.cinematicIntensity} onChange={(value) => saveDial({ cinematicIntensity: value })} />
-            <SceneDialRow label="Prompt Creativity" hint="Strict script ↔ Highly creative" value={dials.promptCreativity} globalValue={globalDials.promptCreativity} onChange={(value) => saveDial({ promptCreativity: value })} />
-            <MoodRow level="scene" mood={dials.mood} moodMode={dials.moodMode} globalMood={globalMood} onChange={(mood, moodMode) => saveDial({ mood, moodMode })} />
+          <div className="bulk-scene-reference roster-launcher">
+            <span>{visualDirectionSetCount} of 5 customized</span>
+            <button type="button" className="secondary" onClick={onOpenVisualDirection}>Manage Visual Direction</button>
           </div>
-          <details className="advanced-settings"><summary><span><strong>Diversity &amp; Consistency</strong><small>How stills should differ from, or match, each other</small></span><b>＋</b></summary><div className="dial-grid">
-            <SceneDialRow label="Camera Angle Diversity" hint="Consistent ↔ Dynamic" value={dials.diversityCamera} globalValue={globalDials.diversityCamera} onChange={(value) => saveDial({ diversityCamera: value })} />
-            <SceneDialRow label="Composition Diversity" hint="Consistent ↔ Dynamic" value={dials.diversityComposition} globalValue={globalDials.diversityComposition} onChange={(value) => saveDial({ diversityComposition: value })} />
-            <SceneDialRow label="Shot Type Diversity" hint="Consistent ↔ Dynamic" value={dials.diversityShotType} globalValue={globalDials.diversityShotType} onChange={(value) => saveDial({ diversityShotType: value })} />
-            <SceneDialRow label="Character Identity Strictness" hint="Flexible ↔ Strict" value={dials.consistencyCharacter} globalValue={globalDials.consistencyCharacter} onChange={(value) => saveDial({ consistencyCharacter: value })} />
-            <SceneDialRow label="Location Identity Strictness" hint="Flexible ↔ Strict" value={dials.consistencyLocation} globalValue={globalDials.consistencyLocation} onChange={(value) => saveDial({ consistencyLocation: value })} />
-            <SceneDialRow label="Style Strictness" hint="Flexible ↔ Strict" value={dials.consistencyStyle} globalValue={globalDials.consistencyStyle} onChange={(value) => saveDial({ consistencyStyle: value })} />
-          </div></details>
+          <div className="bulk-modal-group">Diversity &amp; Consistency</div>
+          <div className="bulk-scene-reference roster-launcher">
+            <span>{diversitySetCount} of 6 customized</span>
+            <button type="button" className="secondary" onClick={onOpenDiversity}>Manage Diversity &amp; Consistency</button>
+          </div>
         </div>
       )}
       {expanded && (
@@ -2279,6 +2268,60 @@ function DiversityConsistencyModal({ dials, onChange, onClose }: {
   );
 }
 
+/** Scene-level counterparts to VisualDirectionModal/DiversityConsistencyModal
+ * — same launcher-button-modal pattern, one level down: SceneDialRow's
+ * "Inherit (X)" instead of GlobalDialRow's "AI decides", against this
+ * scene's own resolved global values. */
+function SceneVisualDirectionModal({ dials, globalDials, globalMood, onChange, onClose }: {
+  dials: BulkVisualDialsRecord;
+  globalDials: BulkVisualDialsRecord;
+  globalMood: string | null;
+  onChange: (patch: Partial<BulkVisualDialsRecord>) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="modal bulk-modal dial-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-heading-row"><h2>Visual Direction — scene override</h2><button type="button" className="icon-button" aria-label="Close" onClick={onClose}><X size={16} /></button></div>
+        <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 10px"}}>Leave any dial on "Inherit" to use this video's global value for it.</p>
+        <div className="dial-grid">
+          <SceneDialRow label="Visual Interpretation" hint="Literal ↔ Creative" value={dials.visualInterpretation} globalValue={globalDials.visualInterpretation} onChange={(value) => onChange({ visualInterpretation: value })} />
+          <SceneDialRow label="Visual Metaphor" hint="Literal ↔ Symbolic" value={dials.visualMetaphor} globalValue={globalDials.visualMetaphor} onChange={(value) => onChange({ visualMetaphor: value })} />
+          <SceneDialRow label="Cinematic Intensity" hint="Documentary ↔ Cinematic" value={dials.cinematicIntensity} globalValue={globalDials.cinematicIntensity} onChange={(value) => onChange({ cinematicIntensity: value })} />
+          <SceneDialRow label="Prompt Creativity" hint="Strict script ↔ Highly creative" value={dials.promptCreativity} globalValue={globalDials.promptCreativity} onChange={(value) => onChange({ promptCreativity: value })} />
+          <MoodRow level="scene" mood={dials.mood} moodMode={dials.moodMode} globalMood={globalMood} onChange={(mood, moodMode) => onChange({ mood, moodMode })} />
+        </div>
+        <button className="primary full" style={{marginTop:"14px"}} onClick={onClose}>Done</button>
+      </div>
+    </div>
+  );
+}
+
+function SceneDiversityConsistencyModal({ dials, globalDials, onChange, onClose }: {
+  dials: BulkVisualDialsRecord;
+  globalDials: BulkVisualDialsRecord;
+  onChange: (patch: Partial<BulkVisualDialsRecord>) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="modal bulk-modal dial-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-heading-row"><h2>Diversity &amp; Consistency — scene override</h2><button type="button" className="icon-button" aria-label="Close" onClick={onClose}><X size={16} /></button></div>
+        <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 10px"}}>Leave any dial on "Inherit" to use this video's global value for it.</p>
+        <div className="dial-grid">
+          <SceneDialRow label="Camera Angle Diversity" hint="Consistent ↔ Dynamic" value={dials.diversityCamera} globalValue={globalDials.diversityCamera} onChange={(value) => onChange({ diversityCamera: value })} />
+          <SceneDialRow label="Composition Diversity" hint="Consistent ↔ Dynamic" value={dials.diversityComposition} globalValue={globalDials.diversityComposition} onChange={(value) => onChange({ diversityComposition: value })} />
+          <SceneDialRow label="Shot Type Diversity" hint="Consistent ↔ Dynamic" value={dials.diversityShotType} globalValue={globalDials.diversityShotType} onChange={(value) => onChange({ diversityShotType: value })} />
+          <SceneDialRow label="Character Identity Strictness" hint="Flexible ↔ Strict" value={dials.consistencyCharacter} globalValue={globalDials.consistencyCharacter} onChange={(value) => onChange({ consistencyCharacter: value })} />
+          <SceneDialRow label="Location Identity Strictness" hint="Flexible ↔ Strict" value={dials.consistencyLocation} globalValue={globalDials.consistencyLocation} onChange={(value) => onChange({ consistencyLocation: value })} />
+          <SceneDialRow label="Style Strictness" hint="Flexible ↔ Strict" value={dials.consistencyStyle} globalValue={globalDials.consistencyStyle} onChange={(value) => onChange({ consistencyStyle: value })} />
+        </div>
+        <button className="primary full" style={{marginTop:"14px"}} onClick={onClose}>Done</button>
+      </div>
+    </div>
+  );
+}
+
 /** Extract Style's "which aspects to focus on" popup — grouped checkboxes
  * over the static 29-item EXTRACTABLE_STYLE_ASPECTS list from the backend. */
 const STYLE_ASPECT_GROUPS: { label: string; keys: string[] }[] = [
@@ -2382,6 +2425,10 @@ function ImagesView() {
   const [rosterModalOpen, setRosterModalOpen] = useState(false);
   const [visualDirectionModalOpen, setVisualDirectionModalOpen] = useState(false);
   const [diversityModalOpen, setDiversityModalOpen] = useState(false);
+  // Which scene's Visual Direction / Diversity & Consistency modal is
+  // open — at most one of either kind at a time, across every scene row
+  // (mirrors bulkOverrideOpenSceneId's "one scene's drawer at a time").
+  const [sceneDialModal, setSceneDialModal] = useState<{ sceneId: string; kind: "visual" | "diversity" } | null>(null);
   const [suggestingCast, setSuggestingCast] = useState(false);
   // Extract Style's selectable-aspects popup — the 29-item list is static,
   // fetched once; the user's selection persists per video via app_settings.
@@ -3600,8 +3647,8 @@ function ImagesView() {
                   rosterLocations={rosterLocations}
                   castAssignment={scene ? sceneCastAssignments.find((item) => item.sceneId === scene.id) ?? null : null}
                   onSaveCast={(characterIds, locationId) => scene && void saveCastAssignment(scene.id, characterIds, locationId)}
-                  globalDials={bulkGlobalVisualSettings.dials}
-                  globalMood={bulkGlobalVisualSettings.dials.mood}
+                  onOpenVisualDirection={() => scene && setSceneDialModal({ sceneId: scene.id, kind: "visual" })}
+                  onOpenDiversity={() => scene && setSceneDialModal({ sceneId: scene.id, kind: "diversity" })}
                 />
               );
             })}
@@ -3682,6 +3729,28 @@ function ImagesView() {
           onClose={() => setDiversityModalOpen(false)}
         />
       )}
+
+      {sceneDialModal && (() => {
+        const sceneId = sceneDialModal.sceneId;
+        const dials = bulkSceneSettings.find((item) => item.sceneId === sceneId)?.dials ?? emptyBulkVisualDials();
+        const onChange = (patch: Partial<BulkVisualDialsRecord>) => void saveSceneOverride(sceneId, { dials: { ...dials, ...patch } });
+        return sceneDialModal.kind === "visual" ? (
+          <SceneVisualDirectionModal
+            dials={dials}
+            globalDials={bulkGlobalVisualSettings.dials}
+            globalMood={bulkGlobalVisualSettings.dials.mood}
+            onChange={onChange}
+            onClose={() => setSceneDialModal(null)}
+          />
+        ) : (
+          <SceneDiversityConsistencyModal
+            dials={dials}
+            globalDials={bulkGlobalVisualSettings.dials}
+            onChange={onChange}
+            onClose={() => setSceneDialModal(null)}
+          />
+        );
+      })()}
 
       {rosterModalOpen && (
         <RosterModal

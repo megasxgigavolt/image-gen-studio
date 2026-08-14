@@ -1070,6 +1070,23 @@ function VisualPlanView() {
   const [error, setError] = useState<string | null>(null);
   const [draggedSentenceId, setDraggedSentenceId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
+  // Read (not state, so it doesn't re-render on every key press) at drop
+  // time in finishDrag — dnd-kit's DragEndEvent doesn't carry the drop
+  // moment's modifier-key state, only whichever event originally armed the
+  // drag. Holding Shift while dropping on a still's own boundary divider
+  // is the only way left to explicitly start a new scene there, now that
+  // a plain drop always just creates a new still in the current scene —
+  // see createGroup's forceNewScene parameter.
+  const shiftHeldRef = useRef(false);
+  useEffect(() => {
+    const onKeyChange = (event: KeyboardEvent) => { if (event.key === "Shift") shiftHeldRef.current = event.type === "keydown"; };
+    window.addEventListener("keydown", onKeyChange);
+    window.addEventListener("keyup", onKeyChange);
+    return () => {
+      window.removeEventListener("keydown", onKeyChange);
+      window.removeEventListener("keyup", onKeyChange);
+    };
+  }, []);
   const [confirmReset, setConfirmReset] = useState(false);
   // Sentences aren't freely editable — this only ever marks WHERE a split
   // would land (a character offset into that one sentence's own text),
@@ -1187,9 +1204,9 @@ function VisualPlanView() {
     setPlan(await projectsClient.resetVisualPlan(activeVideoId));
   }
 
-  async function createGroup(sentenceId: string, insertIndex: number) {
+  async function createGroup(sentenceId: string, insertIndex: number, forceNewScene: boolean) {
     if (!activeVideoId) return;
-    try { setPlan(await projectsClient.createPlanGroup(activeVideoId, sentenceId, insertIndex)); }
+    try { setPlan(await projectsClient.createPlanGroup(activeVideoId, sentenceId, insertIndex, forceNewScene)); }
     catch (caught) { setError(String(caught)); }
   }
 
@@ -1214,7 +1231,7 @@ function VisualPlanView() {
     if (target.startsWith("group:")) {
       void moveSentence(sentenceId, target.replace(/^group:/, ""));
     } else if (target.startsWith("divider:")) {
-      void createGroup(sentenceId, Number(target.replace(/^divider:/, "")));
+      void createGroup(sentenceId, Number(target.replace(/^divider:/, "")), shiftHeldRef.current);
     } else if (target.startsWith("sentence:")) {
       // Dropping one sentence onto another merges them — dropped-onto
       // wins as the "first" half only when it's actually the earlier one,
@@ -1284,7 +1301,7 @@ function VisualPlanView() {
   return (
     <section className="view">
       <div className="page-heading">
-        <div><h1>Visual plan</h1><p>Drag a sentence onto another to merge them, or into a still to regroup it. Click inside a sentence to mark where it should split, then confirm. Chronological order remains enforced.</p></div>
+        <div><h1>Visual plan</h1><p>Drag a sentence onto another to merge them, or into a still to regroup it. Drag it to a divider to split off a new still — hold Shift while dropping at a scene boundary to start a new scene there instead. Click inside a sentence to mark where it should split, then confirm. Chronological order remains enforced.</p></div>
         <div className="heading-actions"><button className="secondary" onClick={() => setStage("inputs")}>← Back</button><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
       </div>
       {searchOpen && (
@@ -1557,7 +1574,7 @@ function StillDivider({ insertIndex, active, sceneSeam, eligible }: { insertInde
     <div
       ref={setNodeRef}
       className={classes.join(" ")}
-      data-seam-hint={sceneSeam ? "Drop here to start a new scene" : undefined}
+      data-seam-hint={sceneSeam ? "Drop to add a new still here · hold Shift to start a new scene instead" : undefined}
       title={ineligible ? "Not a valid drop point for this sentence — it can only become a new still at its own chronological boundary" : undefined}
     />
   );

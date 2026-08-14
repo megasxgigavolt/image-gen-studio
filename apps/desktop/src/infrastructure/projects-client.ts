@@ -1504,8 +1504,8 @@ export const projectsClient = {
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
     return plan;
   },
-  async createPlanGroup(videoId: string, sentenceId: string, insertIndex: number): Promise<VisualPlanRecord> {
-    if (isTauri()) return invoke("create_plan_group", { videoId, sentenceId, insertIndex });
+  async createPlanGroup(videoId: string, sentenceId: string, insertIndex: number, forceNewScene: boolean): Promise<VisualPlanRecord> {
+    if (isTauri()) return invoke("create_plan_group", { videoId, sentenceId, insertIndex, forceNewScene });
     const plan = await this.getVisualPlan(videoId);
     const source = plan.groups.findIndex((group) => group.sentenceIds.includes(sentenceId));
     if (source < 0) throw new Error("Sentence was not found.");
@@ -1516,6 +1516,10 @@ export const projectsClient = {
     });
     plan.groups.sort((a, b) => Number(a.sentenceIds[0].slice(1)) - Number(b.sentenceIds[0].slice(1)));
     plan.groups.forEach((group, index) => { group.ordinal = index + 1; });
+    // This browser/dev fallback never had the Tauri backend's "peel into a
+    // brand new scene" behavior — forceNewScene is a no-op here, matching
+    // (not regressing behind) the new default everywhere else: the split
+    // sentence just stays in whichever scene it already belonged to.
     assignSceneIds(plan.groups, plan.scenes);
     localStorage.setItem(`${STORAGE_KEY}.plan.${videoId}`, JSON.stringify(plan));
     return plan;

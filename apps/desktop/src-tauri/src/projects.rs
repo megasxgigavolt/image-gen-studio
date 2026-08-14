@@ -10413,6 +10413,7 @@ Return JSON only:
         video_id: &str,
         sentence_id: &str,
         insert_index: usize,
+        force_new_scene: bool,
     ) -> Result<VisualPlan, String> {
         let mut groups = self.load_groups(video_id, false)?;
         let source = groups
@@ -10492,43 +10493,40 @@ Return JSON only:
         validate_group_chronology(&groups)?;
         let current = self.get_visual_plan(video_id)?;
         let mut scenes = current.scenes.clone();
-        // "Drag a sentence into the gap between two stills" only becomes a
-        // NEW scene when that gap sits exactly at a pre-existing scene seam
-        // — i.e. the new solo still's two neighbors already belong to two
-        // DIFFERENT scenes. Splitting a still in the middle of one scene
-        // (both neighbors share a scene, or the split is at the very start/
-        // end of the video with only one neighbor) just joins the ambient
-        // scene, unchanged from before this feature existed.
-        let before_scene = target.checked_sub(1)
-            .and_then(|index| groups.get(index))
-            .and_then(|group| group.sentence_ids.first())
-            .and_then(|id| scene_containing_sentence(&scenes, id));
-        let after_scene = groups.get(target + 1)
-            .and_then(|group| group.sentence_ids.first())
-            .and_then(|id| scene_containing_sentence(&scenes, id));
-        if let (Some(before_scene), Some(after_scene)) = (before_scene, after_scene) {
-            if before_scene != after_scene {
-                if let Some(departing_scene) = scene_containing_sentence(&scenes, sentence_id) {
-                    scenes[departing_scene].sentence_ids.retain(|id| id != sentence_id);
-                }
-                let next_scene_id = scenes.iter()
-                    .map(|scene| sentence_number(scene.id.trim_start_matches("sc")))
-                    .max()
-                    .unwrap_or(0)
-                    + 1;
-                scenes.push(PlanScene {
-                    id: format!("sc{next_scene_id}"),
-                    ordinal: 0,
-                    label: "Scene".into(),
-                    narrative_role: None,
-                    core_idea: None,
-                    emotional_state: None,
-                    visual_opportunities: Vec::new(),
-                    sentence_ids: vec![sentence_id.into()],
-                    expanded: true,
-                });
-                rebalance_scene_ordinals(&mut scenes);
+        // "Create a new still" defaults to staying in the still's own
+        // (ambient) scene, full stop — regardless of whether the split
+        // point also happens to sit at a pre-existing scene seam. That
+        // used to auto-promote to "start a new scene" any time the split
+        // landed at a seam, which swallowed the plain "just split this
+        // still" gesture for every scene with only one or two stills (its
+        // only valid split points ARE the seams either side of it) — this
+        // is what force_new_scene (the frontend's Shift-modifier) now
+        // exists to opt into explicitly: peel the sentence into a brand
+        // new scene at exactly this position, unconditionally. Since
+        // `scenes` is otherwise left untouched, the new still's sentence
+        // is still listed under whatever scene it always was, so
+        // assign_scene_ids below naturally keeps it there by default.
+        if force_new_scene {
+            if let Some(departing_scene) = scene_containing_sentence(&scenes, sentence_id) {
+                scenes[departing_scene].sentence_ids.retain(|id| id != sentence_id);
             }
+            let next_scene_id = scenes.iter()
+                .map(|scene| sentence_number(scene.id.trim_start_matches("sc")))
+                .max()
+                .unwrap_or(0)
+                + 1;
+            scenes.push(PlanScene {
+                id: format!("sc{next_scene_id}"),
+                ordinal: 0,
+                label: "Scene".into(),
+                narrative_role: None,
+                core_idea: None,
+                emotional_state: None,
+                visual_opportunities: Vec::new(),
+                sentence_ids: vec![sentence_id.into()],
+                expanded: true,
+            });
+            rebalance_scene_ordinals(&mut scenes);
         }
         assign_scene_ids(&mut groups, &scenes);
         self.save_plan(
@@ -13185,8 +13183,11 @@ mod tests {
 
         // s3 is the last sentence of g2 (scene 1's last still) — drop it at
         // the divider immediately after g2, which is also exactly the seam
-        // between scene 1 and scene 2.
-        let plan = repo.create_plan_group(&video.id, "s3", 2).unwrap();
+        // between scene 1 and scene 2. force_new_scene=true is the
+        // frontend's Shift-modifier: an explicit "start a new scene here"
+        // rather than the default plain split (see the sibling test below
+        // for the force=false / default behavior at the same seam).
+        let plan = repo.create_plan_group(&video.id, "s3", 2, true).unwrap();
 
         assert_eq!(plan.scenes.len(), 3, "a new scene must be inserted at the seam");
         let new_scene = plan.scenes.iter().find(|s| s.ordinal == 2).unwrap();
@@ -13219,7 +13220,8 @@ mod tests {
         // s2 is g2's only sentence (both first and last) and scene 1's last
         // still. Drop it at insert_index = source+1 = 2 — the divider AFTER
         // g2, exactly where the real seam divider sits — not source (1).
-        let plan = repo.create_plan_group(&video.id, "s2", 2).unwrap();
+        // force_new_scene=true, the Shift-modifier.
+        let plan = repo.create_plan_group(&video.id, "s2", 2, true).unwrap();
 
         assert_eq!(plan.scenes.len(), 3, "a new scene must be inserted at the seam");
         let scene1 = plan.scenes.iter().find(|s| s.ordinal == 1).unwrap();
@@ -13234,6 +13236,36 @@ mod tests {
         // group vanished) would have violated.
         let flattened: Vec<&str> = plan.groups.iter().flat_map(|g| g.sentence_ids.iter().map(String::as_str)).collect();
         assert_eq!(flattened, vec!["s1", "s2", "s3", "s4"]);
+        assert_no_group_straddles_two_scenes(&plan);
+    }
+
+    #[test]
+    fn create_plan_group_at_a_scene_seam_without_force_stays_in_the_current_scene() {
+        // The actual bug this default protects against: a scene with only
+        // one or two stills has NO valid split point that isn't also a
+        // scene seam (its only still's boundaries border neighboring
+        // scenes) — so the old "always promote to a new scene at a seam"
+        // behavior meant "create a new still" was unreachable for exactly
+        // the small scenes it's needed on most. Without force_new_scene,
+        // dropping at a seam must just split the still and keep both
+        // halves in whichever scene the sentence already belonged to.
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        seed_plan_with_scenes(&repo, &video.id, &[2, 2]); // sc1={s1,s2} g1(s1),g2(s2); sc2={s3,s4} g3(s3),g4(s4)
+
+        // Same drag as the solo-sentence seam test above, but without the
+        // Shift modifier: s2 is scene 1's last (solo) still, dropped at the
+        // divider right after it — exactly the seam with scene 2.
+        let plan = repo.create_plan_group(&video.id, "s2", 2, false).unwrap();
+
+        assert_eq!(plan.scenes.len(), 2, "no new scene should be created without force_new_scene");
+        let scene1 = plan.scenes.iter().find(|s| s.ordinal == 1).unwrap();
+        assert_eq!(scene1.sentence_ids, vec!["s1", "s2"], "s2 stays in scene 1, its ambient scene");
+        let new_group = plan.groups.iter().find(|g| g.sentence_ids == vec!["s2".to_string()]).unwrap();
+        assert_eq!(new_group.scene_id.as_deref(), Some(scene1.id.as_str()), "the new still joins scene 1, not a new scene");
+        let flattened: Vec<&str> = plan.groups.iter().flat_map(|g| g.sentence_ids.iter().map(String::as_str)).collect();
+        assert_eq!(flattened, vec!["s1", "s2", "s3", "s4"], "chronological order is unaffected");
         assert_no_group_straddles_two_scenes(&plan);
     }
 
@@ -13266,7 +13298,7 @@ mod tests {
 
         // s3 is the last sentence of g2 — drop it at the divider right
         // after g2 (between g2 and g3, both already inside the one scene).
-        let plan = repo.create_plan_group(&video.id, "s3", 2).unwrap();
+        let plan = repo.create_plan_group(&video.id, "s3", 2, false).unwrap();
 
         assert_eq!(plan.scenes.len(), 1, "splitting inside one scene must not create a new scene");
         assert_eq!(plan.scenes[0].sentence_ids, scene_before.sentence_ids, "the scene's own range is unchanged by an intra-scene split");

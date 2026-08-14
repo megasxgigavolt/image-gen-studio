@@ -2516,9 +2516,10 @@ fn create_plan_group(
     video_id: String,
     sentence_id: String,
     insert_index: usize,
+    force_new_scene: bool,
 ) -> Result<VisualPlan, String> {
     with_repository(state, |repository| {
-        repository.create_plan_group(&video_id, &sentence_id, insert_index)
+        repository.create_plan_group(&video_id, &sentence_id, insert_index, force_new_scene)
     })
 }
 

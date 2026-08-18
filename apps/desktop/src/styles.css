@@ -18,7 +18,8 @@ nav{display:grid;gap:6px;justify-items:center}
    via document.body.style.zoom — the layout keeps identical proportions on every
    screen and is simply scaled down on smaller displays, instead of reflowing. */
 @media(max-width:760px){.app-shell{grid-template-columns:1fr}.app-shell-home{grid-template-columns:1fr}.sidebar{position:fixed;z-index:5;top:auto;width:100%;height:58px;padding:6px;flex-direction:row}.sidebar .brand,.settings{display:none}.sidebar nav{width:100%;grid-template-columns:repeat(3,1fr)}.nav-item{justify-content:center}.nav-item span{display:none}.app-shell>main{grid-column:1;padding-bottom:58px}.app-shell-home>main{grid-column:1}.topbar{padding:0 15px}.topbar>div:first-child span,.topbar>div:first-child b,.saved{display:none}.view{padding:22px 15px}.launcher,.inputs-grid{grid-template-columns:1fr}.video-grid{grid-template-columns:1fr}.image-workspace{display:block;height:auto}.stills{display:flex;overflow:auto}.stills>strong,.stills button:not(.icon-button):not(.stills-scene-toggle){min-width:110px}.prompt-panel{border-left:0;border-top:1px solid var(--line)}.plan-row{grid-template-columns:28px 90px 1fr}.heading-actions{flex-wrap:wrap}}
-.channel{position:relative;display:grid;grid-template-columns:1fr auto;padding:0}.channel>button:first-child{border:0;background:transparent;color:inherit;display:grid;grid-template-columns:32px 1fr;gap:9px;align-items:center;text-align:left;padding:9px 10px;cursor:pointer}.channel>button:first-child>span{width:32px;height:32px;display:grid;place-items:center;border-radius:6px;background:#286e75;color:#fff;font-weight:800;font-size:12px}.video-card{position:relative}.video-open{display:block;width:100%;padding:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer}.empty-state{min-height:250px;border:1px dashed var(--line);border-radius:8px;background:var(--surface);display:grid;place-content:center;justify-items:center;gap:9px;text-align:center;padding:28px}.empty-state.compact{min-height:180px}.inline-error{border-left:3px solid #bd5147;background:color-mix(in srgb,#bd5147 10%,var(--surface));padding:10px 13px;margin-bottom:12px}.modal-backdrop{position:fixed;z-index:20;inset:0;background:#08110dcc;display:grid;place-items:center;padding:20px}.modal{width:min(430px,100%);background:var(--surface);color:var(--text);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);padding:22px}.modal h2{font-size:21px;margin-bottom:18px}
+.channel{position:relative;display:grid;grid-template-columns:1fr auto;padding:0}.channel>button:first-child{border:0;background:transparent;color:inherit;display:grid;grid-template-columns:32px 1fr;gap:9px;align-items:center;text-align:left;padding:9px 10px;cursor:pointer}.channel>button:first-child>span{width:32px;height:32px;display:grid;place-items:center;border-radius:6px;background:#286e75;color:#fff;font-weight:800;font-size:12px}.video-card{position:relative}.video-open{display:block;width:100%;padding:0;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer}.empty-state{min-height:250px;border:1px dashed var(--line);border-radius:8px;background:var(--surface);display:grid;place-content:center;justify-items:center;gap:9px;text-align:center;padding:28px}.empty-state.compact{min-height:180px}.inline-error{border-left:3px solid #bd5147;background:color-mix(in srgb,#bd5147 10%,var(--surface));padding:10px 13px;margin-bottom:12px}.modal-backdrop{position:fixed;z-index:20;inset:0;background:#08110dcc;display:grid;place-items:center;padding:20px}
+.modal-backdrop.confirm-backdrop{z-index:30}.modal{width:min(430px,100%);background:var(--surface);color:var(--text);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);padding:22px}.modal h2{font-size:21px;margin-bottom:18px}
 .modal-heading-row{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
 .modal-heading-row h2{margin-bottom:0}
 .modal-heading-row .icon-button{width:30px;height:30px;flex-shrink:0}.modal label{display:grid;gap:6px;font-size:12px;font-weight:700}.modal input,.modal textarea{background:var(--surface);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:10px 11px;outline:none;font-family:inherit}.modal input:focus,.modal textarea:focus{border-color:var(--brand)}.modal textarea{resize:vertical;line-height:1.4}.modal-hint{font-size:11px;color:var(--muted);font-weight:500;margin:-2px 0 1px}button:disabled{opacity:.45;cursor:not-allowed}
@@ -236,6 +237,8 @@ nav{display:grid;gap:6px;justify-items:center}
 .still-thumb .still-status-badge.generating{background:color-mix(in srgb,#3984d8 18%,var(--surface))!important;color:#2769ad!important}
 .still-thumb .still-status-badge.failed{background:color-mix(in srgb,#bd5147 15%,var(--surface))!important;color:#a53e36!important}
 .still-thumb .still-status-badge.outdated{background:color-mix(in srgb,#d77a2d 15%,var(--surface))!important;color:#a75b1c!important}
+.still-list .still-select.multi-selected .still-thumb{box-shadow:0 0 0 2px var(--brand),0 0 0 4px color-mix(in srgb,var(--brand) 25%,transparent)}
+.still-thumb .still-multi-check{position:absolute;right:5px;bottom:5px;width:17px;height:17px;background:var(--brand)!important;color:#fff!important;border-radius:50%!important;display:grid;place-items:center;box-shadow:0 1px 3px #0002}
 .workflow-tabs button{font-size:15px!important}
 .saved{font-size:13px!important}
 .topbar>div:first-child span,.topbar>div:first-child b,.topbar>div:first-child strong{font-size:15px!important}
@@ -253,9 +256,35 @@ textarea{text-align:justify!important}
 .video-art.has-preview{background:var(--surface-2)}
 .video-art img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .video-art span{position:relative;z-index:1}
-.preview>.job-status,.preview>.bulk-live-progress{position:static!important;margin:0!important;border:0!important;border-radius:0!important;box-shadow:none!important;background:var(--surface);border-bottom:1px solid var(--line)!important}
+.preview>.job-status,.preview>.bulk-live-progress,.preview>.bulk-status-bar{position:static!important;margin:0!important;border:0!important;border-radius:0!important;box-shadow:none!important;background:var(--surface);border-bottom:1px solid var(--line)!important}
 .preview>header{margin:12px 12px 0!important;border:1px solid var(--line)!important;border-radius:8px!important}
-.stills-heading{display:flex!important;justify-content:space-between;align-items:center;padding:6px 12px!important;background:var(--surface);border-bottom:1px solid var(--line);gap:8px;box-sizing:border-box;line-height:1}
+/* Single merged status bar for Bulk Generation — replaces what used to be
+   up to three stacked boxes (job-status, bulk-live-progress, and a
+   separate queue-list box) with one compact bar: a label/counts/queued-
+   toggle/actions row, a thin progress bar, and an optional collapsed-by-
+   default mini list for anything still waiting its turn. See the "preview"
+   pane in ImagesView (App.tsx) and BulkQueueMiniList. */
+.bulk-status-bar{display:flex;flex-direction:column;gap:5px;padding:8px 16px}
+.bulk-status-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.bulk-status-top strong{font-size:13px;flex-shrink:0}
+.bulk-status-top>span{color:var(--muted);font-size:12px;flex-shrink:0}
+.bulk-status-bar progress{width:100%;accent-color:var(--brand);margin:0}
+.bulk-status-actions{display:flex;gap:6px;margin-left:auto;flex-shrink:0}
+.bulk-status-actions button{padding:4px 10px;font-size:12px}
+.bulk-status-queued-toggle{display:flex;align-items:center;gap:3px;border:1px solid var(--line);background:var(--surface-2);color:var(--muted);border-radius:999px;padding:2px 9px;font-size:11px;cursor:pointer;flex-shrink:0}
+.bulk-status-queued-toggle:hover{color:var(--text);background:var(--hover)}
+/* Anchors the popover below the toggle button — position:relative here
+   (not on .bulk-status-bar, which is forced position:static!important
+   inside the preview pane, see above) so the list floats over the rest of
+   the pane instead of pushing it down. */
+.bulk-queue-popover-anchor{position:relative;display:inline-flex}
+.bulk-queue-mini-list{position:absolute;top:calc(100% + 6px);right:0;z-index:15;min-width:220px;list-style:none;margin:0;padding:8px 10px;background:var(--surface);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);display:grid;gap:6px}
+.bulk-queue-mini-list li{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;color:var(--text)}
+.bulk-queue-row-actions{display:flex;align-items:center;gap:2px}
+.stills-heading{display:flex!important;justify-content:space-between;align-items:center;padding:6px 12px!important;background:var(--surface);border-bottom:1px solid var(--line);gap:8px;box-sizing:border-box;line-height:1;position:sticky;top:0;z-index:2}
+.stills-multi-select-bar{position:sticky;bottom:0;left:0;right:0;z-index:2;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 12px;background:var(--surface);border-top:1px solid var(--line);font-size:12px;font-weight:700;color:var(--text)}
+.stills-multi-select-bar .icon-button{width:24px!important;height:24px!important;border:0!important;background:transparent!important}
+.stills-multi-select-bar .icon-button:hover{background:var(--surface-2)!important}
 .stills-heading-left{display:flex;align-items:center;gap:9px;min-width:0;overflow:hidden;line-height:1}
 .stills-heading-label{font-weight:700;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1}
 .stills-heading-count{background:var(--brand-soft);color:var(--brand);font-weight:800;font-size:12px;padding:2px 10px;border-radius:99px;flex-shrink:0;line-height:1.4}
@@ -835,6 +864,8 @@ textarea{text-align:justify!important}
 .bulk-still-thumb-button.selected .still-thumb{box-shadow:0 0 0 2px var(--brand)}
 .bulk-still-checkbox{position:absolute;left:5px;bottom:5px;width:17px;height:17px;border-radius:4px;background:var(--surface);border:1px solid var(--line);display:grid;place-items:center;color:#fff}
 .bulk-still-checkbox.checked{background:var(--brand);border-color:var(--brand)}
+.still-visualization-badge{position:absolute;right:5px;top:5px;width:17px;height:17px;background:var(--brand)!important;color:#fff!important;border-radius:50%!important;display:grid;place-items:center;box-shadow:0 1px 3px #0002}
+.bulk-visualization-apply{font-size:12px;color:var(--text);background:var(--surface);border:1px solid var(--line);border-radius:5px;padding:3px 6px}
 
 .inline-error.dismissible{display:flex;align-items:flex-start;gap:10px}
 .inline-error.dismissible span{flex:1}

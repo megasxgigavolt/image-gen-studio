@@ -865,6 +865,61 @@ CREATE TABLE IF NOT EXISTS scene_cast_assignments (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_scene_cast_assignments_scene ON scene_cast_assignments(video_id, scene_id);
 "#;
 
+/// A durable, queueable Bulk Generation request (see `BulkRequestSnapshot`).
+/// `snapshot_json` freezes every setting a request needs — style directive,
+/// creative instruction, base image settings, scope, dials, and roster/cast
+/// assignments — at the moment the user clicks Generate, so a request queued
+/// behind another one is never affected by Global Settings/Roster edits made
+/// while it waits its turn (those tables are otherwise read live, see
+/// `plan_bulk_visuals_batch`/`generate_image_render`). `position` orders the
+/// queue per video (unique together, so reordering is a simple swap);
+/// `plan_index` is the durable planning-phase cursor, replacing the old
+/// frontend-only `bulk_plan.{videoId}` app_setting. `image_jobs.
+/// bulk_request_id` links a request to the generation-phase job it spawned,
+/// once planning finishes.
+const MIGRATION_041: &str = r#"
+CREATE TABLE IF NOT EXISTS bulk_generation_requests (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    status TEXT NOT NULL CHECK(status IN ('pending','planning','generating','completed','failed','cancelled')),
+    position INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    plan_index INTEGER NOT NULL DEFAULT 0,
+    image_job_id TEXT REFERENCES image_jobs(id),
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_generation_requests_position ON bulk_generation_requests(video_id, position);
+CREATE INDEX IF NOT EXISTS idx_bulk_generation_requests_video_status ON bulk_generation_requests(video_id, status);
+ALTER TABLE image_jobs ADD COLUMN bulk_request_id TEXT REFERENCES bulk_generation_requests(id);
+"#;
+
+/// Visualization Type control: a second, independent axis from the AI's own
+/// internal `visualType` shot/framing taxonomy — this one governs the
+/// overall visual medium/format (Photograph, Illustration, Diagram, 3D
+/// Render, ...), picked from a fixed list the frontend owns (the backend
+/// only stores/relays whatever strings it's sent, see `BulkStillSettings`).
+/// `bulk_global_settings` gets a video-wide allowed list plus a hard-rule
+/// toggle (off by default — the AI decides freely, exactly as before this
+/// feature existed). `bulk_still_settings` is new: unlike
+/// `bulk_scene_settings`, it only ever holds rows that are actually
+/// overridden — a still could number in the hundreds per video, so resetting
+/// one back to "Auto" deletes its row rather than leaving an all-null one
+/// behind (see `save_bulk_still_visualization_types`).
+const MIGRATION_042: &str = r#"
+ALTER TABLE bulk_global_settings ADD COLUMN visualization_types_json TEXT;
+ALTER TABLE bulk_global_settings ADD COLUMN visualization_hard_rule INTEGER;
+CREATE TABLE IF NOT EXISTS bulk_still_settings (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    group_id TEXT NOT NULL,
+    visualization_type TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_still_settings_group ON bulk_still_settings(video_id, group_id);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -1279,6 +1334,7 @@ const PROJECT_TABLES: &[&str] = &[
     "visual_plan_meta",
     "bulk_scene_settings",
     "bulk_global_settings",
+    "bulk_still_settings",
     "roster_characters",
     "roster_locations",
     "scene_cast_assignments",
@@ -1814,6 +1870,29 @@ pub struct BulkSceneSettings {
 pub struct BulkGlobalVisualSettings {
     #[serde(default)]
     pub dials: BulkVisualDials,
+    /// Visualization Type control — a second, independent axis from the
+    /// AI's own internal `visualType` shot/framing choice (see
+    /// `MIGRATION_042`'s doc comment). Empty means unset, same idiom as
+    /// every other field here.
+    #[serde(default)]
+    pub visualization_types: Vec<String>,
+    /// Off by default: the checked `visualization_types` above have no
+    /// effect at all until this is explicitly turned on — there is no
+    /// "soft preference" tier, only "AI decides freely" or "must pick from
+    /// this list."
+    #[serde(default)]
+    pub visualization_hard_rule: bool,
+}
+
+/// One still's Visualization Type override — unlike `BulkSceneSettings`,
+/// this table only ever holds rows that are actually set (see
+/// `MIGRATION_042`'s doc comment), so there's no `Option` here: a still
+/// with no override simply has no `BulkStillSettings` entry at all.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkStillSettings {
+    pub group_id: String,
+    pub visualization_type: String,
 }
 
 /// One named entry in a video's character or location roster — see
@@ -1889,6 +1968,95 @@ pub struct BulkPlanBatchResult {
     pub total_stills: usize,
     pub last_ordinal: i64,
     pub done: bool,
+}
+
+/// Frozen settings + scope for one queued Bulk Generation request — see
+/// `MIGRATION_041`'s doc comment. Built once at enqueue time
+/// (`build_bulk_request_snapshot`) from exactly the same tables
+/// `plan_bulk_visuals_batch`/`generate_image_render` otherwise read live —
+/// the whole video's rows, not just the touched scenes/scope, so the
+/// builder itself stays trivial and no scene-id-lookup edge case can be
+/// missed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkRequestSnapshot {
+    pub style_directive: String,
+    pub creative_instruction: String,
+    pub base_settings_json: String,
+    pub group_ids: Vec<String>,
+    pub scene_settings: Vec<BulkSceneSettings>,
+    pub global_visual: BulkGlobalVisualSettings,
+    pub roster_characters: Vec<RosterCharacter>,
+    pub roster_locations: Vec<RosterLocation>,
+    pub scene_cast_assignments: Vec<SceneCastAssignment>,
+    #[serde(default)]
+    pub still_settings: Vec<BulkStillSettings>,
+}
+
+/// Wire shape for `bulk_generation_requests` — deliberately excludes
+/// `snapshot_json` (internal only, never sent to the frontend) and exposes
+/// `total_stills` (the snapshot's `group_ids` length) instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkGenerationRequest {
+    pub id: String,
+    pub video_id: String,
+    pub status: String,
+    pub position: i64,
+    pub total_stills: i64,
+    pub plan_index: i64,
+    pub image_job_id: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Raw `bulk_generation_requests` row, including `snapshot_json` — internal
+/// only (never sent to the frontend, see `BulkGenerationRequest`).
+struct BulkGenerationRequestRow {
+    id: String,
+    video_id: String,
+    status: String,
+    position: i64,
+    snapshot_json: String,
+    plan_index: i64,
+    image_job_id: Option<String>,
+    last_error: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl BulkGenerationRequestRow {
+    fn into_public(self) -> Result<BulkGenerationRequest, String> {
+        let snapshot: BulkRequestSnapshot = serde_json::from_str(&self.snapshot_json)
+            .map_err(|e| format!("Corrupt bulk request snapshot: {e}"))?;
+        Ok(BulkGenerationRequest {
+            id: self.id,
+            video_id: self.video_id,
+            status: self.status,
+            position: self.position,
+            total_stills: snapshot.group_ids.len() as i64,
+            plan_index: self.plan_index,
+            image_job_id: self.image_job_id,
+            last_error: self.last_error,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+/// What one `advance_bulk_generation_queue` call actually did — lets the
+/// frontend's queue-runner loop decide whether to keep calling immediately
+/// (more planning left to do), stop and let the existing job-polling UI take
+/// over (generation just started or is already under way), or stop entirely
+/// (nothing queued for this video).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum BulkQueueAdvanceResult {
+    Idle,
+    Planned { request_id: String, current: i64, total: i64 },
+    GenerationStarted { request_id: String, image_job_id: String },
+    GenerationInProgress { request_id: String, image_job_id: String },
 }
 
 /// Result of one `analyze_motion_graphics_batch` call — see that function's
@@ -2457,6 +2625,36 @@ impl ProjectRepository {
         self.connection.execute_batch(MIGRATION_040).map_err(|error| error.to_string())?;
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(40, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_bulk_request_id: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('image_jobs') WHERE name='bulk_request_id')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_bulk_request_id {
+            self.connection.execute_batch(MIGRATION_041).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(41, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_visualization_types: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bulk_global_settings') WHERE name='visualization_types_json')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_visualization_types {
+            self.connection.execute_batch(MIGRATION_042).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(42, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -3827,35 +4025,94 @@ Return exactly one plan for every supplied row, in the same order."#,
     /// global style directive / creative instruction (kept in
     /// `app_settings`) already behave when unset.
     pub fn get_bulk_global_settings(&self, video_id: &str) -> Result<BulkGlobalVisualSettings, String> {
-        let dials_json: Option<String> = self.connection.query_row(
-            "SELECT dials_json FROM bulk_global_settings WHERE video_id=?1",
+        let row: Option<(Option<String>, Option<String>, Option<bool>)> = self.connection.query_row(
+            "SELECT dials_json, visualization_types_json, visualization_hard_rule FROM bulk_global_settings WHERE video_id=?1",
             [video_id],
-            |row| row.get(0),
-        ).optional().map_err(|e| e.to_string())?.flatten();
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let (dials_json, visualization_types_json, visualization_hard_rule) = row.unwrap_or_default();
         Ok(BulkGlobalVisualSettings {
             dials: dials_json.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default(),
+            visualization_types: visualization_types_json.and_then(|json| serde_json::from_str(&json).ok()).unwrap_or_default(),
+            visualization_hard_rule: visualization_hard_rule.unwrap_or(false),
         })
     }
 
-    /// Upserts the video's full global dials state — same full-replace
-    /// convention as `save_bulk_scene_settings`. Character/location
-    /// identity is no longer part of this row — see
+    /// Upserts the video's full global dials + Visualization Type state —
+    /// same full-replace convention as `save_bulk_scene_settings`.
+    /// Character/location identity is no longer part of this row — see
     /// `save_scene_cast_assignment`/the roster CRUD methods.
     pub fn save_bulk_global_settings(
         &self,
         video_id: &str,
         dials: BulkVisualDials,
+        visualization_types: Vec<String>,
+        visualization_hard_rule: bool,
     ) -> Result<BulkGlobalVisualSettings, String> {
         let dials_json = if dials.is_empty() { None } else { Some(serde_json::to_string(&dials).map_err(|e| e.to_string())?) };
+        let visualization_types_json = if visualization_types.is_empty() { None } else { Some(serde_json::to_string(&visualization_types).map_err(|e| e.to_string())?) };
         self.connection.execute(
-            "INSERT INTO bulk_global_settings(video_id,dials_json,updated_at)
-             VALUES(?1,?2,?3)
+            "INSERT INTO bulk_global_settings(video_id,dials_json,visualization_types_json,visualization_hard_rule,updated_at)
+             VALUES(?1,?2,?3,?4,?5)
              ON CONFLICT(video_id) DO UPDATE SET
                 dials_json=excluded.dials_json,
+                visualization_types_json=excluded.visualization_types_json,
+                visualization_hard_rule=excluded.visualization_hard_rule,
                 updated_at=excluded.updated_at",
-            params![video_id, dials_json, Utc::now().to_rfc3339()],
+            params![video_id, dials_json, visualization_types_json, visualization_hard_rule, Utc::now().to_rfc3339()],
         ).map_err(|e| e.to_string())?;
-        Ok(BulkGlobalVisualSettings { dials })
+        Ok(BulkGlobalVisualSettings { dials, visualization_types, visualization_hard_rule })
+    }
+
+    /// Every still that has a Visualization Type override saved for this
+    /// video — see `MIGRATION_042`'s doc comment for why (unlike
+    /// `bulk_scene_settings`) this table only ever holds actually-set rows.
+    pub fn get_bulk_still_settings(&self, video_id: &str) -> Result<Vec<BulkStillSettings>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT group_id, visualization_type FROM bulk_still_settings WHERE video_id=?1 ORDER BY group_id",
+        ).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([video_id], |row| {
+            Ok(BulkStillSettings { group_id: row.get(0)?, visualization_type: row.get(1)? })
+        }).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// Applies one Visualization Type choice to every still in `group_ids`
+    /// at once (the Bulk Generation panel's "apply to current selection"
+    /// control) — `Some(type)` upserts a row per still, `None` deletes it
+    /// (resets that still back to "Auto"/inherit, see
+    /// `MIGRATION_042`'s doc comment on why this table doesn't keep
+    /// all-null rows around). Returns the video's full updated list, same
+    /// "always hand back complete state" convention as the other bulk
+    /// settings CRUD here.
+    pub fn save_bulk_still_visualization_types(
+        &self,
+        video_id: &str,
+        group_ids: &[String],
+        visualization_type: Option<&str>,
+    ) -> Result<Vec<BulkStillSettings>, String> {
+        let now = Utc::now().to_rfc3339();
+        for group_id in group_ids {
+            match visualization_type {
+                Some(value) => {
+                    self.connection.execute(
+                        "INSERT INTO bulk_still_settings(id,video_id,group_id,visualization_type,updated_at)
+                         VALUES(?1,?2,?3,?4,?5)
+                         ON CONFLICT(video_id,group_id) DO UPDATE SET
+                            visualization_type=excluded.visualization_type,
+                            updated_at=excluded.updated_at",
+                        params![Uuid::new_v4().to_string(), video_id, group_id, value, now],
+                    ).map_err(|e| e.to_string())?;
+                }
+                None => {
+                    self.connection.execute(
+                        "DELETE FROM bulk_still_settings WHERE video_id=?1 AND group_id=?2",
+                        params![video_id, group_id],
+                    ).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        self.get_bulk_still_settings(video_id)
     }
 
     pub fn extract_image_settings_from_directive(&self, directive: &str) -> Result<StyleExtraction, String> {
@@ -4696,6 +4953,57 @@ Return JSON only — no markdown, no explanation:
         selected_group_ids: &[String],
         start_index: usize,
     ) -> Result<BulkPlanBatchResult, String> {
+        self.plan_bulk_visuals_batch_impl(
+            video_id, style_directive, base_settings_json, creative_instruction,
+            selected_group_ids, start_index, None,
+        )
+    }
+
+    /// Queue-aware counterpart to `plan_bulk_visuals_batch` — plans one
+    /// batch on behalf of a durable `bulk_generation_requests` row, sourcing
+    /// every setting from that request's frozen `BulkRequestSnapshot`
+    /// instead of live tables (see `MIGRATION_041`'s doc comment for why),
+    /// and persisting the resulting progress back onto the row as its
+    /// `plan_index` — the durable planning cursor for that request.
+    pub fn plan_bulk_visuals_batch_for_request(
+        &self,
+        request_id: &str,
+    ) -> Result<BulkPlanBatchResult, String> {
+        let request = self.get_bulk_generation_request_row(request_id)?;
+        let snapshot: BulkRequestSnapshot = serde_json::from_str(&request.snapshot_json)
+            .map_err(|e| format!("Corrupt bulk request snapshot: {e}"))?;
+        let result = self.plan_bulk_visuals_batch_impl(
+            &request.video_id,
+            &snapshot.style_directive,
+            &snapshot.base_settings_json,
+            &snapshot.creative_instruction,
+            &snapshot.group_ids,
+            request.plan_index as usize,
+            Some(&snapshot),
+        )?;
+        let next_index = if result.done {
+            result.total_stills
+        } else {
+            request.plan_index as usize + result.planned_count.max(1)
+        };
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "UPDATE bulk_generation_requests SET plan_index=?1,updated_at=?2 WHERE id=?3",
+            params![next_index as i64, now, request_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(result)
+    }
+
+    fn plan_bulk_visuals_batch_impl(
+        &self,
+        video_id: &str,
+        style_directive: &str,
+        base_settings_json: &str,
+        creative_instruction: &str,
+        selected_group_ids: &[String],
+        start_index: usize,
+        snapshot: Option<&BulkRequestSnapshot>,
+    ) -> Result<BulkPlanBatchResult, String> {
         #[cfg(not(test))]
         let claude_cli = claude_cli_available();
         #[cfg(test)]
@@ -4734,6 +5042,24 @@ Return JSON only — no markdown, no explanation:
         if start_index >= total {
             return Ok(BulkPlanBatchResult { planned_count: 0, total_stills: total, last_ordinal: 0, done: true });
         }
+        // Fetched here (before row_data, rather than alongside scene_settings
+        // below) because building each row's per-still Visualization Type
+        // fields needs both, and both are video-wide (not scene-scoped), so
+        // there's no ordering dependency forcing them later. Snapshot mode
+        // sources them from the frozen snapshot, same reasoning as every
+        // other field there — see the comment further down.
+        let global_visual = match snapshot {
+            Some(s) => s.global_visual.clone(),
+            None => self.get_bulk_global_settings(video_id)?,
+        };
+        let still_settings = match snapshot {
+            Some(s) => s.still_settings.clone(),
+            None => self.get_bulk_still_settings(video_id)?,
+        };
+        let still_override_by_group: std::collections::HashMap<&str, &str> = still_settings
+            .iter()
+            .map(|s| (s.group_id.as_str(), s.visualization_type.as_str()))
+            .collect();
         let mut row_data: Vec<serde_json::Value> = Vec::with_capacity(total);
         for group in &selected_groups {
             let members: Vec<_> = group.sentence_ids.iter()
@@ -4742,7 +5068,7 @@ Return JSON only — no markdown, no explanation:
             let start = members.first().map(|s| s.start_seconds).unwrap_or(0.0);
             let end = members.last().map(|s| s.end_seconds).unwrap_or(start);
             let existing_prompt = self.list_prompt_versions(video_id, &group.id)?.into_iter().next();
-            row_data.push(json!({
+            let mut row = json!({
                 "visualPlanRowId": group.id,
                 "ordinal": group.ordinal,
                 "type": group.kind,
@@ -4754,18 +5080,40 @@ Return JSON only — no markdown, no explanation:
                 "existingSettings": existing_prompt.as_ref()
                     .and_then(|p| serde_json::from_str::<serde_json::Value>(&p.settings_json).ok()),
                 "existingPrompt": existing_prompt.as_ref().map(|p| p.user_prompt.as_str()),
-            }));
+            });
+            // Visualization Type — an independent axis from the visualType
+            // field below (overall medium/format vs. shot/content framing).
+            // Rows with no constraint (the common case) get neither field,
+            // so the row is byte-identical to before this feature existed.
+            let effective_visualization = resolve_effective_visualization(
+                still_override_by_group.get(group.id.as_str()).copied(),
+                &global_visual.visualization_types,
+                global_visual.visualization_hard_rule,
+            );
+            if effective_visualization.hard_rule {
+                if effective_visualization.types.len() == 1 {
+                    row["requiredVisualizationType"] = json!(effective_visualization.types[0]);
+                } else {
+                    row["allowedVisualizationTypes"] = json!(effective_visualization.types);
+                }
+            }
+            row_data.push(row);
         }
         // A chunk never spans two scenes (see chunk_end below), so the scene
         // the still at start_index belongs to is this whole call's scene —
         // any bulk_scene_settings override for it replaces the matching
         // global param for this call only.
         let current_scene_id = selected_groups[start_index].scene_id.clone();
-        let scene_settings = match &current_scene_id {
-            Some(id) => self.get_bulk_scene_settings(video_id)?.into_iter().find(|s| &s.scene_id == id),
-            None => None,
+        // Snapshot mode (a queued request, see `BulkRequestSnapshot`) looks
+        // these up in the frozen snapshot instead of the live tables, so a
+        // Global Settings/Roster edit made while this request waits its
+        // turn, or while an earlier batch of the SAME request already ran,
+        // can never change what the rest of this request plans.
+        let scene_settings = match (&current_scene_id, snapshot) {
+            (Some(id), Some(s)) => s.scene_settings.iter().find(|item| &item.scene_id == id).cloned(),
+            (Some(id), None) => self.get_bulk_scene_settings(video_id)?.into_iter().find(|s| &s.scene_id == id),
+            (None, _) => None,
         };
-        let global_visual = self.get_bulk_global_settings(video_id)?;
         let EffectiveBulkSettings {
             style_directive: effective_style_directive,
             creative_instruction: effective_creative_instruction,
@@ -4783,13 +5131,22 @@ Return JSON only — no markdown, no explanation:
         // resolve_effective_scene_cast. A batch with no current_scene_id
         // (a still outside any scene) simply has no assignment, so both
         // blocks below render empty, same as "consistency off" used to.
+        // Snapshot mode again sources the roster/assignment from the frozen
+        // snapshot rather than the live roster tables — see above.
         let cast = {
-            let assignment = match &current_scene_id {
-                Some(scene_id) => self.get_scene_cast_assignment(video_id, scene_id)?,
-                None => None,
+            let assignment = match (&current_scene_id, snapshot) {
+                (Some(scene_id), Some(s)) => s.scene_cast_assignments.iter().find(|a| &a.scene_id == scene_id).cloned(),
+                (Some(scene_id), None) => self.get_scene_cast_assignment(video_id, scene_id)?,
+                (None, _) => None,
             };
-            let characters = self.list_roster_characters(video_id)?;
-            let locations = self.list_roster_locations(video_id)?;
+            let characters = match snapshot {
+                Some(s) => s.roster_characters.clone(),
+                None => self.list_roster_characters(video_id)?,
+            };
+            let locations = match snapshot {
+                Some(s) => s.roster_locations.clone(),
+                None => self.list_roster_locations(video_id)?,
+            };
             resolve_effective_scene_cast(assignment.as_ref(), &characters, &locations)
         };
         // Character descriptions are real vision API calls — cached
@@ -5006,11 +5363,24 @@ Return JSON only — no markdown, no explanation:
                 effective_creative_instruction.trim()
             )
         };
+        // Only rendered if at least one row in THIS chunk actually carries a
+        // constraint — a video that never touches Visualization Type gets a
+        // prompt identical to before this feature existed, same "renders
+        // nothing" pattern as visual_director_block/diversity_controller_block.
+        let visualization_type_block = if chunk.iter().any(|row| row.get("requiredVisualizationType").is_some() || row.get("allowedVisualizationTypes").is_some()) {
+            "\n\nVISUALIZATION TYPE CONSTRAINTS — a SEPARATE axis from the visualType field below (visualType is shot/content framing; this is the overall visual MEDIUM/FORMAT — e.g. Photograph, Illustration, Diagram, 3D Render, Infographic). Check each row in \"Current batch rows to plan\" for these two optional fields:\n\
+             - A row with \"requiredVisualizationType\": that still MUST be rendered in exactly that medium — non-negotiable, overrides your own instinct for that still.\n\
+             - A row with \"allowedVisualizationTypes\": that still MUST use one of the listed media — choose whichever fits its narration best.\n\
+             - A row with neither field: choose the medium freely based on the narration, exactly as you normally would.\n\
+             Both fields are input-only — do NOT echo a visualizationType back in your JSON output; keep returning exactly the fields specified in OUTPUT FORMAT below.\n".to_string()
+        } else {
+            String::new()
+        };
         let prompt = format!(
             r#"You are an Educational Visual Director planning an entire video, not isolated stills.
 {story_context_block}
 Style directive: {effective_style_directive}
-Base image settings: {base_settings_json}{director_note}{character_block}{location_block}{visual_director_block}{diversity_controller_block}
+Base image settings: {base_settings_json}{director_note}{character_block}{location_block}{visual_director_block}{diversity_controller_block}{visualization_type_block}
 Total stills in video: {total}. This batch covers stills {} of {total} (selected for this run).
 Previously planned context (chronological; includes earlier batches and must guide continuity, emotional variety, and non-repetition): {}{video_history_block}
 
@@ -5988,6 +6358,40 @@ Return JSON only:
         user_prompt: &str,
         settings_json: &str,
     ) -> Result<ImageRender, String> {
+        self.generate_image_render_impl(video_id, group_id, prompt_version_id, system_prompt, user_prompt, settings_json, None)
+    }
+
+    /// Queue-aware counterpart to `generate_image_render` — identical except
+    /// character/location cast resolution (see below) is sourced from
+    /// `cast_override`'s frozen `BulkRequestSnapshot` instead of the live
+    /// roster/`scene_cast_assignments` tables, so a queued request's
+    /// generation phase can't be affected by a Roster edit made after it was
+    /// enqueued (e.g. while an earlier queued request is still running).
+    /// Manual/single-still generation always calls the plain function above,
+    /// which passes `None` here and is completely unaffected.
+    pub fn generate_image_render_with_cast_override(
+        &self,
+        video_id: &str,
+        group_id: &str,
+        prompt_version_id: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        settings_json: &str,
+        cast_override: &BulkRequestSnapshot,
+    ) -> Result<ImageRender, String> {
+        self.generate_image_render_impl(video_id, group_id, prompt_version_id, system_prompt, user_prompt, settings_json, Some(cast_override))
+    }
+
+    fn generate_image_render_impl(
+        &self,
+        video_id: &str,
+        group_id: &str,
+        prompt_version_id: &str,
+        system_prompt: &str,
+        user_prompt: &str,
+        settings_json: &str,
+        cast_override: Option<&BulkRequestSnapshot>,
+    ) -> Result<ImageRender, String> {
         let prompt_exists: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM prompt_versions WHERE id = ?1 AND video_id = ?2 AND group_id = ?3)",
             params![prompt_version_id, video_id, group_id],
@@ -6052,12 +6456,19 @@ Return JSON only:
         // was planned, so this reads the same assignment
         // plan_bulk_visuals_batch already resolved at planning time.
         let cast = {
-            let assignment = match &scene_id {
-                Some(id) => self.get_scene_cast_assignment(video_id, id)?,
-                None => None,
+            let assignment = match (&scene_id, cast_override) {
+                (Some(id), Some(snapshot)) => snapshot.scene_cast_assignments.iter().find(|a| &a.scene_id == id).cloned(),
+                (Some(id), None) => self.get_scene_cast_assignment(video_id, id)?,
+                (None, _) => None,
             };
-            let characters = self.list_roster_characters(video_id)?;
-            let locations = self.list_roster_locations(video_id)?;
+            let characters = match cast_override {
+                Some(snapshot) => snapshot.roster_characters.clone(),
+                None => self.list_roster_characters(video_id)?,
+            };
+            let locations = match cast_override {
+                Some(snapshot) => snapshot.roster_locations.clone(),
+                None => self.list_roster_locations(video_id)?,
+            };
             resolve_effective_scene_cast(assignment.as_ref(), &characters, &locations)
         };
         // Only the FIRST assigned character gets the one "attached
@@ -8697,8 +9108,38 @@ Return JSON only:
     /// selection always means "(re)generate this," including an
     /// already-generated still the user checked on purpose.
     pub fn create_image_job(&self, video_id: &str, group_ids: &[String]) -> Result<ImageJob, String> {
+        self.create_image_job_impl(video_id, group_ids, None)
+    }
+
+    /// Same as `create_image_job`, but links the resulting job back to the
+    /// `bulk_generation_requests` row that spawned it (see
+    /// `advance_bulk_generation_queue`), so `spawn_job_workers` can find the
+    /// request to finalize once the job reaches a terminal state, and
+    /// `generate_image_render_with_cast_override` can be used in place of
+    /// the plain live-reading generation call for this job's items.
+    pub fn create_image_job_for_bulk_request(&self, video_id: &str, group_ids: &[String], bulk_request_id: &str) -> Result<ImageJob, String> {
+        self.create_image_job_impl(video_id, group_ids, Some(bulk_request_id))
+    }
+
+    fn create_image_job_impl(&self, video_id: &str, group_ids: &[String], bulk_request_id: Option<&str>) -> Result<ImageJob, String> {
         if group_ids.is_empty() {
             return Err("No stills selected.".into());
+        }
+        // Only one non-terminal image job per video at a time — previously
+        // unenforced (nothing stopped a second `create_image_job` call from
+        // spawning a second, fully independent worker thread hitting the
+        // same Gemini quota concurrently, see `spawn_job_workers`'s own
+        // comment on why that caused real 429s). The Bulk Generation queue
+        // relies on this guard to make requests genuinely serial; it also
+        // protects the older "Auto Educational" prompt-preparation job path
+        // from colliding with a queue-driven job for the same video.
+        let active: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM image_jobs WHERE video_id=?1 AND status IN ('queued','running','paused'))",
+            [video_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if active {
+            return Err("An image job is already active for this video.".into());
         }
         let plan = self.get_visual_plan(video_id)?;
         let groups_by_id: std::collections::HashMap<&str, &PlanGroup> =
@@ -8714,8 +9155,8 @@ Return JSON only:
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         self.connection.execute(
-            "INSERT INTO image_jobs(id,video_id,status,total_items,created_at,updated_at) VALUES(?1,?2,'queued',?3,?4,?4)",
-            params![id, video_id, prompts.len() as i64, now],
+            "INSERT INTO image_jobs(id,video_id,status,total_items,created_at,updated_at,bulk_request_id) VALUES(?1,?2,'queued',?3,?4,?4,?5)",
+            params![id, video_id, prompts.len() as i64, now, bulk_request_id],
         ).map_err(|e| e.to_string())?;
         for (group_id, prompt_id) in prompts {
             self.connection.execute(
@@ -8751,6 +9192,280 @@ Return JSON only:
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
         Ok(job)
+    }
+
+    /// Builds a `BulkRequestSnapshot` from the current live tables — called
+    /// once at enqueue time (`enqueue_bulk_generation_request`) to freeze
+    /// everything a request needs before it ever waits in a queue. Snapshots
+    /// the WHOLE video's scene settings/roster/cast rows (not just the
+    /// touched scope) so the snapshot is trivially complete regardless of
+    /// which scenes the request's stills fall into.
+    pub fn build_bulk_request_snapshot(
+        &self,
+        video_id: &str,
+        style_directive: &str,
+        base_settings_json: &str,
+        creative_instruction: &str,
+        group_ids: &[String],
+    ) -> Result<BulkRequestSnapshot, String> {
+        Ok(BulkRequestSnapshot {
+            style_directive: style_directive.to_string(),
+            creative_instruction: creative_instruction.to_string(),
+            base_settings_json: base_settings_json.to_string(),
+            group_ids: group_ids.to_vec(),
+            scene_settings: self.get_bulk_scene_settings(video_id)?,
+            global_visual: self.get_bulk_global_settings(video_id)?,
+            roster_characters: self.list_roster_characters(video_id)?,
+            roster_locations: self.list_roster_locations(video_id)?,
+            scene_cast_assignments: self.get_scene_cast_assignments(video_id)?,
+            still_settings: self.get_bulk_still_settings(video_id)?,
+        })
+    }
+
+    /// Adds a new request to the back of a video's Bulk Generation queue —
+    /// the sole write path for `bulk_generation_requests` rows. `position`
+    /// is a simple always-incrementing counter per video (terminal rows keep
+    /// their old position, so this never collides with the unique index).
+    pub fn enqueue_bulk_generation_request(
+        &self,
+        video_id: &str,
+        style_directive: &str,
+        base_settings_json: &str,
+        creative_instruction: &str,
+        group_ids: &[String],
+    ) -> Result<BulkGenerationRequest, String> {
+        if group_ids.is_empty() {
+            return Err("No stills selected.".into());
+        }
+        if style_directive.trim().is_empty() {
+            return Err("Style directive cannot be empty.".into());
+        }
+        let snapshot = self.build_bulk_request_snapshot(video_id, style_directive, base_settings_json, creative_instruction, group_ids)?;
+        let snapshot_json = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
+        let next_position: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(position)+1,0) FROM bulk_generation_requests WHERE video_id=?1",
+            [video_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO bulk_generation_requests(id,video_id,status,position,snapshot_json,plan_index,created_at,updated_at) VALUES(?1,?2,'pending',?3,?4,0,?5,?5)",
+            params![id, video_id, next_position, snapshot_json, now],
+        ).map_err(|e| e.to_string())?;
+        self.get_bulk_generation_request(&id)
+    }
+
+    fn get_bulk_generation_request_row(&self, request_id: &str) -> Result<BulkGenerationRequestRow, String> {
+        self.connection.query_row(
+            "SELECT id,video_id,status,position,snapshot_json,plan_index,image_job_id,last_error,created_at,updated_at FROM bulk_generation_requests WHERE id=?1",
+            [request_id],
+            |row| Ok(BulkGenerationRequestRow {
+                id: row.get(0)?, video_id: row.get(1)?, status: row.get(2)?, position: row.get(3)?,
+                snapshot_json: row.get(4)?, plan_index: row.get(5)?, image_job_id: row.get(6)?,
+                last_error: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)?,
+            }),
+        ).map_err(|_| "Bulk generation request was not found.".to_string())
+    }
+
+    pub fn get_bulk_generation_request(&self, request_id: &str) -> Result<BulkGenerationRequest, String> {
+        self.get_bulk_generation_request_row(request_id)?.into_public()
+    }
+
+    pub fn list_bulk_generation_requests(&self, video_id: &str) -> Result<Vec<BulkGenerationRequest>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,video_id,status,position,snapshot_json,plan_index,image_job_id,last_error,created_at,updated_at FROM bulk_generation_requests WHERE video_id=?1 ORDER BY position ASC"
+        ).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([video_id], |row| Ok(BulkGenerationRequestRow {
+            id: row.get(0)?, video_id: row.get(1)?, status: row.get(2)?, position: row.get(3)?,
+            snapshot_json: row.get(4)?, plan_index: row.get(5)?, image_job_id: row.get(6)?,
+            last_error: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)?,
+        })).map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        rows.into_iter().map(|row| row.into_public()).collect()
+    }
+
+    /// Removes a request that hasn't started yet. Requests that are already
+    /// planning/generating/terminal can't be cancelled this way — stopping
+    /// an in-flight one goes through the existing job controls
+    /// (`control_image_job`) on its linked `image_job_id` instead.
+    /// Removes a request that hasn't reached the generation phase yet —
+    /// covers both a `pending` request still waiting its turn and the one
+    /// currently `planning` (this is what the frontend's "Stop" control
+    /// during the planning phase calls). Once a request is `generating` it
+    /// has its own `image_job_id`; stopping it goes through the existing
+    /// `control_image_job`("stop") on that job instead, which the worker
+    /// thread's finalize hook (see `spawn_job_workers`) turns into this
+    /// request ending up `cancelled` automatically.
+    pub fn cancel_bulk_generation_request(&self, request_id: &str) -> Result<(), String> {
+        let deleted = self.connection.execute(
+            "DELETE FROM bulk_generation_requests WHERE id=?1 AND status IN ('pending','planning')",
+            [request_id],
+        ).map_err(|e| e.to_string())?;
+        if deleted == 0 {
+            return Err("Only a request that hasn't started generating yet can be cancelled this way.".into());
+        }
+        Ok(())
+    }
+
+    /// Swaps a still-pending request's queue position with its immediate
+    /// pending neighbor. Goes through a temporary sentinel position (-1,
+    /// never otherwise used — positions are always >= 0) so the two-step
+    /// swap never collides with `idx_bulk_generation_requests_position`'s
+    /// unique index on `(video_id, position)` mid-flight.
+    pub fn reorder_bulk_generation_request(&self, request_id: &str, direction: &str) -> Result<(), String> {
+        if !matches!(direction, "up" | "down") {
+            return Err("Unknown reorder direction.".into());
+        }
+        let row = self.get_bulk_generation_request_row(request_id)?;
+        if row.status != "pending" {
+            return Err("Only a request that hasn't started yet can be reordered.".into());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id,position FROM bulk_generation_requests WHERE video_id=?1 AND status='pending' ORDER BY position ASC"
+        ).map_err(|e| e.to_string())?;
+        let pending: Vec<(String, i64)> = statement.query_map([&row.video_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        let Some(index) = pending.iter().position(|(id, _)| id == request_id) else {
+            return Err("Bulk generation request was not found.".into());
+        };
+        let neighbor_index = if direction == "up" {
+            index.checked_sub(1)
+        } else {
+            index.checked_add(1).filter(|&i| i < pending.len())
+        };
+        let Some(neighbor_index) = neighbor_index else {
+            return Ok(()); // Already at the front/back — a no-op, not an error.
+        };
+        let this_position = pending[index].1;
+        let (neighbor_id, neighbor_position) = &pending[neighbor_index];
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "UPDATE bulk_generation_requests SET position=-1,updated_at=?1 WHERE id=?2",
+            params![now, request_id],
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "UPDATE bulk_generation_requests SET position=?1,updated_at=?2 WHERE id=?3",
+            params![this_position, now, neighbor_id],
+        ).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "UPDATE bulk_generation_requests SET position=?1,updated_at=?2 WHERE id=?3",
+            params![neighbor_position, now, request_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Whose turn it is: if a request is already `planning`/`generating`
+    /// for this video, returns it unchanged (resume — never double-claims).
+    /// Otherwise atomically promotes the lowest-position `pending` request
+    /// to `planning` and returns it. Returns `None` when the queue is
+    /// empty. The `UPDATE ... WHERE status='pending'` is the actual claim —
+    /// if it affects zero rows, another caller (in principle; in practice
+    /// this is only ever called from one queue-runner effect per video plus
+    /// app-boot recovery) won the race and this call reports empty rather
+    /// than erroring.
+    fn claim_next_bulk_request(&self, video_id: &str) -> Result<Option<BulkGenerationRequestRow>, String> {
+        let active_id: Option<String> = self.connection.query_row(
+            "SELECT id FROM bulk_generation_requests WHERE video_id=?1 AND status IN ('planning','generating') ORDER BY position ASC LIMIT 1",
+            [video_id],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        if let Some(id) = active_id {
+            return self.get_bulk_generation_request_row(&id).map(Some);
+        }
+        let claimed_id: Option<String> = self.connection.query_row(
+            "SELECT id FROM bulk_generation_requests WHERE video_id=?1 AND status='pending' ORDER BY position ASC LIMIT 1",
+            [video_id],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some(id) = claimed_id else { return Ok(None); };
+        let now = Utc::now().to_rfc3339();
+        let updated = self.connection.execute(
+            "UPDATE bulk_generation_requests SET status='planning',updated_at=?1 WHERE id=?2 AND status='pending'",
+            params![now, id],
+        ).map_err(|e| e.to_string())?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        self.get_bulk_generation_request_row(&id).map(Some)
+    }
+
+    /// The single entry point the frontend's queue-runner loop calls
+    /// instead of `plan_bulk_visuals_batch` directly. Claims whichever
+    /// request is due (see `claim_next_bulk_request`), advances it by
+    /// exactly one unit of work, and reports what happened so the caller
+    /// knows whether to call again immediately (more planning left),
+    /// hand off to the existing job-polling UI (generation just started or
+    /// is already under way), or stop (queue empty).
+    pub fn advance_bulk_queue(&self, video_id: &str) -> Result<BulkQueueAdvanceResult, String> {
+        let Some(claimed) = self.claim_next_bulk_request(video_id)? else {
+            return Ok(BulkQueueAdvanceResult::Idle);
+        };
+        if claimed.status == "generating" {
+            let image_job_id = claimed.image_job_id.clone().unwrap_or_default();
+            return Ok(BulkQueueAdvanceResult::GenerationInProgress { request_id: claimed.id, image_job_id });
+        }
+        let result = self.plan_bulk_visuals_batch_for_request(&claimed.id)?;
+        if !result.done {
+            let refreshed = self.get_bulk_generation_request_row(&claimed.id)?;
+            return Ok(BulkQueueAdvanceResult::Planned {
+                request_id: claimed.id, current: refreshed.plan_index, total: result.total_stills as i64,
+            });
+        }
+        let snapshot: BulkRequestSnapshot = serde_json::from_str(&claimed.snapshot_json)
+            .map_err(|e| format!("Corrupt bulk request snapshot: {e}"))?;
+        let job = self.create_image_job_for_bulk_request(video_id, &snapshot.group_ids, &claimed.id)?;
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "UPDATE bulk_generation_requests SET status='generating',image_job_id=?1,updated_at=?2 WHERE id=?3",
+            params![job.id, now, claimed.id],
+        ).map_err(|e| e.to_string())?;
+        Ok(BulkQueueAdvanceResult::GenerationStarted { request_id: claimed.id, image_job_id: job.id })
+    }
+
+    /// Given a job id, the `bulk_generation_requests` id it's linked to, if
+    /// any — jobs from manual/single-still generation or the older "Auto
+    /// Educational" prompt-prep flow have no link and return `None`,
+    /// leaving them unaffected by everything below.
+    pub fn bulk_request_id_for_job(&self, job_id: &str) -> Result<Option<String>, String> {
+        self.connection.query_row(
+            "SELECT bulk_request_id FROM image_jobs WHERE id=?1",
+            [job_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
+    /// The frozen snapshot for a job's linked bulk generation request, if
+    /// any — `spawn_job_workers` resolves this once per claimed item and,
+    /// when present, generates via `generate_image_render_with_cast_override`
+    /// instead of the plain live-reading `generate_image_render`.
+    pub fn bulk_snapshot_for_job(&self, job_id: &str) -> Result<Option<BulkRequestSnapshot>, String> {
+        let snapshot_json: Option<String> = self.connection.query_row(
+            "SELECT r.snapshot_json FROM bulk_generation_requests r JOIN image_jobs j ON j.bulk_request_id = r.id WHERE j.id=?1",
+            [job_id],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        snapshot_json.map(|json| serde_json::from_str(&json).map_err(|e| format!("Corrupt bulk request snapshot: {e}"))).transpose()
+    }
+
+    /// Marks a bulk generation request's terminal state once its linked
+    /// image job finishes — called from `spawn_job_workers`'s worker thread
+    /// right after its claim loop exits (see `bulk_request_id_for_job`), so
+    /// the queue's completion state is durable/backend-owned regardless of
+    /// whether the frontend is open to observe it. Guarded to only affect a
+    /// row still `generating`: a job that merely paused (not a terminal
+    /// state) must leave the request alone so it can be resumed in place.
+    pub fn finalize_bulk_request(&self, request_id: &str, status: &str) -> Result<(), String> {
+        if !matches!(status, "completed" | "failed" | "cancelled") {
+            return Err("Unsupported bulk request terminal status.".into());
+        }
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "UPDATE bulk_generation_requests SET status=?1,updated_at=?2 WHERE id=?3 AND status='generating'",
+            params![status, now, request_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn image_job_status(&self, job_id: &str) -> Result<String, String> {
@@ -12031,6 +12746,32 @@ fn resolve_effective_scene_cast(
     EffectiveSceneCast { assigned_characters, assigned_location }
 }
 
+/// Resolved Visualization Type constraint for one still. `hard_rule` false
+/// (with `types` empty) means "no constraint at all" — the common case for
+/// anyone who never touches this feature, and the only possibility unless
+/// either a still override or the global hard-rule toggle is actually set;
+/// there is deliberately no "soft preference" tier in between.
+struct EffectiveVisualizationTypes {
+    types: Vec<String>,
+    hard_rule: bool,
+}
+
+fn resolve_effective_visualization(
+    still_override: Option<&str>,
+    global_types: &[String],
+    global_hard_rule: bool,
+) -> EffectiveVisualizationTypes {
+    if let Some(value) = still_override.filter(|v| !v.trim().is_empty()) {
+        // A still-level pick is always a specific, deliberate choice —
+        // unconditionally a hard rule regardless of the global toggle.
+        return EffectiveVisualizationTypes { types: vec![value.to_string()], hard_rule: true };
+    }
+    if global_hard_rule && !global_types.is_empty() {
+        return EffectiveVisualizationTypes { types: global_types.to_vec(), hard_rule: true };
+    }
+    EffectiveVisualizationTypes { types: Vec::new(), hard_rule: false }
+}
+
 /// Field-by-field layering for `BulkVisualDials`, same "scene wins if set,
 /// else fall back to global" rule as every other Bulk Generation setting.
 fn resolve_effective_dials(scene: Option<&BulkVisualDials>, global: &BulkVisualDials) -> BulkVisualDials {
@@ -12490,6 +13231,53 @@ fn request_gemini_vision(auth: &GeminiAuth, prompt: &str, mime: &str, bytes: &[u
     gemini_extract_text(&body).ok_or_else(|| "Gemini returned no vision analysis.".to_string())
 }
 
+// Each of V2PlanStillResponse's #[serde(alias = ...)] groups, most-preferred
+// spelling first — see dedupe_v2_plan_field_aliases below for why this list
+// has to exist at all.
+const V2_PLAN_FIELD_ALIAS_GROUPS: &[&[&str]] = &[
+    &["visualType", "visual_type", "type"],
+    &["imageSettings", "image_settings", "settings"],
+    &["userPrompt", "user_prompt", "prompt", "scene_prompt", "image_prompt"],
+    &["coreVisualDevice", "core_visual_device"],
+];
+
+// serde's #[serde(alias = "...")] accepts any ONE of several spellings for a
+// field — but if a model's JSON response is redundant and includes MORE THAN
+// ONE spelling for the same still (e.g. both "visualType" and "type" on the
+// same object, a real Gemini/Claude quirk on large structured-output prompts),
+// serde correctly treats that as two different source keys populating the
+// same struct field and raises a hard "duplicate field" error, even though
+// the underlying serde_json::Value the keys were parsed into never itself
+// complained (Value tolerates literal duplicate keys by keeping the last one;
+// this is TWO DIFFERENT key strings that merely alias to the same field,
+// which Value has no concept of). Rather than relying on a retry alone to
+// eventually dodge this — the same redundant-key habit can recur across
+// attempts for a given still — collapse each alias group down to at most one
+// key (kept in priority order above) before the strict typed deserialize, so
+// a redundant-but-otherwise-valid response is fixed up instead of rejected.
+fn dedupe_v2_plan_field_aliases(value: &mut serde_json::Value) {
+    let Some(plans) = value.get_mut("plans").and_then(|p| p.as_array_mut()) else { return };
+    for plan in plans {
+        let Some(obj) = plan.as_object_mut() else { continue };
+        for group in V2_PLAN_FIELD_ALIAS_GROUPS {
+            let mut keep: Option<&str> = None;
+            for key in *group {
+                if obj.contains_key(*key) {
+                    keep = Some(key);
+                    break;
+                }
+            }
+            if let Some(keep) = keep {
+                for key in *group {
+                    if *key != keep {
+                        obj.remove(*key);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Gemini sometimes returns `"plans": {...}` (single object) instead of `"plans": [{...}]`,
 // or returns the array directly without a wrapper, or returns a bare single-plan object.
 // This normalises all of those into a V2PlanChunkResponse before deserialising.
@@ -12515,6 +13303,8 @@ fn normalize_bulk_plan_response(cleaned: &str) -> Result<V2PlanChunkResponse, St
             *plans = serde_json::Value::Array(vec![obj]);
         }
     }
+
+    dedupe_v2_plan_field_aliases(&mut value);
 
     serde_json::from_value(value)
         .map_err(|e| format!("Gemini bulk plan was not valid JSON: {e}"))
@@ -12558,12 +13348,50 @@ fn run_claude_cli(prompt: &str, extra_args: &[&str]) -> Result<String, String> {
             .stderr(Stdio::piped());
         #[cfg(windows)]
         command.creation_flags(0x08000000);
-        let output = command.output().map_err(|e| format!("Could not start the Claude CLI: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut child = command.spawn().map_err(|e| format!("Could not start the Claude CLI: {e}"))?;
+        // `Command::output()` (used here previously) blocks indefinitely if the
+        // subprocess never exits — a real, observed failure mode (the CLI
+        // stalling, e.g. near a usage limit, or contending with another
+        // concurrent Claude Code session on the same machine), and one that's
+        // especially costly now that Bulk Generation queue requests resume
+        // this same call automatically on every app launch: a single stuck
+        // call used to just hang once: now it hangs the app every time it
+        // starts, with no way out except clearing the request by hand. Poll
+        // with an explicit deadline instead, so a stuck call surfaces as a
+        // normal, retryable error. Stdout/stderr are drained on separate
+        // threads concurrently with the wait (not after it) — otherwise a
+        // response larger than the OS pipe buffer would deadlock the child
+        // against an unread pipe well before this timeout ever got a chance
+        // to fire.
+        use std::io::Read;
+        let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+        let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+        let stdout_reader = std::thread::spawn(move || { let mut buf = Vec::new(); let _ = stdout_pipe.read_to_end(&mut buf); buf });
+        let stderr_reader = std::thread::spawn(move || { let mut buf = Vec::new(); let _ = stderr_pipe.read_to_end(&mut buf); buf });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = stdout_reader.join();
+                        let _ = stderr_reader.join();
+                        return Err("Claude CLI timed out after 180s — it may be stalled (e.g. a usage limit, or a conflicting Claude Code session on this machine). Try again, or add a Gemini API key in Settings as a fallback.".to_string());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => return Err(format!("Could not check the Claude CLI: {e}")),
+            }
+        };
+        let stdout_bytes = stdout_reader.join().unwrap_or_default();
+        let stderr_bytes = stderr_reader.join().unwrap_or_default();
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             return Err(format!("Claude CLI exited with an error: {}", stderr.trim()));
         }
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
         let payload: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|_| {
             format!("Claude CLI returned non-JSON output: {}", stdout.chars().take(500).collect::<String>())
         })?;
@@ -14768,6 +15596,34 @@ mod tests {
     }
 
     #[test]
+    fn normalize_bulk_plan_response_collapses_redundant_aliased_keys_instead_of_erroring() {
+        // A real Gemini failure mode: the same still redundantly includes
+        // BOTH "visualType" and "type" (both alias to V2PlanStillResponse's
+        // visual_type field) — naively deserializing this raises a hard
+        // "duplicate field" error even though the JSON itself is well-formed.
+        let raw = r#"{"plans":[{
+            "visualPlanRowId": "g1",
+            "visualType": "Character Scene",
+            "type": "Character Scene",
+            "imageSettings": {"cameraAngle": "Wide Shot"},
+            "settings": {"cameraAngle": "Wide Shot"},
+            "userPrompt": "A hiker on a ridge."
+        }]}"#;
+
+        let parsed = normalize_bulk_plan_response(raw).unwrap();
+        assert_eq!(parsed.plans.len(), 1);
+        assert_eq!(parsed.plans[0].visual_plan_row_id, "g1");
+        assert_eq!(parsed.plans[0].visual_type, "Character Scene");
+        assert_eq!(parsed.plans[0].user_prompt, "A hiker on a ridge.");
+
+        // A response with no redundancy at all is untouched — same result as
+        // before this repair pass existed.
+        let clean = r#"{"plans":[{"visualPlanRowId":"g2","visualType":"Object Focus","imageSettings":{},"userPrompt":"A lantern."}]}"#;
+        let parsed_clean = normalize_bulk_plan_response(clean).unwrap();
+        assert_eq!(parsed_clean.plans[0].visual_type, "Object Focus");
+    }
+
+    #[test]
     fn creates_and_controls_persistent_bulk_jobs() {
         let (temp, repo) = repository();
         let channel = repo.create_channel("Channel", None).unwrap();
@@ -14815,6 +15671,213 @@ mod tests {
         let workspace = repo.get_image_workspace(&video.id).unwrap();
         assert!(workspace.groups.iter().all(|group| group.prompt_versions.is_empty() && group.image_renders.is_empty() && group.educational_plan.is_none()));
         assert!(repo.latest_image_job(&video.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn create_image_job_guard_rejects_a_second_concurrent_job_for_the_same_video() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|group| group.id.clone()).collect();
+        for group in &plan.groups {
+            repo.create_prompt_version(&video.id, &group.id, "{}", "system", "scene").unwrap();
+        }
+
+        let first = repo.create_image_job(&video.id, &group_ids).unwrap();
+        assert_eq!(first.status, "queued");
+
+        // Previously nothing stopped this — two independent worker threads
+        // would both start hitting the same Gemini quota concurrently.
+        let error = repo.create_image_job(&video.id, &group_ids).unwrap_err();
+        assert!(error.contains("already active"), "got: {error}");
+
+        // Once the first job reaches a terminal state, a new one is free to start.
+        repo.set_image_job_status(&first.id, "stopped").unwrap();
+        let second = repo.create_image_job(&video.id, &group_ids).unwrap();
+        assert_ne!(second.id, first.id);
+    }
+
+    #[test]
+    fn build_bulk_request_snapshot_captures_scene_settings_roster_and_cast() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|group| group.id.clone()).collect();
+        let scene_id = plan.groups.iter().find_map(|group| group.scene_id.clone())
+            .expect("a freshly generated plan should have at least one scene");
+
+        repo.save_bulk_global_settings(&video.id, BulkVisualDials { visual_interpretation: Some(40), ..Default::default() }, Vec::new(), false).unwrap();
+        repo.save_bulk_scene_settings(&video.id, &scene_id, Some("scene style".into()), None, BulkVisualDials::default()).unwrap();
+        let character = repo.create_roster_character(&video.id, "Mira").unwrap();
+        let location = repo.create_roster_location(&video.id, "The Lighthouse").unwrap();
+        repo.save_scene_cast_assignment(&video.id, &scene_id, &[character.id.clone()], Some(&location.id)).unwrap();
+
+        let snapshot = repo.build_bulk_request_snapshot(&video.id, "Style X", "{\"aspectRatio\":\"16:9\"}", "Instruction X", &group_ids).unwrap();
+
+        assert_eq!(snapshot.style_directive, "Style X");
+        assert_eq!(snapshot.creative_instruction, "Instruction X");
+        assert_eq!(snapshot.base_settings_json, "{\"aspectRatio\":\"16:9\"}");
+        assert_eq!(snapshot.group_ids, group_ids);
+        assert_eq!(snapshot.global_visual.dials.visual_interpretation, Some(40));
+        assert_eq!(snapshot.scene_settings.iter().find(|s| s.scene_id == scene_id).unwrap().style_directive.as_deref(), Some("scene style"));
+        assert_eq!(snapshot.roster_characters.iter().map(|c| c.id.clone()).collect::<Vec<_>>(), vec![character.id.clone()]);
+        assert_eq!(snapshot.roster_locations.iter().map(|l| l.id.clone()).collect::<Vec<_>>(), vec![location.id.clone()]);
+        let assignment = snapshot.scene_cast_assignments.iter().find(|a| a.scene_id == scene_id).unwrap();
+        assert_eq!(assignment.assigned_character_ids, vec![character.id]);
+        assert_eq!(assignment.assigned_location_id.as_deref(), Some(location.id.as_str()));
+    }
+
+    #[test]
+    fn enqueue_bulk_generation_request_freezes_settings_at_enqueue_time() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|group| group.id.clone()).collect();
+
+        repo.save_bulk_global_settings(&video.id, BulkVisualDials { visual_interpretation: Some(10), ..Default::default() }, Vec::new(), false).unwrap();
+        let first = repo.enqueue_bulk_generation_request(&video.id, "Style A", "{}", "Instruction A", &group_ids).unwrap();
+        assert_eq!(first.status, "pending");
+        assert_eq!(first.total_stills, group_ids.len() as i64);
+
+        // Changed AFTER the first request was already enqueued — its frozen
+        // snapshot must never observe this, no matter when its turn comes.
+        repo.save_bulk_global_settings(&video.id, BulkVisualDials { visual_interpretation: Some(90), ..Default::default() }, Vec::new(), false).unwrap();
+        let second = repo.enqueue_bulk_generation_request(&video.id, "Style B", "{}", "Instruction B", &group_ids).unwrap();
+        assert!(second.position > first.position, "later requests must queue behind earlier ones");
+
+        let listed = repo.list_bulk_generation_requests(&video.id).unwrap();
+        assert_eq!(listed.iter().map(|r| r.id.clone()).collect::<Vec<_>>(), vec![first.id.clone(), second.id.clone()]);
+
+        let first_snapshot: BulkRequestSnapshot = serde_json::from_str(&repo.get_bulk_generation_request_row(&first.id).unwrap().snapshot_json).unwrap();
+        assert_eq!(first_snapshot.style_directive, "Style A");
+        assert_eq!(first_snapshot.global_visual.dials.visual_interpretation, Some(10));
+
+        let second_snapshot: BulkRequestSnapshot = serde_json::from_str(&repo.get_bulk_generation_request_row(&second.id).unwrap().snapshot_json).unwrap();
+        assert_eq!(second_snapshot.style_directive, "Style B");
+        assert_eq!(second_snapshot.global_visual.dials.visual_interpretation, Some(90));
+
+        assert!(repo.enqueue_bulk_generation_request(&video.id, "", "{}", "", &group_ids).is_err(), "an empty style directive must be rejected");
+        assert!(repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &[]).is_err(), "an empty scope must be rejected");
+    }
+
+    #[test]
+    fn claim_next_bulk_request_claims_lowest_position_first_and_then_resumes_it() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|group| group.id.clone()).collect();
+
+        assert!(repo.claim_next_bulk_request(&video.id).unwrap().is_none(), "an empty queue has nothing to claim");
+
+        let first = repo.enqueue_bulk_generation_request(&video.id, "Style A", "{}", "", &group_ids).unwrap();
+        let second = repo.enqueue_bulk_generation_request(&video.id, "Style B", "{}", "", &group_ids).unwrap();
+
+        let claimed = repo.claim_next_bulk_request(&video.id).unwrap().unwrap();
+        assert_eq!(claimed.id, first.id, "the lowest-position pending request must be claimed first");
+        assert_eq!(claimed.status, "planning");
+        assert_eq!(repo.get_bulk_generation_request(&second.id).unwrap().status, "pending", "the second request must not be touched until the first finishes");
+
+        // Calling again must resume the SAME request, never double-claim.
+        let resumed = repo.claim_next_bulk_request(&video.id).unwrap().unwrap();
+        assert_eq!(resumed.id, first.id);
+        assert_eq!(repo.get_bulk_generation_request(&second.id).unwrap().status, "pending");
+    }
+
+    #[test]
+    fn advance_bulk_queue_is_idle_when_nothing_is_queued() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        assert!(matches!(repo.advance_bulk_queue(&video.id).unwrap(), BulkQueueAdvanceResult::Idle));
+    }
+
+    #[test]
+    fn finalize_bulk_request_only_affects_a_row_still_generating() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|group| group.id.clone()).collect();
+
+        let request = repo.enqueue_bulk_generation_request(&video.id, "Style A", "{}", "", &group_ids).unwrap();
+        // Still 'pending' (never claimed) — a stray finalize call (e.g. a
+        // job from an unrelated, older video reusing a ready-to-recycle
+        // thread) must not be able to terminate it early.
+        repo.finalize_bulk_request(&request.id, "completed").unwrap();
+        assert_eq!(repo.get_bulk_generation_request(&request.id).unwrap().status, "pending");
+
+        let claimed = repo.claim_next_bulk_request(&video.id).unwrap().unwrap();
+        assert_eq!(claimed.status, "planning");
+        // Still 'planning' (not yet 'generating') — same guard applies.
+        repo.finalize_bulk_request(&request.id, "completed").unwrap();
+        assert_eq!(repo.get_bulk_generation_request(&request.id).unwrap().status, "planning");
+    }
+
+    #[test]
+    fn cancel_and_reorder_bulk_generation_requests() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|group| group.id.clone()).collect();
+
+        let a = repo.enqueue_bulk_generation_request(&video.id, "A", "{}", "", &group_ids).unwrap();
+        let b = repo.enqueue_bulk_generation_request(&video.id, "B", "{}", "", &group_ids).unwrap();
+        let c = repo.enqueue_bulk_generation_request(&video.id, "C", "{}", "", &group_ids).unwrap();
+        let ids = |repo: &ProjectRepository| repo.list_bulk_generation_requests(&video.id).unwrap().into_iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(ids(&repo), vec![a.id.clone(), b.id.clone(), c.id.clone()]);
+
+        // Move C to the front.
+        repo.reorder_bulk_generation_request(&c.id, "up").unwrap();
+        repo.reorder_bulk_generation_request(&c.id, "up").unwrap();
+        assert_eq!(ids(&repo), vec![c.id.clone(), a.id.clone(), b.id.clone()]);
+
+        // Already at the front — a no-op, not an error.
+        repo.reorder_bulk_generation_request(&c.id, "up").unwrap();
+        assert_eq!(ids(&repo), vec![c.id.clone(), a.id.clone(), b.id.clone()]);
+
+        // Cancelling a pending request removes it outright.
+        repo.cancel_bulk_generation_request(&a.id).unwrap();
+        assert_eq!(ids(&repo), vec![c.id.clone(), b.id.clone()]);
+
+        // Once claimed (no longer pending), it can no longer be reordered —
+        // but it CAN still be cancelled while merely `planning` (this is
+        // what the frontend's "Stop" button during the planning phase
+        // calls); only a `generating` request (its own image job already
+        // running) is excluded from this path.
+        let claimed = repo.claim_next_bulk_request(&video.id).unwrap().unwrap();
+        assert_eq!(claimed.id, c.id);
+        assert!(repo.reorder_bulk_generation_request(&c.id, "down").is_err());
+        repo.cancel_bulk_generation_request(&c.id).unwrap();
+        assert_eq!(ids(&repo), vec![b.id.clone()]);
     }
 
     fn scene_tagged_group(ordinal: i64, scene_id: Option<&str>) -> PlanGroup {
@@ -14894,6 +15957,7 @@ mod tests {
     fn resolve_effective_bulk_settings_layers_dials() {
         let global_visual = BulkGlobalVisualSettings {
             dials: BulkVisualDials { visual_interpretation: Some(40), diversity_camera: Some(70), mood: Some("Hopeful".into()), ..Default::default() },
+            ..Default::default()
         };
 
         // No scene override at all — every dial inherits from global.
@@ -15038,7 +16102,7 @@ mod tests {
         assert_eq!(repo.get_bulk_global_settings(&video.id).unwrap(), BulkGlobalVisualSettings::default());
 
         let dials = BulkVisualDials { visual_interpretation: Some(65), mood: Some("Tense Anxious".into()), ..Default::default() };
-        let saved = repo.save_bulk_global_settings(&video.id, dials.clone()).unwrap();
+        let saved = repo.save_bulk_global_settings(&video.id, dials.clone(), Vec::new(), false).unwrap();
         assert_eq!(saved.dials.visual_interpretation, Some(65));
 
         let loaded = repo.get_bulk_global_settings(&video.id).unwrap();
@@ -15047,9 +16111,62 @@ mod tests {
         // Re-saving with an empty dials struct rolls it all the way back to
         // the default shape, and upserts in place rather than creating a
         // second row.
-        let cleared = repo.save_bulk_global_settings(&video.id, BulkVisualDials::default()).unwrap();
+        let cleared = repo.save_bulk_global_settings(&video.id, BulkVisualDials::default(), Vec::new(), false).unwrap();
         assert_eq!(cleared, BulkGlobalVisualSettings::default());
         assert_eq!(repo.get_bulk_global_settings(&video.id).unwrap(), BulkGlobalVisualSettings::default());
+    }
+
+    #[test]
+    fn bulk_global_settings_visualization_types_round_trip_and_hard_rule_toggle() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+
+        let types = vec!["Photograph".to_string(), "Diagram".to_string()];
+        let saved = repo.save_bulk_global_settings(&video.id, BulkVisualDials::default(), types.clone(), true).unwrap();
+        assert_eq!(saved.visualization_types, types);
+        assert!(saved.visualization_hard_rule);
+        assert_eq!(repo.get_bulk_global_settings(&video.id).unwrap(), saved);
+
+        // Types can stay checked while the hard rule is switched off —
+        // resolve_effective_visualization (not this round trip) is what
+        // makes them inert in that state, not the storage layer.
+        let toggled_off = repo.save_bulk_global_settings(&video.id, BulkVisualDials::default(), types.clone(), false).unwrap();
+        assert_eq!(toggled_off.visualization_types, types);
+        assert!(!toggled_off.visualization_hard_rule);
+    }
+
+    #[test]
+    fn resolve_effective_visualization_layers_still_override_over_global_hard_rule() {
+        // Nothing set anywhere — no constraint at all.
+        let none = resolve_effective_visualization(None, &[], false);
+        assert!(none.types.is_empty());
+        assert!(!none.hard_rule);
+
+        // Global types checked but the hard-rule toggle is OFF — per the
+        // user's explicit choice, this must be completely inert, not a soft
+        // preference.
+        let global_types = vec!["Photograph".to_string(), "Diagram".to_string()];
+        let toggle_off = resolve_effective_visualization(None, &global_types, false);
+        assert!(toggle_off.types.is_empty());
+        assert!(!toggle_off.hard_rule);
+
+        // Global hard rule ON — restricts to the checked list.
+        let toggle_on = resolve_effective_visualization(None, &global_types, true);
+        assert_eq!(toggle_on.types, global_types);
+        assert!(toggle_on.hard_rule);
+
+        // A still-level override wins outright, even over an active global
+        // hard rule naming different types.
+        let still_wins = resolve_effective_visualization(Some("Illustration"), &global_types, true);
+        assert_eq!(still_wins.types, vec!["Illustration".to_string()]);
+        assert!(still_wins.hard_rule);
+
+        // A blank still override (defensive — shouldn't happen via the
+        // storage layer, which never persists an empty string) is treated
+        // as unset, same as every other "blank = not overridden" field.
+        let blank_override = resolve_effective_visualization(Some("   "), &global_types, true);
+        assert_eq!(blank_override.types, global_types);
     }
 
     #[test]
@@ -15077,6 +16194,37 @@ mod tests {
         let updated = repo.save_bulk_scene_settings(&video.id, "sc1", None, Some("scene rule".into()), BulkVisualDials::default()).unwrap();
         assert_eq!(updated.style_directive, None);
         assert_eq!(repo.get_bulk_scene_settings(&video.id).unwrap().len(), 1, "upsert must not create a second row");
+    }
+
+    #[test]
+    fn bulk_still_visualization_types_apply_to_selection_and_clear_deletes_the_row() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+
+        assert!(repo.get_bulk_still_settings(&video.id).unwrap().is_empty());
+
+        // Applying to several stills at once (the "apply to current
+        // selection" UI) is one call, not one round trip per still.
+        let group_ids = vec!["g1".to_string(), "g2".to_string()];
+        let saved = repo.save_bulk_still_visualization_types(&video.id, &group_ids, Some("Diagram")).unwrap();
+        assert_eq!(saved.len(), 2);
+        assert!(saved.iter().all(|s| s.visualization_type == "Diagram"));
+
+        // Re-applying to just one of them upserts in place rather than
+        // creating a second row for that still.
+        let updated = repo.save_bulk_still_visualization_types(&video.id, &["g1".to_string()], Some("Photograph")).unwrap();
+        assert_eq!(updated.len(), 2, "still only 2 rows total, not 3");
+        assert_eq!(updated.iter().find(|s| s.group_id == "g1").unwrap().visualization_type, "Photograph");
+        assert_eq!(updated.iter().find(|s| s.group_id == "g2").unwrap().visualization_type, "Diagram");
+
+        // Unlike bulk_scene_settings, resetting back to "Auto" (None)
+        // deletes the row entirely rather than leaving it behind all-null —
+        // this table can have one row per still, so dead rows shouldn't
+        // accumulate.
+        let cleared = repo.save_bulk_still_visualization_types(&video.id, &["g1".to_string()], None).unwrap();
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].group_id, "g2");
     }
 
     #[test]
@@ -15145,7 +16293,7 @@ mod tests {
         // in use before the roster existed.
         repo.save_app_setting(&format!("global_reference_asset.{}", video.id), "legacy-char-asset").unwrap();
         repo.save_app_setting(&format!("character_description.{}", video.id), "a legacy character description").unwrap();
-        repo.save_bulk_global_settings(&video.id, BulkVisualDials::default()).unwrap();
+        repo.save_bulk_global_settings(&video.id, BulkVisualDials::default(), Vec::new(), false).unwrap();
         repo.connection.execute(
             "UPDATE bulk_global_settings SET location_reference_asset_id='legacy-loc-asset' WHERE video_id=?1",
             [&video.id],

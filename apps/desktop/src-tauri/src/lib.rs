@@ -2,7 +2,8 @@ mod projects;
 
 use base64::Engine;
 use projects::{
-    AnimationJob, BulkGlobalVisualSettings, BulkSceneSettings, BulkVisualDials, CaptionSet, Channel,
+    AnimationJob, BulkGenerationRequest, BulkGlobalVisualSettings, BulkQueueAdvanceResult,
+    BulkSceneSettings, BulkStillSettings, BulkVisualDials, CaptionSet, Channel,
     ExportJob, ExportResult, ExportSettings, ImageJob, ImageRender, ImageWorkspace, InputAsset,
     MediaLibraryAsset, ProjectRepository, ProviderKeyStatus, PromptVersion, ResumeState,
     RosterCharacter, RosterLocation, SceneCastAssignment, StyleAspect, Timeline,
@@ -1670,6 +1671,12 @@ fn spawn_job_workers(
             let Ok(repository) = ProjectRepository::open(&database_path, &projects_dir) else {
                 return;
             };
+            // Resolved once for the whole job (it's tied to whichever bulk
+            // generation request spawned this job, fixed at creation time,
+            // see `create_image_job_for_bulk_request`) — `None` for manual
+            // single-still jobs and the older "Auto Educational" prompt-prep
+            // flow, which generate exactly as they always have.
+            let bulk_snapshot = repository.bulk_snapshot_for_job(&job_id).ok().flatten();
             // One automatic extra pass over anything that ends up 'failed' during this
             // run, once the normal queue empties — a still that hit a real rate-limit
             // 429 earlier may well succeed once retried after the rest of the batch has
@@ -1699,14 +1706,26 @@ fn spawn_job_workers(
                     ) {
                         break;
                     }
-                    match repository.generate_image_render(
-                        &video_id,
-                        &group_id,
-                        &prompt.id,
-                        &prompt.system_prompt,
-                        &prompt.user_prompt,
-                        &prompt.settings_json,
-                    ) {
+                    let generated = match &bulk_snapshot {
+                        Some(snapshot) => repository.generate_image_render_with_cast_override(
+                            &video_id,
+                            &group_id,
+                            &prompt.id,
+                            &prompt.system_prompt,
+                            &prompt.user_prompt,
+                            &prompt.settings_json,
+                            snapshot,
+                        ),
+                        None => repository.generate_image_render(
+                            &video_id,
+                            &group_id,
+                            &prompt.id,
+                            &prompt.system_prompt,
+                            &prompt.user_prompt,
+                            &prompt.settings_json,
+                        ),
+                    };
+                    match generated {
                         Ok(render) => {
                             render_id = Some(render.id);
                             break;
@@ -1765,6 +1784,24 @@ fn spawn_job_workers(
                 }
                 thread::sleep(Duration::from_secs(1));
             }
+            // If this job belongs to a Bulk Generation queue request, tell
+            // it what happened so the queue can advance to the next pending
+            // request — but only when the job actually reached a genuine
+            // terminal state. A merely 'paused' job (loop exited because the
+            // user paused it, not because it finished) must NOT finalize the
+            // request: it stays 'generating' so the existing job-status UI's
+            // Resume button can pick this same job back up in place.
+            if let Ok(Some(request_id)) = repository.bulk_request_id_for_job(&job_id) {
+                let terminal_status = match repository.image_job_status(&job_id).ok().as_deref() {
+                    Some("completed") => Some("completed"),
+                    Some("failed") => Some("failed"),
+                    Some("stopped") => Some("cancelled"),
+                    _ => None,
+                };
+                if let Some(status) = terminal_status {
+                    let _ = repository.finalize_bulk_request(&request_id, status);
+                }
+            }
         });
     }
 }
@@ -1820,6 +1857,82 @@ fn control_image_job(
         spawn_job_workers(paths.0, paths.1, job.id.clone());
     }
     Ok(job)
+}
+
+#[tauri::command]
+fn enqueue_bulk_generation_request(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    style_directive: String,
+    base_settings_json: String,
+    creative_instruction: String,
+    group_ids: Vec<String>,
+) -> Result<BulkGenerationRequest, String> {
+    with_repository(state, |repository| {
+        repository.enqueue_bulk_generation_request(&video_id, &style_directive, &base_settings_json, &creative_instruction, &group_ids)
+    })
+}
+
+#[tauri::command]
+fn list_bulk_generation_requests(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Vec<BulkGenerationRequest>, String> {
+    with_repository(state, |repository| repository.list_bulk_generation_requests(&video_id))
+}
+
+#[tauri::command]
+fn cancel_bulk_generation_request(
+    state: State<'_, RepositoryState>,
+    request_id: String,
+) -> Result<(), String> {
+    with_repository(state, |repository| repository.cancel_bulk_generation_request(&request_id))
+}
+
+#[tauri::command]
+fn reorder_bulk_generation_request(
+    state: State<'_, RepositoryState>,
+    request_id: String,
+    direction: String,
+) -> Result<(), String> {
+    with_repository(state, |repository| repository.reorder_bulk_generation_request(&request_id, &direction))
+}
+
+// The frontend queue-runner's single entry point (see `runQueueRunner` in
+// App.tsx) — called in a loop instead of `plan_bulk_visuals_batch` directly
+// whenever a video's Bulk Generation queue is non-empty. Only the
+// `GenerationStarted` outcome needs to spawn workers here (mirroring
+// `create_image_job` above) since `ProjectRepository::advance_bulk_queue`
+// already did everything else (claiming, planning one batch, or creating
+// the image job) inside the repository/DB layer.
+#[tauri::command]
+async fn advance_bulk_generation_queue(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<BulkQueueAdvanceResult, String> {
+    // Mirrors plan_bulk_visuals_batch above: when the claimed request is
+    // still `planning`, `advance_bulk_queue` makes a real, possibly
+    // many-second AI call. Doing that while holding the shared
+    // RepositoryState mutex (the earlier, broken version of this command)
+    // freezes every other Tauri command in the app — including the ones the
+    // UI needs just to render — for the duration of that call, which reads
+    // as the whole window "Not Responding". Grab only the DB paths through
+    // the shared lock, then do the actual work on a blocking thread against
+    // its own independent connection, exactly like every other
+    // network-calling command already does.
+    let (database_path, projects_dir) =
+        with_repository(state, |repository| Ok(repository.paths()))?;
+    let (result, paths) = tauri::async_runtime::spawn_blocking(move || {
+        let repository = ProjectRepository::open(&database_path, &projects_dir)?;
+        let result = repository.advance_bulk_queue(&video_id)?;
+        Ok::<_, String>((result, repository.paths()))
+    })
+    .await
+    .map_err(|e| format!("Bulk Generation queue stopped unexpectedly: {e}"))??;
+    if let BulkQueueAdvanceResult::GenerationStarted { image_job_id, .. } = &result {
+        spawn_job_workers(paths.0, paths.1, image_job_id.clone());
+    }
+    Ok(result)
 }
 
 // Mirrors `spawn_job_workers` exactly, but each attempt is a full Veo
@@ -2677,8 +2790,32 @@ fn save_bulk_global_settings(
     state: State<'_, RepositoryState>,
     video_id: String,
     dials: BulkVisualDials,
+    visualization_types: Vec<String>,
+    visualization_hard_rule: bool,
 ) -> Result<BulkGlobalVisualSettings, String> {
-    with_repository(state, |repository| repository.save_bulk_global_settings(&video_id, dials))
+    with_repository(state, |repository| {
+        repository.save_bulk_global_settings(&video_id, dials, visualization_types, visualization_hard_rule)
+    })
+}
+
+#[tauri::command]
+fn get_bulk_still_settings(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Vec<BulkStillSettings>, String> {
+    with_repository(state, |repository| repository.get_bulk_still_settings(&video_id))
+}
+
+#[tauri::command]
+fn save_bulk_still_visualization_types(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_ids: Vec<String>,
+    visualization_type: Option<String>,
+) -> Result<Vec<BulkStillSettings>, String> {
+    with_repository(state, |repository| {
+        repository.save_bulk_still_visualization_types(&video_id, &group_ids, visualization_type.as_deref())
+    })
 }
 
 #[tauri::command]
@@ -2934,6 +3071,8 @@ pub fn run() {
             save_bulk_scene_settings,
             get_bulk_global_settings,
             save_bulk_global_settings,
+            get_bulk_still_settings,
+            save_bulk_still_visualization_types,
             list_roster_characters,
             create_roster_character,
             rename_roster_character,
@@ -2962,6 +3101,11 @@ pub fn run() {
             pending_still_ids,
             get_latest_image_job,
             control_image_job,
+            enqueue_bulk_generation_request,
+            list_bulk_generation_requests,
+            cancel_bulk_generation_request,
+            reorder_bulk_generation_request,
+            advance_bulk_generation_queue,
             create_animation_job,
             suggest_animation_prompt,
             explain_motion_graphic_choice,

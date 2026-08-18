@@ -117,10 +117,26 @@ export type BulkSceneSettingsRecord = {
 // sceneId, since a scene layers its own version of this on top.
 export type BulkGlobalVisualSettingsRecord = {
   dials: BulkVisualDialsRecord;
+  // Visualization Type control — a second, independent axis from the AI's
+  // own internal visualType (shot/content framing) choice: this one governs
+  // overall visual medium/format (Photograph, Illustration, Diagram, ...).
+  // visualizationHardRule is off by default, and the checked types below
+  // have NO effect at all until it's turned on — there is no "soft
+  // preference" in between.
+  visualizationTypes: string[];
+  visualizationHardRule: boolean;
 };
 export function emptyBulkGlobalVisualSettings(): BulkGlobalVisualSettingsRecord {
-  return { dials: emptyBulkVisualDials() };
+  return { dials: emptyBulkVisualDials(), visualizationTypes: [], visualizationHardRule: false };
 }
+
+// One still's Visualization Type override — unlike BulkSceneSettingsRecord,
+// only ever exists for a still that actually has one set (see the backend's
+// MIGRATION_042 doc comment), so there's no null case here.
+export type BulkStillSettingsRecord = {
+  groupId: string;
+  visualizationType: string;
+};
 
 // One named entry in a video's character or location roster — replaces the
 // old single global/scene character+location reference model. Characters
@@ -281,6 +297,40 @@ export type ImageJobRecord = {
   updatedAt: string;
   items: { id: string; groupId: string; promptVersionId: string; status: string; attempts: number; lastError: string | null; renderId: string | null }[];
 };
+
+/** One entry in a video's Bulk Generation queue — see `enqueueBulkGenerationRequest`.
+ * `snapshot_json` (style directive, creative instruction, base image settings,
+ * scope, dials, roster/cast assignments — everything frozen at the moment
+ * Generate was clicked) is intentionally not part of the wire shape; only
+ * `totalStills` (its length) is exposed. Requests run strictly one at a time
+ * per video — `pending` ones wait, `planning`/`generating` is whichever one
+ * is currently active, and only a `pending` request can be cancelled or
+ * reordered (an active one is controlled via its `imageJobId` and the
+ * existing `controlImageJob`, once generation has started). */
+export type BulkGenerationRequestRecord = {
+  id: string;
+  videoId: string;
+  status: "pending" | "planning" | "generating" | "completed" | "failed" | "cancelled";
+  position: number;
+  totalStills: number;
+  planIndex: number;
+  imageJobId: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** What one `advanceBulkGenerationQueue` call did — drives the queue-runner
+ * loop (see `runQueueRunner` in App.tsx): keep calling on `"planned"` (more
+ * planning left for the active request), stop and let the existing
+ * job-status UI take over on `"generationStarted"`/`"generationInProgress"`,
+ * or stop entirely on `"idle"`. */
+export type BulkQueueAdvanceResultRecord =
+  | { kind: "idle" }
+  | { kind: "planned"; requestId: string; current: number; total: number }
+  | { kind: "generationStarted"; requestId: string; imageJobId: string }
+  | { kind: "generationInProgress"; requestId: string; imageJobId: string };
+
 export type ExportResultRecord = { path: string; fileCount: number };
 export type MotionPreset =
   | "none"
@@ -1253,6 +1303,38 @@ export const projectsClient = {
     if (isTauri()) return invoke("control_image_job", { jobId, action });
     throw new Error("Bulk jobs require the native application.");
   },
+  /** Adds a new request to the back of a video's Bulk Generation queue —
+   * freezes style directive, creative instruction, base image settings, and
+   * scope (`groupIds`) into a durable snapshot immediately, along with the
+   * video's current dials/roster/cast assignments, so later edits to Global
+   * Settings/Roster can never bleed into an already-queued request. */
+  async enqueueBulkGenerationRequest(
+    videoId: string, styleDirective: string, baseSettingsJson: string, creativeInstruction: string, groupIds: string[],
+  ): Promise<BulkGenerationRequestRecord> {
+    if (isTauri()) return invoke("enqueue_bulk_generation_request", { videoId, styleDirective, baseSettingsJson, creativeInstruction, groupIds });
+    throw new Error("Bulk generation requires the native application.");
+  },
+  async listBulkGenerationRequests(videoId: string): Promise<BulkGenerationRequestRecord[]> {
+    if (isTauri()) return invoke("list_bulk_generation_requests", { videoId });
+    return [];
+  },
+  /** Only a request that hasn't started yet (`status === "pending"`) can be
+   * cancelled this way — an active one is stopped via `controlImageJob` on
+   * its `imageJobId` instead. */
+  async cancelBulkGenerationRequest(requestId: string): Promise<void> {
+    if (isTauri()) return invoke("cancel_bulk_generation_request", { requestId });
+    throw new Error("Bulk generation requires the native application.");
+  },
+  async reorderBulkGenerationRequest(requestId: string, direction: "up" | "down"): Promise<void> {
+    if (isTauri()) return invoke("reorder_bulk_generation_request", { requestId, direction });
+    throw new Error("Bulk generation requires the native application.");
+  },
+  /** The queue-runner's single entry point — call in a loop while a video's
+   * queue is non-empty (see `runQueueRunner` in App.tsx). */
+  async advanceBulkGenerationQueue(videoId: string): Promise<BulkQueueAdvanceResultRecord> {
+    if (isTauri()) return invoke("advance_bulk_generation_queue", { videoId });
+    throw new Error("Bulk generation requires the native application.");
+  },
   async createAnimationJob(videoId: string, clipId: string, resolution: VeoResolution, prompt: string): Promise<AnimationJobRecord> {
     if (isTauri()) return invoke("create_animation_job", { videoId, clipId, resolution, prompt });
     throw new Error("Animation generation requires the native application.");
@@ -1600,11 +1682,35 @@ export const projectsClient = {
     const raw = localStorage.getItem(`${STORAGE_KEY}.bulkGlobalSettings.${videoId}`);
     return raw ? (JSON.parse(raw) as BulkGlobalVisualSettingsRecord) : emptyBulkGlobalVisualSettings();
   },
-  async saveBulkGlobalSettings(videoId: string, dials: BulkVisualDialsRecord): Promise<BulkGlobalVisualSettingsRecord> {
-    if (isTauri()) return invoke("save_bulk_global_settings", { videoId, dials });
-    const record: BulkGlobalVisualSettingsRecord = { dials };
+  async saveBulkGlobalSettings(
+    videoId: string, dials: BulkVisualDialsRecord,
+    visualizationTypes: string[], visualizationHardRule: boolean,
+  ): Promise<BulkGlobalVisualSettingsRecord> {
+    if (isTauri()) return invoke("save_bulk_global_settings", { videoId, dials, visualizationTypes, visualizationHardRule });
+    const record: BulkGlobalVisualSettingsRecord = { dials, visualizationTypes, visualizationHardRule };
     localStorage.setItem(`${STORAGE_KEY}.bulkGlobalSettings.${videoId}`, JSON.stringify(record));
     return record;
+  },
+  async getBulkStillSettings(videoId: string): Promise<BulkStillSettingsRecord[]> {
+    if (isTauri()) return invoke("get_bulk_still_settings", { videoId });
+    const raw = localStorage.getItem(`${STORAGE_KEY}.bulkStillSettings.${videoId}`);
+    return raw ? (JSON.parse(raw) as BulkStillSettingsRecord[]) : [];
+  },
+  /** Applies one Visualization Type choice to every still in `groupIds` at
+   * once (the Bulk Generation panel's "apply to current selection"
+   * control) — `visualizationType: null` resets those stills back to
+   * "Auto"/inherit. Returns the video's full updated list. */
+  async saveBulkStillVisualizationTypes(
+    videoId: string, groupIds: string[], visualizationType: string | null,
+  ): Promise<BulkStillSettingsRecord[]> {
+    if (isTauri()) return invoke("save_bulk_still_visualization_types", { videoId, groupIds, visualizationType });
+    const key = `${STORAGE_KEY}.bulkStillSettings.${videoId}`;
+    const all = await this.getBulkStillSettings(videoId);
+    const groupIdSet = new Set(groupIds);
+    const kept = all.filter((item) => !groupIdSet.has(item.groupId));
+    const next = visualizationType ? [...kept, ...groupIds.map((groupId) => ({ groupId, visualizationType }))] : kept;
+    localStorage.setItem(key, JSON.stringify(next));
+    return next;
   },
   // Character/location roster — replaces the old single global/scene
   // reference model. No browser/dev localStorage fallback for these (the

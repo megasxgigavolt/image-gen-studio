@@ -33,6 +33,7 @@ import {
   Scissors,
   Users,
   MapPin,
+  Tag,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -69,10 +70,12 @@ import {
   type ImageWorkspaceRecord,
   type ImageWorkspaceGroupRecord,
   type ImageJobRecord,
+  type BulkGenerationRequestRecord,
   type ImageRenderRecord,
   type PlanSceneRecord,
   type BulkSceneSettingsRecord,
   type BulkGlobalVisualSettingsRecord,
+  type BulkStillSettingsRecord,
   type BulkVisualDialsRecord,
   type RosterCharacterRecord,
   type RosterLocationRecord,
@@ -93,6 +96,12 @@ const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
 ];
 const MAX_CACHE_SIZE = 20;
 const imageWorkspaceCache = new Map<string, ImageWorkspaceRecord>();
+/** videoId → the user's last manual still-selection edits in the Bulk
+ * Generation panel — so reopening the panel without generating restores
+ * what was checked instead of always recomputing the default "needs
+ * generation" set. Cleared once a request is actually enqueued for that
+ * video, since the next open should start from a fresh default again. */
+const lastBulkSelection = new Map<string, Set<string>>();
 
 function setCached(key: string, value: ImageWorkspaceRecord) {
   if (imageWorkspaceCache.size >= MAX_CACHE_SIZE) {
@@ -148,7 +157,13 @@ export function ConfirmDialog({
     return () => el.removeEventListener("keydown", trap);
   }, []);
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={onCancel}>
+    // confirm-backdrop (see styles.css) always stacks above a plain
+    // modal-backdrop — a ConfirmDialog is frequently opened WHILE another
+    // modal is still showing behind it (e.g. "Add to queue?" over the Bulk
+    // Generation panel), and with both sharing the same z-index, whichever
+    // one is later in the DOM would otherwise win regardless of which is
+    // actually meant to be on top.
+    <div className="modal-backdrop confirm-backdrop" role="presentation" onMouseDown={onCancel}>
       <div ref={dialogRef} className="modal confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(e) => e.stopPropagation()}>
         <h2 id="confirm-title">{title}</h2>
         <p style={{ color: "var(--muted)", fontSize: "13px", lineHeight: 1.55, marginTop: "8px" }}>{message}</p>
@@ -1778,8 +1793,64 @@ function SceneCastPicker({ characters, locations, assignment, onSave }: {
   );
 }
 
+/** The Bulk Generation queue's "up next" list — a compact popover anchored
+ * under the "+N queued" toggle in the merged status bar (see the "preview"
+ * pane in ImagesView). Floats above the rest of the pane (absolutely
+ * positioned, see .bulk-queue-mini-list in styles.css) rather than pushing
+ * the header/preview/prompt panel down, and closes on an outside click or
+ * Escape like the app's other popovers/dialogs. Only pending (not-yet-
+ * started) requests appear here — an active one is controlled via the
+ * status bar's own controls instead. Reorder controls only render at all
+ * when there's more than one pending request to reorder — with just one,
+ * "up"/"down" would always be simultaneously disabled, which read as
+ * permanently greyed-out buttons rather than as "nothing to do yet". */
+function BulkQueueMiniList({
+  pending, onCancel, onReorder, onClose,
+}: {
+  pending: BulkGenerationRequestRecord[];
+  onCancel: (requestId: string) => void;
+  onReorder: (requestId: string, direction: "up" | "down") => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    // Checked against the whole toggle-button-plus-popover wrapper, not
+    // just this list, so a click on the toggle button itself (which sits
+    // outside this <ul>, as its sibling) isn't ALSO treated as an "outside"
+    // click — mousedown fires before the button's own onClick, so without
+    // this it would close here first and then the toggle's own handler
+    // would immediately reopen it.
+    function handlePointerDown(event: MouseEvent) {
+      if ((event.target as HTMLElement).closest?.(".bulk-queue-popover-anchor")) return;
+      onClose();
+    }
+    function handleKey(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+    document.addEventListener("mousedown", handlePointerDown);
+    window.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handlePointerDown);
+      window.removeEventListener("keydown", handleKey);
+    };
+  }, [onClose]);
+  return (
+    <ul className="bulk-queue-mini-list">
+      {pending.map((request, index) => (
+        <li key={request.id}>
+          <span>{request.totalStills} still{request.totalStills === 1 ? "" : "s"}</span>
+          <div className="bulk-queue-row-actions">
+            {pending.length > 1 && <button type="button" className="icon-button" aria-label="Move up in queue" disabled={index === 0} onClick={() => onReorder(request.id, "up")}><ChevronUp size={13} /></button>}
+            {pending.length > 1 && <button type="button" className="icon-button" aria-label="Move down in queue" disabled={index === pending.length - 1} onClick={() => onReorder(request.id, "down")}><ChevronDown size={13} /></button>}
+            <button type="button" className="icon-button" aria-label="Remove from queue" onClick={() => onCancel(request.id)}><X size={13} /></button>
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function SceneBulkRow({
-  scene, groups, selection, aspectRatio, renderUrls,
+  scene, groups, selection, stillSettings, aspectRatio, renderUrls,
   onToggleScene, onToggleStill, expanded, onToggleExpanded,
   override, overrideOpen, onToggleOverrideOpen, onSaveOverride,
   rosterCharacters, rosterLocations, castAssignment, onSaveCast,
@@ -1788,6 +1859,11 @@ function SceneBulkRow({
   scene: PlanSceneRecord | null;
   groups: (ImageWorkspaceGroupRecord & { sceneId: string | null })[];
   selection: Set<string>;
+  // Per-still Visualization Type overrides (see the selection bar's "Set
+  // visualization type…" control) — shown as a small badge on the
+  // overridden still's thumbnail so it's visible without reopening the
+  // dropdown.
+  stillSettings: BulkStillSettingsRecord[];
   aspectRatio: string;
   renderUrls: Record<string, string>;
   onToggleScene: () => void;
@@ -1873,6 +1949,7 @@ function SceneBulkRow({
             const newestRender = group.imageRenders[0];
             const thumbUrl = newestRender ? renderUrls[newestRender.id] : undefined;
             const isSelected = selection.has(group.group.id);
+            const visualizationType = stillSettings.find((item) => item.groupId === group.group.id)?.visualizationType;
             return (
               <button
                 type="button"
@@ -1880,11 +1957,12 @@ function SceneBulkRow({
                 className={`bulk-still-thumb-button${isSelected ? " selected" : ""}`}
                 onClick={() => onToggleStill(group.group.id)}
                 aria-pressed={isSelected}
-                title={`Still ${group.group.ordinal}${isSelected ? " — selected" : ""}`}
+                title={`Still ${group.group.ordinal}${isSelected ? " — selected" : ""}${visualizationType ? ` — Visualization: ${visualizationType}` : ""}`}
               >
                 <div className={`still-thumb ${aspectRatio === "9:16" ? "portrait" : "landscape"}${thumbUrl ? "" : " empty"}`}>
                   {thumbUrl ? <img src={thumbUrl} alt={`Still ${group.group.ordinal} preview`} /> : <div className="still-thumb-empty"><Image size={16} /></div>}
                   <span className="still-number">{group.group.ordinal}</span>
+                  {visualizationType && <span className="still-visualization-badge" aria-hidden="true"><Tag size={10} /></span>}
                 </div>
                 <span className={`bulk-still-checkbox${isSelected ? " checked" : ""}`} aria-hidden="true">{isSelected && <Check size={12} />}</span>
               </button>
@@ -2038,6 +2116,17 @@ function SettingSelect({ label, value, options, onChange }: { label: string; val
 }
 
 const MOOD_DIAL_OPTIONS = ["Serene Peaceful", "Tense Anxious", "Dramatic Intense", "Warm and Cozy", "Cold Distant", "Mysterious", "Cheerful Upbeat", "Melancholic", "Hopeful", "Playful", "Triumphant"];
+
+// The fixed image-medium taxonomy for Visualization Type control — a second,
+// independent axis from the AI's own internal visualType (shot/content
+// framing) choice. Owned entirely by the frontend; the backend only ever
+// stores/relays whatever strings it's sent.
+const VISUALIZATION_TYPES = [
+  "Photograph", "Cinematic Scene", "Illustration", "Character Sheet", "Storyboard",
+  "Infographic", "Diagram", "Chart / Data Visualization", "Map", "Technical Drawing",
+  "3D Render", "Concept Visualization", "Graphic Design", "Icon / Symbol", "UI / Screen",
+  "Document", "Collage / Composite", "Abstract Visual", "Pattern / Texture", "Isolated Asset",
+];
 
 /** One Visual Director / Diversity & Consistency dial at the GLOBAL level —
  * always has a real value (defaults to 50 the first time it's touched);
@@ -2375,10 +2464,60 @@ function ExtractStyleAspectsModal({ aspects, selectedKeys, onToggle, onSelectAll
   );
 }
 
+/** Global Bulk Settings' Visualization Type control — same launcher-button
+ * checkbox-grid pattern as ExtractStyleAspectsModal (reuses its
+ * .aspects-modal/.aspects-checklist CSS as-is), plus one checkbox above the
+ * grid for the hard-rule toggle itself. The checked types below have NO
+ * effect at all unless that toggle is on — there's deliberately no "soft
+ * preference" state in between (see BulkGlobalVisualSettingsRecord). */
+function VisualizationTypesModal({ types, hardRule, onChange, onClose }: {
+  types: string[];
+  hardRule: boolean;
+  onChange: (patch: Partial<Pick<BulkGlobalVisualSettingsRecord, "visualizationTypes" | "visualizationHardRule">>) => void;
+  onClose: () => void;
+}) {
+  const selected = new Set(types);
+  function toggleType(type: string) {
+    const next = new Set(selected);
+    if (next.has(type)) next.delete(type); else next.add(type);
+    onChange({ visualizationTypes: [...next] });
+  }
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="modal bulk-modal aspects-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-heading-row"><h2>Visualization Types</h2><button type="button" className="icon-button" aria-label="Close" onClick={onClose}><X size={16} /></button></div>
+        <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px"}}>A separate axis from the AI's own shot framing — this is the overall image medium (photo, illustration, diagram, ...).</p>
+        <label className="aspects-checkbox-row" style={{marginBottom:"10px"}}>
+          <input type="checkbox" checked={hardRule} onChange={(event) => onChange({ visualizationHardRule: event.target.checked })} />
+          <span>Restrict generation to only the checked types below</span>
+        </label>
+        <p style={{fontSize:"11px",color:"var(--muted)",margin:"0 0 10px"}}>{hardRule
+          ? "Every still must be rendered as one of the checked types — the AI chooses whichever fits the narration best."
+          : "Off: the AI decides each still's visual medium based on the script — the checkboxes below have no effect until this is turned on."}
+        </p>
+        <div className="aspects-select-all">
+          <button type="button" className="link-button" onClick={() => onChange({ visualizationTypes: [...VISUALIZATION_TYPES] })}>Select all</button>
+          <button type="button" className="link-button" onClick={() => onChange({ visualizationTypes: [] })}>Select none</button>
+        </div>
+        <div className="aspects-checklist">
+          {VISUALIZATION_TYPES.map((type) => (
+            <label key={type} className="aspects-checkbox-row">
+              <input type="checkbox" checked={selected.has(type)} onChange={() => toggleType(type)} />
+              <span>{type}</span>
+            </label>
+          ))}
+        </div>
+        <button className="primary full" style={{marginTop:"18px"}} onClick={onClose}>Done</button>
+      </div>
+    </div>
+  );
+}
+
 function ImagesView() {
   const { activeVideoId, addToast, setStage } = useAppStore();
   const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
+  const [multiSelectedGroupIds, setMultiSelectedGroupIds] = useState<Set<string>>(new Set());
   const [systemPrompt, setSystemPrompt] = useState("");
   const [userPrompt, setUserPrompt] = useState("");
   const [imageSettings, setImageSettings] = useState<ImageSettings>(defaultImageSettings);
@@ -2407,16 +2546,24 @@ function ImagesView() {
   const [zoom, setZoom] = useState(1);
   const [references, setReferences] = useState<import("./infrastructure/projects-client").InputAssetRecord[]>([]);
   const [bulkOpen, setBulkOpen] = useState(false);
-  const [bulkInstruction, setBulkInstruction] = useState(() => localStorage.getItem("bulk_creative_instruction") ?? "");
+  const [bulkInstruction, setBulkInstruction] = useState("");
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null);
   const [preparingGroupIds, setPreparingGroupIds] = useState<Set<string>>(new Set());
   const [promptPrepStatus, setPromptPrepStatus] = useState<"running" | "paused" | null>(null);
   const promptPrepControl = useRef<"running" | "paused" | "stopped">("stopped");
   const promptPrepTask = useRef<{ items: ImageWorkspaceRecord["groups"]; index: number } | null>(null);
+  // Drives the Bulk Generation QUEUE runner (see runQueueRunner) — the
+  // planning-phase progress bar/controls (bulkPlanStatus/bulkProgress) still
+  // mean exactly what they used to, just now sourced from whichever
+  // request is currently active in the durable, backend-owned queue
+  // instead of a single in-memory task.
   const [bulkPlanStatus, setBulkPlanStatus] = useState<"running" | "paused" | null>(null);
   const bulkPlanControl = useRef<"running" | "paused" | "stopped">("stopped");
-  type BulkPlanTask = { total: number; index: number; styleDirective: string; baseSettingsJson: string; creativeInstruction: string; groupIds: string[] };
-  const bulkPlanTask = useRef<BulkPlanTask | null>(null);
+  const [bulkQueue, setBulkQueue] = useState<BulkGenerationRequestRecord[]>([]);
+  // Collapsed by default — the merged status bar shows just a "+N queued"
+  // toggle; this expands it into the compact reorder/cancel list.
+  const [bulkQueueExpanded, setBulkQueueExpanded] = useState(false);
+  const [confirmingEnqueue, setConfirmingEnqueue] = useState(false);
   // Character/location roster + per-scene casting — replaces the old
   // single global/scene character+location reference model.
   const [rosterCharacters, setRosterCharacters] = useState<RosterCharacterRecord[]>([]);
@@ -2425,6 +2572,7 @@ function ImagesView() {
   const [rosterModalOpen, setRosterModalOpen] = useState(false);
   const [visualDirectionModalOpen, setVisualDirectionModalOpen] = useState(false);
   const [diversityModalOpen, setDiversityModalOpen] = useState(false);
+  const [visualizationTypesModalOpen, setVisualizationTypesModalOpen] = useState(false);
   // Which scene's Visual Direction / Diversity & Consistency modal is
   // open — at most one of either kind at a time, across every scene row
   // (mirrors bulkOverrideOpenSceneId's "one scene's drawer at a time").
@@ -2437,7 +2585,6 @@ function ImagesView() {
   const [selectedAspectKeys, setSelectedAspectKeys] = useState<Set<string> | null>(null);
   const [referenceUrl, setReferenceUrl] = useState("");
   const promptPrepSettingKey = activeVideoId ? `prompt_prep.${activeVideoId}` : "";
-  const bulkPlanSettingKey = activeVideoId ? `bulk_plan.${activeVideoId}` : "";
   // The old flat "Generate All Stills" modal became a scene-sectioned
   // selection panel — bulkOpen still controls that panel; bulkGlobalOpen is
   // the nested dialog holding the same Style Directive/Reference Image/
@@ -2446,6 +2593,7 @@ function ImagesView() {
   const [bulkSelection, setBulkSelection] = useState<Set<string>>(new Set());
   const [bulkSceneSettings, setBulkSceneSettings] = useState<BulkSceneSettingsRecord[]>([]);
   const [bulkGlobalVisualSettings, setBulkGlobalVisualSettings] = useState<BulkGlobalVisualSettingsRecord>(emptyBulkGlobalVisualSettings);
+  const [bulkStillSettings, setBulkStillSettings] = useState<BulkStillSettingsRecord[]>([]);
   const [bulkOverrideOpenSceneId, setBulkOverrideOpenSceneId] = useState<string | null>(null);
   // Deliberately NOT the shared visual_plan_scenes.expanded flag — the Bulk
   // Generation panel's collapse state is its own local, ephemeral thing,
@@ -2507,6 +2655,9 @@ function ImagesView() {
   useEffect(() => {
     async function loadWorkspace() {
       if (!activeVideoId) return;
+      // Switching videos should never carry a stale multi-selection
+      // referencing another video's stills over into the newly opened one.
+      setMultiSelectedGroupIds(new Set());
       const cached = imageWorkspaceCache.get(activeVideoId);
       if (cached) {
         setWorkspace(cached);
@@ -2542,6 +2693,11 @@ function ImagesView() {
         const latest = loaded.groups[0]?.promptVersions[0];
         setSystemPrompt(loaded.settings.find((s) => s.key === `system_prompt.${activeVideoId}`)?.value ?? latest?.systemPrompt ?? "");
         setUserPrompt(latest?.userPrompt ?? "");
+        // Per-video, same reasoning as systemPrompt/imageSettings above —
+        // this used to be a single localStorage key shared across every
+        // video, so a Creative Instructions note written for one video
+        // silently leaked into whichever video was opened next.
+        setBulkInstruction(loaded.settings.find((s) => s.key === `bulk_instruction.${activeVideoId}`)?.value ?? "");
         const latestRender = loaded.groups[0]?.imageRenders[0];
         setSelectedRenderId(latestRender?.id ?? null);
         const savedPrep = loaded.settings.find((setting) => setting.key === `prompt_prep.${activeVideoId}`)?.value;
@@ -2559,23 +2715,18 @@ function ImagesView() {
             }
           } catch { /* Ignore malformed legacy preparation state. */ }
         }
-        const savedBulkPlan = loaded.settings.find((setting) => setting.key === `bulk_plan.${activeVideoId}`)?.value;
-        if (savedBulkPlan) {
-          try {
-            const saved = JSON.parse(savedBulkPlan) as BulkPlanTask & { status: string };
-            if (saved.status === "paused" && saved.index < saved.total && saved.groupIds?.length) {
-              setSystemPrompt(saved.styleDirective);
-              setBulkInstruction(saved.creativeInstruction);
-              bulkPlanTask.current = {
-                total: saved.total, index: saved.index, styleDirective: saved.styleDirective,
-                baseSettingsJson: saved.baseSettingsJson, creativeInstruction: saved.creativeInstruction,
-                groupIds: saved.groupIds,
-              };
-              bulkPlanControl.current = "paused";
-              setBulkPlanStatus("paused");
-              setBulkProgress({ current: saved.index, total: saved.total, label: "Bulk Generation paused — ready to resume" });
-            }
-          } catch { /* Ignore malformed bulk-plan state. */ }
+        // Durable, backend-owned queue (see enqueueBulkGeneration/
+        // runQueueRunner) — replaces the old single `bulk_plan.{videoId}`
+        // app-setting cursor entirely. Any request left `pending` or
+        // `planning` from before the app closed just resumes on its own:
+        // `advanceBulkGenerationQueue` is safe to call unconditionally
+        // (reports "idle" if there's nothing to do), so this always
+        // reflects the queue's true state rather than requiring a manual
+        // Resume click for a run that was merely interrupted by a restart.
+        const queue = await projectsClient.listBulkGenerationRequests(activeVideoId);
+        setBulkQueue(queue);
+        if (queue.some((request) => ["pending", "planning", "generating"].includes(request.status))) {
+          void runQueueRunner();
         }
       } catch (caught) {
         setError(String(caught));
@@ -2599,6 +2750,32 @@ function ImagesView() {
     }, 1200);
     return () => window.clearInterval(timer);
   }, [activeVideoId, job, selectedGroupId, selectedRenderId]);
+
+  // Keeps the Bulk Generation queue list/hint in sync with its own status,
+  // independent of the job-status poll above. Tying this to `job` (an
+  // earlier version did) missed a real race: the background worker for a
+  // small request (e.g. 2 stills) can finish before this component's own
+  // getImageWorkspace/getLatestImageJob round trip even completes, so `job`
+  // sometimes never settles into an observably "still running" state at
+  // all — it goes straight from unset to null, and a poll gated on `job`
+  // being truthy never starts, leaving `bulkQueue` frozen at whatever it
+  // was the instant the request started generating. This poll is gated on
+  // the queue's own status instead, so it can't miss that transition.
+  useEffect(() => {
+    if (!activeVideoId) return;
+    const hasActiveRequest = bulkQueue.some((request) => ["pending", "planning", "generating"].includes(request.status));
+    if (!hasActiveRequest) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const queue = await projectsClient.listBulkGenerationRequests(activeVideoId);
+        setBulkQueue(queue);
+        if (queue.some((request) => request.status === "pending") && !queue.some((request) => ["planning", "generating"].includes(request.status))) {
+          void runQueueRunner();
+        }
+      } catch { /* Transient — the next tick (or the next video open) retries. */ }
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [activeVideoId, bulkQueue]);
 
   async function refreshWorkspace() {
     if (!activeVideoId) return;
@@ -2676,7 +2853,14 @@ function ImagesView() {
   async function controlJob(action: "pause" | "resume" | "stop" | "cancel") {
     if (!job) return;
     try {
-      setJob(await projectsClient.controlImageJob(job.id, action));
+      const updated = await projectsClient.controlImageJob(job.id, action);
+      // "cancel" (the UI's Stop button) and "stop" are both explicit,
+      // final "I'm done looking at this" actions — even though the
+      // backend leaves the job row itself at 'failed'/'stopped' (so a
+      // *natural* mid-run failure can still show "Retry N failed stills"),
+      // a user-initiated stop should just clear the status box rather than
+      // leave it sitting there indefinitely.
+      setJob(action === "stop" || action === "cancel" ? null : updated);
     } catch (caught) {
       setError(String(caught));
     }
@@ -2693,6 +2877,23 @@ function ImagesView() {
     setImageSettings(parseImageSettings(latest?.settingsJson));
     const latestRender = workspace?.groups.find((item) => item.group.id === groupId)?.imageRenders[0];
     setSelectedRenderId(latestRender?.id ?? null);
+  }
+
+  // Ctrl/Cmd+click toggles multi-select membership without disturbing the
+  // single-preview selection; a plain click clears any multi-selection and
+  // falls through to the normal single-select behavior above.
+  function handleStillClick(event: ReactMouseEvent, groupId: string) {
+    if (event.ctrlKey || event.metaKey) {
+      setMultiSelectedGroupIds((current) => {
+        const next = new Set(current);
+        if (next.has(groupId)) next.delete(groupId);
+        else next.add(groupId);
+        return next;
+      });
+      return;
+    }
+    if (multiSelectedGroupIds.size > 0) setMultiSelectedGroupIds(new Set());
+    selectGroup(groupId);
   }
 
   // Same underlying flag as VisualPlanView's setSceneExpanded (both read/
@@ -2823,35 +3024,53 @@ function ImagesView() {
     finally { setAiLoading(false); }
   }
 
-  // Drives a full Bulk Generation run one batch at a time — the same
-  // resumable pause/resume/stop shape as prompt preparation above, just
-  // batched instead of one still at a time. Every batch is committed to the
-  // database by the backend the instant it's planned (see
-  // plan_bulk_visuals_batch), so there's no separate "review the plan, then
-  // approve it" step anymore: reaching the end of the run immediately queues
-  // generation, the same way prompt preparation already does.
-  async function runBulkPlanLoop() {
-    if (!activeVideoId || !bulkPlanTask.current) return;
+  async function refreshBulkQueue() {
+    if (!activeVideoId) return;
+    try {
+      setBulkQueue(await projectsClient.listBulkGenerationRequests(activeVideoId));
+    } catch { /* Best-effort — the next poll/reopen will catch up. */ }
+  }
+
+  // The Bulk Generation queue's single runner loop — call it any time
+  // something MIGHT be due (after enqueueing, on Resume, on video open, and
+  // after the active request's generation job finishes) rather than trying
+  // to track state transitions precisely; it's always safe to call
+  // (idempotent no-op via the bulkPlanControl guard below, and
+  // advanceBulkGenerationQueue itself reports "idle" when there's nothing
+  // queued). Only the ACTIVE request's planning phase is driven from here —
+  // once it starts generating, this hands off to the existing job-status
+  // polling effect and stops, exactly like the old single-request flow did.
+  async function runQueueRunner() {
+    if (!activeVideoId || bulkPlanControl.current === "running") return;
     bulkPlanControl.current = "running";
     setBulkPlanStatus("running");
-    const task = bulkPlanTask.current;
+    // A single advanceBulkGenerationQueue call can legitimately take a long
+    // time to resolve (a "high effort" Claude CLI planning call especially)
+    // — bulkProgress otherwise stays null for that entire stretch, since it
+    // only gets populated once a "planned" result actually comes back, so
+    // the whole queue/progress UI would render nothing at all while a
+    // request just sits there working. Show something immediately instead;
+    // the first real result overwrites this right away.
+    setBulkProgress({ current: 0, total: 0, label: "Starting Bulk Generation…" });
     try {
-      while (task.index < task.total) {
+      while (bulkPlanControl.current === "running") {
+        const result = await projectsClient.advanceBulkGenerationQueue(activeVideoId);
         if (bulkPlanControl.current !== "running") break;
-        setBulkProgress({ current: task.index, total: task.total, label: `Planning still ${task.index + 1} of ${task.total}` });
-        const result = await projectsClient.planBulkVisualsBatch(
-          activeVideoId, task.styleDirective, task.baseSettingsJson, task.creativeInstruction, task.groupIds, task.index,
-        );
-        if (bulkPlanControl.current !== "running") break;
-        // Guard against a batch that somehow made no progress — never spin forever.
-        task.index += Math.max(result.plannedCount, 1);
-        setBulkProgress({ current: Math.min(task.index, task.total), total: task.total, label: `Still ${Math.min(task.index, task.total)} of ${task.total} planned` });
-        if (bulkPlanSettingKey) await projectsClient.saveAppSetting(bulkPlanSettingKey, JSON.stringify({ status: "running", ...task }));
-        if (result.done) break;
-      }
-      const finalControl = bulkPlanControl.current as "running" | "paused" | "stopped";
-      if (finalControl === "running" && task.index >= task.total) {
-        setBulkProgress({ current: task.total, total: task.total, label: "Starting image generation" });
+        if (result.kind === "idle") {
+          bulkPlanControl.current = "stopped";
+          setBulkPlanStatus(null);
+          setBulkProgress(null);
+          break;
+        } else if (result.kind === "planned") {
+          setBulkProgress({ current: result.current, total: result.total, label: `Still ${result.current} of ${result.total} planned` });
+          continue;
+        }
+        // "generationStarted" or "generationInProgress" — this request's
+        // planning is done (just now, or from before this session); the
+        // existing job-status UI/polling takes over from here.
+        setBulkPlanStatus(null);
+        setBulkProgress(null);
+        bulkPlanControl.current = "stopped";
         const live = await projectsClient.getImageWorkspace(activeVideoId);
         setCached(activeVideoId, live);
         setWorkspace(live);
@@ -2865,28 +3084,19 @@ function ImagesView() {
             setSystemPrompt(videoDirective ?? pv.systemPrompt ?? systemPrompt);
           }
         }
-        const newJob = await projectsClient.createImageJob(activeVideoId, task.groupIds);
-        setJob(newJob);
-        bulkPlanTask.current = null;
-        bulkPlanControl.current = "stopped";
-        setBulkPlanStatus(null);
-        setBulkProgress(null);
-        if (bulkPlanSettingKey) await projectsClient.saveAppSetting(bulkPlanSettingKey, "");
-        addToast(`${task.total} stills planned — generation started`, "success");
-      } else if (finalControl === "paused") {
-        setBulkPlanStatus("paused");
-        if (bulkPlanSettingKey) await projectsClient.saveAppSetting(bulkPlanSettingKey, JSON.stringify({ status: "paused", ...task }));
-      } else if (finalControl === "stopped") {
-        setBulkPlanStatus(null);
-        setBulkProgress(null);
-        bulkPlanTask.current = null;
-        if (bulkPlanSettingKey) await projectsClient.saveAppSetting(bulkPlanSettingKey, "");
+        const latestJob = await projectsClient.getLatestImageJob(activeVideoId);
+        setJob(latestJob && ["queued", "running", "paused", "stopped", "failed"].includes(latestJob.status) ? latestJob : null);
+        if (result.kind === "generationStarted") addToast("Bulk Generation started", "success");
+        break;
       }
     } catch (caught) {
       setError(String(caught));
+      // Leave the request exactly where it is (its plan_index cursor is
+      // already durable on the backend) — Resume just calls this again.
       bulkPlanControl.current = "paused";
       setBulkPlanStatus("paused");
-      if (bulkPlanSettingKey && bulkPlanTask.current) await projectsClient.saveAppSetting(bulkPlanSettingKey, JSON.stringify({ status: "paused", ...bulkPlanTask.current }));
+    } finally {
+      await refreshBulkQueue();
     }
   }
 
@@ -2894,15 +3104,19 @@ function ImagesView() {
     if (action === "pause") {
       bulkPlanControl.current = "paused";
       setBulkPlanStatus("paused");
-      if (bulkPlanSettingKey && bulkPlanTask.current) void projectsClient.saveAppSetting(bulkPlanSettingKey, JSON.stringify({ status: "paused", ...bulkPlanTask.current }));
+    } else if (action === "resume") {
+      void runQueueRunner();
     } else if (action === "stop") {
       bulkPlanControl.current = "stopped";
       setBulkPlanStatus(null);
       setBulkProgress(null);
-      bulkPlanTask.current = null;
-      if (bulkPlanSettingKey) void projectsClient.saveAppSetting(bulkPlanSettingKey, "");
-    } else if (bulkPlanTask.current) {
-      void runBulkPlanLoop();
+      // Abandons only the request that's actively planning right now — the
+      // rest of the queue (if any) is untouched and the runner will pick up
+      // the next pending request the next time something invokes it.
+      const active = bulkQueue.find((request) => request.status === "planning");
+      if (active) {
+        void projectsClient.cancelBulkGenerationRequest(active.id).then(refreshBulkQueue).catch((caught) => setError(String(caught)));
+      }
     }
   }
 
@@ -2925,17 +3139,23 @@ function ImagesView() {
       stillSections.filter((section) => section.scene).map((section, index) => [section.scene!.id, index === 0]),
     ));
     try {
-      const [pending, sceneSettings, globalVisual, characters, locations, assignments] = await Promise.all([
+      const [pending, sceneSettings, globalVisual, stillSettings, characters, locations, assignments] = await Promise.all([
         projectsClient.pendingStillIds(activeVideoId),
         projectsClient.getBulkSceneSettings(activeVideoId),
         projectsClient.getBulkGlobalSettings(activeVideoId),
+        projectsClient.getBulkStillSettings(activeVideoId),
         projectsClient.listRosterCharacters(activeVideoId),
         projectsClient.listRosterLocations(activeVideoId),
         projectsClient.getSceneCastAssignments(activeVideoId),
       ]);
-      setBulkSelection(new Set(pending));
+      // A still-open multi-selection from the left pane wins over both the
+      // remembered edit and the default "needs generation" set — Ctrl+click
+      // there is a deliberate "generate exactly these" scoping gesture, so
+      // it should carry straight into the panel it's opening for.
+      setBulkSelection(multiSelectedGroupIds.size > 0 ? new Set(multiSelectedGroupIds) : lastBulkSelection.get(activeVideoId) ?? new Set(pending));
       setBulkSceneSettings(sceneSettings);
       setBulkGlobalVisualSettings(globalVisual);
+      setBulkStillSettings(stillSettings);
       setRosterCharacters(characters);
       setRosterLocations(locations);
       setSceneCastAssignments(assignments);
@@ -2956,7 +3176,7 @@ function ImagesView() {
     const next: BulkGlobalVisualSettingsRecord = { ...bulkGlobalVisualSettings, ...patch };
     setBulkGlobalVisualSettings(next);
     try {
-      await projectsClient.saveBulkGlobalSettings(activeVideoId, next.dials);
+      await projectsClient.saveBulkGlobalSettings(activeVideoId, next.dials, next.visualizationTypes, next.visualizationHardRule);
     } catch (caught) {
       setError(String(caught));
     }
@@ -2964,6 +3184,19 @@ function ImagesView() {
 
   function updateGlobalDial(patch: Partial<BulkVisualDialsRecord>) {
     void saveGlobalVisualSettings({ dials: { ...bulkGlobalVisualSettings.dials, ...patch } });
+  }
+
+  /** Applies one Visualization Type to every currently-checked still at
+   * once (the Bulk Generation panel selection bar's dropdown) —
+   * `type: null` resets those stills back to "Auto"/inherit. */
+  async function saveStillVisualizationTypes(groupIds: string[], type: string | null) {
+    if (!activeVideoId || !groupIds.length) return;
+    try {
+      const next = await projectsClient.saveBulkStillVisualizationTypes(activeVideoId, groupIds, type);
+      setBulkStillSettings(next);
+    } catch (caught) {
+      setError(String(caught));
+    }
   }
 
   async function refreshRoster() {
@@ -3103,18 +3336,52 @@ function ImagesView() {
     setBulkExpandedScenes((current) => ({ ...current, [sceneId]: !current[sceneId] }));
   }
 
-  async function runBulkPlan() {
-    if (!activeVideoId || !orderedBulkSelection.length || bulkPlanTask.current || !systemPrompt.trim()) return;
+  // Generate always enqueues (never blocks on an active/queued request) —
+  // if the queue already has something in it, confirm first since the user
+  // may not realize this run will wait its turn rather than starting right
+  // away; an empty queue enqueues and starts immediately with no prompt.
+  function requestEnqueueBulkGeneration() {
+    if (!activeVideoId || !orderedBulkSelection.length || !systemPrompt.trim()) return;
+    const hasQueued = bulkQueue.some((request) => !["completed", "failed", "cancelled"].includes(request.status));
+    if (hasQueued) {
+      setConfirmingEnqueue(true);
+      return;
+    }
+    void enqueueBulkGeneration();
+  }
+
+  async function enqueueBulkGeneration() {
+    if (!activeVideoId || !orderedBulkSelection.length || !systemPrompt.trim()) return;
     setBulkOpen(false);
     setError(null);
-    await projectsClient.saveAppSetting(`system_prompt.${activeVideoId}`, systemPrompt);
-    bulkPlanTask.current = {
-      total: orderedBulkSelection.length, index: 0,
-      styleDirective: systemPrompt, baseSettingsJson: settingsJson,
-      creativeInstruction: bulkInstruction,
-      groupIds: orderedBulkSelection,
-    };
-    void runBulkPlanLoop();
+    try {
+      await projectsClient.saveAppSetting(`system_prompt.${activeVideoId}`, systemPrompt);
+      await projectsClient.enqueueBulkGenerationRequest(activeVideoId, systemPrompt, settingsJson, bulkInstruction, orderedBulkSelection);
+      lastBulkSelection.delete(activeVideoId);
+      addToast(`${orderedBulkSelection.length} still${orderedBulkSelection.length === 1 ? "" : "s"} added to the Bulk Generation queue`, "success");
+      await refreshBulkQueue();
+      void runQueueRunner();
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  async function cancelQueuedRequest(requestId: string) {
+    try {
+      await projectsClient.cancelBulkGenerationRequest(requestId);
+      await refreshBulkQueue();
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
+  async function reorderQueuedRequest(requestId: string, direction: "up" | "down") {
+    try {
+      await projectsClient.reorderBulkGenerationRequest(requestId, direction);
+      await refreshBulkQueue();
+    } catch (caught) {
+      setError(String(caught));
+    }
   }
 
   async function saveSceneOverride(sceneId: string, patch: Partial<Omit<BulkSceneSettingsRecord, "sceneId">>) {
@@ -3135,16 +3402,24 @@ function ImagesView() {
     }
   }
 
+  // Every path that changes bulkSelection writes through to
+  // lastBulkSelection so the edit survives closing and reopening the panel
+  // (see openBulkPanel/lastBulkSelection's own comment).
+  function rememberBulkSelection(next: Set<string>) {
+    if (activeVideoId) lastBulkSelection.set(activeVideoId, next);
+    return next;
+  }
+
   function toggleBulkStill(groupId: string) {
     setBulkSelection((current) => {
       const next = new Set(current);
       if (next.has(groupId)) next.delete(groupId); else next.add(groupId);
-      return next;
+      return rememberBulkSelection(next);
     });
   }
 
   function toggleBulkScene(groupIds: string[]) {
-    setBulkSelection((current) => toggleScene(groupIds, current));
+    setBulkSelection((current) => rememberBulkSelection(toggleScene(groupIds, current)));
   }
 
   function updateImageSetting<K extends keyof ImageSettings>(key: K, value: ImageSettings[K]) {
@@ -3162,6 +3437,19 @@ function ImagesView() {
     }, 800);
     return () => window.clearTimeout(timer);
   }, [settingsJson, activeVideoId]);
+
+  // Bulk Generation's Creative Instructions field — per-video, same pattern
+  // as imageSettings above. This used to be a single global localStorage
+  // key shared across every video (see git history); moving it here fixes
+  // that leak and gives it the same "survives closing the modal" behavior
+  // every other Bulk Generation setting already has.
+  useEffect(() => {
+    if (!activeVideoId) return;
+    const timer = window.setTimeout(() => {
+      void projectsClient.saveAppSetting(`bulk_instruction.${activeVideoId}`, bulkInstruction);
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [bulkInstruction, activeVideoId]);
 
   // Aspect ratio is the one field on this panel that's deliberately NOT per-video — it's
   // the same cross-view rendering choice the Editor/Animate stages read (still under the
@@ -3229,6 +3517,7 @@ function ImagesView() {
 
   const previewLabel = selectedGroup?.group.label ?? "Still preview";
   const stillCount = workspace?.groups.length ?? 0;
+  const pendingBulkRequests = bulkQueue.filter((request) => request.status === "pending");
   const imageRenders = selectedGroup?.imageRenders ?? [];
 
   useEffect(() => {
@@ -3353,6 +3642,15 @@ function ImagesView() {
     return () => window.removeEventListener("keydown", onKey);
   }, [zoomOpen]);
 
+  useEffect(() => {
+    if (multiSelectedGroupIds.size === 0) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMultiSelectedGroupIds(new Set());
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [multiSelectedGroupIds.size]);
+
   async function exportStills() {
     if (!activeVideoId) return;
     try {
@@ -3385,6 +3683,7 @@ function ImagesView() {
       {loading && <LoadingOverlay label="Working on your images" />}
       {confirmReset && <ConfirmDialog title="Reset all images?" message="This clears all prompts, image versions, planner results, and still statuses for this video. This cannot be undone." confirmLabel="Reset everything" danger onConfirm={() => { setConfirmReset(false); void doResetImages(); }} onCancel={() => setConfirmReset(false)} />}
       {confirmingStop && <ConfirmDialog title="Stop bulk generation?" message="This will permanently stop the current job. Any stills already generated are kept, but remaining stills will not be generated and the job cannot be resumed." confirmLabel="Stop generation" onConfirm={() => { setConfirmingStop(false); void controlJob("cancel"); }} onCancel={() => setConfirmingStop(false)} />}
+      {confirmingEnqueue && <ConfirmDialog title="Add to queue?" message="A Bulk Generation run is already active or queued for this video. This run will be added to the queue and start automatically once it's its turn." confirmLabel="Add to queue" onConfirm={() => { setConfirmingEnqueue(false); void enqueueBulkGeneration(); }} onCancel={() => setConfirmingEnqueue(false)} />}
       <div className="page-heading">
         <div>
           <h1>Image generation</h1>
@@ -3430,12 +3729,13 @@ function ImagesView() {
                     const isGenerating = item?.status === "running" || generatingGroupId === group.group.id;
                     const statusKey = isPreparing || isGenerating ? "generating" : item?.status === "failed" ? "failed" : newestRender && newestPrompt && newestRender.promptVersionId !== newestPrompt.id ? "outdated" : newestRender ? "generated" : newestPrompt ? "ready" : "empty";
                     const statusLabel = isPreparing ? "Preparing prompt" : isGenerating ? "Generating" : statusKey === "failed" ? "Failed" : statusKey === "outdated" ? "Outdated — regenerate" : statusKey === "generated" ? "Generated" : statusKey === "ready" ? "Prompt ready" : "No prompt yet";
+                    const isMultiSelected = multiSelectedGroupIds.has(group.group.id);
                     return (
                       <button
                         key={group.group.id}
-                        className={`still-select${group.group.id === selectedGroupId ? " active" : ""}`}
+                        className={`still-select${group.group.id === selectedGroupId ? " active" : ""}${isMultiSelected ? " multi-selected" : ""}`}
                         title={statusLabel}
-                        onClick={() => selectGroup(group.group.id)}
+                        onClick={(event) => handleStillClick(event, group.group.id)}
                       >
                         <div className={`still-thumb ${imageSettings.aspectRatio === "9:16" ? "portrait" : "landscape"}${thumbUrl ? "" : " empty"}`}>
                           {thumbUrl ? <img src={thumbUrl} alt={`Still ${group.group.ordinal} preview`} /> : <div className="still-thumb-empty"><Image size={18} /><span>No image generated yet</span></div>}
@@ -3449,6 +3749,7 @@ function ImagesView() {
                               {statusKey === "outdated" && <Undo2 size={11} />}
                             </span>
                           )}
+                          {isMultiSelected && <span className="still-multi-check" aria-hidden="true"><Check size={12} /></span>}
                         </div>
                       </button>
                     );
@@ -3458,21 +3759,61 @@ function ImagesView() {
             })}
           </div>
           {!workspace && <div className="empty-state">Loading stills…</div>}
-        </aside>
-        <div className="preview">
-          {job && !bulkProgress && (
-            <div className="job-status">
-              <div><strong>Bulk job: {job.status}</strong><span>{job.completedItems}/{job.totalItems} completed · {job.failedItems} failed</span></div>
-              <progress value={job.completedItems + job.failedItems} max={job.totalItems} />
-              <div>
-                {["queued", "running"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("pause")}>Pause</button>}
-                {job.status === "paused" && <button className="secondary" onClick={() => void controlJob("resume")}>Resume</button>}
-                {job.status === "failed" && job.failedItems > 0 && <button className="secondary" onClick={() => void controlJob("resume")}>Retry {job.failedItems} failed still{job.failedItems === 1 ? "" : "s"}</button>}
-                {["queued", "running", "paused"].includes(job.status) && <button className="secondary" onClick={() => setConfirmingStop(true)}>Stop</button>}
-              </div>
+          {multiSelectedGroupIds.size > 0 && (
+            <div className="stills-multi-select-bar">
+              <span>{multiSelectedGroupIds.size} selected</span>
+              <button type="button" className="icon-button" title="Clear selection" aria-label="Clear selection" onClick={() => setMultiSelectedGroupIds(new Set())}><X size={13} /></button>
             </div>
           )}
-          {bulkProgress && <div className="bulk-live-progress"><div><strong>{bulkProgress.label}</strong>{bulkProgress.total > 0 && <span>{bulkProgress.current} / {bulkProgress.total}</span>}</div>{bulkProgress.total > 0 ? <progress value={bulkProgress.current} max={bulkProgress.total} /> : <progress />}{bulkProgress.total > 0 && <div className="prompt-progress-actions">{(promptPrepStatus === "running" || bulkPlanStatus === "running") && <button className="secondary" onClick={() => (bulkPlanStatus ? controlBulkPlan("pause") : controlPromptPreparation("pause"))}>Pause</button>}{(promptPrepStatus === "paused" || bulkPlanStatus === "paused") && <button className="secondary" onClick={() => (bulkPlanStatus ? controlBulkPlan("resume") : controlPromptPreparation("resume"))}>Resume</button>}<button className="secondary" onClick={() => (bulkPlanStatus !== null || bulkPlanTask.current ? controlBulkPlan("stop") : controlPromptPreparation("stop"))}>Stop</button></div>}</div>}
+        </aside>
+        <div className="preview">
+          {/* One merged bar for whichever phase is active (job-status vs.
+              bulk-live-progress used to be two separately-boxed blocks,
+              plus a third box below for the queue list — collapsing them
+              into a single compact bar was specifically requested, since
+              stacking all three ate a lot of the preview pane). */}
+          {(job || bulkProgress || pendingBulkRequests.length > 0) && (
+            <div className="bulk-status-bar">
+              <div className="bulk-status-top">
+                <strong>{bulkProgress ? bulkProgress.label : job ? `Bulk job: ${job.status}` : "Bulk Generation queued"}</strong>
+                <span>
+                  {bulkProgress && bulkProgress.total > 0 && `${bulkProgress.current} / ${bulkProgress.total}`}
+                  {!bulkProgress && job && `${job.completedItems}/${job.totalItems} completed${job.failedItems ? ` · ${job.failedItems} failed` : ""}`}
+                </span>
+                {pendingBulkRequests.length > 0 && (
+                  <div className="bulk-queue-popover-anchor">
+                    <button type="button" className="bulk-status-queued-toggle" onClick={() => setBulkQueueExpanded((current) => !current)}>
+                      +{pendingBulkRequests.length} queued {bulkQueueExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                    </button>
+                    {bulkQueueExpanded && (
+                      <BulkQueueMiniList pending={pendingBulkRequests} onCancel={(id) => void cancelQueuedRequest(id)} onReorder={(id, direction) => void reorderQueuedRequest(id, direction)} onClose={() => setBulkQueueExpanded(false)} />
+                    )}
+                  </div>
+                )}
+                <div className="bulk-status-actions">
+                  {bulkProgress ? (
+                    <>
+                      {(promptPrepStatus === "running" || bulkPlanStatus === "running") && <button className="secondary" onClick={() => (bulkPlanStatus ? controlBulkPlan("pause") : controlPromptPreparation("pause"))}>Pause</button>}
+                      {(promptPrepStatus === "paused" || bulkPlanStatus === "paused") && <button className="secondary" onClick={() => (bulkPlanStatus ? controlBulkPlan("resume") : controlPromptPreparation("resume"))}>Resume</button>}
+                      <button className="secondary" onClick={() => (bulkPlanStatus !== null ? controlBulkPlan("stop") : controlPromptPreparation("stop"))}>Stop</button>
+                    </>
+                  ) : job && (
+                    <>
+                      {["queued", "running"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("pause")}>Pause</button>}
+                      {job.status === "paused" && <button className="secondary" onClick={() => void controlJob("resume")}>Resume</button>}
+                      {job.status === "failed" && job.failedItems > 0 && <button className="secondary" onClick={() => void controlJob("resume")}>Retry {job.failedItems}</button>}
+                      {["queued", "running", "paused"].includes(job.status) && <button className="secondary" onClick={() => setConfirmingStop(true)}>Stop</button>}
+                    </>
+                  )}
+                </div>
+              </div>
+              {bulkProgress ? (
+                bulkProgress.total > 0 ? <progress value={bulkProgress.current} max={bulkProgress.total} /> : <progress />
+              ) : job ? (
+                <progress value={job.completedItems + job.failedItems} max={job.totalItems} />
+              ) : null}
+            </div>
+          )}
           <header>
             <div><span className="timestamp-heading">{selectedTiming ? `${formatTimeShort(selectedTiming.start)} – ${formatTimeShort(selectedTiming.end)}` : previewLabel}</span><strong className="production-copy narration-preview">{selectedSentences.map((sentence) => sentence.text).join(" ")}</strong></div>
           </header>
@@ -3616,8 +3957,24 @@ function ImagesView() {
           <div className="bulk-selection-summary">
             <span>{bulkSelection.size} of {stillCount} still{stillCount === 1 ? "" : "s"} selected across {stillSections.filter((section) => section.scene).length} scene{stillSections.filter((section) => section.scene).length === 1 ? "" : "s"}</span>
             <div>
-              <button type="button" className="link-button" onClick={() => setBulkSelection(new Set(stillSections.flatMap((section) => section.groups).map((group) => group.group.id)))}>Select all</button>
-              <button type="button" className="link-button" onClick={() => setBulkSelection(new Set())}>Clear</button>
+              <button type="button" className="link-button" onClick={() => setBulkSelection(rememberBulkSelection(new Set(stillSections.flatMap((section) => section.groups).map((group) => group.group.id))))}>Select all</button>
+              <button type="button" className="link-button" onClick={() => setBulkSelection(rememberBulkSelection(new Set()))}>Clear</button>
+              <select
+                className="bulk-visualization-apply"
+                value=""
+                disabled={bulkSelection.size === 0}
+                title="Set the visualization type for every currently-selected still"
+                onChange={(event) => {
+                  const value = event.target.value;
+                  if (!value) return;
+                  void saveStillVisualizationTypes([...bulkSelection], value === "__auto__" ? null : value);
+                  event.target.value = "";
+                }}
+              >
+                <option value="" disabled>Set visualization type…</option>
+                <option value="__auto__">Auto (let AI decide)</option>
+                {VISUALIZATION_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
+              </select>
             </div>
           </div>
           <div className="bulk-scene-list">
@@ -3633,6 +3990,7 @@ function ImagesView() {
                   scene={scene}
                   groups={section.groups}
                   selection={bulkSelection}
+                  stillSettings={bulkStillSettings}
                   aspectRatio={imageSettings.aspectRatio}
                   renderUrls={renderUrls}
                   onToggleScene={() => toggleBulkScene(groupIds)}
@@ -3653,13 +4011,13 @@ function ImagesView() {
               );
             })}
           </div>
-          <button className="primary full" style={{marginTop:"10px"}} onClick={() => void runBulkPlan()} disabled={bulkPlanStatus !== null || !orderedBulkSelection.length || bulkProgress !== null || !systemPrompt.trim() || Boolean(job && ["queued", "running", "paused"].includes(job.status))}>
+          <button className="primary full" style={{marginTop:"10px"}} onClick={requestEnqueueBulkGeneration} disabled={!orderedBulkSelection.length || !systemPrompt.trim()}>
             <WandSparkles size={16} />Generate Selected ({bulkSelection.size})
           </button>
           {!systemPrompt.trim() ? (
             <p style={{fontSize:"11px",color:"#c77a26",margin:"6px 0 0",textAlign:"center"}}>Write a style directive in Global Settings above, or use Extract Style on a reference image, before generating.</p>
           ) : (
-            <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans and generates the selected stills in one pausable run — no separate review step. {Boolean(job && ["queued", "running", "paused"].includes(job.status)) && "Stop the active job to re-plan."}</p>
+            <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans and generates the selected stills in one pausable run — no separate review step. {bulkQueue.some((request) => !["completed", "failed", "cancelled"].includes(request.status)) && "A generation is already in progress — this will queue and start once it's this run's turn."}</p>
           )}
         </div>
       </div>}
@@ -3690,7 +4048,7 @@ function ImagesView() {
 
           <div className="bulk-modal-group">Creative Instructions</div>
           <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px",lineHeight:"1.55"}}>Hard rules applied to <strong>every</strong> still (unless a scene overrides them below in the main panel). Positive rules (always include X, use Y) are woven into the scene description. Negative rules (avoid X, no Y) are extracted and appended to the prompt as <code>[Avoid: ...]</code>.</p>
-          <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => { setBulkInstruction(e.target.value); localStorage.setItem("bulk_creative_instruction", e.target.value); }} placeholder="e.g. Always include the orange cat as the main character. Show visible emotions and varied body language. Avoid showing text, labels, or close-ups on faces." rows={4} />
+          <textarea className="bulk-directive" value={bulkInstruction} onChange={(e) => setBulkInstruction(e.target.value)} placeholder="e.g. Always include the orange cat as the main character. Show visible emotions and varied body language. Avoid showing text, labels, or close-ups on faces." rows={4} />
 
           <div className="bulk-modal-group">Cast &amp; Locations</div>
           <div className="bulk-scene-reference roster-launcher">
@@ -3710,6 +4068,12 @@ function ImagesView() {
             <button type="button" className="secondary" onClick={() => setDiversityModalOpen(true)}>Manage Diversity &amp; Consistency</button>
           </div>
 
+          <div className="bulk-modal-group">Visualization Types</div>
+          <div className="bulk-scene-reference roster-launcher">
+            <span>{bulkGlobalVisualSettings.visualizationTypes.length} type{bulkGlobalVisualSettings.visualizationTypes.length === 1 ? "" : "s"} selected · Hard rule {bulkGlobalVisualSettings.visualizationHardRule ? "on" : "off"}</span>
+            <button type="button" className="secondary" onClick={() => setVisualizationTypesModalOpen(true)}>Manage Visualization Types</button>
+          </div>
+
           <button className="primary full" style={{marginTop:"18px"}} onClick={() => setBulkGlobalOpen(false)}>Done</button>
         </div>
       </div>}
@@ -3727,6 +4091,15 @@ function ImagesView() {
           dials={bulkGlobalVisualSettings.dials}
           onChange={updateGlobalDial}
           onClose={() => setDiversityModalOpen(false)}
+        />
+      )}
+
+      {visualizationTypesModalOpen && (
+        <VisualizationTypesModal
+          types={bulkGlobalVisualSettings.visualizationTypes}
+          hardRule={bulkGlobalVisualSettings.visualizationHardRule}
+          onChange={(patch) => void saveGlobalVisualSettings(patch)}
+          onClose={() => setVisualizationTypesModalOpen(false)}
         />
       )}
 

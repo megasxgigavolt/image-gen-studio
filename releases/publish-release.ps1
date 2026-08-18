@@ -62,7 +62,17 @@ if (-not $existingTag) {
 # Note: `gh` is a native exe, so a non-zero exit code does NOT throw a
 # PowerShell terminating exception - try/catch around it is a no-op and
 # would always land in the try branch. Check $LASTEXITCODE explicitly.
+# Separately, under $ErrorActionPreference = "Stop" (set at the top of this
+# script), Windows PowerShell treats a native command's STDERR output itself
+# (not just its exit code) as a terminating error - "release not found" on
+# stderr from a genuinely-missing release throws a NativeCommandError before
+# $LASTEXITCODE can even be checked, *> $null redirection notwithstanding.
+# Locally relax to "Continue" for just this call so a missing release is
+# treated as the expected, recoverable case it is.
+$previousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 gh release view $Tag --repo $Repo *> $null
+$ErrorActionPreference = $previousErrorActionPreference
 $releaseExists = ($LASTEXITCODE -eq 0)
 
 if ($releaseExists) {

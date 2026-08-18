@@ -5363,19 +5363,21 @@ Return JSON only — no markdown, no explanation:
                 effective_creative_instruction.trim()
             )
         };
-        // Only rendered if at least one row in THIS chunk actually carries a
-        // constraint — a video that never touches Visualization Type gets a
-        // prompt identical to before this feature existed, same "renders
-        // nothing" pattern as visual_director_block/diversity_controller_block.
-        let visualization_type_block = if chunk.iter().any(|row| row.get("requiredVisualizationType").is_some() || row.get("allowedVisualizationTypes").is_some()) {
-            "\n\nVISUALIZATION TYPE CONSTRAINTS — a SEPARATE axis from the visualType field below (visualType is shot/content framing; this is the overall visual MEDIUM/FORMAT — e.g. Photograph, Illustration, Diagram, 3D Render, Infographic). Check each row in \"Current batch rows to plan\" for these two optional fields:\n\
-             - A row with \"requiredVisualizationType\": that still MUST be rendered in exactly that medium — non-negotiable, overrides your own instinct for that still.\n\
-             - A row with \"allowedVisualizationTypes\": that still MUST use one of the listed media — choose whichever fits its narration best.\n\
-             - A row with neither field: choose the medium freely based on the narration, exactly as you normally would.\n\
-             Both fields are input-only — do NOT echo a visualizationType back in your JSON output; keep returning exactly the fields specified in OUTPUT FORMAT below.\n".to_string()
-        } else {
-            String::new()
-        };
+        // Unlike visual_director_block/diversity_controller_block, this block
+        // is unconditional — visualizationType is now a mandatory imageSettings
+        // key on every still (see the Settings pane, next to Aspect Ratio),
+        // not merely a hint. Whatever comes back is also enforced/validated
+        // server-side after the AI response lands — see the persist loop
+        // below — so a still-level or global hard rule is a real guarantee,
+        // not just something the model was asked nicely to honor.
+        let visualization_type_block = format!(
+            "\n\nVISUALIZATION TYPE — a SEPARATE axis from the visualType field below (visualType is shot/content framing; this is the overall visual MEDIUM/FORMAT). Every still's imageSettings MUST include a \"visualizationType\" key set to EXACTLY one of these values, spelled verbatim: {}.\n\
+             Check each row in \"Current batch rows to plan\" for two optional fields that narrow this choice for that specific still:\n\
+             - A row with \"requiredVisualizationType\": that still's visualizationType MUST be exactly that value — non-negotiable, overrides your own instinct for that still.\n\
+             - A row with \"allowedVisualizationTypes\": that still's visualizationType MUST be one of the listed values — choose whichever fits its narration best.\n\
+             - A row with neither field: choose freely from the full list above based on the narration.\n",
+            IMAGE_MEDIUM_TYPES.join("; "),
+        );
         let prompt = format!(
             r#"You are an Educational Visual Director planning an entire video, not isolated stills.
 {story_context_block}
@@ -5442,10 +5444,11 @@ SETTINGS DIVERSITY — the AI defaults to warm/golden/indoor; actively counter t
 - Location default: if the narration does not explicitly place the subject indoors, choose an EXTERIOR or NATURE setting. Resist defaulting to "home", "office", "classroom", or "bedroom" unless the narration forces it.
 
 IMAGE SETTINGS RULES — provide ALL of the following keys; never leave any as "Undefined":
-BASIC: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere
+BASIC: cameraAngle, lighting, mood, depthOfField, colorTemperature, weatherAtmosphere, visualizationType
 ADVANCED: lensType, lightDirection, lightQuality, shadowType, contrast, focusType, exposure, motion, composition, saturation, vignette, grainIntensity, colorCastTint, surfaceEffects
 
 Field value guidance:
+- visualizationType: see VISUALIZATION TYPE below — must be exactly one of that fixed list, never a value outside it.
 - cameraAngle: Wide Shot | Medium Shot | Close Up | Extreme Close Up | Birds Eye View | Worms Eye View | Low Angle | High Angle | Eye Level | Over the Shoulder | Dutch Angle | Establishing Shot | Point of View POV
 - lighting: Natural Daylight | Golden Hour | Blue Hour Dusk | Overcast Soft Diffused | Studio Lighting | Backlit Silhouette | Low Key Dark | High Key Bright | Night Moonlit | Candlelight Firelight | Window Light | Neon Lit
 - mood: Serene Peaceful | Tense Anxious | Dramatic Intense | Warm and Cozy | Cold Distant | Mysterious | Cheerful Upbeat | Melancholic | Hopeful | Playful | Triumphant
@@ -5576,6 +5579,34 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
             if row["settingsLocked"].as_bool().unwrap_or(false) {
                 if let Some(obj) = row["existingSettings"].as_object() {
                     plan.image_settings = serde_json::Value::Object(obj.clone());
+                }
+            } else if let Some(obj) = plan.image_settings.as_object_mut() {
+                // Enforce/validate visualizationType server-side rather than
+                // just trusting the prompt — a still-level or global hard
+                // rule (see resolve_effective_visualization/row's
+                // requiredVisualizationType/allowedVisualizationTypes) is a
+                // real guarantee this way, and a response that omitted the
+                // field or returned something outside IMAGE_MEDIUM_TYPES
+                // (both real model-compliance misses) never reaches the
+                // Settings pane's blank-free dropdown. Skipped entirely for
+                // a settings-locked still — its settings (including
+                // whatever visualizationType it already had) are frozen
+                // above, untouched by this batch's constraints.
+                if let Some(required) = row.get("requiredVisualizationType").and_then(|v| v.as_str()) {
+                    obj.insert("visualizationType".to_string(), json!(required));
+                } else if let Some(allowed) = row.get("allowedVisualizationTypes").and_then(|v| v.as_array()) {
+                    let current = obj.get("visualizationType").and_then(|v| v.as_str());
+                    let is_allowed = current.map(|c| allowed.iter().any(|a| a.as_str() == Some(c))).unwrap_or(false);
+                    if !is_allowed {
+                        let fallback = allowed.first().and_then(|v| v.as_str()).unwrap_or(IMAGE_MEDIUM_TYPES[0]);
+                        obj.insert("visualizationType".to_string(), json!(fallback));
+                    }
+                } else {
+                    let current = obj.get("visualizationType").and_then(|v| v.as_str());
+                    let is_valid = current.map(|c| IMAGE_MEDIUM_TYPES.contains(&c)).unwrap_or(false);
+                    if !is_valid {
+                        obj.insert("visualizationType".to_string(), json!(IMAGE_MEDIUM_TYPES[0]));
+                    }
                 }
             }
             if row["promptLocked"].as_bool().unwrap_or(false) {
@@ -12745,6 +12776,18 @@ fn resolve_effective_scene_cast(
         .and_then(|id| locations.iter().find(|l| &l.id == id).cloned());
     EffectiveSceneCast { assigned_characters, assigned_location }
 }
+
+/// Canonical Visualization Type labels the AI is asked to pick from and the
+/// backend snaps a response to if it strays — MUST stay in sync with
+/// VISUALIZATION_TYPES in App.tsx, since that file's Settings-pane dropdown
+/// (next to Aspect Ratio) has no free-text/blank option and requires an
+/// exact string match to display correctly.
+const IMAGE_MEDIUM_TYPES: &[&str] = &[
+    "Photograph", "Cinematic Scene", "Illustration", "Character Sheet", "Storyboard",
+    "Infographic", "Diagram", "Chart / Data Visualization", "Map", "Technical Drawing",
+    "3D Render", "Concept Visualization", "Graphic Design", "Icon / Symbol", "UI / Screen",
+    "Document", "Collage / Composite", "Abstract Visual", "Pattern / Texture", "Isolated Asset",
+];
 
 /// Resolved Visualization Type constraint for one still. `hard_rule` false
 /// (with `types` empty) means "no constraint at all" — the common case for

@@ -2002,6 +2002,11 @@ function ProductionView() {
 
 type ImageSettings = {
   aspectRatio: string;
+  // Set automatically by Bulk Generation planning (see VISUALIZATION_TYPES) —
+  // reflects whichever medium/format the AI chose, or the Global Bulk
+  // Settings hard rule constrained it to; editable afterward like any other
+  // setting, no "Undefined"/blank state.
+  visualizationType: string;
   // Basic
   cameraAngle: string;
   lighting: string;
@@ -2027,6 +2032,7 @@ type ImageSettings = {
 };
 const defaultImageSettings: ImageSettings = {
   aspectRatio: "16:9",
+  visualizationType: "Photograph",
   cameraAngle: "Undefined", lighting: "Undefined", mood: "Undefined",
   depthOfField: "Undefined", colorTemperature: "Undefined", weatherAtmosphere: "Undefined",
   lensType: "Undefined", lightDirection: "Undefined", lightQuality: "Undefined",
@@ -2478,6 +2484,7 @@ function VisualizationTypesModal({ types, hardRule, onChange, onClose }: {
 }) {
   const selected = new Set(types);
   function toggleType(type: string) {
+    if (!hardRule) return;
     const next = new Set(selected);
     if (next.has(type)) next.delete(type); else next.add(type);
     onChange({ visualizationTypes: [...next] });
@@ -2486,23 +2493,26 @@ function VisualizationTypesModal({ types, hardRule, onChange, onClose }: {
     <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
       <div className="modal bulk-modal aspects-modal" onMouseDown={(event) => event.stopPropagation()}>
         <div className="modal-heading-row"><h2>Visualization Types</h2><button type="button" className="icon-button" aria-label="Close" onClick={onClose}><X size={16} /></button></div>
-        <p style={{fontSize:"12px",color:"var(--muted)",margin:"0 0 8px"}}>A separate axis from the AI's own shot framing — this is the overall image medium (photo, illustration, diagram, ...).</p>
-        <label className="aspects-checkbox-row" style={{marginBottom:"10px"}}>
-          <input type="checkbox" checked={hardRule} onChange={(event) => onChange({ visualizationHardRule: event.target.checked })} />
-          <span>Restrict generation to only the checked types below</span>
+        <p className="viz-description">A separate axis from the AI's own shot framing — this is the overall image medium (photo, illustration, diagram, ...).</p>
+        <label className="toggle-row">
+          <span className="toggle-switch">
+            <input type="checkbox" checked={!hardRule} onChange={(event) => onChange({ visualizationHardRule: !event.target.checked })} />
+            <span className="toggle-track"><span className="toggle-thumb" /></span>
+          </span>
+          <span>Let AI decide</span>
         </label>
-        <p style={{fontSize:"11px",color:"var(--muted)",margin:"0 0 10px"}}>{hardRule
-          ? "Every still must be rendered as one of the checked types — the AI chooses whichever fits the narration best."
-          : "Off: the AI decides each still's visual medium based on the script — the checkboxes below have no effect until this is turned on."}
+        <p className="viz-description">{hardRule
+          ? "Off — every still must be rendered as one of the checked types below."
+          : "On (default) — the AI decides each still's visual medium based on the script."}
         </p>
-        <div className="aspects-select-all">
-          <button type="button" className="link-button" onClick={() => onChange({ visualizationTypes: [...VISUALIZATION_TYPES] })}>Select all</button>
-          <button type="button" className="link-button" onClick={() => onChange({ visualizationTypes: [] })}>Select none</button>
+        <div className={`aspects-select-all${hardRule ? "" : " disabled"}`}>
+          <button type="button" className="link-button" disabled={!hardRule} onClick={() => onChange({ visualizationTypes: [...VISUALIZATION_TYPES] })}>Select all</button>
+          <button type="button" className="link-button" disabled={!hardRule} onClick={() => onChange({ visualizationTypes: [] })}>Select none</button>
         </div>
-        <div className="aspects-checklist">
+        <div className={`aspects-checklist viz-types-list${hardRule ? "" : " disabled"}`}>
           {VISUALIZATION_TYPES.map((type) => (
             <label key={type} className="aspects-checkbox-row">
-              <input type="checkbox" checked={selected.has(type)} onChange={() => toggleType(type)} />
+              <input type="checkbox" checked={selected.has(type)} disabled={!hardRule} onChange={() => toggleType(type)} />
               <span>{type}</span>
             </label>
           ))}
@@ -2879,9 +2889,11 @@ function ImagesView() {
     setSelectedRenderId(latestRender?.id ?? null);
   }
 
-  // Ctrl/Cmd+click toggles multi-select membership without disturbing the
-  // single-preview selection; a plain click clears any multi-selection and
-  // falls through to the normal single-select behavior above.
+  // Ctrl/Cmd+click toggles multi-select membership, independent of the
+  // single-preview selection. A plain click just changes the preview (like
+  // it always did) and deliberately leaves any multi-selection untouched —
+  // it only clears via Escape or by Ctrl+clicking an already-selected still
+  // again, so browsing other stills while multi-selecting doesn't lose it.
   function handleStillClick(event: ReactMouseEvent, groupId: string) {
     if (event.ctrlKey || event.metaKey) {
       setMultiSelectedGroupIds((current) => {
@@ -2892,7 +2904,6 @@ function ImagesView() {
       });
       return;
     }
-    if (multiSelectedGroupIds.size > 0) setMultiSelectedGroupIds(new Set());
     selectGroup(groupId);
   }
 
@@ -3184,19 +3195,6 @@ function ImagesView() {
 
   function updateGlobalDial(patch: Partial<BulkVisualDialsRecord>) {
     void saveGlobalVisualSettings({ dials: { ...bulkGlobalVisualSettings.dials, ...patch } });
-  }
-
-  /** Applies one Visualization Type to every currently-checked still at
-   * once (the Bulk Generation panel selection bar's dropdown) —
-   * `type: null` resets those stills back to "Auto"/inherit. */
-  async function saveStillVisualizationTypes(groupIds: string[], type: string | null) {
-    if (!activeVideoId || !groupIds.length) return;
-    try {
-      const next = await projectsClient.saveBulkStillVisualizationTypes(activeVideoId, groupIds, type);
-      setBulkStillSettings(next);
-    } catch (caught) {
-      setError(String(caught));
-    }
   }
 
   async function refreshRoster() {
@@ -3875,7 +3873,10 @@ function ImagesView() {
           ) : tab === "settings" ? (
             <>
               <div className="panel-section-heading"><h3>Image settings</h3><small>Per still</small></div>
-              <SettingSelect label="Aspect Ratio" value={imageSettings.aspectRatio} options={["16:9","9:16"]} onChange={(value) => updateImageSetting("aspectRatio", value)} />
+              <div className="setting-grid">
+                <SettingSelect label="Aspect Ratio" value={imageSettings.aspectRatio} options={["16:9","9:16"]} onChange={(value) => updateImageSetting("aspectRatio", value)} />
+                <SettingSelect label="Visualization Type" value={imageSettings.visualizationType} options={VISUALIZATION_TYPES} onChange={(value) => updateImageSetting("visualizationType", value)} />
+              </div>
               <div className="setting-grid" style={{marginTop:"10px"}}>
                 <SettingSelect label="Camera Angle" value={imageSettings.cameraAngle} options={["Undefined","Wide Shot","Medium Shot","Close Up","Extreme Close Up","Birds Eye View","Worms Eye View","Low Angle","High Angle","Eye Level","Over the Shoulder","Dutch Angle","Establishing Shot","Point of View POV","Custom..."]} onChange={(value) => updateImageSetting("cameraAngle", value)} />
                 <SettingSelect label="Lighting" value={imageSettings.lighting} options={["Undefined","Natural Daylight","Golden Hour","Blue Hour Dusk","Overcast Soft Diffused","Studio Lighting","Backlit Silhouette","Low Key Dark","High Key Bright","Night Moonlit","Candlelight Firelight","Underwater Light Rays","Window Light","Neon Lit","Custom..."]} onChange={(value) => updateImageSetting("lighting", value)} />
@@ -3959,22 +3960,6 @@ function ImagesView() {
             <div>
               <button type="button" className="link-button" onClick={() => setBulkSelection(rememberBulkSelection(new Set(stillSections.flatMap((section) => section.groups).map((group) => group.group.id))))}>Select all</button>
               <button type="button" className="link-button" onClick={() => setBulkSelection(rememberBulkSelection(new Set()))}>Clear</button>
-              <select
-                className="bulk-visualization-apply"
-                value=""
-                disabled={bulkSelection.size === 0}
-                title="Set the visualization type for every currently-selected still"
-                onChange={(event) => {
-                  const value = event.target.value;
-                  if (!value) return;
-                  void saveStillVisualizationTypes([...bulkSelection], value === "__auto__" ? null : value);
-                  event.target.value = "";
-                }}
-              >
-                <option value="" disabled>Set visualization type…</option>
-                <option value="__auto__">Auto (let AI decide)</option>
-                {VISUALIZATION_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
-              </select>
             </div>
           </div>
           <div className="bulk-scene-list">
@@ -4070,7 +4055,7 @@ function ImagesView() {
 
           <div className="bulk-modal-group">Visualization Types</div>
           <div className="bulk-scene-reference roster-launcher">
-            <span>{bulkGlobalVisualSettings.visualizationTypes.length} type{bulkGlobalVisualSettings.visualizationTypes.length === 1 ? "" : "s"} selected · Hard rule {bulkGlobalVisualSettings.visualizationHardRule ? "on" : "off"}</span>
+            <span>{bulkGlobalVisualSettings.visualizationHardRule ? `Restricted to ${bulkGlobalVisualSettings.visualizationTypes.length} type${bulkGlobalVisualSettings.visualizationTypes.length === 1 ? "" : "s"}` : "Let AI decide"}</span>
             <button type="button" className="secondary" onClick={() => setVisualizationTypesModalOpen(true)}>Manage Visualization Types</button>
           </div>
 

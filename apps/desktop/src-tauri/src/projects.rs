@@ -10275,6 +10275,14 @@ Return JSON only:
         if inputs.script_text.trim().is_empty() || inputs.audio.is_none() {
             return Err("Script and narration audio are required.".into());
         }
+        // Captured before anything below touches the DB, so it reflects
+        // the plan as it stood right before this recalculation - `None`
+        // for a video's very first plan. Used to carry forward group ids
+        // (and with them, whatever images/prompt history is keyed to
+        // those ids) for stills whose underlying sentence text survives
+        // the recalculation unchanged; see reconcile_recalculated_group_ids.
+        let previous_plan = self.get_visual_plan(video_id).ok();
+        let historical_high_watermark = self.highest_group_number_ever_referenced(video_id)?;
         #[cfg(test)]
         {
             let (clean_script, _) = remove_tts_pause_markers(&inputs.script_text);
@@ -10315,6 +10323,9 @@ Return JSON only:
             );
             let scenes = build_scenes_range(&groups);
             assign_scene_ids(&mut groups, &scenes);
+            if let Some(previous) = &previous_plan {
+                reconcile_recalculated_group_ids(previous, &sentences, &mut groups, historical_high_watermark);
+            }
             self.save_plan(
                 video_id,
                 &sentences,
@@ -10515,7 +10526,7 @@ Return JSON only:
                     end_seconds: item["end"].as_f64().unwrap_or(0.0),
                 })
                 .collect::<Vec<_>>();
-            let groups = audit["groups"]
+            let mut groups = audit["groups"]
                 .as_array()
                 .ok_or("Visual-plan audit contained no groups.")?
                 .iter()
@@ -10583,6 +10594,9 @@ Return JSON only:
                     }
                 })
                 .collect::<Vec<_>>();
+            if let Some(previous) = &previous_plan {
+                reconcile_recalculated_group_ids(previous, &sentences, &mut groups, historical_high_watermark);
+            }
             self.save_plan(
                 video_id,
                 &sentences,
@@ -10644,6 +10658,48 @@ Return JSON only:
             scenes,
             updated_at,
         })
+    }
+
+    /// The highest numeric suffix ever used in a `g<n>` group id for this
+    /// video, across every table that keys rows off a group id and
+    /// OUTLIVES a plan recalculation (`visual_plan_groups` itself does
+    /// not — `save_plan` deletes and rebuilds it from scratch every time,
+    /// see `reconcile_recalculated_group_ids`). A still's own current
+    /// group ids (from `load_groups`) are NOT a safe upper bound on their
+    /// own: if the group count ever shrank in an earlier recalculation
+    /// (sentences removed), the id it shrank past becomes orphaned here
+    /// but the image/prompt/animation/timeline rows filed under it don't
+    /// go anywhere - and if the group count later grows back (sentences
+    /// re-added), a naive "one past the current max" would recompute that
+    /// exact same orphaned id and silently resurrect its stale content.
+    /// Checking every persistent table directly closes that gap.
+    fn highest_group_number_ever_referenced(&self, video_id: &str) -> Result<i64, String> {
+        const GROUP_ID_REFERENCING_TABLES: &[(&str, &str)] = &[
+            ("prompt_versions", "group_id"),
+            ("image_renders", "group_id"),
+            ("image_job_items", "group_id"),
+            ("timeline_clips", "group_id"),
+            ("video_assets", "group_id"),
+            ("animation_job_items", "group_id"),
+            ("bulk_still_settings", "group_id"),
+            ("educational_visual_plans", "visual_plan_row_id"),
+        ];
+        let mut highest = 0i64;
+        for (table, column) in GROUP_ID_REFERENCING_TABLES {
+            let sql = format!("SELECT DISTINCT {column} FROM {table} WHERE video_id = ?1");
+            let mut statement = self.connection.prepare(&sql).map_err(|e| e.to_string())?;
+            let ids = statement
+                .query_map([video_id], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for id in ids {
+                let id = id.map_err(|e| e.to_string())?;
+                let number = sentence_number(id.trim_start_matches('g'));
+                if number < i64::MAX && number > highest {
+                    highest = number;
+                }
+            }
+        }
+        Ok(highest)
     }
 
     pub fn generate_captions(
@@ -11859,11 +11915,19 @@ Return JSON only:
         let source_group_disappears = groups[source].sentence_ids.len() == 1;
         groups[source].sentence_ids.retain(|id| id != sentence_id);
         groups.retain(|group| !group.sentence_ids.is_empty());
+        // Floored by the historical high-water mark (not just the current
+        // groups' own max) for the same reason generate_visual_plan_with_
+        // progress's recalculation does: this video's group count may have
+        // shrunk and grown back before, and the current max alone can't
+        // see an id that dropped out of range in between - see
+        // highest_group_number_ever_referenced.
         let next_id = groups
             .iter()
             .map(|group| sentence_number(group.id.trim_start_matches('g')))
+            .filter(|number| *number < i64::MAX)
             .max()
             .unwrap_or(0)
+            .max(self.highest_group_number_ever_referenced(video_id)?)
             + 1;
         let adjusted_insert_index = if source_group_disappears && source < insert_index {
             insert_index - 1
@@ -14176,6 +14240,76 @@ fn sentence_number(id: &str) -> i64 {
     id.trim_start_matches('s').parse().unwrap_or(i64::MAX)
 }
 
+/// Recalculating the visual plan (script edited, "Recalculate" pressed
+/// again, ...) rebuilds `sentences`/`groups` from scratch every time, and
+/// both this run's group ids and the previous run's are assigned purely
+/// by position (g1, g2, g3, ...). Generated images, prompt history,
+/// timeline clips, and per-still overrides are all keyed by `group_id`
+/// alone - so without this, a still that used to be "g3" but is now "g5"
+/// (or vice versa, once sentences are added/removed) would silently
+/// inherit whatever image an unrelated old still happened to leave behind
+/// under that same id: stills would appear to shuffle, wrong images on
+/// wrong content. This reassigns each freshly-computed group the id of
+/// the PREVIOUS group covering the exact same sentence text, if one
+/// exists, so its images/history carry forward untouched; a group whose
+/// content doesn't match anything before (new or edited script text)
+/// gets a brand new id that has never been used for this video, so it
+/// starts with a genuinely empty preview instead of a stale, unrelated
+/// one.
+fn reconcile_recalculated_group_ids(
+    previous: &VisualPlan,
+    new_sentences: &[PlanSentence],
+    groups: &mut [PlanGroup],
+    historical_high_watermark: i64,
+) {
+    fn signature(sentence_ids: &[String], sentences: &[PlanSentence]) -> String {
+        sentence_ids
+            .iter()
+            .filter_map(|id| sentences.iter().find(|s| &s.id == id))
+            .map(|s| s.text.trim().to_lowercase())
+            .collect::<Vec<_>>()
+            .join("\u{0}")
+    }
+    let mut previous_ids_by_signature: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for group in &previous.groups {
+        previous_ids_by_signature
+            .entry(signature(&group.sentence_ids, &previous.sentences))
+            .or_default()
+            .push(group.id.clone());
+    }
+    // One past the highest group-id number ever used for this video, so a
+    // freshly-minted id can never coincide with one an unmatched (and
+    // therefore now-orphaned) previous group might still have image,
+    // prompt, animation, or timeline rows filed under - including one
+    // that dropped out of the plan entirely in an EARLIER recalculation
+    // and has since come back into range as the group count grew again.
+    // `historical_high_watermark` (see highest_group_number_ever_referenced)
+    // covers that; the previous plan's own ids are folded in too as a
+    // belt-and-braces floor.
+    let mut next_fresh_number = previous
+        .groups
+        .iter()
+        .map(|group| sentence_number(group.id.trim_start_matches('g')))
+        .filter(|number| *number < i64::MAX)
+        .max()
+        .unwrap_or(0)
+        .max(historical_high_watermark)
+        + 1;
+    for group in groups.iter_mut() {
+        let signature = signature(&group.sentence_ids, new_sentences);
+        let reused = previous_ids_by_signature.get_mut(&signature).and_then(Vec::pop);
+        group.id = match reused {
+            Some(id) => id,
+            None => {
+                let id = format!("g{next_fresh_number}");
+                next_fresh_number += 1;
+                id
+            }
+        };
+    }
+}
+
 fn validate_group_chronology(groups: &[PlanGroup]) -> Result<(), String> {
     let flattened = groups
         .iter()
@@ -14587,6 +14721,228 @@ mod tests {
                 original.groups
             );
         }
+    }
+
+    #[test]
+    fn reconcile_recalculated_group_ids_keeps_ids_for_unchanged_text_and_mints_fresh_ones_otherwise() {
+        fn sentence(id: &str, text: &str) -> PlanSentence {
+            PlanSentence { id: id.into(), ordinal: 1, text: text.into(), start_seconds: 0.0, end_seconds: 1.0 }
+        }
+        fn group(id: &str, sentence_ids: &[&str]) -> PlanGroup {
+            PlanGroup {
+                id: id.into(),
+                ordinal: 1,
+                label: "Still".into(),
+                kind: "custom".into(),
+                sentence_ids: sentence_ids.iter().map(|s| s.to_string()).collect(),
+                settings_locked: false,
+                prompt_locked: false,
+                scene_id: None,
+            }
+        }
+        let previous = VisualPlan {
+            video_id: "video".into(),
+            timing_source: "test".into(),
+            sentences: vec![
+                sentence("s1", "One short sentence."),
+                sentence("s2", "A second sentence follows."),
+                sentence("s3", "The final sentence closes."),
+            ],
+            // Deliberately non-contiguous/out-of-order-looking ids (g1, g4)
+            // — a prior recalculation could easily have left gaps like this,
+            // and the "highest number used" bookkeeping must still hold.
+            groups: vec![
+                group("g1", &["s1"]),
+                group("g4", &["s2"]),
+                group("g2", &["s3"]),
+            ],
+            scenes: Vec::new(),
+            updated_at: "now".into(),
+        };
+        // New pass over an edited script: sentence 1 is untouched, sentence
+        // 2's text changed (still occupies the "same" position but no longer
+        // matches anything before), and a brand-new sentence is inserted
+        // before the closing one; "s3" here happens to be new content too,
+        // it's the OLD s3 that's now new-s4 with unchanged text.
+        let new_sentences = vec![
+            sentence("s1", "One short sentence."),
+            sentence("s2", "A second sentence, rewritten."),
+            sentence("s3", "A brand new sentence."),
+            sentence("s4", "The final sentence closes."),
+        ];
+        let mut groups = vec![
+            group("g1", &["s1"]),
+            group("g2", &["s2"]),
+            group("g3", &["s3"]),
+            group("g4", &["s4"]),
+        ];
+        reconcile_recalculated_group_ids(&previous, &new_sentences, &mut groups, 0);
+        // Unchanged sentence text -> the OLD group id carries forward, so
+        // whatever images/prompt history are filed under it stay attached.
+        assert_eq!(groups[0].id, "g1", "unchanged first sentence must keep its old still's id");
+        assert_eq!(groups[3].id, "g2", "unchanged closing sentence must keep its old still's id, wherever it used to live");
+        // Changed/new content must NOT reuse any id that ever existed
+        // before (g1, g2, or g4) — only a genuinely fresh number, so it
+        // can't accidentally inherit a stale, unrelated image.
+        let previous_ids: std::collections::HashSet<&str> = ["g1", "g2", "g4"].into_iter().collect();
+        assert!(!previous_ids.contains(groups[1].id.as_str()), "rewritten sentence must not reuse any old id: got {}", groups[1].id);
+        assert!(!previous_ids.contains(groups[2].id.as_str()), "brand new sentence must not reuse any old id: got {}", groups[2].id);
+        assert_ne!(groups[1].id, groups[2].id, "two different new stills must not collide with each other either");
+    }
+
+    #[test]
+    fn reconcile_recalculated_group_ids_floors_fresh_ids_below_a_historical_high_watermark() {
+        fn sentence(id: &str, text: &str) -> PlanSentence {
+            PlanSentence { id: id.into(), ordinal: 1, text: text.into(), start_seconds: 0.0, end_seconds: 1.0 }
+        }
+        fn group(id: &str, sentence_ids: &[&str]) -> PlanGroup {
+            PlanGroup {
+                id: id.into(),
+                ordinal: 1,
+                label: "Still".into(),
+                kind: "custom".into(),
+                sentence_ids: sentence_ids.iter().map(|s| s.to_string()).collect(),
+                settings_locked: false,
+                prompt_locked: false,
+                scene_id: None,
+            }
+        }
+        // Simulates a video whose plan once had a "g5" (an image was
+        // generated for it), then a LATER recalculation shrank the script
+        // down to only 2 stills (g5 dropped out of the CURRENT plan
+        // entirely - it's now only visible in a table like image_renders,
+        // never again in `previous.groups`). `previous` here is that
+        // shrunken 2-still state.
+        let previous = VisualPlan {
+            video_id: "video".into(),
+            timing_source: "test".into(),
+            sentences: vec![sentence("s1", "Kept sentence one."), sentence("s2", "Kept sentence two.")],
+            groups: vec![group("g1", &["s1"]), group("g2", &["s2"])],
+            scenes: Vec::new(),
+            updated_at: "now".into(),
+        };
+        // The script grows back to 3 stills, with a genuinely new third
+        // sentence. Without the historical floor, "one past previous's
+        // own max" would recompute g3 - safe here, but if the orphaned
+        // id had been g5 (as in the scenario this models), "one past 2"
+        // would land back on a number nowhere near it. This test pins the
+        // floor itself: passing a historical_high_watermark of 5 must
+        // push the fresh id past it regardless of what `previous` alone
+        // would have produced.
+        let new_sentences = vec![
+            sentence("s1", "Kept sentence one."),
+            sentence("s2", "Kept sentence two."),
+            sentence("s3", "Brand new third sentence."),
+        ];
+        let mut groups = vec![group("g1", &["s1"]), group("g2", &["s2"]), group("g3", &["s3"])];
+        reconcile_recalculated_group_ids(&previous, &new_sentences, &mut groups, 5);
+        assert_eq!(groups[0].id, "g1");
+        assert_eq!(groups[1].id, "g2");
+        assert_eq!(
+            groups[2].id, "g6",
+            "the brand-new still's id must be minted past the historical watermark (5), not just past previous.groups' own max (2)"
+        );
+    }
+
+    #[test]
+    fn recalculating_the_visual_plan_keeps_a_stills_image_when_its_sentence_survives_and_drops_it_otherwise() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+
+        // A single-sentence script always collapses to exactly one group
+        // (build_groups_range can't produce less than one), which keeps
+        // this test deterministic without depending on pacing/duration
+        // bucketing.
+        repo.save_video_inputs(&video.id, "Original sentence text.", 4).unwrap();
+        let first = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        assert_eq!(first.groups.len(), 1);
+        let original_still_id = first.groups[0].id.clone();
+        repo.create_prompt_version(
+            &video.id,
+            &original_still_id,
+            r#"{"aspectRatio":"16:9"}"#,
+            "system",
+            "A generated image for the original sentence.",
+        )
+        .unwrap();
+        assert_eq!(
+            repo.list_prompt_versions(&video.id, &original_still_id).unwrap().len(),
+            1
+        );
+
+        // Recalculate with the SAME sentence text unchanged: the still
+        // must keep the same group id, and therefore its generated
+        // image/prompt history.
+        repo.save_video_inputs(&video.id, "Original sentence text.", 4).unwrap();
+        let unchanged = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        assert_eq!(unchanged.groups.len(), 1);
+        assert_eq!(
+            unchanged.groups[0].id, original_still_id,
+            "an unchanged sentence must keep carrying the same still id across a recalculation"
+        );
+        assert_eq!(
+            repo.list_prompt_versions(&video.id, &unchanged.groups[0].id).unwrap().len(),
+            1,
+            "the still's existing generated image must survive a recalculation that didn't touch its sentence"
+        );
+
+        // Recalculate again, this time with genuinely different text: the
+        // still must NOT reuse the old id (which still has an image filed
+        // under it) — it needs a fresh, empty one.
+        repo.save_video_inputs(&video.id, "A completely different sentence.", 4).unwrap();
+        let changed = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        assert_eq!(changed.groups.len(), 1);
+        assert_ne!(
+            changed.groups[0].id, original_still_id,
+            "changed sentence text must not reuse the old still's id and inherit its stale image"
+        );
+        assert!(
+            repo.list_prompt_versions(&video.id, &changed.groups[0].id).unwrap().is_empty(),
+            "a still whose sentence no longer exists verbatim must start with an empty generated-image preview"
+        );
+    }
+
+    #[test]
+    fn recalculation_never_resurrects_an_orphaned_group_ids_stale_image() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        repo.save_video_inputs(&video.id, "First sentence text.", 4).unwrap();
+        let first = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        assert_eq!(first.groups.len(), 1);
+
+        // Simulates a still that existed several recalculations ago under
+        // id "g5" (an image was generated for it) but has since dropped
+        // out of the plan entirely - the current plan only knows about
+        // "g1". This is exactly what happens when a script shrinks (a
+        // still's group number falls out of range) - nothing needs to
+        // reference "g5" as a CURRENT group for its image row to still
+        // exist in the database.
+        repo.create_prompt_version(&video.id, "g5", r#"{"aspectRatio":"16:9"}"#, "system", "An old, orphaned still's image.").unwrap();
+        assert_eq!(
+            repo.highest_group_number_ever_referenced(&video.id).unwrap(),
+            5,
+            "the historical watermark must see the orphaned g5 row even though no CURRENT group is called that"
+        );
+
+        // Recalculate with different text, so this still can't match the
+        // existing "g1" by content either - it must mint a fresh id.
+        repo.save_video_inputs(&video.id, "A totally different sentence.", 4).unwrap();
+        let changed = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        assert_eq!(changed.groups.len(), 1);
+        let new_id = &changed.groups[0].id;
+        assert_ne!(new_id, "g5", "must not resurrect the orphaned still's old id and inherit its stale image");
+        assert!(
+            repo.list_prompt_versions(&video.id, new_id).unwrap().is_empty(),
+            "the recalculated still must start with a genuinely empty preview, not the orphaned g5 image"
+        );
     }
 
     /// Seeds a plan with one sentence per still (simplest fixture for

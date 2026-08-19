@@ -111,6 +111,22 @@ function setCached(key: string, value: ImageWorkspaceRecord) {
   imageWorkspaceCache.set(key, value);
 }
 
+/** videoId → the visual plan's STILL STRUCTURE (groups) has changed since
+ * Images last explicitly synced to it via "Continue to images →". By
+ * design, plain navigation to the Visuals tab (the left sidebar's button)
+ * does NOT clear this or fetch a fresh workspace while it's set - Images
+ * keeps showing whatever structure it last committed to, exactly as it
+ * was, until the user explicitly re-confirms the new plan. Without this,
+ * a still recalculation/edit made in the Visual Plan tab would otherwise
+ * flash through a mismatched cache-then-fresh-fetch swap the instant you
+ * next opened Visuals from the sidebar, showing a wrong or stale image
+ * for a moment before correcting itself. */
+const imagesPlanDirty = new Set<string>();
+
+function markPlanDirtyForImages(videoId: string | null) {
+  if (videoId) imagesPlanDirty.add(videoId);
+}
+
 function getGreeting() {
   const hour = new Date().getHours();
   if (hour < 12) return "Good morning";
@@ -1015,6 +1031,11 @@ function InputsView() {
       await projectsClient.generateVisualPlan(activeVideoId);
       setHasPlan(true);
       setGeneratedInputSignature(inputSignature);
+      // A (re)generated plan's still structure must not reach Images until
+      // the user explicitly confirms it via "Continue to images →" - see
+      // imagesPlanDirty. Harmless no-op for a video's very first plan,
+      // since Images has no cache yet to protect at that point anyway.
+      markPlanDirtyForImages(activeVideoId);
       setStage("visual-plan");
     } catch (caught) {
       setError(String(caught));
@@ -1127,7 +1148,7 @@ function VisualPlanView() {
   /** `skipHistory` is for mutations that shouldn't clutter undo — a scene
    * expand/collapse toggle (fired on every click), and the undo/redo
    * restore itself (which would otherwise re-push the state it's replacing). */
-  async function refresh(promise: Promise<VisualPlanRecord>, options?: { skipHistory?: boolean }) {
+  async function refresh(promise: Promise<VisualPlanRecord>, options?: { skipHistory?: boolean; skipDirty?: boolean }) {
     const before = plan;
     try {
       const next = await promise;
@@ -1137,6 +1158,11 @@ function VisualPlanView() {
         if (undoStackRef.current.length > 50) undoStackRef.current.shift();
         redoStackRef.current = [];
       }
+      // Every structural edit (move/create/merge/split/reset/undo/redo)
+      // changes group composition, which Images must NOT pick up until
+      // "Continue to images →" - see imagesPlanDirty. Scene expand/collapse
+      // (the one skipDirty caller) never touches group ids, so it's exempt.
+      if (!options?.skipDirty) markPlanDirtyForImages(activeVideoId);
     } catch (caught) {
       setError(String(caught));
       throw caught;
@@ -1280,6 +1306,24 @@ function VisualPlanView() {
     await refresh(projectsClient.resetVisualPlan(activeVideoId));
   }
 
+  // The only path that's allowed to sync Images to a plan that changed
+  // here (see imagesPlanDirty) - prefetches the freshly-recalculated
+  // workspace and primes the cache with it BEFORE switching stages, so
+  // ImagesView's own cache-first mount render already shows the correct,
+  // final state instead of the old cache flashing through first.
+  async function continueToImages() {
+    if (activeVideoId) {
+      try {
+        setCached(activeVideoId, await projectsClient.getImageWorkspace(activeVideoId));
+      } catch {
+        // Best-effort prefetch only - if this fails, ImagesView's own
+        // mount-time fetch will surface the error the normal way.
+      }
+      imagesPlanDirty.delete(activeVideoId);
+    }
+    setStage("images");
+  }
+
   async function createGroup(sentenceId: string, insertIndex: number, keepInCurrentScene: boolean) {
     if (!activeVideoId) return;
     try { await refresh(projectsClient.createPlanGroup(activeVideoId, sentenceId, insertIndex, keepInCurrentScene)); }
@@ -1294,7 +1338,7 @@ function VisualPlanView() {
 
   async function setSceneExpanded(sceneId: string, expanded: boolean) {
     if (!activeVideoId) return;
-    try { await refresh(projectsClient.setPlanSceneExpanded(activeVideoId, sceneId, expanded), { skipHistory: true }); }
+    try { await refresh(projectsClient.setPlanSceneExpanded(activeVideoId, sceneId, expanded), { skipHistory: true, skipDirty: true }); }
     catch { /* refresh already recorded the error */ }
   }
 
@@ -1378,7 +1422,7 @@ function VisualPlanView() {
     <section className="view">
       <div className="page-heading">
         <div><h1>Visual plan</h1><p>Drag a sentence onto another to merge them, or into a still to regroup it. Click inside a sentence to mark where it should split, then confirm. Chronological order remains enforced.</p></div>
-        <div className="heading-actions"><button className="secondary" onClick={() => setStage("inputs")}>← Back</button><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => setStage("images")}>Continue to images →</button></div>
+        <div className="heading-actions"><button className="secondary" onClick={() => setStage("inputs")}>← Back</button><button className="secondary" disabled={!plan} onClick={() => setConfirmReset(true)}>Reset original</button><button className="primary" disabled={!plan} onClick={() => void continueToImages()}>Continue to images →</button></div>
       </div>
       {searchOpen && (
         <div className="plan-search-bar">
@@ -2671,11 +2715,38 @@ function ImagesView() {
       const cached = imageWorkspaceCache.get(activeVideoId);
       if (cached) {
         setWorkspace(cached);
+        // selectedRenderId must always track whichever group selectedGroupId
+        // actually resolves to here (restored selection, or the first
+        // group) - NOT unconditionally the first group's own render. Get
+        // it wrong and a still that isn't actually group 0 renders group
+        // 0's image (in both this thumbnail and the main preview) until
+        // the next click through selectGroup recomputes it correctly -
+        // resolvedGroupId captures the id setSelectedGroupId's updater
+        // just resolved, since the updater callback runs synchronously.
+        let resolvedGroupId: string | null = null;
         setSelectedGroupId((current) => {
           const restore = lastSelectedStill.get(activeVideoId);
-          if (restore && cached.groups.some((g) => g.group.id === restore)) return restore;
-          return current ?? cached.groups[0]?.group.id ?? null;
+          const next = restore && cached.groups.some((g) => g.group.id === restore)
+            ? restore
+            : current ?? cached.groups[0]?.group.id ?? null;
+          resolvedGroupId = next;
+          return next;
         });
+        const selectedFromCache = cached.groups.find((g) => g.group.id === resolvedGroupId);
+        setSelectedRenderId(selectedFromCache?.imageRenders[0]?.id ?? null);
+      }
+      // The visual plan changed since Images last explicitly synced to it
+      // (a recalculation, or a move/split/merge/reset in the Visual Plan
+      // tab) and this mount wasn't reached via "Continue to images →" -
+      // keep showing exactly what's cached and skip the fetch below
+      // entirely, rather than silently pulling in the new still structure
+      // (which would also reintroduce the stale-cache-then-fresh-swap
+      // flash this guard exists to prevent). Still dirty either way: it's
+      // only cleared by continueToImages, never by a plain visit here.
+      if (cached && imagesPlanDirty.has(activeVideoId)) {
+        setLoading(false);
+        setError(null);
+        return;
       }
       setLoading(!cached);
       setError(null);
@@ -2683,12 +2754,23 @@ function ImagesView() {
         const loaded = await projectsClient.getImageWorkspace(activeVideoId);
         setCached(activeVideoId, loaded);
         setWorkspace(loaded);
+        // See the identical comment on the cached-branch above: everything
+        // derived below (selectedRenderId, and the systemPrompt/userPrompt
+        // fallback) must come from whichever group this resolves to, never
+        // unconditionally loaded.groups[0] - group[0] is only "selected"
+        // when nothing else was restored.
+        let resolvedGroupId: string | null = null;
         setSelectedGroupId((current) => {
           const restore = lastSelectedStill.get(activeVideoId);
-          if (restore && loaded.groups.some((g) => g.group.id === restore)) return restore;
-          if (current && loaded.groups.some((g) => g.group.id === current)) return current;
-          return loaded.groups[0]?.group.id ?? null;
+          const next = restore && loaded.groups.some((g) => g.group.id === restore)
+            ? restore
+            : current && loaded.groups.some((g) => g.group.id === current)
+              ? current
+              : loaded.groups[0]?.group.id ?? null;
+          resolvedGroupId = next;
+          return next;
         });
+        const selectedFromLoaded = loaded.groups.find((g) => g.group.id === resolvedGroupId);
         // Both keyed per-video (`.${activeVideoId}` suffix) — these used to be
         // one shared key across every video in the workspace, so a style
         // directive or settings tweak on one video silently bled into
@@ -2700,7 +2782,7 @@ function ImagesView() {
         setReferences(inputs.references);
         const latestJob = await projectsClient.getLatestImageJob(activeVideoId);
         setJob(latestJob && ["queued", "running", "paused", "stopped", "failed"].includes(latestJob.status) ? latestJob : null);
-        const latest = loaded.groups[0]?.promptVersions[0];
+        const latest = selectedFromLoaded?.promptVersions[0];
         setSystemPrompt(loaded.settings.find((s) => s.key === `system_prompt.${activeVideoId}`)?.value ?? latest?.systemPrompt ?? "");
         setUserPrompt(latest?.userPrompt ?? "");
         // Per-video, same reasoning as systemPrompt/imageSettings above —
@@ -2708,8 +2790,7 @@ function ImagesView() {
         // video, so a Creative Instructions note written for one video
         // silently leaked into whichever video was opened next.
         setBulkInstruction(loaded.settings.find((s) => s.key === `bulk_instruction.${activeVideoId}`)?.value ?? "");
-        const latestRender = loaded.groups[0]?.imageRenders[0];
-        setSelectedRenderId(latestRender?.id ?? null);
+        setSelectedRenderId(selectedFromLoaded?.imageRenders[0]?.id ?? null);
         const savedPrep = loaded.settings.find((setting) => setting.key === `prompt_prep.${activeVideoId}`)?.value;
         if (savedPrep) {
           try {

@@ -1,3 +1,4 @@
+use crate::session_log;
 use base64::Engine;
 use chrono::Utc;
 use keyring::{Entry, Error as KeyringError};
@@ -3267,6 +3268,22 @@ impl ProjectRepository {
             .map_err(|e| e.to_string())
     }
 
+    /// Base directory the session planning log (`session_log.rs`) resolves
+    /// its `Logs/` folder under — Preferences' "Save location"
+    /// (`download_folder`, the same setting `downloadStill`'s frontend
+    /// counterpart already reads/writes), falling back to this video
+    /// library's own root if that was never set, so automatic background
+    /// logging never silently does nothing just because Preferences was
+    /// never opened.
+    fn logs_base_dir(&self) -> PathBuf {
+        self.get_app_setting("download_folder")
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.projects_dir.clone())
+    }
+
     pub fn save_app_setting(&self, key: &str, value: &str) -> Result<(), String> {
         self.connection
             .execute(
@@ -4953,9 +4970,12 @@ Return JSON only — no markdown, no explanation:
         selected_group_ids: &[String],
         start_index: usize,
     ) -> Result<BulkPlanBatchResult, String> {
+        // No durable request row to key a session-log run on for this
+        // legacy direct path (see plan_bulk_visuals_batch_for_request) —
+        // the video id itself is a reasonable enough "one run" stand-in.
         self.plan_bulk_visuals_batch_impl(
             video_id, style_directive, base_settings_json, creative_instruction,
-            selected_group_ids, start_index, None,
+            selected_group_ids, start_index, None, video_id,
         )
     }
 
@@ -4980,6 +5000,7 @@ Return JSON only — no markdown, no explanation:
             &snapshot.group_ids,
             request.plan_index as usize,
             Some(&snapshot),
+            request_id,
         )?;
         let next_index = if result.done {
             result.total_stills
@@ -5003,6 +5024,7 @@ Return JSON only — no markdown, no explanation:
         selected_group_ids: &[String],
         start_index: usize,
         snapshot: Option<&BulkRequestSnapshot>,
+        run_key: &str,
     ) -> Result<BulkPlanBatchResult, String> {
         #[cfg(not(test))]
         let claude_cli = claude_cli_available();
@@ -5016,6 +5038,15 @@ Return JSON only — no markdown, no explanation:
         if gemini_auth.is_none() && !claude_cli {
             return Err("A logged-in Claude Code CLI, or a Gemini API key, is required for Bulk planning. Run `claude` once to log in, or add a Gemini key in Settings.".into());
         }
+        // Fetched once up front for the session planning log (see
+        // session_log::record_bulk_planned_still below) rather than once
+        // per still — a fallback to the raw id costs nothing and keeps
+        // this from erroring out over a cosmetic log label.
+        let video_title: String = self.connection.query_row(
+            "SELECT title FROM videos WHERE id=?1", [video_id], |row| row.get(0),
+        ).unwrap_or_else(|_| video_id.to_string());
+        let logs_base_dir = self.logs_base_dir();
+        let planning_provider = if claude_cli { "Claude CLI" } else { "Gemini" };
         // Upper bound on how many stills a single AI planning call covers —
         // no longer the primary chunking unit (a scene boundary always wins,
         // see below), just a prompt-size safety cap for scenes larger than
@@ -5504,9 +5535,11 @@ TEXTLESS VISUAL RULE (Textless Infographic, Timeline, Geographic Map, Scientific
 
 Allowed visualType values: Character Scene; Character Close-Up / Reaction; Behavioral Demonstration; Close Detail; Environmental Scene; Object Focus; Comparison; Before/After or Transformation; Size / Scale Comparison; Process Illustration; Timeline; Title / Statement Card; Textless Infographic; Scientific Diagram; Family Tree / Lineage Diagram; Geographic Map; Concept Visualization; POV Scene; Symbolic Representation; Documentary Frame.
 
+REASON — required per still, written for a production log a human will read afterward, not shown to any downstream generation step: 4-8 sentences explaining, in depth, why you chose this specific userPrompt and these imageSettings. Reference the actual, concrete details that drove each decision — which words/beats in the narration produced the subject/action/environment, how the Style Directive and any MANDATORY CREATIVE RULES shaped the composition, how the Visual Director dials and Diversity & Consistency constraints (if present above) influenced this still relative to its neighbors, and — if this still carried a required or allowed Visualization Type — why the chosen medium satisfies it. Be specific to THIS still, never a generic template sentence.
+
 You MUST return exactly one plan for every row in the current batch.
 OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object and NOTHING else. Do not write any introduction, restatement of the task, narration of your planning process, explanation, commentary, or markdown fences before, between, or after it. Do not describe what you are about to plan — just plan it, silently, and output only the resulting JSON. The very first character of your response must be {{ and the very last character must be }}.
-{{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content — mandatory creative rules embedded; negatives as [Avoid: ...]","coreVisualDevice":"2-6 words naming the concrete symbol/object this still leans on, e.g. 'dice and coin', 'gears', 'split panel: podium vs porch'"}}]}}"#,
+{{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content — mandatory creative rules embedded; negatives as [Avoid: ...]","reason":"in-depth explanation, see REASON above","coreVisualDevice":"2-6 words naming the concrete symbol/object this still leans on, e.g. 'dice and coin', 'gears', 'split panel: podium vs porch'"}}]}}"#,
             format!("{}-{}", start_index + 1, chunk_end),
             serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
             serde_json::to_string_pretty(chunk).unwrap_or_default(),
@@ -5616,6 +5649,24 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
             }
             if let Some(saved) = self.persist_bulk_planned_still(video_id, &effective_style_directive, group, row, plan)? {
                 last_ordinal = saved.ordinal;
+                // Best-effort, same non-fatal convention as
+                // write_bulk_prompt_log below — a log-write failure must
+                // never fail an otherwise successful, already-persisted
+                // batch.
+                let _ = session_log::record_bulk_planned_still(
+                    &logs_base_dir,
+                    video_id,
+                    &video_title,
+                    run_key,
+                    session_log::PlannedEntry {
+                        group_id: saved.visual_plan_row_id.clone(),
+                        ordinal: saved.ordinal,
+                        narration: row["narration"].as_str().unwrap_or_default().to_string(),
+                        decision_reasoning: saved.reason.clone(),
+                        user_prompt: saved.user_prompt.clone(),
+                        provider: planning_provider,
+                    },
+                );
             }
             planned_count += 1;
         }
@@ -5877,6 +5928,17 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
         let start = members.first().map(|s| s.start_seconds).unwrap_or(0.0);
         let end = members.last().map(|s| s.end_seconds).unwrap_or(start);
         let existing_prompt = self.list_prompt_versions(video_id, group_id)?.into_iter().next();
+        let existing_settings = existing_prompt.as_ref()
+            .and_then(|p| serde_json::from_str::<serde_json::Value>(&p.settings_json).ok());
+        let current_settings = serde_json::from_str::<serde_json::Value>(base_settings_json).ok();
+        // What the user has manually changed in the Settings pane since the
+        // last suggestion was saved for this still - the actual signal that
+        // was previously missing entirely. Without it, re-clicking Suggest
+        // Prompt after only tweaking, say, mood or camera angle gave the AI
+        // nothing to distinguish that from re-clicking with nothing changed
+        // at all, so it kept reconverging on the same phrasing. Empty on the
+        // still's very first suggestion (nothing to diff against yet).
+        let changed_settings = diff_settings_changes(existing_settings.as_ref(), current_settings.as_ref());
         let row = json!({
             "visualPlanRowId": group.id,
             "ordinal": group.ordinal,
@@ -5884,10 +5946,25 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
             "startSeconds": start,
             "endSeconds": end,
             "narration": narration,
-            "existingSettings": existing_prompt.as_ref()
-                .and_then(|p| serde_json::from_str::<serde_json::Value>(&p.settings_json).ok()),
+            "existingSettings": existing_settings,
             "existingPrompt": existing_prompt.as_ref().map(|p| p.user_prompt.as_str()),
+            "settingsChangedSinceLastSuggestion": changed_settings,
         });
+        let settings_change_block = if changed_settings.as_object().is_some_and(|obj| !obj.is_empty()) {
+            format!(
+                r#"
+
+SETTINGS CHANGED SINCE THE LAST SUGGESTION for this still: {}
+The user just deliberately changed these image-setting fields (each shown as the previous suggested value -> what it is now). Your new suggestion must visibly respond to this, not reproduce "existingPrompt" with only cosmetic wording changes:
+- Carry forward every changed field's NEW value as-is in your returned imageSettings — never revert a field the user just set back toward its old value.
+- Let the changed fields genuinely inform the rest of your imageSettings choices where they interact (e.g. a new mood/lighting/weather should read as consistent with whichever OTHER settings you're still free to choose, a new depthOfField/composition should be reflected in how tightly framed your reasoning implies the shot is).
+- USER PROMPT RULES below still apply (no camera/lighting/style terms in userPrompt) — but reconsider the staging, action, or framing emphasis of the scene itself in light of the new settings rather than repeating the previous userPrompt's exact phrasing.
+- Write a fresh "reason" that explicitly references what changed and why your suggestion answers it."#,
+                serde_json::to_string(&changed_settings).unwrap_or_default(),
+            )
+        } else {
+            String::new()
+        };
         let prompt = format!(
             r#"You are an Educational Visual Director suggesting a prompt for a single still image.
 
@@ -5895,7 +5972,7 @@ Style directive: {style_directive}
 Base image settings: {base_settings_json}
 
 Still to plan:
-{}
+{}{settings_change_block}
 
 CORE GOAL: Ask "What image best helps the viewer understand this concept?" — never "What literally matches the sentence?"
 
@@ -5914,8 +5991,10 @@ USER PROMPT RULES:
 
 Allowed visualType values: Character Scene; Behavioral Demonstration; Close Detail; Environmental Scene; Object Focus; Comparison; Process Illustration; Timeline; Textless Infographic; Scientific Diagram; Geographic Map; Concept Visualization; POV Scene; Symbolic Representation; Documentary Frame.
 
+REASON — written for a production log a human will read afterward: 4-8 sentences explaining, in depth, why you chose this specific userPrompt and these imageSettings. Reference the actual, concrete details that drove each decision — which words/beats in the narration produced the subject/action/environment, how the Style Directive shaped the composition, and (see SETTINGS CHANGED above, if present) how any settings the user just changed specifically informed this suggestion. Be specific to THIS still, never a generic template sentence.
+
 Return JSON only — one plan object:
-{{"plans":[{{"visualPlanRowId":"{}","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content only","reason":"1-2 sentences"}}]}}"#,
+{{"plans":[{{"visualPlanRowId":"{}","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content only","reason":"in-depth explanation, see REASON above"}}]}}"#,
             serde_json::to_string(&row).unwrap_or_default(),
             group.id,
         );
@@ -5927,6 +6006,24 @@ Return JSON only — one plan object:
             .ok_or("No plan returned.")?;
         let response: V2PlanStillResponse = serde_json::from_value(plan.clone())
             .map_err(|e| format!("Plan had unexpected structure: {e}"))?;
+        // Best-effort, same non-fatal convention as bulk planning's own
+        // session-log write — never fails the suggestion itself.
+        let video_title: String = self.connection.query_row(
+            "SELECT title FROM videos WHERE id=?1", [video_id], |row| row.get(0),
+        ).unwrap_or_else(|_| video_id.to_string());
+        let _ = session_log::record_suggested_still(
+            &self.logs_base_dir(),
+            video_id,
+            &video_title,
+            session_log::PlannedEntry {
+                group_id: response.visual_plan_row_id.clone(),
+                ordinal: group.ordinal,
+                narration: narration.clone(),
+                decision_reasoning: response.reason.clone(),
+                user_prompt: response.user_prompt.clone(),
+                provider: "Gemini",
+            },
+        );
         Ok(BulkPlannedStill {
             visual_plan_row_id: response.visual_plan_row_id,
             ordinal: group.ordinal as i64,
@@ -6626,6 +6723,10 @@ Return JSON only:
         let file_name = format!("render-v{}.{}", version, extension);
         let relative_path = format!("renders/{}/{}", group_id, file_name);
         let out_path = render_dir.join(&file_name);
+        // Cloned before the move into fs::write below — the session
+        // planning log's thumbnail column embeds this same image, see the
+        // record_generated_image call near the end of this function.
+        let thumbnail_bytes = image_bytes.clone();
         fs::write(&out_path, image_bytes).map_err(|e| e.to_string())?;
         let id = Uuid::new_v4().to_string();
         let render = self.insert_image_render(
@@ -6653,6 +6754,19 @@ Return JSON only:
             })
             .to_string(),
         )?;
+        // Best-effort — fills in the still-pending planning-log row (if
+        // any) this generation belongs to with the literal text actually
+        // sent to Gemini and a thumbnail of the result. A silent no-op if
+        // this prompt was never planned via Claude/Gemini in this session
+        // (hand-typed/edited prompt) — see record_generated_image's doc
+        // comment for why that's the correct behavior, not a bug.
+        let _ = session_log::record_generated_image(
+            &self.logs_base_dir(),
+            video_id,
+            group_id,
+            prompt,
+            Some(thumbnail_bytes),
+        );
         Ok(render)
     }
 
@@ -12853,6 +12967,57 @@ const IMAGE_MEDIUM_TYPES: &[&str] = &[
     "Document", "Collage / Composite", "Abstract Visual", "Pattern / Texture", "Isolated Asset",
 ];
 
+/// Image-setting fields `suggest_still_prompt`'s AI is actually asked to
+/// choose (its IMAGE SETTINGS RULES BASIC/ADVANCED lists) — `aspectRatio`
+/// (an output-dimension choice, not a "look" dial) and `visualizationType`
+/// (deliberately out of scope for the single-still Suggest action, see
+/// resolve_effective_visualization's doc comment) are excluded so a change
+/// to either never gets surfaced to the AI as something to react to.
+const SUGGEST_STILL_PROMPT_DIFFABLE_SETTINGS: &[&str] = &[
+    "cameraAngle", "lighting", "mood", "depthOfField", "colorTemperature", "weatherAtmosphere",
+    "lensType", "lightDirection", "lightQuality", "shadowType", "contrast", "focusType",
+    "exposure", "motion", "composition", "saturation", "vignette", "grainIntensity",
+    "colorCastTint", "surfaceEffects",
+];
+
+/// Diffs two flat image-settings JSON objects, returning only the dial
+/// fields the user has manually set to a concrete (non-"Undefined") value
+/// in `current` that differs from what was saved in `previous` — as
+/// `{"field": {"from": <old value or null>, "to": <new value>}}`. Used by
+/// `suggest_still_prompt` so the AI is told exactly which settings changed
+/// since the still's last saved suggestion, rather than having to infer it
+/// from two opaque settings blobs (which it was never reliably doing,
+/// hence repeated "Suggest Prompt" clicks after a settings tweak kept
+/// reconverging on the same phrasing). `None` for `previous` (nothing
+/// saved yet for this still) always yields an empty diff.
+fn diff_settings_changes(
+    previous: Option<&serde_json::Value>,
+    current: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    // No prior suggestion saved for this still yet — every field would
+    // trivially "differ" from nothing, which isn't a meaningful signal;
+    // treat it the same as "nothing changed" rather than flooding the
+    // first-ever suggestion with a full diff of itself.
+    let (Some(current), Some(previous)) = (current.and_then(|v| v.as_object()), previous.and_then(|v| v.as_object())) else {
+        return json!({});
+    };
+    let mut changed = serde_json::Map::new();
+    for key in SUGGEST_STILL_PROMPT_DIFFABLE_SETTINGS {
+        let Some(new_value) = current.get(*key) else { continue };
+        if new_value.as_str().is_some_and(|s| s.eq_ignore_ascii_case("undefined") || s.trim().is_empty()) {
+            continue;
+        }
+        let old_value = previous.get(*key);
+        if old_value != Some(new_value) {
+            changed.insert(
+                (*key).to_string(),
+                json!({ "from": old_value.cloned().unwrap_or(serde_json::Value::Null), "to": new_value.clone() }),
+            );
+        }
+    }
+    serde_json::Value::Object(changed)
+}
+
 /// Resolved Visualization Type constraint for one still. `hard_rule` false
 /// (with `types` empty) means "no constraint at all" — the common case for
 /// anyone who never touches this feature, and the only possibility unless
@@ -16566,6 +16731,43 @@ mod tests {
         // as unset, same as every other "blank = not overridden" field.
         let blank_override = resolve_effective_visualization(Some("   "), &global_types, true);
         assert_eq!(blank_override.types, global_types);
+    }
+
+    #[test]
+    fn diff_settings_changes_surfaces_only_concrete_manual_changes_to_diffable_fields() {
+        // No previous suggestion saved yet for this still — nothing to
+        // diff against, regardless of what `current` holds.
+        let current = json!({"cameraAngle": "Low angle", "mood": "Tense"});
+        assert_eq!(diff_settings_changes(None, Some(&current)), json!({}));
+
+        let previous = json!({
+            "cameraAngle": "Eye level", "lighting": "Soft", "mood": "Calm",
+            "aspectRatio": "16:9", "visualizationType": "Photograph",
+        });
+        let current = json!({
+            // Actually changed to a concrete value — must be surfaced.
+            "cameraAngle": "Low angle",
+            // Unchanged — must NOT be surfaced.
+            "lighting": "Soft",
+            // Changed but reset back to the placeholder — a placeholder
+            // isn't a deliberate instruction, so it must NOT be surfaced.
+            "mood": "Undefined",
+            // Changed, but on a field outside this endpoint's AI schema
+            // (aspectRatio is an output dimension; visualizationType is
+            // explicitly out of scope for single-still Suggest) — must
+            // NOT be surfaced regardless of how different it is.
+            "aspectRatio": "9:16",
+            "visualizationType": "Diagram",
+            // Present in `current` but never in `previous` — a fresh
+            // manual pick on a field the AI never set before, still
+            // must be surfaced (from: null).
+            "weatherAtmosphere": "Foggy",
+        });
+        let changed = diff_settings_changes(Some(&previous), Some(&current));
+        let obj = changed.as_object().unwrap();
+        assert_eq!(obj.len(), 2, "expected exactly cameraAngle and weatherAtmosphere, got {changed}");
+        assert_eq!(obj["cameraAngle"], json!({"from": "Eye level", "to": "Low angle"}));
+        assert_eq!(obj["weatherAtmosphere"], json!({"from": null, "to": "Foggy"}));
     }
 
     #[test]

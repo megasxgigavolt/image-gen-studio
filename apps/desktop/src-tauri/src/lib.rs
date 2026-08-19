@@ -1,4 +1,5 @@
 mod projects;
+mod session_log;
 
 use base64::Engine;
 use projects::{

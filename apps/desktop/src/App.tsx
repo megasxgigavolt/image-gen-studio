@@ -3594,6 +3594,29 @@ function ImagesView() {
     finally { setAiLoading(false); }
   }
 
+  // Strips anything settings/subject-specific out of the Style Directive
+  // (camera angle, lighting, named characters/objects, scene content —
+  // whatever already has its own dedicated field elsewhere), leaving only
+  // the global aesthetic rules a Style Directive is actually meant to
+  // hold. Same handler for both textareas that edit this field (the main
+  // Settings tab and Global Bulk Settings) since they already share this
+  // one systemPrompt state.
+  async function cleanStyleDirective() {
+    if (!systemPrompt.trim()) return;
+    setAiLoading(true);
+    setError(null);
+    try {
+      // Text only — deliberately never touches imageSettings. Those may
+      // already hold real values pulled from a reference image (Extract
+      // Style) or set by hand; this button's only job is trimming
+      // settings-language OUT of the directive prose, not re-deriving or
+      // overwriting the structured dials themselves.
+      const extracted = await projectsClient.extractImageSettingsFromDirective(systemPrompt);
+      setSystemPrompt(extracted.styleDirective);
+    } catch (caught) { setError(String(caught)); }
+    finally { setAiLoading(false); }
+  }
+
   const previewLabel = selectedGroup?.group.label ?? "Still preview";
   const stillCount = workspace?.groups.length ?? 0;
   const pendingBulkRequests = bulkQueue.filter((request) => request.status === "pending");
@@ -3938,7 +3961,10 @@ function ImagesView() {
               <button className="secondary full" onClick={() => void suggestPrompt()} disabled={!selectedGroupId || aiLoading}>{aiLoading ? <><LoaderCircle className="spin" size={14} />Suggesting…</> : <><Sparkles size={15} />Suggest Prompt</>}</button>
               <label>
                 <span className="field-heading">Style Directive <small>Optional</small></span>
-                <textarea className="production-copy" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="Art style, rendering, color language, recurring subjects, visual consistency rules..." />
+                <div className="directive-field">
+                  <textarea className="production-copy" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="Art style, rendering, color language, recurring subjects, visual consistency rules..." />
+                  <button type="button" className="directive-clean-button" title="Clean up style directive — remove anything that belongs in Image Settings instead" aria-label="Clean up style directive" onClick={() => void cleanStyleDirective()} disabled={!systemPrompt.trim() || aiLoading}><Sparkles size={12} /></button>
+                </div>
               </label>
               <button
                 type="button"
@@ -4094,7 +4120,10 @@ function ImagesView() {
 
           <div className="bulk-modal-group">Style Directive<span className="required-badge">Required</span></div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Describe overall cinematography and visual language. Avoid scene-specific details — the AI will handle those per still.</p>
-          <textarea className={`bulk-directive${systemPrompt.trim() ? "" : " needs-attention"}`} value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="e.g. Cinematic documentary style, shallow depth of field, warm color grade, soft natural lighting…" rows={4} />
+          <div className="directive-field">
+            <textarea className={`bulk-directive${systemPrompt.trim() ? "" : " needs-attention"}`} value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} placeholder="e.g. Cinematic documentary style, shallow depth of field, warm color grade, soft natural lighting…" rows={4} />
+            <button type="button" className="directive-clean-button" title="Clean up style directive — remove anything that belongs in Image Settings instead" aria-label="Clean up style directive" onClick={() => void cleanStyleDirective()} disabled={!systemPrompt.trim() || aiLoading}><Sparkles size={12} /></button>
+          </div>
 
           <div className="bulk-modal-group">Reference Image</div>
           <p style={{fontSize:"12px",color:"var(--text-muted)",margin:"0 0 8px"}}>Upload a reference to extract visual style and populate the directive automatically.</p>

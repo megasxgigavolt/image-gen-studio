@@ -17,10 +17,8 @@ type TimelineLanesProps = {
   waveformCanvasRef: RefObject<HTMLCanvasElement | null>;
   onNarrationDuration: (seconds: number) => void;
   narrationOffsetSeconds: number;
-  narrationDragPreview: number | null;
   selectedTrack: "narration" | null;
   onSelectNarrationTrack: () => void;
-  onBeginNarrationDrag: (event: ReactPointerEvent) => void;
   stillsClips: TimelineClipRecord[];
   stillsDragPreview: DragPreview;
   renderUrls: Record<string, string>;
@@ -29,7 +27,7 @@ type TimelineLanesProps = {
   selectedClipId: string | null;
   sequenceLocked: boolean;
   onBeginStillsDrag: (clip: TimelineClipRecord, mode: "start" | "end" | "move", event: ReactPointerEvent) => void;
-  onSelectStillsClip: (clip: TimelineClipRecord) => void;
+  onSelectStillsClip: (clip: TimelineClipRecord, atSeconds: number) => void;
   onDuplicateStillsClip: (clip: TimelineClipRecord) => void;
   onRemoveStillsClip: (clip: TimelineClipRecord) => void;
   onGoToStillInVisuals: (groupId: string) => void;
@@ -147,10 +145,8 @@ const TimelineLanes = memo(function TimelineLanes({
   waveformCanvasRef,
   onNarrationDuration,
   narrationOffsetSeconds,
-  narrationDragPreview,
   selectedTrack,
   onSelectNarrationTrack,
-  onBeginNarrationDrag,
   stillsClips,
   stillsDragPreview,
   renderUrls,
@@ -181,14 +177,17 @@ const TimelineLanes = memo(function TimelineLanes({
           <div
             className={selectedTrack === "narration" ? "tl-lane-track tl-narration-track active" : "tl-lane-track tl-narration-track"}
             style={{ height: NARRATION_LANE_HEIGHT }}
-            onClick={(event) => { event.stopPropagation(); onSelectNarrationTrack(); }}
+            onClick={(event) => {
+              event.stopPropagation();
+              const rect = event.currentTarget.getBoundingClientRect();
+              onSeek(pixelsToSeconds(event.clientX - rect.left, pixelsPerSecond));
+              onSelectNarrationTrack();
+            }}
           >
             {audioDataUrl && (
               <div
                 className="tl-narration-offset"
-                style={{ left: secondsToPixels(narrationDragPreview ?? narrationOffsetSeconds, pixelsPerSecond) }}
-                onPointerDown={onBeginNarrationDrag}
-                title="Drag to shift when narration starts"
+                style={{ left: secondsToPixels(narrationOffsetSeconds, pixelsPerSecond) }}
               >
                 <NarrationWaveform audioDataUrl={audioDataUrl} pixelsPerSecond={pixelsPerSecond} canvasRef={waveformCanvasRef} onDuration={onNarrationDuration} />
               </div>
@@ -220,7 +219,11 @@ const TimelineLanes = memo(function TimelineLanes({
                   style={{ left: secondsToPixels(start, pixelsPerSecond), width: Math.max(4, secondsToPixels(end - start, pixelsPerSecond)) }}
                   title={sequenceLocked ? "Sequence locked — resize freely, unlock to reorder (⋯ menu)" : undefined}
                   onPointerDown={(event) => onBeginStillsDrag(clip, "move", event)}
-                  onClick={(event) => { event.stopPropagation(); onSelectStillsClip(clip); }}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    onSelectStillsClip(clip, clip.startSeconds + pixelsToSeconds(event.clientX - rect.left, pixelsPerSecond));
+                  }}
                   onContextMenu={(event) => onOpenContextMenu(event, [
                     { label: "Duplicate clip", onSelect: () => onDuplicateStillsClip(clip) },
                     { label: "Remove clip", danger: true, onSelect: () => onRemoveStillsClip(clip) },
@@ -264,7 +267,11 @@ const TimelineLanes = memo(function TimelineLanes({
                   style={{ left: secondsToPixels(start, pixelsPerSecond), width: clipWidth }}
                   title={clip.text}
                   onPointerDown={(event) => onBeginCaptionDrag(clip, "move", event)}
-                  onClick={(event) => { event.stopPropagation(); onSeek(clip.startSeconds); }}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    onSeek(clip.startSeconds + pixelsToSeconds(event.clientX - rect.left, pixelsPerSecond));
+                  }}
                   onDoubleClick={(event) => { event.stopPropagation(); onSelectCaptionAndSeek(clip); }}
                   onContextMenu={(event) => onOpenContextMenu(event, [
                     { label: "Edit", onSelect: () => onEditCaptionClip(clip) },

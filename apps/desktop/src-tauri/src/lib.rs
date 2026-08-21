@@ -7,7 +7,7 @@ use projects::{
     BulkSceneSettings, BulkStillSettings, BulkVisualDials, CaptionSet, Channel,
     ExportJob, ExportResult, ExportSettings, ImageJob, ImageRender, ImageWorkspace, InputAsset,
     MediaLibraryAsset, ProjectRepository, ProviderKeyStatus, PromptVersion, ResumeState,
-    RosterCharacter, RosterLocation, SceneCastAssignment, StyleAspect, Timeline,
+    RosterCharacter, RosterLocation, SceneCastAssignment, SingleStillGeneration, StyleAspect, Timeline,
     Video, VideoAsset, VideoInputs, VideoProgress, VisualPlan,
 };
 use serde_json::json;
@@ -1807,6 +1807,65 @@ fn spawn_job_workers(
     }
 }
 
+/// Always-on dispatcher for the standalone single-still generation queue
+/// (see `MIGRATION_043`'s doc comment in projects.rs for why this isn't
+/// routed through `image_jobs`/`spawn_job_workers`). Started once at app
+/// startup, never per-enqueue — so unlike `spawn_job_workers`, there's no
+/// race between "a worker thread just exited because its queue was
+/// momentarily empty" and "a new item just landed": this thread never
+/// exits, it just sleeps and polls. `claim_next_single_still_generation`
+/// itself refuses to claim while a bulk `image_jobs` row is `'running'`
+/// anywhere, so this and Bulk Generation never hit Gemini concurrently.
+fn spawn_single_still_dispatcher(database_path: std::path::PathBuf, projects_dir: std::path::PathBuf) {
+    thread::spawn(move || {
+        let Ok(repository) = ProjectRepository::open(&database_path, &projects_dir) else {
+            return;
+        };
+        loop {
+            let (id, video_id, group_id, prompt) = match repository.claim_next_single_still_generation() {
+                Ok(Some(item)) => item,
+                Ok(None) => {
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+            };
+            let mut last_error = String::new();
+            let mut render_id = None;
+            // Same retry/backoff ladder as spawn_job_workers, minus the
+            // stopped/failed job-status checks (this queue has no
+            // pause/stop concept) and the bulk-snapshot/bulk-finalize
+            // steps, which don't apply to a manually-typed single prompt.
+            for attempt in 0..5 {
+                match repository.generate_image_render(
+                    &video_id, &group_id, &prompt.id, &prompt.system_prompt, &prompt.user_prompt, &prompt.settings_json,
+                ) {
+                    Ok(render) => {
+                        render_id = Some(render.id);
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = error;
+                        if attempt < 4 {
+                            let rate_limited = last_error.contains("429")
+                                || last_error.to_ascii_lowercase().contains("resource exhausted");
+                            let delay = if rate_limited { 15 * 2_u64.pow(attempt) } else { 3 * 2_u64.pow(attempt) };
+                            thread::sleep(Duration::from_secs(delay.min(75)));
+                        }
+                    }
+                }
+            }
+            let result = render_id.ok_or(last_error);
+            let _ = repository.finish_single_still_generation(&id, result);
+            // Same brief politeness gap between items as spawn_job_workers.
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
 #[tauri::command]
 fn create_image_job(
     state: State<'_, RepositoryState>,
@@ -1835,6 +1894,29 @@ fn get_latest_image_job(
     video_id: String,
 ) -> Result<Option<ImageJob>, String> {
     with_repository(state, |repository| repository.latest_image_job(&video_id))
+}
+
+#[tauri::command]
+fn enqueue_single_still_generation(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    group_id: String,
+    prompt_version_id: String,
+) -> Result<SingleStillGeneration, String> {
+    // The dispatcher thread is always running (started once at app
+    // startup, see run()) — enqueuing here is just a plain insert it'll
+    // pick up on its next poll, no per-call spawn needed.
+    with_repository(state, |repository| {
+        repository.enqueue_single_still_generation(&video_id, &group_id, &prompt_version_id)
+    })
+}
+
+#[tauri::command]
+fn list_single_still_generations(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+) -> Result<Vec<SingleStillGeneration>, String> {
+    with_repository(state, |repository| repository.list_single_still_generations(&video_id))
 }
 
 #[tauri::command]
@@ -3012,6 +3094,10 @@ pub fn run() {
             repository
                 .recover_animation_jobs()
                 .map_err(std::io::Error::other)?;
+            repository
+                .recover_single_still_generations()
+                .map_err(std::io::Error::other)?;
+            spawn_single_still_dispatcher(data_dir.join("auto-gen-studio.db"), data_dir.join("Projects"));
             if repository
                 .get_app_setting("gemini_model")
                 .map_err(std::io::Error::other)?
@@ -3101,6 +3187,8 @@ pub fn run() {
             create_image_job,
             pending_still_ids,
             get_latest_image_job,
+            enqueue_single_still_generation,
+            list_single_still_generations,
             control_image_job,
             enqueue_bulk_generation_request,
             list_bulk_generation_requests,

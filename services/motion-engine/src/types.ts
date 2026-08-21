@@ -64,6 +64,13 @@ export interface MotionRecipe {
   easing: MotionEasing;
   motionBlurStrength: number; // 0 = none; >0 adds directional blur + faint ghost-trail layers peaking mid-move
   shakeAmount: number; // 0 = none; subtle deterministic handheld jitter
+  // A constant extra zoom-in, held flat for the whole clip — unlike
+  // cameraEffect/scaleFrom/scaleTo above, which are always a MOVE over
+  // time, this one never animates. Multiplies on top of whatever the
+  // dynamic camera move computes each frame, so the two compose: e.g. a
+  // 20% static zoom under a zoom_in that already goes 1.0->1.1 reads as
+  // 1.2->1.32 (see MotionClip.tsx). 0 = no static zoom.
+  staticZoomPercent: number;
 
   // --- Subject anchor: a fractional bounding box (0-1) around the actual
   // main subject/focal point of the image, always set — informs origin/pan
@@ -134,7 +141,19 @@ export interface MotionRecipe {
 }
 
 export interface MotionClipProps {
-  imagePath: string;
+  /** `staticFile()`-relative basename of the source media — a still's
+   * generated image, or (once that still has been replaced by an
+   * animation/imported clip, see video_export_engine.py's build_segments)
+   * a video file. Which one it is is `sourceKind` below; the same
+   * `--public-dir`/`staticFile()` resolution mechanism works identically
+   * for either. */
+  mediaPath: string;
+  /** "video" renders `mediaPath` as `<OffthreadVideo>`; "image" (the
+   * original, still default) as `<Img>`. The Tier 1-5 transform/mask/filter
+   * math in MotionClip.tsx is entirely agnostic to this — it only ever
+   * applies to an ancestor `<AbsoluteFill>`'s style, never to the media
+   * element itself, so nothing else in this file branches on it. */
+  sourceKind: "image" | "video";
   recipe: MotionRecipe;
   durationInFrames: number;
   fps: number;
@@ -157,6 +176,7 @@ export const DEFAULT_RECIPE: MotionRecipe = {
   easing: "ease",
   motionBlurStrength: 0,
   shakeAmount: 0,
+  staticZoomPercent: 0,
   subjectRegionX: 0.3,
   subjectRegionY: 0.25,
   subjectRegionW: 0.4,
@@ -202,7 +222,8 @@ export const DEFAULT_RECIPE: MotionRecipe = {
 };
 
 export const DEFAULT_PROPS: MotionClipProps = {
-  imagePath: "",
+  mediaPath: "",
+  sourceKind: "image",
   recipe: DEFAULT_RECIPE,
   durationInFrames: 150,
   fps: 30,

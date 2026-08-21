@@ -298,6 +298,23 @@ export type ImageJobRecord = {
   items: { id: string; groupId: string; promptVersionId: string; status: string; attempts: number; lastError: string | null; renderId: string | null }[];
 };
 
+/** One still queued via the single-still "Generate Image" button — a
+ * separate, independent queue from `ImageJobRecord`/Bulk Generation (see
+ * MIGRATION_043's doc comment in projects.rs), so several single-still
+ * generations can queue up and run one at a time in the background without
+ * blocking navigation to other stills. */
+export type SingleStillGenerationRecord = {
+  id: string;
+  videoId: string;
+  groupId: string;
+  promptVersionId: string;
+  status: "queued" | "running" | "completed" | "failed";
+  renderId: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 /** One entry in a video's Bulk Generation queue — see `enqueueBulkGenerationRequest`.
  * `snapshot_json` (style directive, creative instruction, base image settings,
  * scope, dials, roster/cast assignments — everything frozen at the moment
@@ -428,6 +445,12 @@ export type MotionRecipe = {
   originX: number; originY: number;
   easing: MotionEasing;
   motionBlurStrength: number; shakeAmount: number;
+  /** A constant extra zoom-in held flat for the whole clip — unlike
+   * cameraEffect/scaleFrom/scaleTo above, which are always a MOVE over
+   * time, this never animates; it multiplies on top of whatever the
+   * dynamic camera move computes each frame (see MotionClip.tsx), so the
+   * two compose. 0 = no static zoom. */
+  staticZoomPercent: number;
   subjectRegionX: number; subjectRegionY: number; subjectRegionW: number; subjectRegionH: number;
   depthEffect: DepthEffect;
   fgScaleFrom: number; fgScaleTo: number;
@@ -462,6 +485,7 @@ export const DEFAULT_MOTION_RECIPE: MotionRecipe = {
   originX: 50, originY: 50,
   easing: "ease",
   motionBlurStrength: 0, shakeAmount: 0,
+  staticZoomPercent: 0,
   subjectRegionX: 0.3, subjectRegionY: 0.25, subjectRegionW: 0.4, subjectRegionH: 0.5,
   depthEffect: "none",
   fgScaleFrom: 1, fgScaleTo: 1,
@@ -1290,6 +1314,17 @@ export const projectsClient = {
   async getLatestImageJob(videoId: string): Promise<ImageJobRecord | null> {
     if (isTauri()) return invoke("get_latest_image_job", { videoId });
     return null;
+  },
+  /** Queues one still for generation on the standalone single-still queue
+   * (fire-and-forget — the always-on backend dispatcher processes it in the
+   * background; poll `listSingleStillGenerations` for status). */
+  async enqueueSingleStillGeneration(videoId: string, groupId: string, promptVersionId: string): Promise<SingleStillGenerationRecord> {
+    if (isTauri()) return invoke("enqueue_single_still_generation", { videoId, groupId, promptVersionId });
+    throw new Error("Single-still generation requires the native application.");
+  },
+  async listSingleStillGenerations(videoId: string): Promise<SingleStillGenerationRecord[]> {
+    if (isTauri()) return invoke("list_single_still_generations", { videoId });
+    return [];
   },
   /** Every still whose newest render is missing or stale relative to its
    * newest prompt/educational plan — used purely to compute the Bulk

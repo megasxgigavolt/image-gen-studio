@@ -53,7 +53,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { Fragment, type ChangeEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { type AppStage, lastSelectedStill, useAppStore } from "./store/app-store";
+import { type AppStage, lastSelectedStill, lastVisualPlanScrollTop, lastVisualsStillListScrollTop, useAppStore } from "./store/app-store";
 import { log } from "./infrastructure/logger";
 import { resolveAssetUrl, resolveRenderUrl } from "./infrastructure/media-cache";
 import { formatTimeShort } from "./domain/timecode";
@@ -70,6 +70,7 @@ import {
   type ImageWorkspaceRecord,
   type ImageWorkspaceGroupRecord,
   type ImageJobRecord,
+  type SingleStillGenerationRecord,
   type BulkGenerationRequestRecord,
   type ImageRenderRecord,
   type PlanSceneRecord,
@@ -125,6 +126,19 @@ const imagesPlanDirty = new Set<string>();
 
 function markPlanDirtyForImages(videoId: string | null) {
   if (videoId) imagesPlanDirty.add(videoId);
+}
+
+/** Whichever render should be treated as "the" selected version for a
+ * still — the one explicitly locked via `isFinal` (set by browsing to a
+ * version, see selectRender) if there is one, otherwise the newest.
+ * `imageRenders` is already newest-first (version DESC), so `[0]` is the
+ * correct "no lock yet" fallback. Every place that derives selectedRenderId
+ * from a group (initial load, restore-on-remount, clicking a still) must
+ * go through this — using imageRenders[0] directly silently discards
+ * whatever version the user had locked in and reverts to the newest one. */
+function finalOrNewestRender(group: { imageRenders: ImageRenderRecord[] } | null | undefined): ImageRenderRecord | undefined {
+  if (!group) return undefined;
+  return group.imageRenders.find((render) => render.isFinal) ?? group.imageRenders[0];
 }
 
 function getGreeting() {
@@ -1194,6 +1208,17 @@ function VisualPlanView() {
   const [matchIndex, setMatchIndex] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const matchRefs = useRef<Map<string, HTMLElement>>(new Map());
+  const planScrollRef = useRef<HTMLDivElement>(null);
+  // Restores this video's plan-list scroll position once, the next time
+  // this view mounts for it — the stage router fully unmounts VisualPlanView
+  // on every stage switch, so nothing here survives on its own otherwise.
+  const restoredScrollForVideoRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeVideoId || !plan || restoredScrollForVideoRef.current === activeVideoId) return;
+    restoredScrollForVideoRef.current = activeVideoId;
+    const remembered = lastVisualPlanScrollTop.get(activeVideoId);
+    if (remembered !== undefined && planScrollRef.current) planScrollRef.current.scrollTop = remembered;
+  }, [activeVideoId, plan]);
 
   function registerMatchRef(key: string, el: HTMLElement | null) {
     if (el) matchRefs.current.set(key, el);
@@ -1446,7 +1471,11 @@ function VisualPlanView() {
       {!plan && !error && <div className="empty-state">Loading visual plan…</div>}
       {confirmReset && <ConfirmDialog title="Reset visual plan?" message="This restores everything to exactly how it was right after generation — groupings, and any sentence edits, splits, or merges. Everything you've changed since then will be lost." confirmLabel="Reset" onConfirm={() => { setConfirmReset(false); void resetPlan(); }} onCancel={() => setConfirmReset(false)} />}
       {plan && <><div className="plan-summary"><strong>{plan.groups.length} stills</strong><span>{formatTimeShort(plan.sentences.at(-1)?.endSeconds ?? 0)} total · Average {((plan.sentences.at(-1)?.endSeconds ?? 0) / plan.groups.length).toFixed(1)} sec · {plan.scenes.length} scene{plan.scenes.length === 1 ? "" : "s"}</span></div>
-      <div className="plan-scroll"><DndContext
+      <div
+        className="plan-scroll"
+        ref={planScrollRef}
+        onScroll={(event) => { if (activeVideoId) lastVisualPlanScrollTop.set(activeVideoId, event.currentTarget.scrollTop); }}
+      ><DndContext
         sensors={sensors}
         // pointerWithin (not the default rectIntersection) so a small
         // nested target — the merge drop zone on a sentence's own grip
@@ -2570,6 +2599,7 @@ function VisualizationTypesModal({ types, hardRule, onChange, onClose }: {
 function ImagesView() {
   const { activeVideoId, addToast, setStage } = useAppStore();
   const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
+  const stillListScrollRef = useRef<HTMLElement>(null);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [multiSelectedGroupIds, setMultiSelectedGroupIds] = useState<Set<string>>(new Set());
   const [systemPrompt, setSystemPrompt] = useState("");
@@ -2582,6 +2612,8 @@ function ImagesView() {
   const [aiLoading, setAiLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [job, setJob] = useState<ImageJobRecord | null>(null);
+  // Independent of `job` (Bulk Generation) — see SingleStillGenerationRecord.
+  const [singleQueue, setSingleQueue] = useState<SingleStillGenerationRecord[]>([]);
   const [selectedRenderId, setSelectedRenderId] = useState<string | null>(null);
   const [renderUrls, setRenderUrls] = useState<Record<string, string>>({});
   const [confirmReset, setConfirmReset] = useState(false);
@@ -2733,7 +2765,7 @@ function ImagesView() {
           return next;
         });
         const selectedFromCache = cached.groups.find((g) => g.group.id === resolvedGroupId);
-        setSelectedRenderId(selectedFromCache?.imageRenders[0]?.id ?? null);
+        setSelectedRenderId(finalOrNewestRender(selectedFromCache)?.id ?? null);
       }
       // The visual plan changed since Images last explicitly synced to it
       // (a recalculation, or a move/split/merge/reset in the Visual Plan
@@ -2782,6 +2814,7 @@ function ImagesView() {
         setReferences(inputs.references);
         const latestJob = await projectsClient.getLatestImageJob(activeVideoId);
         setJob(latestJob && ["queued", "running", "paused", "stopped", "failed"].includes(latestJob.status) ? latestJob : null);
+        setSingleQueue(await projectsClient.listSingleStillGenerations(activeVideoId));
         const latest = selectedFromLoaded?.promptVersions[0];
         setSystemPrompt(loaded.settings.find((s) => s.key === `system_prompt.${activeVideoId}`)?.value ?? latest?.systemPrompt ?? "");
         setUserPrompt(latest?.userPrompt ?? "");
@@ -2790,7 +2823,7 @@ function ImagesView() {
         // video, so a Creative Instructions note written for one video
         // silently leaked into whichever video was opened next.
         setBulkInstruction(loaded.settings.find((s) => s.key === `bulk_instruction.${activeVideoId}`)?.value ?? "");
-        setSelectedRenderId(selectedFromLoaded?.imageRenders[0]?.id ?? null);
+        setSelectedRenderId(finalOrNewestRender(selectedFromLoaded)?.id ?? null);
         const savedPrep = loaded.settings.find((setting) => setting.key === `prompt_prep.${activeVideoId}`)?.value;
         if (savedPrep) {
           try {
@@ -2828,6 +2861,20 @@ function ImagesView() {
     void loadWorkspace();
   }, [activeVideoId]);
 
+  // Restores the stills list's scroll position once, the next time this
+  // view mounts for the video — ImagesView fully unmounts on every stage
+  // switch, so a scroll-position ref set here doesn't survive on its own.
+  // Guarded to run once per video load (not on every subsequent workspace
+  // refresh) via restoredScrollForVideoRef, same pattern as Timeline/Visual
+  // Plan's equivalents.
+  const restoredScrollForVideoRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeVideoId || !workspace || restoredScrollForVideoRef.current === activeVideoId) return;
+    restoredScrollForVideoRef.current = activeVideoId;
+    const remembered = lastVisualsStillListScrollTop.get(activeVideoId);
+    if (remembered !== undefined && stillListScrollRef.current) stillListScrollRef.current.scrollTop = remembered;
+  }, [activeVideoId, workspace]);
+
   useEffect(() => {
     if (!activeVideoId || !job || !["queued", "running"].includes(job.status)) return;
     const timer = window.setInterval(async () => {
@@ -2841,6 +2888,23 @@ function ImagesView() {
     }, 1200);
     return () => window.clearInterval(timer);
   }, [activeVideoId, job, selectedGroupId, selectedRenderId]);
+
+  // Polls the standalone single-still queue, independent of the bulk `job`
+  // poll above — several single-still generations can be in flight/queued
+  // even with no Bulk Generation job active at all.
+  useEffect(() => {
+    if (!activeVideoId || !singleQueue.some((item) => ["queued", "running"].includes(item.status))) return;
+    const timer = window.setInterval(async () => {
+      const latest = await projectsClient.listSingleStillGenerations(activeVideoId);
+      setSingleQueue(latest);
+      const refreshed = await projectsClient.getImageWorkspace(activeVideoId);
+      setWorkspace(refreshed);
+      const selected = refreshed.groups.find((item) => item.group.id === selectedGroupId);
+      const newest = selected?.imageRenders[0];
+      if (newest && newest.id !== selectedRenderId) setSelectedRenderId(newest.id);
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [activeVideoId, singleQueue, selectedGroupId, selectedRenderId]);
 
   // Keeps the Bulk Generation queue list/hint in sync with its own status,
   // independent of the job-status poll above. Tying this to `job` (an
@@ -2903,6 +2967,14 @@ function ImagesView() {
     }
   }
 
+  /** Queues this still on the standalone single-still generation queue
+   * (see SingleStillGenerationRecord) instead of generating synchronously —
+   * returns as soon as the item is queued, not once the image is actually
+   * generated, so the button (and every other still) stays usable while it
+   * runs in the background. `generatingGroupId` here only covers the brief
+   * create-prompt-version + enqueue round trip, to prevent a double-submit
+   * of the same still — actual generation progress is tracked via
+   * `singleQueue`, polled separately. */
   async function generateRender() {
     if (!activeVideoId || !selectedGroupId) return;
     setGeneratingGroupId(selectedGroupId);
@@ -2917,21 +2989,8 @@ function ImagesView() {
           userPrompt,
         )
       ).id;
-      const render = await projectsClient.generateImageRender(
-        activeVideoId,
-        selectedGroupId,
-        versionId,
-        systemPrompt || "Preserve a coherent visual style.",
-        userPrompt,
-        settingsJson,
-      );
-      setSelectedRenderId(render.id);
-      setRenderUrls((current) => {
-        const next = { ...current };
-        delete next[render.id];
-        return next;
-      });
-      await refreshWorkspace();
+      const queued = await projectsClient.enqueueSingleStillGeneration(activeVideoId, selectedGroupId, versionId);
+      setSingleQueue((current) => [...current, queued]);
     } catch (caught) {
       setError(String(caught));
     } finally {
@@ -2966,8 +3025,7 @@ function ImagesView() {
     setSystemPrompt(videoDirective ?? latest?.systemPrompt ?? "");
     setUserPrompt(latest?.userPrompt ?? "");
     setImageSettings(parseImageSettings(latest?.settingsJson));
-    const latestRender = workspace?.groups.find((item) => item.group.id === groupId)?.imageRenders[0];
-    setSelectedRenderId(latestRender?.id ?? null);
+    setSelectedRenderId(finalOrNewestRender(workspace?.groups.find((item) => item.group.id === groupId))?.id ?? null);
   }
 
   // Ctrl/Cmd+click toggles multi-select membership, independent of the
@@ -3624,18 +3682,36 @@ function ImagesView() {
 
   useEffect(() => {
     const ids = [selectedRenderId].filter(Boolean) as string[];
+    // Per-item catch: one failed resolve (now retryable next time thanks to
+    // media-cache's cachedOrRetry, see resolveRenderUrl) shouldn't sink the
+    // whole batch via an unhandled rejection, nor block the others.
     void Promise.all(ids.filter((id) => !renderUrls[id]).map(async (id) => {
-      const url = await resolveRenderUrl(id);
-      setRenderUrls((current) => ({ ...current, [id]: url }));
+      try {
+        const url = await resolveRenderUrl(id);
+        setRenderUrls((current) => ({ ...current, [id]: url }));
+      } catch { /* Transient — retried on the next render/poll. */ }
     }));
   }, [selectedRenderId, renderUrls]);
 
   useEffect(() => {
-    const ids = workspace?.groups.map((group) => group.imageRenders[0]?.id).filter(Boolean) as string[] | undefined;
+    // Both the thumbnail (always newest, so the list hints a fresher
+    // generation exists) and the locked/final version if it differs from
+    // newest — otherwise a still whose selected version is an older,
+    // explicitly-locked one only gets its URL resolved reactively once it
+    // becomes selectedRenderId (the effect above), which can read as "no
+    // image generated yet" for a beat right after restoring a video whose
+    // last-selected still is that locked version.
+    const ids = workspace?.groups.flatMap((group) => {
+      const newest = group.imageRenders[0]?.id;
+      const final = finalOrNewestRender(group)?.id;
+      return [newest, final].filter((id): id is string => Boolean(id));
+    });
     if (!ids?.length) return;
     void Promise.all(ids.filter((id) => !renderUrls[id]).map(async (id) => {
-      const url = await resolveRenderUrl(id);
-      setRenderUrls((current) => ({ ...current, [id]: url }));
+      try {
+        const url = await resolveRenderUrl(id);
+        setRenderUrls((current) => ({ ...current, [id]: url }));
+      } catch { /* Transient — retried on the next render/poll. */ }
     }));
   }, [workspace, renderUrls]);
 
@@ -3795,7 +3871,11 @@ function ImagesView() {
       </div>
       {error && <div className="error-toast" role="alert"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss error">×</button></div>}
       <div className="image-workspace">
-        <aside className="stills">
+        <aside
+          className="stills"
+          ref={stillListScrollRef}
+          onScroll={(event) => { if (activeVideoId) lastVisualsStillListScrollTop.set(activeVideoId, event.currentTarget.scrollTop); }}
+        >
           <div className="stills-heading">
             <div className="stills-heading-left">
               <span className="stills-heading-label">Stills</span>
@@ -3827,10 +3907,25 @@ function ImagesView() {
                       ? renderUrls[selectedRenderId]
                       : newestRender ? renderUrls[newestRender.id] : undefined;
                     const item = job?.items.find((candidate) => candidate.groupId === group.group.id);
+                    // The single-still queue is independent of Bulk Generation's
+                    // job (see SingleStillGenerationRecord) — matched the same
+                    // way, by groupId, against its own list.
+                    const singleItem = singleQueue.find((candidate) => candidate.groupId === group.group.id
+                      && (candidate.status === "queued" || candidate.status === "running"));
                     const isPreparing = preparingGroupIds.has(group.group.id);
-                    const isGenerating = item?.status === "running" || generatingGroupId === group.group.id;
-                    const statusKey = isPreparing || isGenerating ? "generating" : item?.status === "failed" ? "failed" : newestRender && newestPrompt && newestRender.promptVersionId !== newestPrompt.id ? "outdated" : newestRender ? "generated" : newestPrompt ? "ready" : "empty";
-                    const statusLabel = isPreparing ? "Preparing prompt" : isGenerating ? "Generating" : statusKey === "failed" ? "Failed" : statusKey === "outdated" ? "Outdated — regenerate" : statusKey === "generated" ? "Generated" : statusKey === "ready" ? "Prompt ready" : "No prompt yet";
+                    const isGeneratingBulk = item?.status === "running" || generatingGroupId === group.group.id;
+                    const isGeneratingSingle = singleItem?.status === "running";
+                    const isQueuedSingle = singleItem?.status === "queued";
+                    const isGenerating = isGeneratingBulk || isGeneratingSingle;
+                    const statusKey = isPreparing || isGenerating || isQueuedSingle ? "generating" : item?.status === "failed" ? "failed" : newestRender && newestPrompt && newestRender.promptVersionId !== newestPrompt.id ? "outdated" : newestRender ? "generated" : newestPrompt ? "ready" : "empty";
+                    const statusLabel = isPreparing ? "Preparing prompt"
+                      : isGeneratingSingle ? "Generating (single)"
+                      : isGeneratingBulk ? "Generating (bulk)"
+                      : isQueuedSingle ? "Queued (single)"
+                      : statusKey === "failed" ? "Failed"
+                      : statusKey === "outdated" ? "Outdated — regenerate"
+                      : statusKey === "generated" ? "Generated"
+                      : statusKey === "ready" ? "Prompt ready" : "No prompt yet";
                     const isMultiSelected = multiSelectedGroupIds.has(group.group.id);
                     return (
                       <button
@@ -3916,6 +4011,20 @@ function ImagesView() {
               ) : null}
             </div>
           )}
+          {(() => {
+            const active = singleQueue.filter((item) => ["queued", "running"].includes(item.status));
+            if (!active.length) return null;
+            const running = active.filter((item) => item.status === "running").length;
+            const queued = active.length - running;
+            return (
+              <div className="bulk-status-bar single-queue-status-bar">
+                <div className="bulk-status-top">
+                  <strong>Single-still queue</strong>
+                  <span>{running ? `${running} generating` : ""}{running && queued ? " · " : ""}{queued ? `${queued} queued` : ""}</span>
+                </div>
+              </div>
+            );
+          })()}
           <header>
             <div><span className="timestamp-heading">{selectedTiming ? `${formatTimeShort(selectedTiming.start)} – ${formatTimeShort(selectedTiming.end)}` : previewLabel}</span><strong className="production-copy narration-preview">{selectedSentences.map((sentence) => sentence.text).join(" ")}</strong></div>
           </header>
@@ -3975,7 +4084,21 @@ function ImagesView() {
               >
                 {applyingStyle ? <><LoaderCircle className="spin" size={13} />Applying to all stills…</> : <><WandSparkles size={13} />Apply this style to all stills</>}
               </button>
-              <button className="primary full generate-image-btn" onClick={() => void generateRender()} disabled={!selectedGroupId || !userPrompt.trim() || !!generatingGroupId}>{generatingGroupId === selectedGroupId ? <><LoaderCircle className="spin" size={14} />Generating…</> : "Generate Image"}</button>
+              {(() => {
+                // Scoped to THIS still only — queuing one still no longer
+                // blocks Generate for every other still (see generateRender).
+                const selectedQueued = singleQueue.find((item) => item.groupId === selectedGroupId
+                  && ["queued", "running"].includes(item.status));
+                const submitting = generatingGroupId === selectedGroupId;
+                const busy = submitting || Boolean(selectedQueued);
+                return (
+                  <button className="primary full generate-image-btn" onClick={() => void generateRender()} disabled={!selectedGroupId || !userPrompt.trim() || busy}>
+                    {busy
+                      ? <><LoaderCircle className="spin" size={14} />{selectedQueued?.status === "queued" ? "Queued…" : "Generating…"}</>
+                      : "Generate Image"}
+                  </button>
+                );
+              })()}
             </div>
           ) : tab === "settings" ? (
             <>

@@ -194,6 +194,15 @@ class MotionRecipe(BaseModel):
     easing: Easing = "ease"
     motion_blur_strength: float = 0.0
     shake_amount: float = 0.0
+    # A constant extra zoom-in, held flat for the whole clip (no
+    # interpolation) — unlike camera_effect/scale_from/scale_to above, which
+    # are always a MOVE over time. Multiplies on top of whatever the dynamic
+    # camera move computes each frame (see MotionClip.tsx), so the two
+    # compose: e.g. a 20% static zoom under a zoom_in that already goes
+    # 1.0->1.1 reads as 1.2->1.32. 0 = no static zoom (the default — Auto
+    # Motion never sets this itself today, it's a manual per-still dial in
+    # MotionSettingsPanel).
+    static_zoom_percent: float = 0.0
 
     # --- Subject anchor: always marked (not just when a depth effect is
     # used) — a fractional bounding box around the actual main subject/focal
@@ -537,6 +546,7 @@ def _clamp_recipe(recipe: MotionRecipe) -> MotionRecipe:
     recipe.origin_y = _clamp(recipe.origin_y, 0.0, 100.0)
     recipe.motion_blur_strength = _clamp(recipe.motion_blur_strength, 0.0, 1.0)
     recipe.shake_amount = _clamp(recipe.shake_amount, 0.0, 1.0)
+    recipe.static_zoom_percent = _clamp(recipe.static_zoom_percent, 0.0, 100.0)
 
     recipe.subject_region_x = _clamp(recipe.subject_region_x, 0.0, 1.0)
     recipe.subject_region_y = _clamp(recipe.subject_region_y, 0.0, 1.0)

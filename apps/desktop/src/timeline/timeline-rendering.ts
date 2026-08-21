@@ -225,7 +225,11 @@ export function applyMotionRecipe(
   canvasHeight: number,
 ): { x: number; y: number; w: number; h: number; blurPx: number } {
   const t = easeMotionProgress(duration > 0 ? elapsedSeconds / duration : 0, recipe.easing);
-  const scale = recipe.scaleFrom + (recipe.scaleTo - recipe.scaleFrom) * t;
+  // Static zoom: a flat extra zoom-in held constant for the whole clip (no
+  // interpolation of its own) — multiplies on top of the dynamic camera
+  // move above, same as MotionClip.tsx's real Remotion render, so the
+  // preview and the actual export agree.
+  const scale = (recipe.scaleFrom + (recipe.scaleTo - recipe.scaleFrom) * t) * (1 + recipe.staticZoomPercent / 100);
   const panXPercent = recipe.panXFrom + (recipe.panXTo - recipe.panXFrom) * t;
   const panYPercent = recipe.panYFrom + (recipe.panYTo - recipe.panYFrom) * t;
   const originPxX = (recipe.originX / 100) * canvasWidth;

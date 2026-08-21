@@ -1,6 +1,21 @@
 import React from "react";
-import { AbsoluteFill, Img, interpolate, random, staticFile, useCurrentFrame, Easing } from "remotion";
+import { AbsoluteFill, Img, OffthreadVideo, interpolate, random, staticFile, useCurrentFrame, Easing } from "remotion";
 import type { EnvironmentEffect, MaskShape, MotionClipProps, MotionEasing, SpeedCurve } from "./types";
+
+// A still replaced by an animation/imported clip keeps whatever Camera
+// Effect was set on it (see video_export_engine.py's build_segments) — the
+// Tier 1-5 transform/mask/filter math below is entirely agnostic to what
+// kind of media it's being applied to (it only ever styles an ancestor
+// `<AbsoluteFill>`, never the media element itself), so the only thing that
+// needs to vary per source is which element actually renders the pixels.
+// `muted`: this is a background motion-graphic layer — the narration/music
+// mix is assembled separately in the main ffmpeg pass, so a video source's
+// own embedded audio must never leak through as a second track.
+function Media({ sourceKind, src, style }: { sourceKind: "image" | "video"; src: string; style: React.CSSProperties }) {
+  return sourceKind === "video"
+    ? <OffthreadVideo src={src} muted style={style} />
+    : <Img src={src} style={style} />;
+}
 
 // ONE generic renderer for every recipe the AI's fixed effect catalog can
 // produce (see types.ts's module doc) — there is no per-effect component or
@@ -238,9 +253,9 @@ function EnvironmentOverlay({ effect, intensity, frame, width, height }: { effec
   );
 }
 
-export const MotionClip: React.FC<MotionClipProps> = ({ imagePath, recipe, durationInFrames, width, height }) => {
+export const MotionClip: React.FC<MotionClipProps> = ({ mediaPath, sourceKind, recipe, durationInFrames, width, height }) => {
   const frame = useCurrentFrame();
-  const src = staticFile(imagePath);
+  const src = staticFile(mediaPath);
   const diagonal = Math.sqrt(width * width + height * height);
   const easingFn = mapEasing(recipe.easing);
 
@@ -302,6 +317,11 @@ export const MotionClip: React.FC<MotionClipProps> = ({ imagePath, recipe, durat
     translateYPercent = interpolate(overallProgress, [0, 1], [recipe.panYFrom, recipe.panYTo]);
   }
   let scale = interpolate(overallProgress, [0, 1], [recipe.scaleFrom, recipe.scaleTo]);
+  // Static zoom: a flat extra zoom-in held constant for the whole clip (no
+  // interpolation of its own) — multiplies on top of whatever the dynamic
+  // camera move above computed for this frame, so the two compose instead
+  // of one replacing the other.
+  scale *= 1 + recipe.staticZoomPercent / 100;
   const rotationDeg = interpolate(overallProgress, [0, 1], [recipe.rotationFromDeg, recipe.rotationToDeg]);
 
   // Safety floor, not a style choice: a pan and/or rotation with too little
@@ -397,13 +417,14 @@ export const MotionClip: React.FC<MotionClipProps> = ({ imagePath, recipe, durat
             filter: `blur(${motionBlurPx + 4}px)`,
           }}
         >
-          <Img src={src} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+          <Media sourceKind={sourceKind} src={src} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
         </AbsoluteFill>
       ))}
 
       {needsBlurLayer && (
         <AbsoluteFill style={{ transform: baseTransform, transformOrigin }}>
-          <Img
+          <Media
+            sourceKind={sourceKind}
             src={src}
             style={{ width: "100%", height: "100%", objectFit: "cover", filter: `blur(${blurPx}px) saturate(${saturation})` }}
           />
@@ -420,17 +441,19 @@ export const MotionClip: React.FC<MotionClipProps> = ({ imagePath, recipe, durat
         {hasDepth ? (
           <>
             <AbsoluteFill style={{ transform: baseTransform, transformOrigin }}>
-              <Img
+              <Media
+                sourceKind={sourceKind}
                 src={src}
                 style={{ width: "100%", height: "100%", objectFit: "cover", filter: `blur(${bgBlurPx}px) saturate(${saturation})` }}
               />
             </AbsoluteFill>
             <AbsoluteFill style={{ transform: fgTransform, transformOrigin, maskImage: subjectMask, WebkitMaskImage: subjectMask }}>
-              <Img src={src} style={{ width: "100%", height: "100%", objectFit: "cover", filter: `saturate(${saturation})` }} />
+              <Media sourceKind={sourceKind} src={src} style={{ width: "100%", height: "100%", objectFit: "cover", filter: `saturate(${saturation})` }} />
             </AbsoluteFill>
           </>
         ) : (
-          <Img
+          <Media
+            sourceKind={sourceKind}
             src={src}
             style={{
               width: "100%",

@@ -14,8 +14,10 @@ import { nextDragBounds, type DragMode } from "./timeline-drag-math";
 type OverlayClipRef = { id: string; startSeconds: number; endSeconds: number };
 
 /** Owns every pointer-drag interaction on the timeline tracks: move/resize
- * for stills, captions, music, and text/logo overlays, the narration offset
- * handle, music fade handles, and the playhead itself. Each drag keeps a
+ * for stills, captions, music, and text/logo overlays, music fade handles,
+ * and the playhead itself. Narration is intentionally NOT draggable — its
+ * offset is fixed once set (see TimelineTracks' narration lane, which no
+ * longer wires a pointerdown handler onto the waveform). Each drag keeps a
  * live "preview" position in React state (rendered by TimelineTracks while
  * the pointer is down) and only commits to the backend — via `refresh`, so
  * it participates in undo history — once the pointer is released and the
@@ -48,7 +50,6 @@ export function useTimelineDrag(params: {
 
   const [captionDragPreview, setCaptionDragPreview] = useState<{ clipId: string; start: number; end: number } | null>(null);
   const [stillsDragPreview, setStillsDragPreview] = useState<{ clipId: string; start: number; end: number } | null>(null);
-  const [narrationDragPreview, setNarrationDragPreview] = useState<number | null>(null);
   const [musicDragPreview, setMusicDragPreview] = useState<{ clipId: string; start: number; end: number } | null>(null);
   const [overlayDragPreview, setOverlayDragPreview] = useState<{ kind: "text" | "logo"; clipId: string; start: number; end: number } | null>(null);
   const [fadeDragPreview, setFadeDragPreview] = useState<{ clipId: string; edge: "in" | "out"; seconds: number } | null>(null);
@@ -57,7 +58,6 @@ export function useTimelineDrag(params: {
   const playheadDragRef = useRef(false);
   const captionDragRef = useRef<{ clipId: string; mode: DragMode; originalStart: number; originalEnd: number; pointerStartSeconds: number } | null>(null);
   const stillsDragRef = useRef<{ clipId: string; mode: DragMode; originalStart: number; originalEnd: number; pointerStartSeconds: number } | null>(null);
-  const narrationDragRef = useRef<{ pointerStartSeconds: number; originalOffset: number } | null>(null);
   const musicDragRef = useRef<{ clipId: string; mode: DragMode; originalStart: number; originalEnd: number; pointerStartSeconds: number } | null>(null);
   const overlayDragRef = useRef<{ kind: "text" | "logo"; clipId: string; mode: DragMode; originalStart: number; originalEnd: number; pointerStartSeconds: number } | null>(null);
 
@@ -91,14 +91,6 @@ export function useTimelineDrag(params: {
     const pointerStartSeconds = timeAtPointer(event);
     stillsDragRef.current = { clipId: clip.id, mode, originalStart: clip.startSeconds, originalEnd: clip.endSeconds, pointerStartSeconds };
     setStillsDragPreview({ clipId: clip.id, start: clip.startSeconds, end: clip.endSeconds });
-  }
-
-  function beginNarrationDrag(event: ReactPointerEvent) {
-    event.stopPropagation();
-    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-    const pointerStartSeconds = timeAtPointer(event);
-    narrationDragRef.current = { pointerStartSeconds, originalOffset: timeline?.narrationOffsetSeconds ?? 0 };
-    setNarrationDragPreview(timeline?.narrationOffsetSeconds ?? 0);
   }
 
   function beginMusicDrag(clip: TimelineMusicClipRecord, mode: DragMode, event: ReactPointerEvent) {
@@ -184,11 +176,6 @@ export function useTimelineDrag(params: {
         return { clipId: current.clipId, start: bounds.start, end: bounds.end };
       });
     }
-    const narrationDrag = narrationDragRef.current;
-    if (narrationDrag) {
-      const delta = time - narrationDrag.pointerStartSeconds;
-      setNarrationDragPreview(Math.max(0, narrationDrag.originalOffset + delta));
-    }
     const musicDrag = musicDragRef.current;
     if (musicDrag) {
       const targets = [previewTimeRef.current, ...musicClips.filter((c) => c.id !== musicDrag.clipId).flatMap((c) => [c.startSeconds, c.endSeconds])];
@@ -238,16 +225,6 @@ export function useTimelineDrag(params: {
         return null;
       });
     }
-    const narrationDrag = narrationDragRef.current;
-    if (narrationDrag) {
-      narrationDragRef.current = null;
-      setNarrationDragPreview((preview) => {
-        if (activeVideoId && preview !== null && preview !== narrationDrag.originalOffset) {
-          void refresh(projectsClient.setNarrationOffset(activeVideoId, preview));
-        }
-        return null;
-      });
-    }
     const musicDrag = musicDragRef.current;
     if (musicDrag) {
       musicDragRef.current = null;
@@ -278,7 +255,6 @@ export function useTimelineDrag(params: {
   return {
     captionDragPreview,
     stillsDragPreview,
-    narrationDragPreview,
     musicDragPreview,
     overlayDragPreview,
     fadeDragPreview,
@@ -286,7 +262,6 @@ export function useTimelineDrag(params: {
     beginPlayheadDrag,
     beginCaptionDrag,
     beginStillsDrag,
-    beginNarrationDrag,
     beginMusicDrag,
     beginOverlayDrag,
     beginFadeHandleDrag,

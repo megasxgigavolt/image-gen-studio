@@ -921,6 +921,34 @@ CREATE TABLE IF NOT EXISTS bulk_still_settings (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_still_settings_group ON bulk_still_settings(video_id, group_id);
 "#;
 
+/// A small, independent queue for one-off single-still "Generate Image"
+/// clicks — deliberately NOT routed through `image_jobs`/`image_job_items`.
+/// That system enforces exactly one active job per video (see
+/// `create_image_job_impl`'s guard) specifically so Bulk Generation never
+/// runs two workers against Gemini at once (a real, documented 429 problem —
+/// see `spawn_job_workers`'s own comment), and its worker thread exits as
+/// soon as its queue is momentarily empty — appending "just one more still"
+/// to it risks a race where nothing is left running to pick it up. This
+/// table is instead drained by one always-on background thread (started
+/// once at app startup, see `run()`), so there's no spawn-per-enqueue race
+/// to reason about; its claim step separately checks for an active bulk
+/// `image_jobs` row before claiming, preserving the same
+/// one-Gemini-call-at-a-time invariant across both queues.
+const MIGRATION_043: &str = r#"
+CREATE TABLE IF NOT EXISTS single_still_generations (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    group_id TEXT NOT NULL,
+    prompt_version_id TEXT NOT NULL REFERENCES prompt_versions(id),
+    status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed')),
+    render_id TEXT REFERENCES image_renders(id),
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_single_still_generations_video_status ON single_still_generations(video_id, status);
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -1277,6 +1305,25 @@ pub struct ImageJob {
     pub created_at: String,
     pub updated_at: String,
     pub items: Vec<ImageJobItem>,
+}
+
+/// One row in the standalone single-still generation queue (see
+/// `MIGRATION_043`'s doc comment for why this is independent of
+/// `image_jobs`). `status` starts `'queued'`, is claimed to `'running'` by
+/// the always-on dispatcher thread (`spawn_single_still_dispatcher`), and
+/// ends at `'completed'`/`'failed'`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleStillGeneration {
+    pub id: String,
+    pub video_id: String,
+    pub group_id: String,
+    pub prompt_version_id: String,
+    pub status: String,
+    pub render_id: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2658,6 +2705,21 @@ impl ProjectRepository {
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(42, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
+        let has_single_still_generations: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='single_still_generations')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_single_still_generations {
+            self.connection.execute_batch(MIGRATION_043).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(43, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -3573,6 +3635,21 @@ impl ProjectRepository {
             self.connection.execute(
                 "UPDATE image_renders SET is_final=0 WHERE video_id=?1 AND group_id=?2",
                 params![video_id, group_id],
+            ).map_err(|e| e.to_string())?;
+            // A clip's render_id is otherwise only ever set once, at the moment
+            // it's first added to the timeline (see backfill_missing_clip_renders'
+            // doc comment for the same lesson learned about NULL render_ids) —
+            // nothing revisits an EXISTING render_id when the group's final
+            // version later changes. Propagating here means picking a different
+            // version in the Visual tab is reflected on the Timeline going
+            // forward, without clobbering an unrelated concern: the per-clip
+            // "Version" picker (set_timeline_clip_render) stays independent of
+            // is_final, exactly as today — it just gets overwritten the next
+            // time this runs, since "whatever I just made final" is the
+            // stronger, more recent signal of intent.
+            self.connection.execute(
+                "UPDATE timeline_clips SET render_id=?1 WHERE video_id=?2 AND group_id=?3",
+                params![render_id, video_id, group_id],
             ).map_err(|e| e.to_string())?;
         }
         self.connection.execute(
@@ -9767,6 +9844,104 @@ Return JSON only:
         Ok(())
     }
 
+    /// Adds a still to the standalone single-still generation queue (see
+    /// `MIGRATION_043`'s doc comment) — a plain insert, picked up by the
+    /// always-on dispatcher thread. Never blocks on (or is blocked by) an
+    /// active Bulk Generation job for this same video; the two queues are
+    /// independent, only serialized against each other at claim time.
+    pub fn enqueue_single_still_generation(&self, video_id: &str, group_id: &str, prompt_version_id: &str) -> Result<SingleStillGeneration, String> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO single_still_generations(id,video_id,group_id,prompt_version_id,status,created_at,updated_at) VALUES(?1,?2,?3,?4,'queued',?5,?5)",
+            params![id, video_id, group_id, prompt_version_id, now],
+        ).map_err(|e| e.to_string())?;
+        Ok(SingleStillGeneration {
+            id, video_id: video_id.into(), group_id: group_id.into(), prompt_version_id: prompt_version_id.into(),
+            status: "queued".into(), render_id: None, last_error: None, created_at: now.clone(), updated_at: now,
+        })
+    }
+
+    pub fn list_single_still_generations(&self, video_id: &str) -> Result<Vec<SingleStillGeneration>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,video_id,group_id,prompt_version_id,status,render_id,last_error,created_at,updated_at FROM single_still_generations WHERE video_id=?1 ORDER BY created_at",
+        ).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([video_id], |row| Ok(SingleStillGeneration {
+            id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?, prompt_version_id: row.get(3)?,
+            status: row.get(4)?, render_id: row.get(5)?, last_error: row.get(6)?, created_at: row.get(7)?, updated_at: row.get(8)?,
+        })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// Claims the oldest queued single-still item across ALL videos (a
+    /// single global dispatcher, not one per video) — but only while no
+    /// bulk `image_jobs` row is currently `'running'` anywhere, which is
+    /// what keeps this queue from ever hitting Gemini concurrently with
+    /// Bulk Generation (see MIGRATION_043's doc comment). Returns `None`
+    /// (not an error) when there's nothing claimable right now, whether
+    /// because the queue is empty or a bulk job is holding the lane —
+    /// callers should treat both the same: sleep and poll again.
+    pub fn claim_next_single_still_generation(&self) -> Result<Option<(String, String, String, PromptVersion)>, String> {
+        let bulk_job_running: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM image_jobs WHERE status='running')",
+            [], |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if bulk_job_running {
+            return Ok(None);
+        }
+        let item: Option<(String, String, String, String)> = self.connection.query_row(
+            "SELECT id,video_id,group_id,prompt_version_id FROM single_still_generations WHERE status='queued' ORDER BY created_at LIMIT 1",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional().map_err(|e| e.to_string())?;
+        let Some((id, video_id, group_id, prompt_version_id)) = item else {
+            return Ok(None);
+        };
+        let claimed = self.connection.execute(
+            "UPDATE single_still_generations SET status='running',updated_at=?1 WHERE id=?2 AND status='queued'",
+            params![Utc::now().to_rfc3339(), id],
+        ).map_err(|e| e.to_string())?;
+        if claimed == 0 {
+            // Lost a race (shouldn't happen with a single dispatcher thread,
+            // but stay correct if that ever changes) — try the next one.
+            return self.claim_next_single_still_generation();
+        }
+        let prompt = self.connection.query_row(
+            "SELECT id,video_id,group_id,version,settings_json,system_prompt,user_prompt,created_at FROM prompt_versions WHERE id=?1",
+            [&prompt_version_id], |row| Ok(PromptVersion {
+                id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?, version: row.get(3)?,
+                settings_json: row.get(4)?, system_prompt: row.get(5)?, user_prompt: row.get(6)?, created_at: row.get(7)?,
+            }),
+        ).map_err(|e| e.to_string())?;
+        Ok(Some((id, video_id, group_id, prompt)))
+    }
+
+    pub fn finish_single_still_generation(&self, id: &str, result: Result<String, String>) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        match result {
+            Ok(render_id) => self.connection.execute(
+                "UPDATE single_still_generations SET status='completed',render_id=?1,last_error=NULL,updated_at=?2 WHERE id=?3 AND status='running'",
+                params![render_id, now, id],
+            ),
+            Err(error) => self.connection.execute(
+                "UPDATE single_still_generations SET status='failed',last_error=?1,updated_at=?2 WHERE id=?3 AND status='running'",
+                params![error, now, id],
+            ),
+        }.map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Crash-safety mirror of `recover_image_jobs` — a row stuck `'running'`
+    /// from a previous session (the app closed/crashed mid-generation) goes
+    /// back to `'queued'` so the dispatcher picks it back up on its own; this
+    /// queue has no user-facing "paused" concept to preserve, unlike bulk jobs.
+    pub fn recover_single_still_generations(&self) -> Result<(), String> {
+        self.connection.execute(
+            "UPDATE single_still_generations SET status='queued',updated_at=?1 WHERE status='running'",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     pub fn create_animation_job(&self, video_id: &str, clip_id: &str, resolution: &str, prompt: &str) -> Result<AnimationJob, String> {
         if !matches!(resolution, "720p" | "1080p") {
             return Err("Resolution must be 720p or 1080p.".into());
@@ -11117,6 +11292,8 @@ Return JSON only:
                     "transitionOut": clip.transition_out,
                     "colorFilter": clip.color_filter_preset,
                     "colorFilterIntensity": clip.color_filter_intensity,
+                    "motionGraphicEffect": clip.motion_graphic_effect,
+                    "motionGraphicSettings": motion_graphic_settings_value(&clip),
                 }));
                 continue;
             }
@@ -11134,6 +11311,8 @@ Return JSON only:
                     "transitionOut": clip.transition_out,
                     "colorFilter": clip.color_filter_preset,
                     "colorFilterIntensity": clip.color_filter_intensity,
+                    "motionGraphicEffect": clip.motion_graphic_effect,
+                    "motionGraphicSettings": motion_graphic_settings_value(&clip),
                 }));
                 continue;
             }
@@ -17831,6 +18010,121 @@ mod tests {
 
         let after_delete = repo.delete_text_overlay_clip(&video.id, &clip_id).unwrap();
         assert!(after_delete.text_clips.is_empty());
+    }
+
+    #[test]
+    fn set_final_render_propagates_to_an_existing_timeline_clip() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        repo.connection.execute(
+            "INSERT INTO timelines(video_id,duration_seconds,playhead_seconds,zoom,updated_at) VALUES(?1,10,0,1,'now')",
+            [&video.id],
+        ).unwrap();
+
+        let prompt_v1 = repo.create_prompt_version(&video.id, "g1", "{}", "system", "scene v1").unwrap();
+        let render_v1 = repo.insert_image_render(
+            "render-v1", &video.id, "g1", 1, &prompt_v1.id, "render-v1.png",
+            "renders/g1/render-v1.png", None, None, "generation",
+        ).unwrap();
+        assert!(render_v1.is_final);
+
+        // Simulates the still already being on the Timeline, pointing at v1
+        // — set up directly rather than via add_stills_clip, which needs a
+        // real visual-plan group this test doesn't otherwise need.
+        repo.connection.execute(
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label) VALUES('clip-1',?1,'g1',?2,0,0,3,'Still 1')",
+            params![video.id, render_v1.id],
+        ).unwrap();
+
+        let prompt_v2 = repo.create_prompt_version(&video.id, "g1", "{}", "system", "scene v2").unwrap();
+        let render_v2 = repo.insert_image_render(
+            "render-v2", &video.id, "g1", 2, &prompt_v2.id, "render-v2.png",
+            "renders/g1/render-v2.png", None, None, "generation",
+        ).unwrap();
+        // Generating a new render already makes IT final — but the existing
+        // timeline clip still points at v1 until something re-confirms v2.
+        assert!(render_v2.is_final);
+        let timeline = repo.get_timeline(&video.id).unwrap();
+        let clip = timeline.clips.iter().find(|c| c.id == "clip-1").unwrap();
+        assert_eq!(clip.render_id.as_deref(), Some(render_v1.id.as_str()), "stale clip should still show v1 until final is re-confirmed");
+
+        // Mirrors the Visual tab's "browsing to a version marks it final" action.
+        repo.set_final_render(&render_v2.id, true).unwrap();
+        let timeline = repo.get_timeline(&video.id).unwrap();
+        let clip = timeline.clips.iter().find(|c| c.id == "clip-1").unwrap();
+        assert_eq!(clip.render_id.as_deref(), Some(render_v2.id.as_str()));
+
+        // Browsing back to v1 and re-confirming it propagates too, in either direction.
+        repo.set_final_render(&render_v1.id, true).unwrap();
+        let timeline = repo.get_timeline(&video.id).unwrap();
+        let clip = timeline.clips.iter().find(|c| c.id == "clip-1").unwrap();
+        assert_eq!(clip.render_id.as_deref(), Some(render_v1.id.as_str()));
+    }
+
+    #[test]
+    fn single_still_generation_queue_lifecycle_and_bulk_job_guard() {
+        let (_temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video_a = repo.create_video(&channel.id, "Video A").unwrap();
+        let video_b = repo.create_video(&channel.id, "Video B").unwrap();
+        let video_c = repo.create_video(&channel.id, "Video C").unwrap();
+        let prompt_a = repo.create_prompt_version(&video_a.id, "g1", "{}", "system", "scene").unwrap();
+        let prompt_b = repo.create_prompt_version(&video_b.id, "g1", "{}", "system", "scene").unwrap();
+
+        // Nothing queued yet.
+        assert!(repo.claim_next_single_still_generation().unwrap().is_none());
+
+        let item_a = repo.enqueue_single_still_generation(&video_a.id, "g1", &prompt_a.id).unwrap();
+        assert_eq!(item_a.status, "queued");
+        assert_eq!(repo.list_single_still_generations(&video_a.id).unwrap().len(), 1);
+
+        // An active bulk job — for a DIFFERENT video — still blocks claiming,
+        // since Gemini's rate limit is per-project, not per-video (see
+        // MIGRATION_043's doc comment).
+        repo.connection.execute(
+            "INSERT INTO image_jobs(id,video_id,status,total_items,completed_items,failed_items,created_at,updated_at) VALUES('bulk-job',?1,'running',1,0,0,'now','now')",
+            [&video_c.id],
+        ).unwrap();
+        assert!(repo.claim_next_single_still_generation().unwrap().is_none(), "should not claim while a bulk job is running anywhere");
+
+        // Once the bulk job is no longer running, claiming proceeds.
+        repo.connection.execute("UPDATE image_jobs SET status='completed' WHERE id='bulk-job'", []).unwrap();
+        let (claimed_id, claimed_video, claimed_group, claimed_prompt) =
+            repo.claim_next_single_still_generation().unwrap().expect("should claim the queued item");
+        assert_eq!(claimed_id, item_a.id);
+        assert_eq!(claimed_video, video_a.id);
+        assert_eq!(claimed_group, "g1");
+        assert_eq!(claimed_prompt.id, prompt_a.id);
+        let running = repo.list_single_still_generations(&video_a.id).unwrap().into_iter().find(|i| i.id == item_a.id).unwrap();
+        assert_eq!(running.status, "running");
+
+        // A second, still-queued item for a different video is untouched by
+        // the first claim, and isn't claimable again until finished (FIFO).
+        let item_b = repo.enqueue_single_still_generation(&video_b.id, "g1", &prompt_b.id).unwrap();
+        let (claimed_id2, ..) = repo.claim_next_single_still_generation().unwrap().expect("should claim item B next");
+        assert_eq!(claimed_id2, item_b.id);
+
+        let render_a = repo.insert_image_render(
+            "render-a", &video_a.id, "g1", 1, &prompt_a.id, "render.png", "renders/g1/render.png", None, None, "generation",
+        ).unwrap();
+        repo.finish_single_still_generation(&item_a.id, Ok(render_a.id.clone())).unwrap();
+        let finished = repo.list_single_still_generations(&video_a.id).unwrap().into_iter().find(|i| i.id == item_a.id).unwrap();
+        assert_eq!(finished.status, "completed");
+        assert_eq!(finished.render_id.as_deref(), Some(render_a.id.as_str()));
+
+        repo.finish_single_still_generation(&item_b.id, Err("boom".into())).unwrap();
+        let failed = repo.list_single_still_generations(&video_b.id).unwrap().into_iter().find(|i| i.id == item_b.id).unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.last_error.as_deref(), Some("boom"));
+
+        // Crash recovery: a row stuck 'running' (app closed mid-generation)
+        // resets to 'queued' so the always-on dispatcher picks it back up.
+        let stuck = repo.enqueue_single_still_generation(&video_a.id, "g1", &prompt_a.id).unwrap();
+        repo.connection.execute("UPDATE single_still_generations SET status='running' WHERE id=?1", [&stuck.id]).unwrap();
+        repo.recover_single_still_generations().unwrap();
+        let recovered = repo.list_single_still_generations(&video_a.id).unwrap().into_iter().find(|i| i.id == stuck.id).unwrap();
+        assert_eq!(recovered.status, "queued");
     }
 
     #[test]

@@ -390,8 +390,7 @@ textarea{text-align:justify!important}
 .tl-narration-track.active{outline:2px solid #2e9e5b;outline-offset:-2px}
 .tl-narration-empty{padding:0 12px;font-size:12px;color:var(--muted);white-space:nowrap}
 .tl-waveform-canvas{height:100%;display:block}
-.tl-narration-offset{position:relative;height:100%;cursor:grab;flex-shrink:0}
-.tl-narration-offset:active{cursor:grabbing}
+.tl-narration-offset{position:relative;height:100%;cursor:pointer;flex-shrink:0}
 .tl-captions-track{background:var(--surface-2)}
 .tl-clip{position:absolute;top:4px;bottom:4px;border-radius:7px;overflow:hidden;cursor:pointer;display:flex;align-items:center;user-select:none;box-shadow:0 1px 2px rgba(0,0,0,.18);transition:box-shadow .12s ease}
 .tl-clip:hover{box-shadow:0 2px 6px rgba(0,0,0,.28)}

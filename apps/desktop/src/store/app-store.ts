@@ -9,6 +9,29 @@ export type AppStage = "home" | "inputs" | "visual-plan" | "images" | "animate" 
  * Visuals" context menu action) pre-seed which still the Images stage
  * restores as selected when it next mounts. */
 export const lastSelectedStill = new Map<string, string>();
+
+/** videoId → last Editor-tab playhead/selection, restored the next time
+ * TimelineView mounts for that video. The stage router (App.tsx) fully
+ * unmounts TimelineView on every stage switch, so none of its local state
+ * survives on its own — same "outlives unmount, keyed by video" idiom as
+ * lastSelectedStill above. Selected clip isn't tracked here: it's derived
+ * from playhead position (see TimelineView's updateSelectionForTime), so
+ * restoring playheadSeconds via seekPreview brings it back for free. */
+export interface TimelineViewMemory {
+  playheadSeconds: number;
+  selectedCaptionClipId: string | null;
+  selectedTrack: "narration" | null;
+}
+export const lastTimelineViewState = new Map<string, TimelineViewMemory>();
+
+/** videoId → Visual tab's plan-list scroll position, restored the next time
+ * VisualPlanView mounts for that video. Same idiom as the two maps above. */
+export const lastVisualPlanScrollTop = new Map<string, number>();
+
+/** videoId → the Images/Visuals stage's stills-list scroll position,
+ * restored the next time ImagesView mounts for that video. Same idiom as
+ * the maps above — ImagesView fully unmounts on stage switch too. */
+export const lastVisualsStillListScrollTop = new Map<string, number>();
 export type Theme = "light" | "dark";
 
 type Toast = { id: number; message: string; kind: "success" | "error" | "info"; durationMs: number };

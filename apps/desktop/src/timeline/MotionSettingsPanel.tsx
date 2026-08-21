@@ -174,6 +174,22 @@ export function MotionSettingsPanel({
         </div>
         <p className="tl-source-hint">Subtle at the low end, more dramatic as it climbs toward 150%.</p>
       </div>
+      <div className="tl-inspector-group">
+        <span className="tl-inspector-label">Static zoom</span>
+        <div className="tl-intensity-control">
+          <input
+            type="range" className="tl-slider" min={0} max={100} step={1}
+            value={recipe.staticZoomPercent}
+            onChange={(event) => commit({ ...recipe, staticZoomPercent: Number(event.target.value) })}
+          />
+          <span className="tl-intensity-value">{recipe.staticZoomPercent}%</span>
+        </div>
+        <p className="tl-source-hint">
+          A fixed extra zoom-in held for the whole still — not animated, unlike the camera effect
+          above. Works together with it: this sets the baseline crop, the camera effect still moves
+          on top of it.
+        </p>
+      </div>
       <TlSelectRow
         label="Depth effect"
         value={recipe.depthEffect}

@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { secondsToPixels } from "../domain/timecode";
-import type { CaptionStyle, TimelineCaptionClipRecord, TimelineClipRecord, TimelineMusicClipRecord, TimelineRecord } from "../infrastructure/projects-client";
+import { parseMotionRecipe, type CaptionStyle, type TimelineCaptionClipRecord, type TimelineClipRecord, type TimelineMusicClipRecord, type TimelineRecord } from "../infrastructure/projects-client";
 import {
+  applyMotion,
+  applyMotionRecipe,
   buildColorFilterCss,
   drawCaptionText,
   drawJoinTransitionFrame,
@@ -145,20 +147,34 @@ export function useTimelinePlayback(params: {
         activeVideoElRef.current = video;
         activeAnimationAssetIdRef.current = videoSourceId as string;
         const elapsedSeconds = Math.max(0, time - clip.startSeconds);
+        const clipDuration = clip.endSeconds - clip.startSeconds;
         if (Math.abs(video.currentTime - elapsedSeconds) > 0.15) {
           video.currentTime = elapsedSeconds;
         }
         if (video.paused) void video.play().catch(() => {});
         if (video.readyState >= 2 && video.videoWidth && video.videoHeight) {
-          // Cover-fill, matching drawStillClipContent's crop behavior.
+          // Cover-fill, matching drawStillClipContent's crop behavior — then
+          // the exact same recipe/legacy-preset fallback chain a still
+          // image goes through: a still replaced by an animation/imported
+          // clip keeps whatever Camera Effect was set on it, and the rect
+          // math (applyMotionRecipe/applyMotion) is source-agnostic, so it
+          // applies identically to a drawn video frame.
           const scale = Math.max(canvas.width / video.videoWidth, canvas.height / video.videoHeight);
-          const w = video.videoWidth * scale;
-          const h = video.videoHeight * scale;
-          ctx.filter = buildColorFilterCss(clip.colorFilterPreset, clip.colorFilterIntensity);
-          ctx.drawImage(video, (canvas.width - w) / 2, (canvas.height - h) / 2, w, h);
+          const base = {
+            w: video.videoWidth * scale, h: video.videoHeight * scale,
+            x: (canvas.width - video.videoWidth * scale) / 2, y: (canvas.height - video.videoHeight * scale) / 2,
+          };
+          const recipe = clip.motionGraphicSettingsJson ? parseMotionRecipe(clip.motionGraphicSettingsJson) : null;
+          const recipeResult = recipe
+            ? applyMotionRecipe(recipe, elapsedSeconds, clipDuration, base, canvas.width, canvas.height)
+            : null;
+          const rect = recipeResult ?? applyMotion(clip.motionPreset, elapsedSeconds, clipDuration, clip.motionIntensity, base);
+          const colorCss = buildColorFilterCss(clip.colorFilterPreset, clip.colorFilterIntensity);
+          const blurCss = recipeResult && recipeResult.blurPx > 0 ? `blur(${recipeResult.blurPx.toFixed(1)}px)` : "";
+          ctx.filter = [colorCss === "none" ? "" : colorCss, blurCss].filter(Boolean).join(" ") || "none";
+          ctx.drawImage(video, rect.x, rect.y, rect.w, rect.h);
           ctx.filter = "none";
           drewVideoFrame = true;
-          const clipDuration = clip.endSeconds - clip.startSeconds;
           const { alpha: overlayAlpha, color: overlayColor } = fadeOverlay(clip.transitionIn, clip.transitionOut, elapsedSeconds, clipDuration);
           if (overlayAlpha > 0) {
             ctx.globalAlpha = overlayAlpha;

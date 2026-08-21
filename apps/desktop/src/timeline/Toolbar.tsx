@@ -1,8 +1,8 @@
 import { useState } from "react";
-import { Clapperboard, ChevronDown, LoaderCircle, Move, Music, Play, Trash2, X } from "lucide-react";
+import { Clapperboard, ChevronDown, LoaderCircle, Move, Music, Play, Trash2, X, ZoomIn } from "lucide-react";
 import { ContextMenu } from "./ContextMenu";
 
-export type ToolKind = "text" | "captions" | "music";
+export type ToolKind = "text" | "captions" | "music" | "motion";
 export type AspectRatio = "16:9" | "9:16";
 
 /** Slim icon toolbar between the preview and the timeline. Clicking a tool
@@ -61,6 +61,9 @@ export function Toolbar({
         </button>
         <button className={activeTool === "music" ? "tl-tool-btn active" : "tl-tool-btn"} title="Audio" onClick={() => toggle("music")}>
           <Music size={16} /><span>Audio</span>
+        </button>
+        <button className={activeTool === "motion" ? "tl-tool-btn active" : "tl-tool-btn"} title="Motion" onClick={() => toggle("motion")}>
+          <ZoomIn size={16} /><span>Motion</span>
         </button>
         <div className="tl-aspect-toggle" role="group" aria-label="Aspect ratio">
           <button

@@ -76,8 +76,12 @@ def build_segments(stills: list[dict], duration_seconds: float) -> list[dict]:
     """Fills any uncovered time range between/around stills with black
     segments so the whole [0, duration_seconds] range is covered. A still
     entry with `"kind": "video"` is a generated animation clip (Veo output)
-    rather than a static image — it carries a `videoPath` instead of an
-    `imagePath` and no motion/Ken-Burns settings."""
+    or an imported video file rather than a static image — it carries a
+    `videoPath` instead of an `imagePath`. It can still carry a motion-
+    graphic recipe (a still replaced by a clip keeps whatever Camera Effect
+    was set on it) — see `_encode_segment_to_path`'s "video" branch, which
+    renders it via Remotion the same way an "image" segment with a recipe
+    does."""
     ordered = sorted(stills, key=lambda item: item["start"])
     segments: list[dict] = []
     cursor = 0.0
@@ -94,6 +98,13 @@ def build_segments(stills: list[dict], duration_seconds: float) -> list[dict]:
                 "sourceDurationSeconds": still.get("sourceDurationSeconds"),
                 "transitionIn": still.get("transitionIn", "cut"),
                 "transitionOut": still.get("transitionOut", "cut"),
+                "colorFilter": still.get("colorFilter", "none"),
+                "colorFilterIntensity": still.get("colorFilterIntensity", 50.0),
+                # A still that had a Camera Effect assigned keeps it once
+                # replaced by an animation/imported clip — see
+                # _encode_segment_to_path's "video" branch.
+                "motionGraphicEffect": still.get("motionGraphicEffect"),
+                "motionGraphicSettings": still.get("motionGraphicSettings"),
             })
         elif still.get("motion") == "cuts":
             # Hard cuts between CUTS_SEGMENT_COUNT static crops of the same
@@ -481,12 +492,34 @@ def run_ffmpeg(args: list[str]) -> None:
         raise RuntimeError(f"ffmpeg failed: {result.stderr[-2000:]}")
 
 
+def _without_extended_path_prefix(path: Path) -> Path:
+    """Windows' `Path.resolve()` can hand back an extended-length
+    (`\\\\?\\...`) path depending on the install drive/filesystem driver —
+    confirmed happening for at least one real install (a deeply nested
+    custom install directory on a `D:` drive). `cmd.exe` (which `npm.cmd`/
+    `npx.cmd` — themselves plain batch files — always shell out through)
+    flatly refuses to use an extended-length path as its starting
+    directory: it silently falls back to `%SystemRoot%` (`C:\\Windows`)
+    instead, where it then has no write permission — surfacing as a
+    baffling `npm error ... EPERM ... C:\\Windows\\package-lock.json`, with
+    no obvious link back to the real cause. Stripping the prefix keeps the
+    exact same real filesystem location while staying something cmd.exe can
+    actually chdir into. A plain (non-UNC, non-extended) path passes through
+    unchanged."""
+    text = str(path)
+    if text.startswith("\\\\?\\UNC\\"):
+        return Path("\\\\" + text[8:])
+    if text.startswith("\\\\?\\"):
+        return Path(text[4:])
+    return path
+
+
 # services/motion-engine — the Remotion project that renders whatever
 # free-form "motion recipe" motion_graphics_engine.py composed for a clip (see
 # that module's docstring — there's no fixed catalog of named treatments
 # anymore, just a shared vocabulary of independent primitives). Sibling of
 # python-engine under services/.
-MOTION_ENGINE_DIR = Path(__file__).resolve().parents[2] / "motion-engine"
+MOTION_ENGINE_DIR = _without_extended_path_prefix(Path(__file__).resolve().parents[2] / "motion-engine")
 
 
 def _resolve_node_bin(name: str) -> str:
@@ -533,7 +566,7 @@ def _ensure_motion_engine_ready() -> None:
 
 
 def _render_motion_graphic(
-    image_path: str, effect: str, settings: dict,
+    media_path: str, source_kind: str, effect: str, settings: dict,
     frames: int, fps: int, width: int, height: int, out_path: Path,
 ) -> None:
     """Renders one clip's AI-composed (or manually overridden) motion recipe
@@ -542,9 +575,15 @@ def _render_motion_graphic(
     still applies this segment's own color filter / transition fades and the
     exact output frame count on top of this in a second, ordinary ffmpeg
     pass, same as every other segment kind. `--public-dir` points Remotion's
-    headless Chromium at the still's own folder so `staticFile(imagePath)`
+    headless Chromium at the media file's own folder so `staticFile(mediaPath)`
     inside the composition can load it — Chromium refuses to load `file://`
-    URLs outside a folder it's been told is servable.
+    URLs outside a folder it's been told is servable. This same mechanism
+    works identically for a video source (`source_kind="video"` — a still
+    replaced by an animation/imported clip keeps whatever Camera Effect was
+    set on it, see build_segments) as for the original static-image case —
+    `MotionClip.tsx` picks `<OffthreadVideo>` vs `<Img>` based on `sourceKind`
+    but the same transform math (an ancestor `<AbsoluteFill>`'s CSS
+    transform, never the media element itself) applies to either.
 
     `effect` (the free-text treatment label, kept as its own DB column for
     quick display/debugging — see projects.rs) is only used here for the
@@ -552,9 +591,10 @@ def _render_motion_graphic(
     included — from `settings`, forwarded whole as the single `recipe` prop
     (see services/motion-engine/src/types.ts's `MotionRecipe`)."""
     _ensure_motion_engine_ready()
-    image_file = Path(image_path)
+    media_file = Path(media_path)
     props = {
-        "imagePath": image_file.name,
+        "mediaPath": media_file.name,
+        "sourceKind": source_kind,
         "recipe": settings,
         "durationInFrames": max(1, frames),
         "fps": fps,
@@ -568,7 +608,7 @@ def _render_motion_graphic(
             [
                 _resolve_node_bin("npx"), "remotion", "render", "src/index.ts", "MotionClip", str(out_path),
                 f"--props={props_path}",
-                f"--public-dir={image_file.parent}",
+                f"--public-dir={media_file.parent}",
                 "--log=error",
             ],
             cwd=str(MOTION_ENGINE_DIR), capture_output=True, text=True, **_subprocess_kwargs(),
@@ -604,15 +644,22 @@ def _encode_segment_to_path(
     output_frames = segment["frames"]
     original_frames = segment.get("_originalFrames", output_frames)
     trim_start_frames = segment.get("_trimStartFrames", 0)
-    if segment["kind"] == "image" and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings"):
+    if segment["kind"] in ("image", "video") and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings"):
         # AI-composed (or manually overridden) motion recipe: render the real
         # thing via services/motion-engine instead of approximating it with
-        # a zoompan preset, then apply this segment's own color filter and
-        # transition fades on top in an ordinary second ffmpeg pass — same
-        # post-processing every other segment kind already gets.
+        # a zoompan preset (image) or leaving it static (video — see
+        # build_video_filter's own docstring), then apply this segment's own
+        # color filter and transition fades on top in an ordinary second
+        # ffmpeg pass — same post-processing every other segment kind already
+        # gets. A still replaced by an animation/imported clip keeps
+        # whatever Camera Effect was set on it (see build_segments), so a
+        # "video" segment goes through the exact same Remotion render as an
+        # "image" one — just with a video source (`source_kind="video"`,
+        # see `_render_motion_graphic`) instead of a static one.
         raw_path = out_path.with_suffix(".raw.mp4")
         _render_motion_graphic(
-            segment["path"], segment["motionGraphicEffect"], segment["motionGraphicSettings"],
+            segment["path"], "video" if segment["kind"] == "video" else "image",
+            segment["motionGraphicEffect"], segment["motionGraphicSettings"],
             original_frames, fps, width, height, raw_path,
         )
         vf_parts = []
@@ -633,13 +680,25 @@ def _encode_segment_to_path(
             vf_parts.append(
                 f"fade=t=out:st={max(0.0, duration - fade_out_duration):.3f}:d={fade_out_duration:.3f}:color={out_color}"
             )
+        if segment["kind"] == "video":
+            # Same stale-asset safety net the plain (no-recipe) "video"
+            # branch below applies — Remotion's rendered output can end up
+            # shorter than the timeline slot if the source clip itself is
+            # (e.g. the slot was resized after the last "Adjust animation to
+            # duration" click): clone the last frame to fill the remainder
+            # rather than let ffmpeg emit fewer frames than `-frames:v` asks
+            # for.
+            source_duration = segment.get("sourceDurationSeconds")
+            if source_duration is not None and source_duration < duration - 0.05:
+                vf_parts.insert(0, f"tpad=stop_mode=clone:stop_duration={duration - source_duration:.3f}")
         if trim_start_frames > 0:
             vf_parts.insert(0, f"trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS")
         vf = ",".join(vf_parts) if vf_parts else "null"
         try:
             run_ffmpeg([
                 "-y", "-i", str(raw_path),
-                "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+                "-vf", vf, *(["-an"] if segment["kind"] == "video" else []),
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
                 "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
             ])
         finally:
@@ -801,7 +860,10 @@ def escape_subtitles_path(path: Path) -> str:
 # "Rubik" (the caption default font) isn't a built-in OS font — bundling it
 # here and pointing libass at this folder via the ass filter's `fontsdir`
 # lets it render correctly without needing a system-wide font install.
-_BUNDLED_FONTS_DIR = Path(__file__).resolve().parent / "fonts"
+# Same extended-length-path defense as MOTION_ENGINE_DIR above — libass's
+# own path parsing inside an ffmpeg filter string is just as unlikely to
+# understand a `\\?\`-prefixed path as cmd.exe is.
+_BUNDLED_FONTS_DIR = _without_extended_path_prefix(Path(__file__).resolve().parent / "fonts")
 
 
 def to_ass_ts(seconds: float) -> str:

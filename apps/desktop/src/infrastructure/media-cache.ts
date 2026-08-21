@@ -9,46 +9,51 @@ const assetUrlCache = new Map<string, Promise<string>>();
 const videoAssetUrlCache = new Map<string, Promise<string>>();
 const mediaLibraryAssetUrlCache = new Map<string, Promise<string>>();
 
-export function resolveRenderUrl(renderId: string): Promise<string> {
-  let cached = renderUrlCache.get(renderId);
+/** Wraps a cache-populating lookup so a REJECTED promise never sits in the
+ * cache permanently. Without this, a single transient failure (e.g. a
+ * request that raced ahead of something not fully committed yet) poisoned
+ * that id for the rest of the app session — every future caller got back
+ * the same dead rejection instead of a fresh retry, which read as "this
+ * specific image is stuck broken forever" (recoverable only by chance,
+ * e.g. selecting a different, not-yet-cached id that happened to resolve
+ * cleanly). On failure the entry is evicted so the very next call retries
+ * from scratch instead of replaying the same rejection. */
+function cachedOrRetry(cache: Map<string, Promise<string>>, key: string, load: () => Promise<string>): Promise<string> {
+  let cached = cache.get(key);
   if (!cached) {
-    cached = projectsClient.getRenderFilePath(renderId).then((path) => (path ? convertFileSrc(path) : ""));
-    renderUrlCache.set(renderId, cached);
+    cached = load().catch((error: unknown) => {
+      cache.delete(key);
+      throw error;
+    });
+    cache.set(key, cached);
   }
   return cached;
 }
 
+export function resolveRenderUrl(renderId: string): Promise<string> {
+  return cachedOrRetry(renderUrlCache, renderId, () =>
+    projectsClient.getRenderFilePath(renderId).then((path) => (path ? convertFileSrc(path) : "")));
+}
+
 export function resolveAssetUrl(assetId: string): Promise<string> {
-  let cached = assetUrlCache.get(assetId);
-  if (!cached) {
-    cached = projectsClient.getAssetFilePath(assetId).then((path) => (path ? convertFileSrc(path) : ""));
-    assetUrlCache.set(assetId, cached);
-  }
-  return cached;
+  return cachedOrRetry(assetUrlCache, assetId, () =>
+    projectsClient.getAssetFilePath(assetId).then((path) => (path ? convertFileSrc(path) : "")));
 }
 
 // Every retime creates a new video_assets row/version (never mutates a file
 // in place), so a resolved video-asset id is just as safe to cache forever
 // as a render id — a stale cache entry can never point at superseded content.
 export function resolveVideoAssetUrl(videoAssetId: string): Promise<string> {
-  let cached = videoAssetUrlCache.get(videoAssetId);
-  if (!cached) {
-    cached = projectsClient.getVideoAssetFilePath(videoAssetId).then((path) => (path ? convertFileSrc(path) : ""));
-    videoAssetUrlCache.set(videoAssetId, cached);
-  }
-  return cached;
+  return cachedOrRetry(videoAssetUrlCache, videoAssetId, () =>
+    projectsClient.getVideoAssetFilePath(videoAssetId).then((path) => (path ? convertFileSrc(path) : "")));
 }
 
 // Media library imports are copied into an immutable per-video library
 // folder and never rewritten in place, so a resolved id is safe to cache
 // forever — same reasoning as resolveVideoAssetUrl above.
 export function resolveMediaLibraryAssetUrl(assetId: string): Promise<string> {
-  let cached = mediaLibraryAssetUrlCache.get(assetId);
-  if (!cached) {
-    cached = projectsClient.getMediaLibraryAssetFilePath(assetId).then((path) => (path ? convertFileSrc(path) : ""));
-    mediaLibraryAssetUrlCache.set(assetId, cached);
-  }
-  return cached;
+  return cachedOrRetry(mediaLibraryAssetUrlCache, assetId, () =>
+    projectsClient.getMediaLibraryAssetFilePath(assetId).then((path) => (path ? convertFileSrc(path) : "")));
 }
 
 // Lightweight stale-while-revalidate store for per-video view data (image

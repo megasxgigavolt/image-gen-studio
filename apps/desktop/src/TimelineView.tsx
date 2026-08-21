@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type WheelEvent } from "react";
-import { lastSelectedStill, useAppStore } from "./store/app-store";
+import { lastSelectedStill, lastTimelineViewState, useAppStore } from "./store/app-store";
 import { formatTime, secondsToPixels } from "./domain/timecode";
 import { setCachedData } from "./infrastructure/media-cache";
 import {
@@ -34,6 +34,7 @@ import { Toolbar, type AspectRatio, type ToolKind } from "./timeline/Toolbar";
 import { ExportDrawer } from "./timeline/ExportDrawer";
 import { ExportHistoryModal } from "./timeline/ExportHistoryModal";
 import { MusicTool } from "./timeline/tools/MusicTool";
+import { MotionTool } from "./timeline/tools/MotionTool";
 import { TextOverlayTool } from "./timeline/tools/TextOverlayTool";
 import { PlaybackControls, ZOOM_MAX, ZOOM_MIN } from "./timeline/EditorToolbar";
 import { TimelinePreview } from "./timeline/TimelinePreview";
@@ -257,6 +258,46 @@ export function TimelineView() {
   useEffect(() => {
     redrawRequestRef.current = () => playback.drawFrameRef.current(previewTimeRef.current);
   });
+
+  // Restores wherever the user left off in this video's Editor the last
+  // time it was open — the stage router fully unmounts TimelineView on
+  // every stage switch, so nothing here survives on its own otherwise. Runs
+  // once per video (guarded by the ref) rather than on every `timeline`
+  // update, so it doesn't fight a subsequent refresh()/undo/redo. Clip
+  // selection isn't restored directly — seekPreview cascades into it via
+  // updateSelectionForTime.
+  const restoredTimelineViewRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeVideoId || !timeline || restoredTimelineViewRef.current === activeVideoId) return;
+    restoredTimelineViewRef.current = activeVideoId;
+    const remembered = lastTimelineViewState.get(activeVideoId);
+    if (!remembered) return;
+    seekPreview(remembered.playheadSeconds);
+    setSelectedTrack(remembered.selectedTrack);
+    if (remembered.selectedCaptionClipId) {
+      const clip = timeline.captionClips.find((candidate) => candidate.id === remembered.selectedCaptionClipId);
+      if (clip) setSelectedCaptionClip(clip);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeVideoId, timeline]);
+
+  // Keeps the memory above current as the user plays/scrubs/selects — a
+  // plain module-level Map write, not React state, so this never triggers
+  // its own re-render. Gated on the restore effect above having already run
+  // for this video: without that guard, this fired on the very first render
+  // too (activeVideoId set, timeline still null, previewTime still its
+  // initial 0) and clobbered the remembered state with zeros before the
+  // restore effect (which only runs once `timeline` loads, a later render)
+  // ever got a chance to read it back — the bug that made restoration
+  // appear to do nothing at all.
+  useEffect(() => {
+    if (!activeVideoId || restoredTimelineViewRef.current !== activeVideoId) return;
+    lastTimelineViewState.set(activeVideoId, {
+      playheadSeconds: previewTime,
+      selectedCaptionClipId: selectedCaptionClip?.id ?? null,
+      selectedTrack,
+    });
+  }, [activeVideoId, previewTime, selectedCaptionClip, selectedTrack]);
 
   const drag = useTimelineDrag({
     activeVideoId, timeline, canvasInnerRef, pixelsPerSecond, previewTimeRef, isPlayingRef,
@@ -1496,6 +1537,9 @@ export function TimelineView() {
             {activeTool === "music" && (
               <MusicTool videoId={activeVideoId} timeline={timeline} playheadSeconds={previewTime} refresh={refresh} addToast={addToast} />
             )}
+            {activeTool === "motion" && (
+              <MotionTool videoId={activeVideoId} timeline={timeline} refresh={refresh} addToast={addToast} />
+            )}
           </aside>
         </div>
         <div className="tl-timeline-pane">
@@ -1542,11 +1586,9 @@ export function TimelineView() {
             waveformCanvasRef={waveformCanvasRef}
             onNarrationDuration={setNarrationDuration}
             narrationOffsetSeconds={timeline.narrationOffsetSeconds}
-            narrationDragPreview={drag.narrationDragPreview}
             selectedTrack={selectedTrack}
             onSelectNarrationTrack={selectNarrationTrack}
             onBeginPlayheadDrag={drag.beginPlayheadDrag}
-            onBeginNarrationDrag={drag.beginNarrationDrag}
             stillsClips={stillsClips}
             stillsDragPreview={drag.stillsDragPreview}
             renderUrls={renderUrls}
@@ -1554,7 +1596,7 @@ export function TimelineView() {
             selectedClipId={selectedClip?.id ?? null}
             sequenceLocked={timeline.sequenceLocked}
             onBeginStillsDrag={drag.beginStillsDrag}
-            onSelectStillsClip={(clip) => { setSelectedTrack(null); seekPreview(clip.startSeconds); }}
+            onSelectStillsClip={(_clip, atSeconds) => { setSelectedTrack(null); seekPreview(atSeconds); }}
             onDuplicateStillsClip={(clip) => void duplicateStillsClip(clip)}
             onRemoveStillsClip={(clip) => void removeStillsClip(clip)}
             onGoToStillInVisuals={goToStillInVisuals}

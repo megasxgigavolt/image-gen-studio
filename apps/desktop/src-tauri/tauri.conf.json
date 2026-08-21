@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Auto Gen Studio",
-  "version": "2.15.2",
+  "version": "2.15.3",
   "identifier": "studio.autogen.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -39,7 +39,12 @@
     "createUpdaterArtifacts": true,
     "resources": {
       "../../../services/python-engine/auto_gen_engine/*.py": "python-engine/auto_gen_engine/",
-      "../../../services/python-engine/google-service-account.json": "google-service-account.json"
+      "../../../services/python-engine/auto_gen_engine/fonts/*": "python-engine/auto_gen_engine/fonts/",
+      "../../../services/python-engine/google-service-account.json": "google-service-account.json",
+      "../../../services/motion-engine/package.json": "motion-engine/package.json",
+      "../../../services/motion-engine/package-lock.json": "motion-engine/package-lock.json",
+      "../../../services/motion-engine/tsconfig.json": "motion-engine/tsconfig.json",
+      "../../../services/motion-engine/src/*": "motion-engine/src/"
     },
     "windows": {
       "webviewInstallMode": {

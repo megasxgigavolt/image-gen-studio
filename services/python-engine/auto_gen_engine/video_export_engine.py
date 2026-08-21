@@ -510,6 +510,18 @@ def _ensure_motion_engine_ready() -> None:
     graphics can render for the first time."""
     if (MOTION_ENGINE_DIR / "node_modules").exists():
         return
+    if not MOTION_ENGINE_DIR.is_dir():
+        # `cwd=` below only ever raises the cryptic OS-level
+        # `[WinError 267] The directory name is invalid` if this is missing —
+        # give a message that actually points at the fix (a packaging bug:
+        # the motion-engine sidecar wasn't bundled as an app resource) rather
+        # than let that opaque error surface to the user.
+        raise RuntimeError(
+            f"The motion-graphics render engine is missing from this install "
+            f"(expected at {MOTION_ENGINE_DIR}). Reinstall Auto Gen Studio; if "
+            "this keeps happening, the app package is missing the motion-engine "
+            "resource."
+        )
     result = subprocess.run(
         [_resolve_node_bin("npm"), "install"], cwd=str(MOTION_ENGINE_DIR),
         capture_output=True, text=True, **_subprocess_kwargs(),

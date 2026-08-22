@@ -132,6 +132,35 @@ def test_encode_segment_video_without_recipe_skips_motion_graphic_render(tmp_pat
     assert calls == ["ffmpeg"]
 
 
+# Root-cause coverage for the other half of the "clip-to-clip transitions
+# don't apply" fix: once expand_join_transitions is willing to build a
+# virtually-extended tail window for a video-kind outgoing segment (see the
+# tests above), _encode_segment_to_path must actually be able to render that
+# window — its existing stale-asset tpad safety net (previously only
+# exercised by a resized/mismatched "Adjust animation to duration" slot)
+# needs to engage here too, holding the source's last real frame for
+# whatever time the requested window runs past the clip's own real
+# duration, since real footage can't be extended any other way.
+def test_encode_segment_pads_a_virtually_extended_video_tail_with_a_cloned_last_frame(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
+
+    fps = 24
+    transition_frames = 12  # 0.5s virtual extension past the real 4.0s clip
+    tail_segment = {
+        "kind": "video", "path": "/tmp/clip.mp4",
+        "start": 0.0, "end": 4.0 + transition_frames / fps,
+        "frames": transition_frames, "_originalFrames": 96 + transition_frames, "_trimStartFrames": 96,
+        "sourceDurationSeconds": 4.0, "transitionIn": "cut", "transitionOut": "cut",
+    }
+    export_engine._encode_segment_to_path(tail_segment, tmp_path / "seg_a.ts", 1920, 1080, fps)
+
+    assert len(calls) == 1
+    vf = calls[0][calls[0].index("-vf") + 1]
+    assert "tpad=stop_mode=clone" in vf
+    assert calls[0][calls[0].index("-frames:v") + 1] == str(transition_frames)
+
+
 # Root-cause coverage for a real user's export failure: "Could not install
 # the motion-graphics render engine: ... UNC paths are not supported.
 # Defaulting to Windows directory. npm error ... EPERM ...
@@ -235,3 +264,45 @@ def test_expand_join_transitions_intensity_still_capped_by_short_clip_safety_net
     expanded = export_engine.expand_join_transitions(segments, fps)
     transition = next(s for s in expanded if s["kind"] == "transition")
     assert transition["frames"] == round((1.0 / 3) * fps)
+
+
+# Root-cause coverage for "transitions aren't applied to clips or
+# animations, only stills": expand_join_transitions used to require the
+# OUTGOING segment to be kind == "image" — a "video" (Veo animation /
+# imported clip) segment could never be the one transitioning OUT via a join
+# transition (cross-fade/slide/zoom-blur/whip-pan/blur), silently falling
+# back to a hard cut, even though _encode_segment_to_path's existing
+# stale-asset tpad safety net already makes a video-kind tail window
+# renderable. These pin that a "transition" segment now gets created
+# regardless of which side(s) are video.
+def test_expand_join_transitions_creates_a_transition_for_video_outgoing_into_still():
+    fps = 24
+    segments = [
+        {
+            "kind": "video", "path": "/tmp/clip.mp4", "start": 0.0, "end": 4.0, "frames": 96,
+            "transitionOut": "cross-fade", "sourceDurationSeconds": 4.0,
+        },
+        {"kind": "image", "start": 4.0, "end": 8.0, "frames": 96},
+    ]
+    expanded = export_engine.expand_join_transitions(segments, fps)
+    transition = next((s for s in expanded if s["kind"] == "transition"), None)
+    assert transition is not None
+    assert transition["segmentA"]["kind"] == "video"
+    assert transition["segmentB"]["kind"] == "image"
+
+
+def test_expand_join_transitions_creates_a_transition_for_video_to_video():
+    fps = 24
+    segments = [
+        {
+            "kind": "video", "path": "/tmp/a.mp4", "start": 0.0, "end": 4.0, "frames": 96,
+            "transitionOut": "whip-pan", "sourceDurationSeconds": 4.0,
+        },
+        {"kind": "video", "path": "/tmp/b.mp4", "start": 4.0, "end": 8.0, "frames": 96, "sourceDurationSeconds": 4.0},
+    ]
+    expanded = export_engine.expand_join_transitions(segments, fps)
+    transition = next((s for s in expanded if s["kind"] == "transition"), None)
+    assert transition is not None
+    assert transition["segmentA"]["kind"] == "video"
+    assert transition["segmentB"]["kind"] == "video"
+    assert transition["transitionType"] == "whip-pan"

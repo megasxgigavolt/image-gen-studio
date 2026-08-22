@@ -232,12 +232,18 @@ const TimelineLanes = memo(function TimelineLanes({
                 >
                   <div className="tl-clip-resize-handle left" onPointerDown={(event) => onBeginStillsDrag(clip, "start", event)} />
                   {(() => {
-                    const thumbnailUrl = (clip.renderId && renderUrls[clip.renderId])
+                    // 'animation' is deliberately excluded from the renderId
+                    // lookup below even though it always still has one (see
+                    // import_animation_clip) — showing the pre-replacement
+                    // still's thumbnail here reads as "the replacement didn't
+                    // take," especially right after "upload your own clip
+                    // instead" swaps a still for a clip the user picked
+                    // themselves. The Clapperboard badge below already flags
+                    // it as animated; falls back to the label like
+                    // imported-clip (a plain video file) already did.
+                    const thumbnailUrl = (clip.clipKind === "still" && clip.renderId && renderUrls[clip.renderId])
                       || (clip.mediaLibraryAssetId && clip.clipKind === "imported-still" && mediaAssetUrls[clip.mediaLibraryAssetId])
                       || null;
-                    // imported-clip has no still poster frame to show here (it's a
-                    // video file, not an image) — falls back to its label like any
-                    // other clip whose thumbnail hasn't resolved yet.
                     return thumbnailUrl ? <img src={thumbnailUrl} alt="" draggable={false} /> : <span className="tl-clip-fallback">{clip.label}</span>;
                   })()}
                   {clip.transitionIn === "fade" && <span className="tl-clip-badge tl-clip-badge-fade" title="Fade in"><Sparkles size={10} /></span>}

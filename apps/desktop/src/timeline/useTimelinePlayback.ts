@@ -125,9 +125,45 @@ export function useTimelinePlayback(params: {
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     const clip = findClipAtTime(stillsClips, time);
 
+    // Join-transition window, computed once up front (not just inside the
+    // poster/still branch below) so the live-video branch can also see it —
+    // for the last `transitionSeconds` of an animation/imported clip that's
+    // handing off via a join transition (cross-fade/slide/zoom-blur/whip-pan/
+    // blur), it defers to the same poster-frame-based blend a still uses
+    // instead of continuing to draw the live video frame, so the transition
+    // is actually visible rather than the video just playing through the cut.
+    // "animation" clips are included here (their `renderId` always still
+    // points at the source still, even after "upload your own clip instead"
+    // replaces one — see import_animation_clip) — "imported-clip" clips have
+    // no still image of their own to blend from, so they're left out and
+    // still hard-cut, same as before.
+    let clipDuration = 0;
+    let elapsedSeconds = 0;
+    let nextClip: TimelineClipRecord | undefined;
+    let canJoin = false;
+    let transitionSeconds = 0;
+    let inJoinWindow = false;
+    if (clip) {
+      elapsedSeconds = Math.max(0, time - clip.startSeconds);
+      clipDuration = clip.endSeconds - clip.startSeconds;
+      const clipIndex = stillsClips.indexOf(clip);
+      nextClip = clipIndex >= 0 ? stillsClips[clipIndex + 1] : undefined;
+      const joinableKind = (kind: string) => kind === "still" || kind === "imported-still" || kind === "animation";
+      canJoin = !!nextClip
+        && joinableKind(clip.clipKind)
+        && joinableKind(nextClip.clipKind)
+        && JOIN_TRANSITIONS.has(clip.transitionOut)
+        && Math.abs(nextClip.startSeconds - clip.endSeconds) < 0.05;
+      transitionSeconds = canJoin && nextClip
+        ? joinTransitionSeconds(clipDuration, nextClip.endSeconds - nextClip.startSeconds, clip.transitionOut, clip.transitionIntensity)
+        : 0;
+      inJoinWindow = canJoin && transitionSeconds > 0 && elapsedSeconds >= clipDuration - transitionSeconds;
+    }
+
     // Live playback of a generated animation clip (or an imported video
-    // clip, same treatment) draws real video frames; while paused/scrubbing
-    // it falls through to the poster-frame path below (renderId still points
+    // clip, same treatment) draws real video frames; while paused/scrubbing,
+    // or during its own outgoing join-transition window (see above), it
+    // falls through to the poster-frame path below (renderId still points
     // at the source still for every animation clip; an imported clip has no
     // poster frame of its own, so it just draws nothing while paused).
     let drewVideoFrame = false;
@@ -140,14 +176,12 @@ export function useTimelinePlayback(params: {
       activeVideoElRef.current = null;
       activeAnimationAssetIdRef.current = null;
     }
-    if (clip && isVideoClip && isPlayingRef.current) {
+    if (clip && isVideoClip && isPlayingRef.current && !inJoinWindow) {
       const videoUrl = videoAssetUrls[videoSourceId as string] ?? mediaAssetUrls[videoSourceId as string];
       if (videoUrl) {
         const video = getOrLoadVideo(videoUrl);
         activeVideoElRef.current = video;
         activeAnimationAssetIdRef.current = videoSourceId as string;
-        const elapsedSeconds = Math.max(0, time - clip.startSeconds);
-        const clipDuration = clip.endSeconds - clip.startSeconds;
         if (Math.abs(video.currentTime - elapsedSeconds) > 0.15) {
           video.currentTime = elapsedSeconds;
         }
@@ -187,27 +221,6 @@ export function useTimelinePlayback(params: {
     }
 
     if (!drewVideoFrame && (clip?.renderId || clip?.mediaLibraryAssetId)) {
-      // Clamp to 0 rather than going negative during the leading-gap
-      // fallback (time before this clip's own start) — freezes on the
-      // clip's first frame instead of extrapolating zoom/fade backwards.
-      const elapsedSeconds = Math.max(0, time - clip.startSeconds);
-      const clipDuration = clip.endSeconds - clip.startSeconds;
-      const clipIndex = stillsClips.indexOf(clip);
-      const nextClip = clipIndex >= 0 ? stillsClips[clipIndex + 1] : undefined;
-      // Join-transition preview is a deliberately simplified approximation of
-      // what export actually produces — only offered between two plain still
-      // images, both here and in expand_join_transitions's own "image"-only
-      // gate on the export side.
-      const canJoin = nextClip
-        && (clip.clipKind === "still" || clip.clipKind === "imported-still")
-        && (nextClip.clipKind === "still" || nextClip.clipKind === "imported-still")
-        && JOIN_TRANSITIONS.has(clip.transitionOut)
-        && Math.abs(nextClip.startSeconds - clip.endSeconds) < 0.05;
-      const transitionSeconds = canJoin && nextClip
-        ? joinTransitionSeconds(clipDuration, nextClip.endSeconds - nextClip.startSeconds, clip.transitionOut, clip.transitionIntensity)
-        : 0;
-      const inJoinWindow = canJoin && transitionSeconds > 0 && elapsedSeconds >= clipDuration - transitionSeconds;
-
       if (inJoinWindow && nextClip) {
         const progress = Math.max(0, Math.min(1, (elapsedSeconds - (clipDuration - transitionSeconds)) / transitionSeconds));
         drawJoinTransitionFrame(ctx, canvas, clip, nextClip, elapsedSeconds, progress * transitionSeconds, progress, clip.transitionOut, getImageByAssetId, getSubjectByRenderId);

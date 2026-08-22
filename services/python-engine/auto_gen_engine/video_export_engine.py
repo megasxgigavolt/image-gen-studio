@@ -232,19 +232,24 @@ def expand_join_transitions(segments: list[dict], fps: int) -> list[dict]:
     track after every single one. Instead, the outgoing clip's own segment
     is left completely untouched (still its full nominal length) and the
     *transition segment* renders N extra "virtual" frames of the outgoing
-    clip continuing past its nominal end — safe for a still image, since its
-    Ken-Burns motion formulas are just math with no footage limit — blended
-    against the incoming clip's own first N frames. The incoming clip's own
-    independent segment then starts N frames later (skipping the head that
-    now plays inside the transition instead). Net effect: nominal_a + N +
-    (nominal_b - N) == nominal_a + nominal_b, so total output length (and
-    narration sync) is exactly preserved.
+    clip continuing past its nominal end, blended against the incoming
+    clip's own first N frames. The incoming clip's own independent segment
+    then starts N frames later (skipping the head that now plays inside the
+    transition instead). Net effect: nominal_a + N + (nominal_b - N) ==
+    nominal_a + nominal_b, so total output length (and narration sync) is
+    exactly preserved.
 
-    This only works when the outgoing side is a still image — a "video"
-    (Veo/imported) clip has no footage beyond what it was trimmed to for its
-    own slot, so extending it isn't possible; a join transition into/out of
-    a "video" segment, a "black" gap, or the very edge of the timeline
-    silently renders as a hard cut instead, same as how the true first/last
+    The outgoing side can be a still image OR a video (Veo animation /
+    imported clip) — for a still, the "extra virtual frames" are just more
+    Ken-Burns math with no footage limit; for a video, `_encode_segment_to_path`'s
+    existing stale-asset safety net (`tpad=stop_mode=clone`, see both its
+    "video" branches) kicks in automatically once the virtually-extended
+    window's requested duration exceeds the clip's real `sourceDurationSeconds`,
+    holding a frozen last frame for the extra time (or, if the source
+    actually has unused footage beyond its nominal slot, that real footage
+    plays instead — either way a valid tail window comes out). A join
+    transition into/out of a "black" gap or the very edge of the timeline
+    still silently renders as a hard cut, same as how the true first/last
     segment's fade already gets ignored."""
     for segment in segments:
         segment["_originalFrames"] = segment["frames"]
@@ -256,7 +261,7 @@ def expand_join_transitions(segments: list[dict], fps: int) -> list[dict]:
         next_segment = segments[index + 1] if index + 1 < len(segments) else None
         if (
             transition_type not in JOIN_TRANSITIONS
-            or segment["kind"] != "image"
+            or segment["kind"] not in ("image", "video")
             or next_segment is None
             or next_segment["kind"] not in ("image", "video")
         ):

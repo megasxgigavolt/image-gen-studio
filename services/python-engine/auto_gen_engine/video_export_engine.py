@@ -501,6 +501,133 @@ def build_image_filter(
     )
 
 
+def _ease_expr(easing: str, t_expr: str) -> str:
+    """FFmpeg expression computing the eased 0-1 progress from a raw 0-1
+    progress expression `t_expr` — used by `build_recipe_zoompan_filter`.
+    Mirrors timeline-rendering.ts's `easeMotionProgress`: plain quadratic
+    ease-in/out, and smoothstep standing in for "ease"/"cubic" — close
+    enough to Remotion's real `Easing.in/out/inOut(ease/cubic)` curves that
+    the difference isn't perceptible at typical camera-move durations,
+    since this only ever gets evaluated once per OUTPUT FRAME either way
+    (neither renderer is sub-frame-accurate). "elastic" (the one curve that
+    visibly overshoots and settles back) has no reasonable monotonic
+    approximation — recipes using it are excluded from this fast path
+    entirely (see `_is_ffmpeg_native_recipe`), not approximated here."""
+    if easing == "linear":
+        return t_expr
+    if easing == "easeIn":
+        return f"(({t_expr})*({t_expr}))"
+    if easing == "easeOut":
+        return f"(1-(1-({t_expr}))*(1-({t_expr})))"
+    # "ease" / "cubic" (and any future default) — smoothstep.
+    return f"(({t_expr})*({t_expr})*(3-2*({t_expr})))"
+
+
+# Every field here left at its neutral/off value is what makes a MotionRecipe
+# eligible for `build_recipe_zoompan_filter` — see `_is_ffmpeg_native_recipe`.
+_FFMPEG_NATIVE_NEUTRAL_RECIPE = {
+    "depthEffect": "none", "storyEffect": "none", "environmentEffect": "none",
+    "environmentIntensity": 0.0, "maskShape": "none", "vignette": 0.0,
+    "fadeInFrames": 0.0, "fadeOutFrames": 0.0, "motionBlurStrength": 0.0, "shakeAmount": 0.0,
+    "speedCurve": "linear_pace", "saturationFrom": 1.0, "saturationTo": 1.0,
+}
+
+
+def _is_ffmpeg_native_recipe(recipe: dict) -> bool:
+    """Whether a MotionRecipe uses ONLY Tier 1 (camera move — see
+    Motion_Graphics_SOP_v1.md's tier catalog) and can therefore render via
+    `build_recipe_zoompan_filter` — plain ffmpeg, no Remotion/Chromium
+    involved at all — instead of the real Remotion composition. This is a
+    pure opt-in fast path, never a capability regression: any field below
+    left at other than its neutral/off default routes the clip through
+    Remotion exactly as before, unchanged. Deliberately conservative —
+    Tier 2 (depth), Tier 4 (story), Tier 5 (environment), masks, glow,
+    rotation, motion blur/shake, and 'elastic' easing (see `_ease_expr`)
+    all still need the real render."""
+    for key, neutral in _FFMPEG_NATIVE_NEUTRAL_RECIPE.items():
+        value = recipe.get(key, neutral)
+        if isinstance(neutral, str):
+            if value != neutral:
+                return False
+        elif float(value or 0.0) != neutral:
+            return False
+    if recipe.get("glowColor"):
+        return False
+    if recipe.get("pathPoints"):
+        return False
+    if recipe.get("easing", "ease") == "elastic":
+        return False
+    if float(recipe.get("rotationFromDeg", 0.0)) != float(recipe.get("rotationToDeg", 0.0)):
+        return False
+    return True
+
+
+def build_recipe_zoompan_filter(
+    recipe: dict, width: int, height: int, fps: int, duration: float, frames: int,
+    color_filter: str = "none", color_filter_intensity: float = 50.0,
+    transition_in: str = "cut", transition_out: str = "cut", transition_intensity: float = 50.0,
+) -> str:
+    """FFmpeg-native equivalent of a Tier-1-only MotionRecipe — mathematically
+    derived from timeline-rendering.ts's `applyMotionRecipe` (translate-then-
+    scale around `originX/Y`, in canvas space) converted into zoompan's
+    crop-window model, under the same assumption this module's other
+    zoompan presets already make (the source image's aspect ratio matches
+    the export target — true for AI-generated stills, produced at the
+    export's own aspect ratio). The two representations are mathematically
+    equivalent; as a sanity check, this reduces to the existing
+    `anchored_xy` formula (`(iw-iw/zoom)*sx`) exactly when there's no pan.
+    Only reached for a clip `_is_ffmpeg_native_recipe` has already approved
+    — lets that clip skip the Remotion/Chromium render entirely, which by
+    clip *count* is most of them (Tier 1 is required on every recipe; Tiers
+    2/4/5 are optional accents per the SOP's own diversity guidance, not
+    the default shape)."""
+    frames = max(1, frames)
+    t_expr = f"min(1,on/{max(1, frames - 1)})"
+    eased = _ease_expr(recipe.get("easing", "ease"), t_expr)
+    scale_from = float(recipe.get("scaleFrom", 1.0))
+    scale_to = float(recipe.get("scaleTo", 1.0))
+    static_zoom = float(recipe.get("staticZoomPercent", 0.0))
+    z_expr = (
+        f"(({scale_from:.6f}+({scale_to:.6f}-{scale_from:.6f})*{eased})"
+        f"*(1+{static_zoom:.6f}/100))"
+    )
+    sx = float(recipe.get("originX", 50.0)) / 100
+    sy = float(recipe.get("originY", 50.0)) / 100
+    pan_x_from = float(recipe.get("panXFrom", 0.0)) / 100
+    pan_x_to = float(recipe.get("panXTo", 0.0)) / 100
+    pan_y_from = float(recipe.get("panYFrom", 0.0)) / 100
+    pan_y_to = float(recipe.get("panYTo", 0.0)) / 100
+    px_expr = f"({pan_x_from:.6f}+({pan_x_to:.6f}-{pan_x_from:.6f})*{eased})"
+    py_expr = f"({pan_y_from:.6f}+({pan_y_to:.6f}-{pan_y_from:.6f})*{eased})"
+    x_expr = f"(iw-iw/zoom)*{sx:.6f}-(iw/zoom)*{px_expr}"
+    y_expr = f"(ih-ih/zoom)*{sy:.6f}-(ih/zoom)*{py_expr}"
+
+    # Same fade-to-black/white handling as build_image_filter, and the same
+    # transition-intensity scaling (_scaled_fade_seconds) every other
+    # segment kind already gets — a Tier-1-only recipe still has its own
+    # transitionIn/Out like any other still.
+    fade_in_duration = _scaled_fade_seconds(duration, transition_intensity)
+    fade_out_duration = _scaled_fade_seconds(duration, transition_intensity)
+    fades = []
+    if transition_in in ("fade", "dip-to-white"):
+        in_color = "white" if transition_in == "dip-to-white" else "black"
+        fades.append(f"fade=t=in:st=0:d={fade_in_duration:.3f}:color={in_color}")
+    if transition_out in ("fade", "dip-to-white"):
+        out_color = "white" if transition_out == "dip-to-white" else "black"
+        fades.append(f"fade=t=out:st={max(0.0, duration - fade_out_duration):.3f}:d={fade_out_duration:.3f}:color={out_color}")
+    fade = "".join(f",{f}" for f in fades)
+
+    # Same 8x pre-scale sub-pixel-stutter fix as every other zoompan preset
+    # above — see that comment for the measured rationale.
+    pre_scale = max(width, height) * 8
+    color_vf = build_color_filter_vf(color_filter, color_filter_intensity)
+    color_node = f",{color_vf}" if color_vf else ""
+    return (
+        f"scale={pre_scale}:-2,zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
+        f"d={frames}:s={width}x{height}:fps={fps}{color_node}{fade}"
+    )
+
+
 def build_video_filter(
     transition_in: str, transition_out: str, width: int, height: int, fps: int, duration: float,
     color_filter: str = "none", color_filter_intensity: float = 50.0,
@@ -822,7 +949,31 @@ def _encode_segment_to_path(
     output_frames = segment["frames"]
     original_frames = segment.get("_originalFrames", output_frames)
     trim_start_frames = segment.get("_trimStartFrames", 0)
-    if segment["kind"] in ("image", "video") and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings"):
+    if (
+        segment["kind"] == "image"
+        and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings")
+        and _is_ffmpeg_native_recipe(segment["motionGraphicSettings"])
+    ):
+        # Tier-1-only recipe (see _is_ffmpeg_native_recipe) — one plain
+        # ffmpeg pass via build_recipe_zoompan_filter, no Remotion/Chromium
+        # involved at all. Mirrors the plain "image" branch below exactly
+        # (same -loop 1 input, same trim handling) with the recipe-derived
+        # zoompan filter standing in for build_image_filter's discrete
+        # presets.
+        vf = build_recipe_zoompan_filter(
+            segment["motionGraphicSettings"], width, height, fps, duration, original_frames,
+            segment.get("colorFilter", "none"), segment.get("colorFilterIntensity", 50.0),
+            segment.get("transitionIn", "cut"), segment.get("transitionOut", "cut"),
+            segment.get("transitionIntensity", 50.0),
+        )
+        if trim_start_frames > 0:
+            vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
+        run_ffmpeg([
+            "-y", "-loop", "1", "-t", f"{duration + 1:.3f}", "-i", segment["path"],
+            "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+            "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
+        ])
+    elif segment["kind"] in ("image", "video") and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings"):
         # AI-composed (or manually overridden) motion recipe: render the real
         # thing via services/motion-engine instead of approximating it with
         # a zoompan preset (image) or leaving it static (video — see
@@ -1433,10 +1584,15 @@ def run(manifest_path: Path, output_path: Path) -> None:
     # engine isn't ready yet or the common-public-dir computation fails —
     # neither should ever actually block an export that would have worked
     # before this batching existed.
+    # A Tier-1-only recipe on an "image" segment never reaches Remotion at
+    # all now (see _is_ffmpeg_native_recipe / build_recipe_zoompan_filter in
+    # _encode_segment_to_path) — excluded here so the batch below isn't
+    # spent on clips that don't need it.
     motion_graphic_segments = [
         (index, segment) for index, segment in enumerate(segments)
         if segment["kind"] in ("image", "video")
         and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings")
+        and not (segment["kind"] == "image" and _is_ffmpeg_native_recipe(segment["motionGraphicSettings"]))
     ]
     pre_rendered_paths: list[Path] = []
     if motion_graphic_segments:

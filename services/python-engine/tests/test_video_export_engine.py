@@ -136,6 +136,134 @@ def test_encode_segment_video_without_recipe_skips_motion_graphic_render(tmp_pat
     assert calls == ["ffmpeg"]
 
 
+# Root-cause coverage for the "Remotion is heavy for simple zoom/pan clips"
+# fix: _is_ffmpeg_native_recipe gates which MotionRecipes can skip
+# Remotion/Chromium entirely (see build_recipe_zoompan_filter) — every field
+# below must independently disqualify a recipe when set to something other
+# than its neutral/off default, since any one of them means the clip
+# actually needs the real Remotion composition.
+def _neutral_recipe(**overrides):
+    base = {
+        "cameraEffect": "push_in", "scaleFrom": 1.05, "scaleTo": 1.2,
+        "panXFrom": 0, "panXTo": 0, "panYFrom": 0, "panYTo": 0,
+        "rotationFromDeg": 0, "rotationToDeg": 0, "originX": 50, "originY": 50,
+        "easing": "ease", "staticZoomPercent": 0,
+        "depthEffect": "none", "storyEffect": "none", "environmentEffect": "none",
+        "environmentIntensity": 0, "maskShape": "none", "vignette": 0,
+        "fadeInFrames": 0, "fadeOutFrames": 0, "motionBlurStrength": 0, "shakeAmount": 0,
+        "speedCurve": "linear_pace", "saturationFrom": 1, "saturationTo": 1,
+        "glowColor": None, "pathPoints": None,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_is_ffmpeg_native_recipe_true_for_a_fully_neutral_recipe():
+    assert export_engine._is_ffmpeg_native_recipe(_neutral_recipe()) is True
+
+
+def test_is_ffmpeg_native_recipe_true_with_only_camera_move_customized():
+    # The whole point: scale/pan/origin/easing/staticZoom freely varying is
+    # still "Tier 1 only" as long as every other tier stays at its default.
+    recipe = _neutral_recipe(
+        scaleFrom=1.0, scaleTo=1.4, panXFrom=-10, panXTo=20, panYFrom=5, panYTo=-5,
+        originX=30, originY=70, easing="easeOut", staticZoomPercent=15,
+    )
+    assert export_engine._is_ffmpeg_native_recipe(recipe) is True
+
+
+@pytest.mark.parametrize("overrides", [
+    {"depthEffect": "parallax_3d"},
+    {"storyEffect": "freeze_frame"},
+    {"environmentEffect": "snow"},
+    {"environmentIntensity": 0.5},
+    {"maskShape": "circle"},
+    {"vignette": 0.3},
+    {"fadeInFrames": 12},
+    {"fadeOutFrames": 12},
+    {"motionBlurStrength": 0.4},
+    {"shakeAmount": 0.2},
+    {"speedCurve": "punch_in_hold"},
+    {"saturationFrom": 0.5},
+    {"saturationTo": 1.5},
+    {"glowColor": "#FFEB3B"},
+    {"pathPoints": [{"x": 0, "y": 0}, {"x": 10, "y": 10}]},
+    {"easing": "elastic"},
+    {"rotationFromDeg": 0, "rotationToDeg": 15},
+])
+def test_is_ffmpeg_native_recipe_false_when_any_higher_tier_field_is_active(overrides):
+    assert export_engine._is_ffmpeg_native_recipe(_neutral_recipe(**overrides)) is False
+
+
+def test_build_recipe_zoompan_filter_produces_a_zoompan_chain():
+    vf = export_engine.build_recipe_zoompan_filter(_neutral_recipe(), 1920, 1080, 24, 3.0, 72)
+    assert "zoompan=" in vf
+    assert "d=72" in vf
+    assert "s=1920x1080" in vf
+    assert "fps=24" in vf
+
+
+def test_build_recipe_zoompan_filter_includes_fade_when_transition_requests_it():
+    vf = export_engine.build_recipe_zoompan_filter(
+        _neutral_recipe(), 1920, 1080, 24, 3.0, 72,
+        transition_in="fade", transition_out="dip-to-white",
+    )
+    assert "fade=t=in" in vf
+    assert "color=black" in vf
+    assert "fade=t=out" in vf
+    assert "color=white" in vf
+
+
+def test_build_recipe_zoompan_filter_reduces_to_the_existing_anchor_formula_with_no_pan():
+    # Sanity check on the derivation itself (see the function's own doc
+    # comment): with panX/Y at 0, the x/y expressions must reduce to
+    # exactly the same shape as anchored_xy's proven `(iw-iw/zoom)*sx` —
+    # not just "close", structurally identical.
+    vf = export_engine.build_recipe_zoompan_filter(
+        _neutral_recipe(originX=35, originY=65, panXFrom=0, panXTo=0, panYFrom=0, panYTo=0),
+        1920, 1080, 24, 3.0, 72,
+    )
+    assert "(iw-iw/zoom)*0.350000-(iw/zoom)*(0.000000+" in vf
+    assert "(ih-ih/zoom)*0.650000-(ih/zoom)*(0.000000+" in vf
+
+
+# Root-cause coverage for the branch-selection half: an eligible "image"
+# segment must skip Remotion/_render_motion_graphic entirely and go
+# straight to a single run_ffmpeg call using the zoompan filter — this is
+# what actually removes the Chromium cold-start for these clips, not just a
+# helper function existing unused.
+def test_encode_segment_routes_a_simple_image_recipe_through_ffmpeg_native(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_render_motion_graphic", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not call Remotion")))
+    calls = []
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
+
+    segment = {
+        "kind": "image", "path": "/tmp/still.png", "start": 0.0, "end": 3.0, "frames": 72,
+        "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": _neutral_recipe(),
+        "transitionIn": "cut", "transitionOut": "cut",
+    }
+    export_engine._encode_segment_to_path(segment, tmp_path / "out.ts", 1920, 1080, 24)
+
+    assert len(calls) == 1
+    vf = calls[0][calls[0].index("-vf") + 1]
+    assert "zoompan=" in vf
+
+
+def test_encode_segment_routes_a_complex_image_recipe_through_remotion_as_before(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(export_engine, "_render_motion_graphic", lambda *args, **kwargs: calls.append("motion_graphic"))
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append("ffmpeg"))
+
+    segment = {
+        "kind": "image", "path": "/tmp/still.png", "start": 0.0, "end": 3.0, "frames": 72,
+        "motionGraphicEffect": "Manual: Snow", "motionGraphicSettings": _neutral_recipe(environmentEffect="snow", environmentIntensity=0.5),
+        "transitionIn": "cut", "transitionOut": "cut",
+    }
+    export_engine._encode_segment_to_path(segment, tmp_path / "out.ts", 1920, 1080, 24)
+
+    assert calls[0] == "motion_graphic"
+
+
 # Root-cause coverage for the render-speed fix: a segment carrying a
 # pre-rendered raw clip (written by run()'s upfront batch pre-render — see
 # _batch_render_motion_graphics) must reuse it directly instead of calling
@@ -147,10 +275,15 @@ def test_encode_segment_reuses_a_pre_rendered_raw_path_when_present(tmp_path, mo
     monkeypatch.setattr(export_engine, "_render_motion_graphic", lambda *args, **kwargs: calls.append("motion_graphic"))
     monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
 
+    # "video" kind — always goes through Remotion regardless of how simple
+    # the recipe is (the ffmpeg-native fast path is image-only, see
+    # _is_ffmpeg_native_recipe's call site), so this exercises the
+    # pre-render/fallback machinery unconditionally rather than depending on
+    # the recipe's own field values.
     pre_rendered = tmp_path / "pre.raw.mp4"
     pre_rendered.write_bytes(b"fake-video")
     segment = {
-        "kind": "image", "path": "/tmp/still.png", "start": 0.0, "end": 2.0, "frames": 48,
+        "kind": "video", "path": "/tmp/clip.mp4", "start": 0.0, "end": 2.0, "frames": 48,
         "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": {"cameraEffect": "push_in"},
         "transitionIn": "cut", "transitionOut": "cut", "_preRenderedRawPath": str(pre_rendered),
     }
@@ -168,7 +301,7 @@ def test_encode_segment_falls_back_to_render_when_pre_rendered_path_is_missing(t
     monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
 
     segment = {
-        "kind": "image", "path": "/tmp/still.png", "start": 0.0, "end": 2.0, "frames": 48,
+        "kind": "video", "path": "/tmp/clip.mp4", "start": 0.0, "end": 2.0, "frames": 48,
         "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": {"cameraEffect": "push_in"},
         "transitionIn": "cut", "transitionOut": "cut",
         "_preRenderedRawPath": str(tmp_path / "does-not-exist.mp4"),

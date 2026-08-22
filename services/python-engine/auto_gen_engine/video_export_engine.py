@@ -98,6 +98,7 @@ def build_segments(stills: list[dict], duration_seconds: float) -> list[dict]:
                 "sourceDurationSeconds": still.get("sourceDurationSeconds"),
                 "transitionIn": still.get("transitionIn", "cut"),
                 "transitionOut": still.get("transitionOut", "cut"),
+                "transitionIntensity": still.get("transitionIntensity", 50.0),
                 "colorFilter": still.get("colorFilter", "none"),
                 "colorFilterIntensity": still.get("colorFilterIntensity", 50.0),
                 # A still that had a Camera Effect assigned keeps it once
@@ -129,6 +130,7 @@ def build_segments(stills: list[dict], duration_seconds: float) -> list[dict]:
                     # sub-segments are always hard cuts, not user-chosen.
                     "transitionIn": still.get("transitionIn", "cut") if cut_index == 0 else "cut",
                     "transitionOut": still.get("transitionOut", "cut") if cut_index == count - 1 else "cut",
+                    "transitionIntensity": still.get("transitionIntensity", 50.0),
                     "colorFilter": still.get("colorFilter", "none"),
                     "colorFilterIntensity": still.get("colorFilterIntensity", 50.0),
                 })
@@ -139,6 +141,7 @@ def build_segments(stills: list[dict], duration_seconds: float) -> list[dict]:
                 "motionIntensity": still.get("motionIntensity", 0.22),
                 "transitionIn": still.get("transitionIn", "cut"),
                 "transitionOut": still.get("transitionOut", "cut"),
+                "transitionIntensity": still.get("transitionIntensity", 50.0),
                 # These were previously dropped here despite the manifest
                 # already carrying them (Rust always sends them per still) —
                 # meant color filters and subject-anchored zoom silently
@@ -261,7 +264,15 @@ def expand_join_transitions(segments: list[dict], fps: int) -> list[dict]:
         duration_a = segment["end"] - segment["start"]
         duration_b = next_segment["end"] - next_segment["start"]
         seconds_lo, seconds_hi = _JOIN_TRANSITION_SECONDS.get(transition_type, (0.2, 0.75))
-        transition_seconds = max(seconds_lo, min(seconds_hi, min(duration_a, duration_b) / 3))
+        # The transition-intensity slider (0-100%, see timeline_clips.transition_intensity)
+        # scales linearly within this transition type's own (lo, hi) duration
+        # bounds — 0% is the snappiest the type ever gets, 100% the longest —
+        # then the existing 1/3-of-the-shorter-clip safety cap still applies
+        # on top, so an aggressive intensity on two very short adjacent clips
+        # can never eat more of either one than before.
+        intensity_fraction = max(0.0, min(100.0, segment.get("transitionIntensity", 50.0))) / 100.0
+        desired_seconds = seconds_lo + (seconds_hi - seconds_lo) * intensity_fraction
+        transition_seconds = max(0.05, min(desired_seconds, min(duration_a, duration_b) / 3))
         transition_frames = max(1, min(round(transition_seconds * fps), next_segment["frames"] - 1))
         next_segment["frames"] -= transition_frames
         next_segment["_trimStartFrames"] = next_segment.get("_trimStartFrames", 0) + transition_frames
@@ -327,12 +338,28 @@ def build_color_filter_vf(preset: str, intensity_percent: float) -> str:
     return f"eq=brightness={brightness:.4f}:contrast={contrast:.4f}:saturation={saturation:.4f}"
 
 
+def _scaled_fade_seconds(duration: float, transition_intensity: float) -> float:
+    """Fade-to-black/white duration for a 'fade'/'dip-to-white' transition,
+    scaled by the transition-intensity slider (0-100%, see
+    timeline_clips.transition_intensity). Proportional to the clip's own
+    duration, same shape as the original fixed formula, but the proportion
+    itself now ranges from a snappy ~2% at intensity=0 up to a lingering
+    ~15% at intensity=100 (the old fixed value was a flat 8%, i.e.
+    intensity=50 on this scale — see MIGRATION_044's doc comment in
+    projects.rs for why that's the default). Floored at 0.15s so even a
+    intensity=0 fade stays perceptible, capped at half the duration so
+    in+out fades on a short clip never overlap — both unchanged from before
+    this was user-adjustable."""
+    fraction = 0.02 + (0.15 - 0.02) * (max(0.0, min(100.0, transition_intensity)) / 100.0)
+    return max(0.15, min(duration / 2, duration * fraction))
+
+
 def build_image_filter(
     motion: str, transition_in: str, transition_out: str, intensity: float,
     width: int, height: int, fps: int, duration: float, frames: int,
     subject_x: float = 0.5, subject_y: float = 0.5,
     color_filter: str = "none", color_filter_intensity: float = 50.0,
-    cut_index: int = 0,
+    cut_index: int = 0, transition_intensity: float = 50.0,
 ) -> str:
     """Ken Burns camera-movement presets via ffmpeg's zoompan filter, plus
     optional fade-from/to-black "transitions" at the start and/or end.
@@ -350,8 +377,8 @@ def build_image_filter(
     half_duration = duration / 2
     mid_scale = min(max_scale, 1 + rate * half_duration)
 
-    fade_in_duration = max(0.15, min(duration / 2, duration * 0.08))
-    fade_out_duration = max(0.15, min(duration / 2, duration * 0.08))
+    fade_in_duration = _scaled_fade_seconds(duration, transition_intensity)
+    fade_out_duration = _scaled_fade_seconds(duration, transition_intensity)
     fades = []
     if transition_in in ("fade", "dip-to-white"):
         in_color = "white" if transition_in == "dip-to-white" else "black"
@@ -462,17 +489,18 @@ def build_image_filter(
 def build_video_filter(
     transition_in: str, transition_out: str, width: int, height: int, fps: int, duration: float,
     color_filter: str = "none", color_filter_intensity: float = 50.0,
+    transition_intensity: float = 50.0,
 ) -> str:
     """Scale/pad a generated animation clip onto the target canvas, same as a
     still's `build_image_filter` but with no Ken-Burns zoompan — Veo output
     already has real motion, it just needs to fit the export frame."""
     fades = []
     if transition_in in ("fade", "dip-to-white"):
-        fade_in_duration = max(0.15, min(duration / 2, duration * 0.08))
+        fade_in_duration = _scaled_fade_seconds(duration, transition_intensity)
         in_color = "white" if transition_in == "dip-to-white" else "black"
         fades.append(f"fade=t=in:st=0:d={fade_in_duration:.3f}:color={in_color}")
     if transition_out in ("fade", "dip-to-white"):
-        fade_out_duration = max(0.15, min(duration / 2, duration * 0.08))
+        fade_out_duration = _scaled_fade_seconds(duration, transition_intensity)
         out_color = "white" if transition_out == "dip-to-white" else "black"
         fades.append(f"fade=t=out:st={max(0.0, duration - fade_out_duration):.3f}:d={fade_out_duration:.3f}:color={out_color}")
     fade = "".join(f",{f}" for f in fades)
@@ -668,8 +696,9 @@ def _encode_segment_to_path(
         )
         if color_vf:
             vf_parts.append(color_vf)
-        fade_in_duration = max(0.15, min(duration / 2, duration * 0.08))
-        fade_out_duration = max(0.15, min(duration / 2, duration * 0.08))
+        segment_transition_intensity = segment.get("transitionIntensity", 50.0)
+        fade_in_duration = _scaled_fade_seconds(duration, segment_transition_intensity)
+        fade_out_duration = _scaled_fade_seconds(duration, segment_transition_intensity)
         transition_in = segment.get("transitionIn", "cut")
         transition_out = segment.get("transitionOut", "cut")
         if transition_in in ("fade", "dip-to-white"):
@@ -712,7 +741,7 @@ def _encode_segment_to_path(
             width, height, fps, duration, original_frames,
             segment.get("subjectX", 0.5), segment.get("subjectY", 0.5),
             segment.get("colorFilter", "none"), segment.get("colorFilterIntensity", 50.0),
-            segment.get("cutIndex", 0),
+            segment.get("cutIndex", 0), segment.get("transitionIntensity", 50.0),
         )
         if trim_start_frames > 0:
             vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
@@ -732,6 +761,7 @@ def _encode_segment_to_path(
             segment.get("transitionOut", "cut"),
             width, height, fps, duration,
             segment.get("colorFilter", "none"), segment.get("colorFilterIntensity", 50.0),
+            segment.get("transitionIntensity", 50.0),
         )
         # Safety net for a stale asset (the slot was resized after the last
         # "Adjust animation to duration" click): if the stored clip is

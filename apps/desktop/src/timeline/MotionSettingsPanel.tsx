@@ -8,6 +8,7 @@ import {
   type MotionRecipe,
   type StoryEffect,
   type TimelineClipRecord,
+  type TransitionPreset,
 } from "../infrastructure/projects-client";
 import {
   applyCameraEffect,
@@ -17,6 +18,7 @@ import {
   applyStoryEffect,
   deriveIntensityFromRecipe,
 } from "./motionRecipeIntensity";
+import { TRANSITION_OPTIONS } from "./timeline-rendering";
 
 const CAMERA_OPTIONS: CameraEffect[] = [
   "position_pan", "zoom_in", "zoom_out", "push_in", "pull_out", "camera_drift", "dynamic_reframing",
@@ -75,18 +77,23 @@ function TlSelectRow<T extends string>({
 
 /** Interactive per-still motion settings — replaces ClipInspector's old
  * read-only Motion readout. Four dropdowns for the categorical MotionRecipe
- * tiers (camera/depth/story/environment — transitionOut is deliberately
- * excluded, it already has its own separate mechanism, see
- * `timeline_clips.transition_out`) plus one shared intensity slider whose
- * meaning follows whichever camera effect is selected. AI-composed by Auto
- * Motion initially, freely reconfigurable per still afterward — a manual
- * edit here never re-runs the AI or its vision-QA pass, it just persists
- * the edited recipe directly (see motion_graphics_engine.py's module
- * docstring for that tradeoff). */
+ * tiers (camera/depth/story/environment) plus one shared intensity slider
+ * whose meaning follows whichever camera effect is selected, and a
+ * Transition section (type + strength) that reads/writes the clip's own
+ * `transitionOut`/`transitionIntensity` columns directly — a separate
+ * mechanism from the recipe (see `timeline_clips.transition_out`), always
+ * rendered regardless of whether a motion graphic has been composed yet.
+ * The camera/depth/story/environment tiers are AI-composed by Auto Motion
+ * initially, freely reconfigurable per still afterward — a manual edit here
+ * never re-runs the AI or its vision-QA pass, it just persists the edited
+ * recipe directly (see motion_graphics_engine.py's module docstring for
+ * that tradeoff). */
 export function MotionSettingsPanel({
   selectedClip,
   onChange,
   onResetToAiDefault,
+  onSetTransition,
+  onSetTransitionIntensity,
 }: {
   selectedClip: TimelineClipRecord;
   onChange: (effect: string | null, settingsJson: string | null, reason: string | null) => void;
@@ -95,36 +102,69 @@ export function MotionSettingsPanel({
    * is set, i.e. Auto Motion has actually analyzed this clip at least once
    * (a still built from scratch by hand has nothing to reset to). */
   onResetToAiDefault: () => void;
+  onSetTransition: (transitionOut: TransitionPreset) => void;
+  onSetTransitionIntensity: (intensity: number) => void;
 }) {
+  const transitionSection = (
+    <div className="tl-inspector-group">
+      <span className="tl-inspector-label">Transition</span>
+      <select
+        className="tl-select"
+        value={selectedClip.transitionOut}
+        onChange={(event) => onSetTransition(event.target.value as TransitionPreset)}
+      >
+        {TRANSITION_OPTIONS.map((option) => (
+          <option key={option.value} value={option.value}>{option.label}</option>
+        ))}
+      </select>
+      <p className="tl-source-hint">
+        How this still hands off to whatever comes right after it on the timeline.
+      </p>
+      {selectedClip.transitionOut !== "cut" && (
+        <div className="tl-intensity-control">
+          <input
+            type="range" className="tl-slider" min={0} max={100} step={1}
+            value={selectedClip.transitionIntensity}
+            onChange={(event) => onSetTransitionIntensity(Number(event.target.value))}
+          />
+          <span className="tl-intensity-value">{Math.round(selectedClip.transitionIntensity)}%</span>
+        </div>
+      )}
+    </div>
+  );
+
   if (!selectedClip.motionGraphicEffect) {
     // A snapshot can still be present here even with no live effect — e.g.
     // Auto Motion composed one and "Remove effects" cleared it back to
     // none afterward (that clears the live columns only, deliberately
     // leaving the snapshot for exactly this recovery path).
     return (
-      <div className="tl-inspector-group">
-        <span className="tl-inspector-label"><Wand2 size={12} />Motion</span>
-        <p className="tl-source-hint">No motion generated yet for this still — run Auto motion.</p>
-        {selectedClip.motionGraphicAiSnapshotJson && (
+      <>
+        <div className="tl-inspector-group">
+          <span className="tl-inspector-label"><Wand2 size={12} />Motion</span>
+          <p className="tl-source-hint">No motion generated yet for this still — run Auto motion.</p>
+          {selectedClip.motionGraphicAiSnapshotJson && (
+            <button
+              className="tl-upload-secondary"
+              title="Bring back the treatment Auto Motion previously composed for this still"
+              onClick={onResetToAiDefault}
+            >
+              <RotateCcw size={12} />Restore AI-composed motion
+            </button>
+          )}
           <button
             className="tl-upload-secondary"
-            title="Bring back the treatment Auto Motion previously composed for this still"
-            onClick={onResetToAiDefault}
+            onClick={() => onChange(
+              `Manual: ${humanize(DEFAULT_MOTION_RECIPE.cameraEffect)}`,
+              JSON.stringify(DEFAULT_MOTION_RECIPE),
+              null,
+            )}
           >
-            <RotateCcw size={12} />Restore AI-composed motion
+            <Wand2 size={12} />Or start from scratch
           </button>
-        )}
-        <button
-          className="tl-upload-secondary"
-          onClick={() => onChange(
-            `Manual: ${humanize(DEFAULT_MOTION_RECIPE.cameraEffect)}`,
-            JSON.stringify(DEFAULT_MOTION_RECIPE),
-            null,
-          )}
-        >
-          <Wand2 size={12} />Or start from scratch
-        </button>
-      </div>
+        </div>
+        {transitionSection}
+      </>
     );
   }
 
@@ -208,6 +248,7 @@ export function MotionSettingsPanel({
         options={ENVIRONMENT_OPTIONS}
         onChange={(effect) => commit(applyEnvironmentEffect(recipe, effect))}
       />
+      {transitionSection}
     </>
   );
 }

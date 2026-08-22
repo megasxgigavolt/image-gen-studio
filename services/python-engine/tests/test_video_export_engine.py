@@ -155,3 +155,83 @@ def test_without_extended_path_prefix_strips_the_unc_variant():
 def test_without_extended_path_prefix_leaves_a_plain_path_unchanged():
     plain = Path("D:\\Rahim\\Business\\YouTube\\Auto Gen Studio\\motion-engine")
     assert export_engine._without_extended_path_prefix(plain) == plain
+
+
+# Root-cause coverage for the new "transition intensity" slider (global
+# Motion tool + per-still Motion panel): build_segments used to always drop
+# transitionIntensity on the floor even though transitionIn/transitionOut
+# were already forwarded — these pin that it now travels through for every
+# still shape the way transitionIn/Out already do.
+def test_build_segments_forwards_transition_intensity_for_image_stills():
+    stills = [{"kind": "image", "imagePath": "/tmp/a.png", "start": 0.0, "end": 3.0, "transitionIntensity": 80.0}]
+    segment = export_engine.build_segments(stills, 3.0)[0]
+    assert segment["transitionIntensity"] == 80.0
+
+
+def test_build_segments_defaults_transition_intensity_to_fifty():
+    stills = [{"kind": "image", "imagePath": "/tmp/a.png", "start": 0.0, "end": 3.0}]
+    segment = export_engine.build_segments(stills, 3.0)[0]
+    assert segment["transitionIntensity"] == 50.0
+
+
+def test_build_segments_forwards_transition_intensity_for_video_stills():
+    stills = [{"kind": "video", "videoPath": "/tmp/clip.mp4", "start": 0.0, "end": 3.0, "transitionIntensity": 12.0}]
+    segment = next(s for s in export_engine.build_segments(stills, 3.0) if s["kind"] == "video")
+    assert segment["transitionIntensity"] == 12.0
+
+
+# Root-cause coverage for the fade duration itself actually scaling with the
+# slider, not just being carried as inert metadata — _scaled_fade_seconds
+# backs both build_image_filter's and build_video_filter's fade-in/out
+# windows and the motion-graphic branch of _encode_segment_to_path.
+def test_scaled_fade_seconds_grows_with_intensity():
+    low = export_engine._scaled_fade_seconds(10.0, 0.0)
+    mid = export_engine._scaled_fade_seconds(10.0, 50.0)
+    high = export_engine._scaled_fade_seconds(10.0, 100.0)
+    assert low < mid < high
+    assert low == 0.2  # 10 * 0.02, above the 0.15s floor
+    assert high == 1.5  # 10 * 0.15
+
+
+def test_scaled_fade_seconds_floors_short_clips_regardless_of_intensity():
+    # The proportion never exceeds 15% of the clip's own duration, so
+    # duration*fraction is always well under the 0.15s floor for a clip this
+    # short — the floor is what actually protects it, at any intensity.
+    assert export_engine._scaled_fade_seconds(0.5, 0.0) == 0.15
+    assert export_engine._scaled_fade_seconds(0.5, 100.0) == 0.15
+
+
+# Root-cause coverage for expand_join_transitions actually respecting the
+# slider (previously the join-transition window was purely a function of the
+# two clips' own durations, with no user-adjustable knob at all).
+def test_expand_join_transitions_scales_within_type_bounds_by_intensity():
+    fps = 24
+    segments = [
+        {"kind": "image", "start": 0.0, "end": 5.0, "frames": 120, "transitionOut": "cross-fade", "transitionIntensity": 0.0},
+        {"kind": "image", "start": 5.0, "end": 10.0, "frames": 120},
+    ]
+    low = export_engine.expand_join_transitions([dict(s) for s in segments], fps)
+    transition_low = next(s for s in low if s["kind"] == "transition")
+
+    segments[0]["transitionIntensity"] = 100.0
+    high = export_engine.expand_join_transitions([dict(s) for s in segments], fps)
+    transition_high = next(s for s in high if s["kind"] == "transition")
+
+    assert transition_low["frames"] < transition_high["frames"]
+    # cross-fade has no per-type override, so it uses the generic (0.2, 0.75)
+    # bounds — well under the 1/3-of-5s safety cap either way.
+    assert transition_low["frames"] == round(0.2 * fps)
+    assert transition_high["frames"] == round(0.75 * fps)
+
+
+def test_expand_join_transitions_intensity_still_capped_by_short_clip_safety_net():
+    fps = 24
+    # Both clips only 1s long: 1/3 of that is well below cross-fade's 0.75s
+    # max-intensity bound, so the cap (not the slider) should win.
+    segments = [
+        {"kind": "image", "start": 0.0, "end": 1.0, "frames": 24, "transitionOut": "cross-fade", "transitionIntensity": 100.0},
+        {"kind": "image", "start": 1.0, "end": 2.0, "frames": 24},
+    ]
+    expanded = export_engine.expand_join_transitions(segments, fps)
+    transition = next(s for s in expanded if s["kind"] == "transition")
+    assert transition["frames"] == round((1.0 / 3) * fps)

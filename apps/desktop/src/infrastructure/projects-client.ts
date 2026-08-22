@@ -387,6 +387,10 @@ export type ColorFilterPreset = "none" | "warm" | "cool" | "cinematic" | "bright
 export type TimelineClipRecord = {
   id: string; groupId: string; renderId: string | null; ordinal: number; startSeconds: number; endSeconds: number; label: string;
   motionPreset: MotionPreset; transitionIn: TransitionPreset; transitionOut: TransitionPreset; motionIntensity: number;
+  /** Strength/duration of `transitionOut`'s effect, 0-100 (default 50) — only
+   * meaningful when transitionOut isn't 'cut'. See `TimelineClip.transition_intensity`'s
+   * doc comment in projects.rs for exactly what it scales. */
+  transitionIntensity: number;
   clipKind: ClipKind; videoAssetId: string | null;
   /** Set for clipKind 'imported-still'/'imported-clip' — the media library asset backing this clip. */
   mediaLibraryAssetId: string | null;
@@ -1114,6 +1118,14 @@ export const projectsClient = {
   },
   async applyTransitionOutToAllClips(videoId: string, transitionOut: TransitionPreset): Promise<TimelineRecord> {
     if (isTauri()) return invoke("apply_transition_out_to_all_clips", { videoId, transitionOut });
+    throw new Error("Timeline requires the native application.");
+  },
+  async setTimelineClipTransitionIntensity(videoId: string, clipId: string, intensity: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("set_timeline_clip_transition_intensity", { videoId, clipId, intensity });
+    throw new Error("Timeline requires the native application.");
+  },
+  async applyTransitionIntensityToAllClips(videoId: string, intensity: number): Promise<TimelineRecord> {
+    if (isTauri()) return invoke("apply_transition_intensity_to_all_clips", { videoId, intensity });
     throw new Error("Timeline requires the native application.");
   },
   async applyMotionIntensityToAllClips(videoId: string, intensity: number): Promise<TimelineRecord> {

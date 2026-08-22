@@ -949,6 +949,15 @@ CREATE TABLE IF NOT EXISTS single_still_generations (
 CREATE INDEX IF NOT EXISTS idx_single_still_generations_video_status ON single_still_generations(video_id, status);
 "#;
 
+/// 50.0 (the midpoint of the 0-100 slider) matches the strength the fixed
+/// pre-existing formulas (duration*8% fade, duration/3-capped join blend)
+/// already produced before this column existed — so every clip already on
+/// disk keeps its exact current transition feel after this migration runs,
+/// not a jarring reset to some other default.
+const MIGRATION_044: &str = r#"
+ALTER TABLE timeline_clips ADD COLUMN transition_intensity REAL NOT NULL DEFAULT 50.0;
+"#;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {
@@ -1518,6 +1527,15 @@ pub struct TimelineClip {
     pub motion_preset: String,
     pub transition_in: String,
     pub transition_out: String,
+    /// Strength/duration of `transition_out`'s effect, 0-100 (default 50 —
+    /// see MIGRATION_044). Only meaningful for a non-'cut' transition_out;
+    /// scales the fade-to-black/white window (fade/dip-to-white) or the
+    /// cross-fade/slide/blur blend window (the 6 "join" transitions) between
+    /// their existing min/max seconds bounds — see `_scaled_fade_seconds`
+    /// and `expand_join_transitions` in video_export_engine.py, and
+    /// `fadeOverlay`/`joinTransitionSeconds` in timeline-rendering.ts for the
+    /// live-preview mirrors of both.
+    pub transition_intensity: f64,
     pub motion_intensity: f64,
     pub clip_kind: String,
     pub video_asset_id: Option<String>,
@@ -2718,6 +2736,21 @@ impl ProjectRepository {
         }
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(43, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_transition_intensity: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('timeline_clips') WHERE name='transition_intensity')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_transition_intensity {
+            self.connection.execute_batch(MIGRATION_044).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(44, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -7602,7 +7635,7 @@ Return JSON only:
         let caption_style = serde_json::from_str(&caption_style_raw).unwrap_or_else(|_| json!({}));
         self.backfill_missing_clip_renders(video_id)?;
         let mut statement = self.connection.prepare(
-            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason,motion_graphic_ai_snapshot_json FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
+            "SELECT id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason,motion_graphic_ai_snapshot_json,transition_intensity FROM timeline_clips WHERE video_id=?1 ORDER BY ordinal"
         ).map_err(|e| e.to_string())?;
         let clips = statement
             .query_map([video_id], |row| {
@@ -7627,6 +7660,7 @@ Return JSON only:
                     motion_graphic_settings_json: row.get(17)?,
                     motion_graphic_reason: row.get(18)?,
                     motion_graphic_ai_snapshot_json: row.get(19)?,
+                    transition_intensity: row.get(20)?,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -8362,6 +8396,24 @@ Return JSON only:
         self.get_timeline(video_id)
     }
 
+    pub fn set_timeline_clip_transition_intensity(&self, video_id: &str, clip_id: &str, intensity: f64) -> Result<Timeline, String> {
+        let clamped = intensity.clamp(0.0, 100.0);
+        self.connection.execute(
+            "UPDATE timeline_clips SET transition_intensity=?1 WHERE id=?2 AND video_id=?3",
+            params![clamped, clip_id, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
+    pub fn apply_transition_intensity_to_all_clips(&self, video_id: &str, intensity: f64) -> Result<Timeline, String> {
+        let clamped = intensity.clamp(0.0, 100.0);
+        self.connection.execute(
+            "UPDATE timeline_clips SET transition_intensity=?1 WHERE video_id=?2",
+            params![clamped, video_id],
+        ).map_err(|e| e.to_string())?;
+        self.get_timeline(video_id)
+    }
+
     pub fn apply_motion_intensity_to_all_clips(&self, video_id: &str, intensity: f64) -> Result<Timeline, String> {
         let clamped = intensity.clamp(0.02, 0.6);
         self.connection.execute(
@@ -8500,13 +8552,14 @@ Return JSON only:
             clip_kind, video_asset_id, media_library_asset_id, start_seconds, end_seconds,
             color_filter_preset, color_filter_intensity,
             motion_graphic_effect, motion_graphic_settings_json, motion_graphic_reason, motion_graphic_ai_snapshot_json,
-        ): (String, Option<String>, String, String, String, String, f64, String, Option<String>, Option<String>, f64, f64, String, f64, Option<String>, Option<String>, Option<String>, Option<String>) = self.connection.query_row(
-            "SELECT group_id,render_id,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,start_seconds,end_seconds,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason,motion_graphic_ai_snapshot_json FROM timeline_clips WHERE id=?1 AND video_id=?2",
+            transition_intensity,
+        ): (String, Option<String>, String, String, String, String, f64, String, Option<String>, Option<String>, f64, f64, String, f64, Option<String>, Option<String>, Option<String>, Option<String>, f64) = self.connection.query_row(
+            "SELECT group_id,render_id,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,start_seconds,end_seconds,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason,motion_graphic_ai_snapshot_json,transition_intensity FROM timeline_clips WHERE id=?1 AND video_id=?2",
             params![clip_id, video_id],
             |row| Ok((
                 row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?,
                 row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?, row.get(12)?, row.get(13)?,
-                row.get(14)?, row.get(15)?, row.get(16)?, row.get(17)?,
+                row.get(14)?, row.get(15)?, row.get(16)?, row.get(17)?, row.get(18)?,
             )),
         ).map_err(|_| "Clip was not found.".to_string())?;
         let duration = (end_seconds - start_seconds).max(0.5);
@@ -8519,8 +8572,8 @@ Return JSON only:
             "SELECT COALESCE(MAX(ordinal),0)+1 FROM timeline_clips WHERE video_id=?1", [video_id], |row| row.get(0),
         ).map_err(|e| e.to_string())?;
         self.connection.execute(
-            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason,motion_graphic_ai_snapshot_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
-            params![Uuid::new_v4().to_string(), video_id, group_id, render_id, next_ordinal, new_start, new_end, label, motion_preset, transition_in, transition_out, motion_intensity, clip_kind, video_asset_id, media_library_asset_id, color_filter_preset, color_filter_intensity, motion_graphic_effect, motion_graphic_settings_json, motion_graphic_reason, motion_graphic_ai_snapshot_json],
+            "INSERT INTO timeline_clips(id,video_id,group_id,render_id,ordinal,start_seconds,end_seconds,label,motion_preset,transition_in,transition_out,motion_intensity,clip_kind,video_asset_id,media_library_asset_id,color_filter_preset,color_filter_intensity,motion_graphic_effect,motion_graphic_settings_json,motion_graphic_reason,motion_graphic_ai_snapshot_json,transition_intensity) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+            params![Uuid::new_v4().to_string(), video_id, group_id, render_id, next_ordinal, new_start, new_end, label, motion_preset, transition_in, transition_out, motion_intensity, clip_kind, video_asset_id, media_library_asset_id, color_filter_preset, color_filter_intensity, motion_graphic_effect, motion_graphic_settings_json, motion_graphic_reason, motion_graphic_ai_snapshot_json, transition_intensity],
         ).map_err(|e| e.to_string())?;
         self.recompute_timeline_duration(video_id)?;
         self.get_timeline(video_id)
@@ -9023,7 +9076,7 @@ Return JSON only:
     /// `clear_timeline_track` (which deletes clips outright).
     pub fn remove_all_clip_effects(&self, video_id: &str) -> Result<Timeline, String> {
         self.connection.execute(
-            "UPDATE timeline_clips SET motion_preset='none', transition_in='cut', transition_out='cut', motion_intensity=0.22, color_filter_preset='none', color_filter_intensity=100, motion_graphic_effect=NULL, motion_graphic_settings_json=NULL, motion_graphic_reason=NULL WHERE video_id=?1",
+            "UPDATE timeline_clips SET motion_preset='none', transition_in='cut', transition_out='cut', transition_intensity=50.0, motion_intensity=0.22, color_filter_preset='none', color_filter_intensity=100, motion_graphic_effect=NULL, motion_graphic_settings_json=NULL, motion_graphic_reason=NULL WHERE video_id=?1",
             [video_id],
         ).map_err(|e| e.to_string())?;
         self.get_timeline(video_id)
@@ -11290,6 +11343,7 @@ Return JSON only:
                     "sourceDurationSeconds": asset.actual_duration_seconds,
                     "transitionIn": clip.transition_in,
                     "transitionOut": clip.transition_out,
+                    "transitionIntensity": clip.transition_intensity,
                     "colorFilter": clip.color_filter_preset,
                     "colorFilterIntensity": clip.color_filter_intensity,
                     "motionGraphicEffect": clip.motion_graphic_effect,
@@ -11309,6 +11363,7 @@ Return JSON only:
                     "sourceDurationSeconds": asset.duration_seconds.unwrap_or(clip.end_seconds - clip.start_seconds),
                     "transitionIn": clip.transition_in,
                     "transitionOut": clip.transition_out,
+                    "transitionIntensity": clip.transition_intensity,
                     "colorFilter": clip.color_filter_preset,
                     "colorFilterIntensity": clip.color_filter_intensity,
                     "motionGraphicEffect": clip.motion_graphic_effect,
@@ -11328,6 +11383,7 @@ Return JSON only:
                     "motionIntensity": clip.motion_intensity,
                     "transitionIn": clip.transition_in,
                     "transitionOut": clip.transition_out,
+                    "transitionIntensity": clip.transition_intensity,
                     "subjectX": 0.5,
                     "subjectY": 0.5,
                     "colorFilter": clip.color_filter_preset,
@@ -11349,6 +11405,7 @@ Return JSON only:
                 "motionIntensity": clip.motion_intensity,
                 "transitionIn": clip.transition_in,
                 "transitionOut": clip.transition_out,
+                "transitionIntensity": clip.transition_intensity,
                 "subjectX": render.subject_x.unwrap_or(0.5),
                 "subjectY": render.subject_y.unwrap_or(0.5),
                 "colorFilter": clip.color_filter_preset,
@@ -17981,6 +18038,35 @@ mod tests {
 
         let all = repo.apply_color_filter_to_all_clips(&video.id, "cinematic", 60.0).unwrap();
         assert!(all.clips.iter().all(|c| c.color_filter_preset == "cinematic" && (c.color_filter_intensity - 60.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn transition_intensity_defaults_clamps_and_bulk_applies() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene. Second scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let timeline = repo.build_timeline(&video.id).unwrap();
+        // Every clip starts at the same 50.0 midpoint the old fixed formulas
+        // already produced (see MIGRATION_044's doc comment), not 0.
+        assert!(timeline.clips.iter().all(|c| (c.transition_intensity - 50.0).abs() < 1e-9));
+        let first_clip_id = timeline.clips[0].id.clone();
+
+        let updated = repo.set_timeline_clip_transition_intensity(&video.id, &first_clip_id, 80.0).unwrap();
+        let clip = updated.clips.iter().find(|c| c.id == first_clip_id).unwrap();
+        assert_eq!(clip.transition_intensity, 80.0);
+
+        let clamped_high = repo.set_timeline_clip_transition_intensity(&video.id, &first_clip_id, 500.0).unwrap();
+        assert_eq!(clamped_high.clips.iter().find(|c| c.id == first_clip_id).unwrap().transition_intensity, 100.0);
+        let clamped_low = repo.set_timeline_clip_transition_intensity(&video.id, &first_clip_id, -20.0).unwrap();
+        assert_eq!(clamped_low.clips.iter().find(|c| c.id == first_clip_id).unwrap().transition_intensity, 0.0);
+
+        let all = repo.apply_transition_intensity_to_all_clips(&video.id, 35.0).unwrap();
+        assert!(all.clips.iter().all(|c| (c.transition_intensity - 35.0).abs() < 1e-9));
     }
 
     #[test]

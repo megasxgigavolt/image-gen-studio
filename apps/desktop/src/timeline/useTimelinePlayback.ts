@@ -175,7 +175,7 @@ export function useTimelinePlayback(params: {
           ctx.drawImage(video, rect.x, rect.y, rect.w, rect.h);
           ctx.filter = "none";
           drewVideoFrame = true;
-          const { alpha: overlayAlpha, color: overlayColor } = fadeOverlay(clip.transitionIn, clip.transitionOut, elapsedSeconds, clipDuration);
+          const { alpha: overlayAlpha, color: overlayColor } = fadeOverlay(clip.transitionIn, clip.transitionOut, elapsedSeconds, clipDuration, clip.transitionIntensity);
           if (overlayAlpha > 0) {
             ctx.globalAlpha = overlayAlpha;
             ctx.fillStyle = overlayColor;
@@ -204,7 +204,7 @@ export function useTimelinePlayback(params: {
         && JOIN_TRANSITIONS.has(clip.transitionOut)
         && Math.abs(nextClip.startSeconds - clip.endSeconds) < 0.05;
       const transitionSeconds = canJoin && nextClip
-        ? joinTransitionSeconds(clipDuration, nextClip.endSeconds - nextClip.startSeconds)
+        ? joinTransitionSeconds(clipDuration, nextClip.endSeconds - nextClip.startSeconds, clip.transitionOut, clip.transitionIntensity)
         : 0;
       const inJoinWindow = canJoin && transitionSeconds > 0 && elapsedSeconds >= clipDuration - transitionSeconds;
 
@@ -222,7 +222,7 @@ export function useTimelinePlayback(params: {
         const isTrueLastClip = clip === stillsClips[stillsClips.length - 1] && clip.endSeconds >= totalDuration - 0.05;
         const effectiveTransitionIn = isFirstClip ? "cut" : clip.transitionIn;
         const effectiveTransitionOut = isTrueLastClip ? "cut" : clip.transitionOut;
-        const { alpha: overlayAlpha, color: overlayColor } = fadeOverlay(effectiveTransitionIn, effectiveTransitionOut, elapsedSeconds, clipDuration);
+        const { alpha: overlayAlpha, color: overlayColor } = fadeOverlay(effectiveTransitionIn, effectiveTransitionOut, elapsedSeconds, clipDuration, clip.transitionIntensity);
         if (overlayAlpha > 0) {
           ctx.globalAlpha = overlayAlpha;
           ctx.fillStyle = overlayColor;

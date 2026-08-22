@@ -26,6 +26,7 @@ import {
   type TimelineClipRecord,
   type TimelineMusicClipRecord,
   type TimelineTextClipRecord,
+  type TransitionPreset,
   type VideoAssetRecord,
 } from "./infrastructure/projects-client";
 import { MediaLibraryPanel, MEDIA_DRAG_MIME, type MediaDragPayload } from "./timeline/MediaLibraryPanel";
@@ -146,6 +147,15 @@ export function TimelineView() {
   const [confirmAutoMotion, setConfirmAutoMotion] = useState(false);
   const [resettingTimeline, setResettingTimeline] = useState(false);
   const [aspectRatio, setAspectRatio] = useState<AspectRatio>("16:9");
+  // Dismissing the "Sequence unlocked" banner just hides it for the current
+  // unlock — it isn't a one-off event to remember forever, it's a standing
+  // fact about the timeline's state, so it re-arms (shows again) the next
+  // time the sequence actually goes from locked back to unlocked, and on
+  // switching videos, rather than staying suppressed indefinitely.
+  const [lockBannerDismissed, setLockBannerDismissed] = useState(false);
+  useEffect(() => {
+    setLockBannerDismissed(false);
+  }, [activeVideoId]);
   const [exportFileName, setExportFileName] = useState("");
   // Caption style sliders update these synchronously (so the canvas preview
   // reacts on every drag tick), while the actual backend commit — a full
@@ -172,6 +182,13 @@ export function TimelineView() {
     setActiveTool(null);
   });
   const { timeline, setTimeline, workspace, captionSet, setCaptionSet, audioDataUrl, loading, error, setError, savingCount, refresh, undo, redo, canUndo, canRedo } = data;
+
+  // Re-arms the "Sequence unlocked" banner (see its dismiss state above) the
+  // next time the sequence actually goes from locked back to unlocked,
+  // rather than staying suppressed indefinitely after one dismiss.
+  useEffect(() => {
+    if (timeline?.sequenceLocked) setLockBannerDismissed(false);
+  }, [timeline?.sequenceLocked]);
 
   const redrawRequestRef = useRef<() => void>(() => {});
   const assets = useTimelineAssets(activeVideoId, timeline, workspace, aspectRatio, () => redrawRequestRef.current());
@@ -551,6 +568,16 @@ export function TimelineView() {
   async function setMotionRecipe(effect: string | null, settingsJson: string | null, reason: string | null) {
     if (!activeVideoId || !selectedClip) return;
     await refresh(projectsClient.setTimelineClipMotionGraphic(activeVideoId, selectedClip.id, effect, settingsJson, reason));
+  }
+
+  async function setSelectedClipTransition(transitionOut: TransitionPreset) {
+    if (!activeVideoId || !selectedClip) return;
+    await refresh(projectsClient.setTimelineClipTransitionOut(activeVideoId, selectedClip.id, transitionOut));
+  }
+
+  async function setSelectedClipTransitionIntensity(intensity: number) {
+    if (!activeVideoId || !selectedClip) return;
+    await refresh(projectsClient.setTimelineClipTransitionIntensity(activeVideoId, selectedClip.id, intensity));
   }
 
   /** Discards any manual edit on the selected clip's Motion panel, restoring
@@ -1515,6 +1542,8 @@ export function TimelineView() {
                 onSwapRender={(renderId) => void swapRender(renderId)}
                 onMotionRecipeChange={(effect, settingsJson, reason) => void setMotionRecipe(effect, settingsJson, reason)}
                 onResetMotionRecipeToAi={() => void resetMotionRecipeToAi()}
+                onSetTransition={(transitionOut) => void setSelectedClipTransition(transitionOut)}
+                onSetTransitionIntensity={(intensity) => void setSelectedClipTransitionIntensity(intensity)}
               />
             ) : (
               <div className="tl-inspector-empty">
@@ -1543,8 +1572,11 @@ export function TimelineView() {
           </aside>
         </div>
         <div className="tl-timeline-pane">
-          {!timeline.sequenceLocked && (
-            <div className="tl-lock-banner">Sequence unlocked — clips are no longer synced to narration.</div>
+          {!timeline.sequenceLocked && !lockBannerDismissed && (
+            <div className="tl-lock-banner">
+              <span>Sequence unlocked — clips are no longer synced to narration.</span>
+              <button type="button" className="tl-lock-banner-dismiss" onClick={() => setLockBannerDismissed(true)} aria-label="Dismiss">×</button>
+            </div>
           )}
           <PlaybackControls
             canUndo={canUndo}

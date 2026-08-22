@@ -248,16 +248,25 @@ export function applyMotionRecipe(
   };
 }
 
-// Matches the export engine's fade window: proportional to the clip's own
-// duration (~8%), floored so short clips still get a perceptible fade, and
-// capped at half the duration so in+out fades on a short clip never overlap.
+// Matches the export engine's _scaled_fade_seconds exactly: proportional to
+// the clip's own duration, with the proportion itself scaled by the
+// transition-intensity slider (0-100%) from a snappy ~2% at 0 up to a
+// lingering ~15% at 100 — floored so short clips still get a perceptible
+// fade, and capped at half the duration so in+out fades on a short clip
+// never overlap.
+export function scaledFadeSeconds(duration: number, transitionIntensity: number): number {
+  const fraction = 0.02 + (0.15 - 0.02) * (Math.max(0, Math.min(100, transitionIntensity)) / 100);
+  return Math.max(0.15, Math.min(duration / 2, duration * fraction));
+}
+
 export function fadeOverlay(
   transitionIn: string,
   transitionOut: string,
   elapsedSeconds: number,
   duration: number,
+  transitionIntensity: number = 50,
 ): { alpha: number; color: string } {
-  const fadeDuration = Math.max(0.15, Math.min(duration / 2, duration * 0.08));
+  const fadeDuration = scaledFadeSeconds(duration, transitionIntensity);
   if (fadeDuration <= 0) return { alpha: 0, color: "#000000" };
   const isFadeLike = (transition: string) => transition === "fade" || transition === "dip-to-white";
   const colorFor = (transition: string) => (transition === "dip-to-white" ? "#ffffff" : "#000000");
@@ -383,10 +392,32 @@ export function drawCaptionText(
   });
 }
 
+// Mirrors _JOIN_TRANSITION_SECONDS in video_export_engine.py — whip-pan and
+// blur-transition both approximate their look with a duration-only cue (see
+// that module's comment), so they get their own tighter/looser bounds; every
+// other join transition shares the generic bounds.
+const JOIN_TRANSITION_SECONDS_BOUNDS: Record<string, [number, number]> = {
+  "whip-pan": [0.12, 0.25],
+  "blur-transition": [0.4, 0.7],
+};
+
 // Matches video_export_engine.py's expand_join_transitions formula exactly,
-// so the preview's transition window lines up with what export will do.
-export function joinTransitionSeconds(durationA: number, durationB: number): number {
-  return Math.max(0.2, Math.min(0.75, Math.min(durationA, durationB) / 3));
+// so the preview's transition window lines up with what export will do:
+// the transition-intensity slider (0-100%) scales linearly within this
+// transition type's own (lo, hi) duration bounds, then the result is still
+// capped to a third of the shorter neighboring clip so an aggressive
+// intensity on two very short clips can't eat more of either one.
+export function joinTransitionSeconds(
+  durationA: number,
+  durationB: number,
+  transitionType: string = "cross-fade",
+  transitionIntensity: number = 50,
+): number {
+  const [lo, hi] = JOIN_TRANSITION_SECONDS_BOUNDS[transitionType] ?? [0.2, 0.75];
+  const fraction = Math.max(0, Math.min(100, transitionIntensity)) / 100;
+  const desired = lo + (hi - lo) * fraction;
+  const cap = Math.min(durationA, durationB) / 3;
+  return Math.max(0.05, Math.min(desired, cap));
 }
 
 // Mirrors JOIN_TRANSITIONS in video_export_engine.py — these need both

@@ -1214,6 +1214,29 @@ fn apply_transition_out_to_all_clips(
 }
 
 #[tauri::command]
+fn set_timeline_clip_transition_intensity(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    clip_id: String,
+    intensity: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.set_timeline_clip_transition_intensity(&video_id, &clip_id, intensity)
+    })
+}
+
+#[tauri::command]
+fn apply_transition_intensity_to_all_clips(
+    state: State<'_, RepositoryState>,
+    video_id: String,
+    intensity: f64,
+) -> Result<Timeline, String> {
+    with_repository(state, |repository| {
+        repository.apply_transition_intensity_to_all_clips(&video_id, intensity)
+    })
+}
+
+#[tauri::command]
 fn apply_motion_intensity_to_all_clips(
     state: State<'_, RepositoryState>,
     video_id: String,
@@ -3267,6 +3290,8 @@ pub fn run() {
             apply_motion_to_all_clips,
             apply_transition_in_to_all_clips,
             apply_transition_out_to_all_clips,
+            set_timeline_clip_transition_intensity,
+            apply_transition_intensity_to_all_clips,
             apply_motion_intensity_to_all_clips,
             alternate_zoom_for_all_clips,
             extrapolate_stills_to_fill_gaps,

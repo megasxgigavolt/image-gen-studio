@@ -600,7 +600,8 @@ textarea{text-align:justify!important}
 .tl-shortcuts-list li{display:flex;align-items:center;gap:8px;font-size:13px}
 .tl-shortcuts-list li span{color:var(--muted);margin-left:auto}
 .tl-shortcuts-list kbd{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;padding:0 6px;border:1px solid var(--line);border-radius:5px;background:var(--surface-2);font-size:11px;font-weight:700;font-family:inherit}
-.tl-lock-banner{background:color-mix(in srgb,#d9a72e 14%,var(--surface));border:1px solid color-mix(in srgb,#d9a72e 45%,var(--line));color:#8a6510;font-size:12px;font-weight:600;padding:8px 12px;border-radius:6px;margin-bottom:8px}
+.tl-lock-banner{background:color-mix(in srgb,#d9a72e 14%,var(--surface));border:1px solid color-mix(in srgb,#d9a72e 45%,var(--line));color:#8a6510;font-size:12px;font-weight:600;padding:8px 12px;border-radius:6px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.tl-lock-banner-dismiss{border:0;background:transparent;color:inherit;opacity:.65;font-size:17px;line-height:16px;padding:0 2px;cursor:pointer;flex-shrink:0}.tl-lock-banner-dismiss:hover{opacity:1}
 .tl-context-menu{position:fixed;z-index:200;min-width:180px;background:var(--surface);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.28);padding:4px;display:flex;flex-direction:column}
 .tl-context-menu button{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:7px 10px;border:none;background:none;border-radius:5px;font-size:13px;color:var(--text);cursor:pointer}
 .tl-context-menu button:hover:not(:disabled){background:var(--surface-2)}

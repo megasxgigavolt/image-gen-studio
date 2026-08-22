@@ -1,7 +1,7 @@
 {
   "name": "@auto-gen-studio/desktop",
   "private": true,
-  "version": "2.15.4",
+  "version": "2.16.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

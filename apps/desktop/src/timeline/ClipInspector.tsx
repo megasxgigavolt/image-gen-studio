@@ -1,18 +1,17 @@
 import { Clapperboard, Clock, Redo2, Undo2, Upload } from "lucide-react";
 import { formatTime } from "../domain/timecode";
-import type { ImageRenderRecord, TimelineClipRecord, VideoAssetRecord } from "../infrastructure/projects-client";
+import type { ImageRenderRecord, TimelineClipRecord, TransitionPreset, VideoAssetRecord } from "../infrastructure/projects-client";
 import { MotionSettingsPanel } from "./MotionSettingsPanel";
 
 /** Right-panel inspector for the selected still/animation clip: duration,
  * version swaps, the animate-this-clip flow (generate/upload/restore/undo),
  * and the Motion section — Auto Motion composes the first pass automatically
  * (see SOPs/Motion_Graphics_SOP_v1.md), and `MotionSettingsPanel` (below)
- * exposes it as editable per-still dropdowns + a shared intensity slider so
- * it can be reconfigured afterward without re-running the AI. Camera
- * movement transitions and color filter are handled elsewhere (Filters
- * tool, transition picker) and aren't duplicated here. Shown whenever a
- * stills clip is selected and no tool (captions/music/text/filters/logo) is
- * active. */
+ * exposes it as editable per-still dropdowns + a shared intensity slider,
+ * plus a Transition type/strength picker, so it can all be reconfigured
+ * afterward without re-running the AI. Color filter is handled elsewhere
+ * (Filters tool) and isn't duplicated here. Shown whenever a stills clip is
+ * selected and no tool (captions/music/text/filters/logo) is active. */
 export function ClipInspector({
   selectedClip,
   selectedClipRenders,
@@ -29,6 +28,8 @@ export function ClipInspector({
   onSwapRender,
   onMotionRecipeChange,
   onResetMotionRecipeToAi,
+  onSetTransition,
+  onSetTransitionIntensity,
 }: {
   selectedClip: TimelineClipRecord;
   selectedClipRenders: ImageRenderRecord[];
@@ -45,6 +46,8 @@ export function ClipInspector({
   onSwapRender: (renderId: string) => void;
   onMotionRecipeChange: (effect: string | null, settingsJson: string | null, reason: string | null) => void;
   onResetMotionRecipeToAi: () => void;
+  onSetTransition: (transitionOut: TransitionPreset) => void;
+  onSetTransitionIntensity: (intensity: number) => void;
 }) {
   const durationMismatch = selectedClip.clipKind === "animation" && selectedClipVideoAsset
     ? Math.abs(selectedClipVideoAsset.actualDurationSeconds - (selectedClip.endSeconds - selectedClip.startSeconds)) > 0.05
@@ -143,7 +146,13 @@ export function ClipInspector({
           </>
         )}
       </div>
-      <MotionSettingsPanel selectedClip={selectedClip} onChange={onMotionRecipeChange} onResetToAiDefault={onResetMotionRecipeToAi} />
+      <MotionSettingsPanel
+        selectedClip={selectedClip}
+        onChange={onMotionRecipeChange}
+        onResetToAiDefault={onResetMotionRecipeToAi}
+        onSetTransition={onSetTransition}
+        onSetTransitionIntensity={onSetTransitionIntensity}
+      />
     </div>
   );
 }

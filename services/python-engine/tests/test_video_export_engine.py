@@ -228,6 +228,7 @@ def test_ensure_motion_engine_ready_skips_install_when_already_healthy(tmp_path,
     _mark_installed(tmp_path)
     monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
     monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not run npm")))
+    monkeypatch.setattr(export_engine, "_ensure_remotion_browser_downloaded", lambda: None)
     export_engine._ensure_motion_engine_ready()  # no exception == no (re)install attempted
 
 
@@ -235,6 +236,7 @@ def test_ensure_motion_engine_ready_prefers_npm_ci_when_lockfile_bundled(tmp_pat
     (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
     monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(export_engine, "_ensure_remotion_browser_downloaded", lambda: None)
     calls = []
 
     def fake_run(args, **kwargs):
@@ -250,6 +252,7 @@ def test_ensure_motion_engine_ready_prefers_npm_ci_when_lockfile_bundled(tmp_pat
 def test_ensure_motion_engine_ready_falls_back_to_npm_install_without_a_lockfile(tmp_path, monkeypatch):
     monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
     monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(export_engine, "_ensure_remotion_browser_downloaded", lambda: None)
     calls = []
 
     def fake_run(args, **kwargs):
@@ -268,6 +271,86 @@ def test_ensure_motion_engine_ready_raises_a_clear_error_when_npm_itself_fails(t
     monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1, stderr="network error"))
     with pytest.raises(RuntimeError, match="Could not install"):
         export_engine._ensure_motion_engine_ready()
+
+
+# Root-cause coverage for a real user's report: `npm ci`'s own internal
+# "delete node_modules first" step hit a transient Windows file lock
+# (ENOTEMPTY), left node_modules in a broken partial state, and the install
+# that followed failed too (ENOENT trying to cd into node_modules/webpack) —
+# a second plain retry alone doesn't fix this, it hits the same partial
+# state again. _ensure_motion_engine_ready must clean up itself and retry.
+def test_ensure_motion_engine_ready_cleans_up_and_retries_after_a_broken_npm_ci(tmp_path, monkeypatch):
+    (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
+    stale_node_modules = tmp_path / "node_modules"
+    (stale_node_modules / "webpack").mkdir(parents=True)  # left-behind partial state
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(export_engine, "_ensure_remotion_browser_downloaded", lambda: None)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args == ["/fake/npm", "ci"]:
+            return SimpleNamespace(returncode=1, stderr="npm error enoent ENOENT: Cannot cd into node_modules/webpack")
+        if args == ["/fake/npm", "install"]:
+            _mark_installed(tmp_path)
+            return SimpleNamespace(returncode=0, stderr="")
+        raise AssertionError(f"unexpected npm invocation: {args}")
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    export_engine._ensure_motion_engine_ready()  # no exception == recovered
+    assert calls == [["/fake/npm", "ci"], ["/fake/npm", "install"]]
+    assert not stale_node_modules.exists() or (stale_node_modules / ".bin" / "remotion.cmd").exists()
+
+
+def test_robust_rmtree_retries_through_a_transient_failure(tmp_path, monkeypatch):
+    target = tmp_path / "node_modules"
+    (target / "pkg").mkdir(parents=True)
+    attempts = {"count": 0}
+    real_rmtree = export_engine.shutil.rmtree
+
+    def flaky_rmtree(path):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise OSError("ENOTEMPTY: directory not empty")
+        real_rmtree(path)
+
+    monkeypatch.setattr(export_engine.shutil, "rmtree", flaky_rmtree)
+    monkeypatch.setattr(export_engine.time, "sleep", lambda *_: None)
+    export_engine._robust_rmtree(target)
+    assert attempts["count"] == 3
+    assert not target.exists()
+
+
+def test_robust_rmtree_raises_the_last_error_after_exhausting_attempts(tmp_path, monkeypatch):
+    target = tmp_path / "node_modules"
+    target.mkdir()
+    monkeypatch.setattr(export_engine.shutil, "rmtree", lambda path: (_ for _ in ()).throw(OSError("still locked")))
+    monkeypatch.setattr(export_engine.time, "sleep", lambda *_: None)
+    with pytest.raises(OSError, match="still locked"):
+        export_engine._robust_rmtree(target, attempts=3, delay_seconds=0)
+
+
+# Root-cause coverage for a second real user's crash: Remotion's own lazy,
+# on-first-render Chromium download failed
+# ('ENOENT ... chrome-headless-shell-win64.zip') as an unhandled promise
+# rejection with a raw Node stack trace and no indication of what to do.
+def test_ensure_remotion_browser_downloaded_succeeds_quietly(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stderr="", stdout=""))
+    export_engine._ensure_remotion_browser_downloaded()  # no exception == success
+
+
+def test_ensure_remotion_browser_downloaded_raises_a_clear_actionable_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(
+        export_engine.subprocess, "run",
+        lambda *a, **k: SimpleNamespace(returncode=1, stderr="ENOENT ... chrome-headless-shell-win64.zip", stdout=""),
+    )
+    with pytest.raises(RuntimeError, match="headless Chromium"):
+        export_engine._ensure_remotion_browser_downloaded()
 
 
 def test_ensure_motion_engine_ready_raises_when_npm_reports_success_but_bin_still_missing(tmp_path, monkeypatch):
@@ -300,6 +383,44 @@ def test_render_motion_graphic_passes_no_install_to_npx_so_failures_are_clear(tm
     assert calls[0][0] == "/fake/npx"
     assert "--no-install" in calls[0]
     assert calls[0].index("--no-install") < calls[0].index("remotion")
+
+
+# Root-cause coverage for two render-speed fixes: this clip's own audio is
+# never used downstream (confirmed by reading every caller of
+# _render_motion_graphic — video kind always re-encodes with its own -an,
+# image kind never maps an audio stream from it at all), so --muted skips
+# Remotion's own audio encode pass for free; and an explicit --concurrency
+# keeps N concurrent Remotion processes (one per ThreadPoolExecutor worker)
+# from each independently trying to use most of the machine's cores and
+# oversubscribing the CPU collectively.
+def test_render_motion_graphic_passes_muted_and_bounded_concurrency(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    calls = []
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda args, **k: (calls.append(args), SimpleNamespace(returncode=0, stderr=""))[1])
+
+    media = tmp_path / "still.png"
+    media.write_bytes(b"fake")
+    export_engine._render_motion_graphic(str(media), "image", "Manual: Push In", {}, 48, 24, 1920, 1080, tmp_path / "out.mp4")
+
+    assert "--muted" in calls[0]
+    assert any(arg.startswith("--concurrency=") for arg in calls[0])
+
+
+def test_remotion_concurrency_divides_cores_across_encode_workers(monkeypatch):
+    monkeypatch.setattr(export_engine.os, "cpu_count", lambda: 16)
+    assert export_engine._remotion_concurrency() == 16 // export_engine.MAX_ENCODE_WORKERS
+
+
+def test_remotion_concurrency_never_drops_below_one_on_a_low_core_machine(monkeypatch):
+    monkeypatch.setattr(export_engine.os, "cpu_count", lambda: 2)
+    assert export_engine._remotion_concurrency() == 1
+
+
+def test_remotion_concurrency_falls_back_when_cpu_count_is_unknown(monkeypatch):
+    monkeypatch.setattr(export_engine.os, "cpu_count", lambda: None)
+    assert export_engine._remotion_concurrency() >= 1
 
 
 # Root-cause coverage for the new "transition intensity" slider (global

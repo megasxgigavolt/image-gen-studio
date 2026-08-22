@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -34,6 +35,15 @@ import scene_grouping_engine as engine
 
 FPS_DEFAULT = 30
 MAX_ENCODE_WORKERS = 4
+
+
+def _remotion_concurrency() -> int:
+    """Per-process browser-tab concurrency for one `_render_motion_graphic`
+    call, sized so that up to MAX_ENCODE_WORKERS of these can run at once
+    (via the segment ThreadPoolExecutor) without collectively oversubscribing
+    the machine's CPU — see the call site's comment for why an explicit cap
+    matters here specifically."""
+    return max(1, (os.cpu_count() or MAX_ENCODE_WORKERS) // MAX_ENCODE_WORKERS)
 
 # "cuts" motion preset: a still is split into this many hard-cut static
 # crops instead of one continuous pan/zoom — see build_segments()'s "cuts"
@@ -588,6 +598,62 @@ def _motion_engine_installed() -> bool:
     return (MOTION_ENGINE_DIR / "node_modules" / ".bin" / "remotion.cmd").exists()
 
 
+def _robust_rmtree(path: Path, attempts: int = 5, delay_seconds: float = 1.0) -> None:
+    """Windows can transiently hold a lock on a file somewhere inside a large
+    `node_modules` tree (antivirus scanning it, the search indexer, a handle
+    left open by a just-exited process) just long enough that a single
+    delete attempt fails — confirmed by a real user's report where `npm ci`'s
+    own internal "delete node_modules first" step hit exactly this
+    (`ENOTEMPTY: directory not empty, rmdir ...\\node_modules\\remotion\\dist\\cjs`),
+    left the tree in a broken partial state, and then the install that
+    followed failed too (`ENOENT ... Cannot cd into ...\\node_modules\\webpack`)
+    — a second plain `npm ci`/`npm install` attempt alone doesn't fix this,
+    it just hits the same partial state again. Retrying the delete with a
+    short backoff is usually enough for a transient lock to clear."""
+    last_error: OSError | None = None
+    for _ in range(attempts):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            last_error = error
+            time.sleep(delay_seconds)
+    if path.exists() and last_error is not None:
+        raise last_error
+
+
+def _ensure_remotion_browser_downloaded() -> None:
+    """Explicitly verifies (and downloads if missing) the headless Chromium
+    Remotion's renderer needs, via `@remotion/renderer`'s own `ensureBrowser`
+    — root-cause fix for a real user's export crash:
+    'ENOENT ... node_modules\\.remotion\\chrome-headless-shell\\chrome-headless-shell-win64.zip',
+    an unhandled promise rejection from deep inside Remotion's own lazy,
+    on-first-render download path, surfaced as a raw Node stack trace with
+    no indication of what actually went wrong or how to fix it. Calling this
+    proactively (from `_ensure_motion_engine_ready`, i.e. before the first
+    render *and* self-healingly on every subsequent one) turns a silent or
+    partial download failure into one clear, actionable error instead."""
+    result = subprocess.run(
+        [
+            _resolve_node_bin("node"), "-e",
+            "require('@remotion/renderer').ensureBrowser()"
+            ".then(() => process.exit(0))"
+            ".catch((e) => { console.error(String(e && e.stack || e)); process.exit(1); });",
+        ],
+        cwd=str(MOTION_ENGINE_DIR), capture_output=True, text=True, **_subprocess_kwargs(),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Could not prepare the motion-graphics render engine's headless "
+            f"Chromium: {result.stderr[-2000:] or result.stdout[-2000:]}\n"
+            "This usually means the download was interrupted or blocked (antivirus, "
+            "network) — try the export again; if it keeps happening, check your "
+            "internet connection and antivirus settings, or reinstall Auto Gen Studio."
+        )
+
+
 def _ensure_motion_engine_ready() -> None:
     """One-time (or self-healing) `npm ci`/`npm install` for
     services/motion-engine, mirroring this module's own `_check_deps()`-style
@@ -598,9 +664,12 @@ def _ensure_motion_engine_ready() -> None:
     lockfile-exact install, `npm ci` always deletes any existing
     `node_modules` first — which is exactly what turns a broken partial
     install (see `_motion_engine_installed`'s doc comment) into a clean one
-    on the very next export attempt, with no manual intervention needed."""
-    if _motion_engine_installed():
-        return
+    on the very next export attempt, with no manual intervention needed.
+    That delete-first step can itself fail on Windows though (see
+    `_robust_rmtree`'s doc comment) — this retries through that specific
+    failure before giving up. Also verifies the actual headless-Chromium
+    download Remotion needs at render time, not just the npm packages (see
+    `_ensure_remotion_browser_downloaded`)."""
     if not MOTION_ENGINE_DIR.is_dir():
         # `cwd=` below only ever raises the cryptic OS-level
         # `[WinError 267] The directory name is invalid` if this is missing —
@@ -613,22 +682,37 @@ def _ensure_motion_engine_ready() -> None:
             "this keeps happening, the app package is missing the motion-engine "
             "resource."
         )
-    npm = _resolve_node_bin("npm")
-    install_args = ["ci"] if (MOTION_ENGINE_DIR / "package-lock.json").exists() else ["install"]
-    result = subprocess.run(
-        [npm, *install_args], cwd=str(MOTION_ENGINE_DIR),
-        capture_output=True, text=True, **_subprocess_kwargs(),
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Could not install the motion-graphics render engine: {result.stderr[-2000:]}"
-        )
     if not _motion_engine_installed():
-        raise RuntimeError(
-            "The motion-graphics render engine installed but 'remotion' still "
-            f"isn't available at {MOTION_ENGINE_DIR}\\node_modules\\.bin\\remotion.cmd — "
-            "try the export again; if this keeps happening, reinstall Auto Gen Studio."
+        npm = _resolve_node_bin("npm")
+        install_args = ["ci"] if (MOTION_ENGINE_DIR / "package-lock.json").exists() else ["install"]
+        result = subprocess.run(
+            [npm, *install_args], cwd=str(MOTION_ENGINE_DIR),
+            capture_output=True, text=True, **_subprocess_kwargs(),
         )
+        if result.returncode != 0:
+            node_modules = MOTION_ENGINE_DIR / "node_modules"
+            if node_modules.exists():
+                try:
+                    _robust_rmtree(node_modules)
+                except OSError:
+                    pass  # best-effort — the error below still fires if this didn't help
+                retry = subprocess.run(
+                    [npm, "install"], cwd=str(MOTION_ENGINE_DIR),
+                    capture_output=True, text=True, **_subprocess_kwargs(),
+                )
+                if retry.returncode == 0:
+                    result = retry
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Could not install the motion-graphics render engine: {result.stderr[-2000:]}"
+            )
+        if not _motion_engine_installed():
+            raise RuntimeError(
+                "The motion-graphics render engine installed but 'remotion' still "
+                f"isn't available at {MOTION_ENGINE_DIR}\\node_modules\\.bin\\remotion.cmd — "
+                "try the export again; if this keeps happening, reinstall Auto Gen Studio."
+            )
+    _ensure_remotion_browser_downloaded()
 
 
 def _render_motion_graphic(
@@ -681,6 +765,28 @@ def _render_motion_graphic(
                 _resolve_node_bin("npx"), "--no-install", "remotion", "render", "src/index.ts", "MotionClip", str(out_path),
                 f"--props={props_path}",
                 f"--public-dir={media_file.parent}",
+                # This clip's own audio is never used downstream — every
+                # caller of _render_motion_graphic re-encodes the output with
+                # its own `-an` (video kind) or simply never maps an audio
+                # stream from it at all (image kind); the export's real audio
+                # comes entirely from narration/music mixed separately in the
+                # final pass. `--muted` skips Remotion's own audio encode
+                # pass for free (confirmed via a real render: it's the
+                # difference between the "audio: Encoding progress" step
+                # running at all).
+                "--muted",
+                # Caps how many browser tabs THIS one render uses internally.
+                # Segments (including motion-graphic ones) already run up to
+                # MAX_ENCODE_WORKERS at a time via the outer ThreadPoolExecutor
+                # — without an explicit cap here, each concurrent Remotion
+                # process independently defaults to using most of the
+                # machine's cores, so several running at once oversubscribe
+                # the CPU (N processes x each trying to use ~all cores) and
+                # can end up slower than if they'd shared cleanly. Dividing
+                # available cores across the worker slots keeps total
+                # concurrent tab usage roughly bounded regardless of how many
+                # motion-graphic clips land in the same batch.
+                f"--concurrency={_remotion_concurrency()}",
                 "--log=error",
             ],
             cwd=str(MOTION_ENGINE_DIR), capture_output=True, text=True, **_subprocess_kwargs(),

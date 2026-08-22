@@ -161,11 +161,16 @@
   FileWrite $R7 'Log ""$\n'
 
   ; -- [7/7] MOTION ENGINE --
-  ; Pre-warms services/motion-engine's own npm install here, with full
-  ; visibility in the installer log, instead of leaving it to happen lazily
-  ; (and silently) on the first export. `_ensure_motion_engine_ready` in
-  ; video_export_engine.py is still the runtime safety net if this step is
-  ; skipped (no Node.js yet) or fails here.
+  ; Pre-warms services/motion-engine's own npm install (plus its headless-
+  ; Chromium download) here, with full visibility in the installer log,
+  ; instead of leaving it to happen lazily (and silently) on the first
+  ; export. `_ensure_motion_engine_ready`/`_ensure_remotion_browser_downloaded`
+  ; in video_export_engine.py are still the runtime safety net if this step
+  ; is skipped (no Node.js yet) or fails here — including the same
+  ; delete-and-retry recovery for a Windows file-lock breaking `npm ci`'s own
+  ; cleanup mid-install (a real user hit this: ENOTEMPTY during npm ci's
+  ; delete, then ENOENT on the install that followed, from node_modules
+  ; being left in a broken partial state).
   FileWrite $R7 'Log "[7/7] MOTION ENGINE - preparing the AI camera-effects render engine (may take a few minutes) ..."$\n'
   FileWrite $R7 'if ($nodeExe) {$\n'
   FileWrite $R7 '  $npmCmd = $null$\n'
@@ -176,8 +181,23 @@
   FileWrite $R7 '    Push-Location $motionDir$\n'
   FileWrite $R7 '    if (Test-Path "package-lock.json") { & $npmCmd "ci" 2>&1 | ForEach-Object { Log "        $_" } } else { & $npmCmd "install" 2>&1 | ForEach-Object { Log "        $_" } }$\n'
   FileWrite $R7 '    $npmExit = $LASTEXITCODE$\n'
+  FileWrite $R7 '    if ($npmExit -ne 0 -and (Test-Path "node_modules")) {$\n'
+  FileWrite $R7 '      Log "        Cleaning up an interrupted install and retrying ..."$\n'
+  FileWrite $R7 '      for ($i = 0; $i -lt 5; $i++) {$\n'
+  FileWrite $R7 '        try { Remove-Item -Recurse -Force "node_modules" -ErrorAction Stop; break } catch { Start-Sleep 1 }$\n'
+  FileWrite $R7 '      }$\n'
+  FileWrite $R7 '      & $npmCmd "install" 2>&1 | ForEach-Object { Log "        $_" }$\n'
+  FileWrite $R7 '      $npmExit = $LASTEXITCODE$\n'
+  FileWrite $R7 '    }$\n'
+  FileWrite $R7 '    $remotionOk = $npmExit -eq 0 -and (Test-Path "node_modules\.bin\remotion.cmd")$\n'
+  FileWrite $R7 '    if ($remotionOk) {$\n'
+  FileWrite $R7 '      Log "   [OK] Motion engine dependencies installed"$\n'
+  FileWrite $R7 '      & $nodeExe "-e" "require($\'@remotion/renderer$\').ensureBrowser().then(()=>process.exit(0)).catch((e)=>{console.error(String(e&&e.stack||e));process.exit(1)})" 2>&1 | ForEach-Object { Log "        $_" }$\n'
+  FileWrite $R7 '      if ($LASTEXITCODE -eq 0) { Log "   [OK] Headless Chromium ready" } else { Log "   [!!] Headless Chromium download failed - the app will retry automatically on first export" }$\n'
+  FileWrite $R7 '    } else {$\n'
+  FileWrite $R7 '      Log "   [!!] Motion engine setup failed - the app will retry automatically on first export"$\n'
+  FileWrite $R7 '    }$\n'
   FileWrite $R7 '    Pop-Location$\n'
-  FileWrite $R7 '    if ($npmExit -eq 0 -and (Test-Path "$motionDir\node_modules\.bin\remotion.cmd")) { Log "   [OK] Motion engine dependencies installed" } else { Log "   [!!] Motion engine setup failed - the app will retry automatically on first export" }$\n'
   FileWrite $R7 '  } else {$\n'
   FileWrite $R7 '    Log "   [!!] Motion engine folder not found at $motionDir - camera-effect exports will fail. Reinstall the app."$\n'
   FileWrite $R7 '  }$\n'

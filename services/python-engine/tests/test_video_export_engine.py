@@ -8,6 +8,7 @@ ffmpeg discovery at module import time that only behaves correctly with its
 own directory on sys.path.
 """
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -133,6 +134,134 @@ def test_encode_segment_video_without_recipe_skips_motion_graphic_render(tmp_pat
 
     assert "motion_graphic" not in calls
     assert calls == ["ffmpeg"]
+
+
+# Root-cause coverage for the render-speed fix: a segment carrying a
+# pre-rendered raw clip (written by run()'s upfront batch pre-render — see
+# _batch_render_motion_graphics) must reuse it directly instead of calling
+# _render_motion_graphic again, which would silently throw away the whole
+# point of batching (one bundle/browser for the entire export instead of a
+# fresh cold Node/webpack/Chromium process per clip).
+def test_encode_segment_reuses_a_pre_rendered_raw_path_when_present(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(export_engine, "_render_motion_graphic", lambda *args, **kwargs: calls.append("motion_graphic"))
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
+
+    pre_rendered = tmp_path / "pre.raw.mp4"
+    pre_rendered.write_bytes(b"fake-video")
+    segment = {
+        "kind": "image", "path": "/tmp/still.png", "start": 0.0, "end": 2.0, "frames": 48,
+        "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": {"cameraEffect": "push_in"},
+        "transitionIn": "cut", "transitionOut": "cut", "_preRenderedRawPath": str(pre_rendered),
+    }
+    export_engine._encode_segment_to_path(segment, tmp_path / "out.ts", 1920, 1080, 24)
+
+    assert "motion_graphic" not in calls  # never re-rendered
+    ffmpeg_call = next(c for c in calls if isinstance(c, list))
+    assert str(pre_rendered) in ffmpeg_call  # fed the pre-rendered file straight into ffmpeg
+    assert pre_rendered.exists()  # _encode_segment_to_path itself never deletes a shared pre-rendered file
+
+
+def test_encode_segment_falls_back_to_render_when_pre_rendered_path_is_missing(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(export_engine, "_render_motion_graphic", lambda *args, **kwargs: calls.append("motion_graphic"))
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
+
+    segment = {
+        "kind": "image", "path": "/tmp/still.png", "start": 0.0, "end": 2.0, "frames": 48,
+        "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": {"cameraEffect": "push_in"},
+        "transitionIn": "cut", "transitionOut": "cut",
+        "_preRenderedRawPath": str(tmp_path / "does-not-exist.mp4"),
+    }
+    export_engine._encode_segment_to_path(segment, tmp_path / "out.ts", 1920, 1080, 24)
+
+    assert calls[0] == "motion_graphic"  # fell back since the pre-rendered file wasn't actually there
+
+
+# Root-cause coverage for _common_public_dir, the shared serving root a
+# batched Remotion render needs (staticFile() resolves every clip's
+# mediaPath relative to it) — every asset for one video already lives under
+# one shared Projects/<channel>/<video>/ root in real use, so this should
+# normally succeed; a pathological failure (e.g. cross-drive paths) must
+# degrade to None, not raise, so the caller can just skip batching instead
+# of failing the whole export.
+def test_common_public_dir_finds_the_shared_ancestor(tmp_path):
+    (tmp_path / "renders" / "g1").mkdir(parents=True)
+    (tmp_path / "animations" / "g2").mkdir(parents=True)
+    a = tmp_path / "renders" / "g1" / "still.png"
+    b = tmp_path / "animations" / "g2" / "clip.mp4"
+    a.write_bytes(b"x")
+    b.write_bytes(b"x")
+    assert export_engine._common_public_dir([str(a), str(b)]) == tmp_path
+
+
+def test_common_public_dir_returns_none_on_a_pathological_failure(monkeypatch):
+    monkeypatch.setattr(export_engine.os.path, "commonpath", lambda paths: (_ for _ in ()).throw(ValueError("no common path")))
+    assert export_engine._common_public_dir(["/a/b.png", "/c/d.png"]) is None
+
+
+# Root-cause coverage for _batch_render_motion_graphics's three outcomes:
+# empty input, a clean success, and the batch PROCESS itself failing to run
+# (as opposed to an individual clip within it failing — see the next test)
+# — the caller relies on the returned per-id error dict to decide which
+# segments keep their pre-render and which fall back to the older,
+# already-proven per-clip path.
+def test_batch_render_motion_graphics_returns_empty_dict_for_no_items(tmp_path):
+    assert export_engine._batch_render_motion_graphics([], tmp_path, tmp_path) == {}
+
+
+def test_batch_render_motion_graphics_reports_no_errors_on_full_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+
+    def fake_run(args, **kwargs):
+        results_path = Path(args[3])
+        results_path.write_text(json.dumps([{"id": "0", "ok": True}, {"id": "1", "ok": True}]), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    items = [
+        {"id": "0", "mediaPath": "a.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "0.mp4")},
+        {"id": "1", "mediaPath": "b.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "1.mp4")},
+    ]
+    assert export_engine._batch_render_motion_graphics(items, tmp_path, tmp_path) == {}
+    # Scratch files are cleaned up regardless of outcome.
+    assert not (tmp_path / "motion_batch_spec.json").exists()
+    assert not (tmp_path / "motion_batch_results.json").exists()
+
+
+def test_batch_render_motion_graphics_all_items_fall_back_when_the_process_itself_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1, stderr="node crashed"))
+
+    items = [{"id": "0", "mediaPath": "a.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "0.mp4")}]
+    errors = export_engine._batch_render_motion_graphics(items, tmp_path, tmp_path)
+    assert "0" in errors
+
+
+def test_batch_render_motion_graphics_reports_only_the_items_that_actually_failed(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+
+    def fake_run(args, **kwargs):
+        results_path = Path(args[3])
+        # id "1" never reported at all (crashed mid-batch) — must still
+        # surface as a failure for that one item, not silently trusted.
+        results_path.write_text(json.dumps([
+            {"id": "0", "ok": True},
+            {"id": "2", "ok": False, "error": "render failed"},
+        ]), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    items = [
+        {"id": "0", "mediaPath": "a.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "0.mp4")},
+        {"id": "1", "mediaPath": "b.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "1.mp4")},
+        {"id": "2", "mediaPath": "c.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "2.mp4")},
+    ]
+    errors = export_engine._batch_render_motion_graphics(items, tmp_path, tmp_path)
+    assert set(errors.keys()) == {"1", "2"}
 
 
 # Root-cause coverage for the other half of the "clip-to-clip transitions

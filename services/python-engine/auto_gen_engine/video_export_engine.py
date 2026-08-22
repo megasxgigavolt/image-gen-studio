@@ -834,12 +834,27 @@ def _encode_segment_to_path(
         # "video" segment goes through the exact same Remotion render as an
         # "image" one — just with a video source (`source_kind="video"`,
         # see `_render_motion_graphic`) instead of a static one.
-        raw_path = out_path.with_suffix(".raw.mp4")
-        _render_motion_graphic(
-            segment["path"], "video" if segment["kind"] == "video" else "image",
-            segment["motionGraphicEffect"], segment["motionGraphicSettings"],
-            original_frames, fps, width, height, raw_path,
-        )
+        # `run()` pre-renders every motion-graphic clip it can up front, in
+        # one batched Node process that bundles once and reuses one browser
+        # across all of them (see `_batch_render_motion_graphics`) — far
+        # cheaper than this falling back to spawning a whole fresh
+        # Node/webpack/Chromium process per clip via `_render_motion_graphic`
+        # below (measured at ~30s of pure startup overhead per clip). Only
+        # segments the batch step didn't cover (or that failed there) still
+        # take that slower path — e.g. a join-transition's tail/head window,
+        # synthesized after the batch step already ran.
+        pre_rendered = segment.get("_preRenderedRawPath")
+        if pre_rendered and Path(pre_rendered).exists():
+            raw_path = Path(pre_rendered)
+            cleanup_raw_path = False
+        else:
+            raw_path = out_path.with_suffix(".raw.mp4")
+            cleanup_raw_path = True
+            _render_motion_graphic(
+                segment["path"], "video" if segment["kind"] == "video" else "image",
+                segment["motionGraphicEffect"], segment["motionGraphicSettings"],
+                original_frames, fps, width, height, raw_path,
+            )
         vf_parts = []
         color_vf = build_color_filter_vf(
             segment.get("colorFilter", "none"), segment.get("colorFilterIntensity", 50.0)
@@ -881,7 +896,8 @@ def _encode_segment_to_path(
                 "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
             ])
         finally:
-            raw_path.unlink(missing_ok=True)
+            if cleanup_raw_path:
+                raw_path.unlink(missing_ok=True)
     elif segment["kind"] == "image":
         vf = build_image_filter(
             segment.get("motion", "none"),
@@ -1294,6 +1310,83 @@ def run_final_pass(args: list[str], duration_seconds: float) -> None:
         raise RuntimeError(f"ffmpeg failed: {''.join(stderr_lines)[-2000:]}")
 
 
+def _common_public_dir(media_paths: list[str]) -> Path | None:
+    """Longest common ancestor directory across every motion-graphic clip's
+    own source file — the one `publicDir` a batched Remotion render needs
+    (see `_batch_render_motion_graphics`), since `staticFile()` inside the
+    composition resolves every clip's `mediaPath` relative to it. Every
+    asset for one video already lives under one shared
+    `Projects/<channel>/<video>/` root (see CLAUDE.md), so this succeeds for
+    any real export; returns `None` only in a genuinely pathological case
+    (e.g. paths spread across different drives), which just means the batch
+    step is skipped for this export — every clip still renders correctly,
+    one at a time, via the older per-clip `_render_motion_graphic` path."""
+    try:
+        parents = [str(Path(p).resolve().parent) for p in media_paths]
+        return Path(os.path.commonpath(parents))
+    except (ValueError, OSError):
+        return None
+
+
+def _batch_render_motion_graphics(items: list[dict], public_dir: Path, work_dir: Path) -> dict[str, str]:
+    """Pre-renders every item (each already carrying its own `outPath`) in
+    one batched Node process (`services/motion-engine/src/batch-render.mjs`)
+    that bundles services/motion-engine and launches headless Chromium only
+    once, reusing both across every clip — versus the old approach of
+    `_render_motion_graphic` spawning a whole fresh Node/webpack/Chromium
+    process per clip, measured at ~30s of pure startup overhead each time,
+    the dominant cost of an export for any timeline with Camera Effects
+    applied. See that script's own docstring for the render-per-item detail.
+
+    Returns a dict of `id -> error message` for every item that did NOT
+    render successfully (empty if everything succeeded, including when
+    `items` itself is empty). The caller leaves a failed (or entirely
+    un-batched, if this whole step raised) item's `_preRenderedRawPath`
+    unset, so `_encode_segment_to_path` silently falls back to the slower
+    but already-proven per-clip path for just that one clip instead of
+    failing the whole export."""
+    if not items:
+        return {}
+    _ensure_motion_engine_ready()
+    batch_path = work_dir / "motion_batch_spec.json"
+    results_path = work_dir / "motion_batch_results.json"
+    batch_path.write_text(json.dumps([
+        {
+            "id": item["id"], "mediaPath": item["mediaPath"], "sourceKind": item["sourceKind"],
+            "recipe": item["recipe"], "durationInFrames": item["durationInFrames"], "fps": item["fps"],
+            "width": item["width"], "height": item["height"], "outPath": item["outPath"],
+        }
+        for item in items
+    ]), encoding="utf-8")
+    try:
+        result = subprocess.run(
+            [
+                _resolve_node_bin("node"), "src/batch-render.mjs",
+                str(batch_path), str(results_path), str(public_dir),
+            ],
+            cwd=str(MOTION_ENGINE_DIR), capture_output=True, text=True, **_subprocess_kwargs(),
+        )
+        if result.returncode != 0 or not results_path.exists():
+            # The whole batch process itself failed to run (not an
+            # individual clip within it) — every item falls back.
+            message = (result.stderr or "")[-500:] or "the batch render process did not run"
+            return {item["id"]: message for item in items}
+        raw_results = json.loads(results_path.read_text(encoding="utf-8"))
+        errors: dict[str, str] = {}
+        seen_ids: set[str] = set()
+        for entry in raw_results:
+            seen_ids.add(entry["id"])
+            if not entry.get("ok"):
+                errors[entry["id"]] = str(entry.get("error", "unknown error"))
+        for item in items:
+            if item["id"] not in seen_ids:
+                errors[item["id"]] = "the batch render process did not report a result for this clip"
+        return errors
+    finally:
+        batch_path.unlink(missing_ok=True)
+        results_path.unlink(missing_ok=True)
+
+
 def run(manifest_path: Path, output_path: Path) -> None:
     engine.report_progress(2, "Preparing export", "Reading timeline manifest")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1331,7 +1424,55 @@ def run(manifest_path: Path, output_path: Path) -> None:
     # meaningful to mean.
     segments = expand_join_transitions(segments, fps)
 
-    engine.report_progress(5, "Preparing export", f"{len(segments)} segments to render")
+    # Pre-render every motion-graphic clip this early scan can see (the vast
+    # majority — everything except a join-transition's tail/head window,
+    # synthesized later by _build_transition_segment, still just falls back
+    # to the older per-clip path below) in one batched pass — see
+    # `_batch_render_motion_graphics`'s doc comment for why this exists.
+    # Skipped entirely (silently, same per-clip fallback) if the motion
+    # engine isn't ready yet or the common-public-dir computation fails —
+    # neither should ever actually block an export that would have worked
+    # before this batching existed.
+    motion_graphic_segments = [
+        (index, segment) for index, segment in enumerate(segments)
+        if segment["kind"] in ("image", "video")
+        and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings")
+    ]
+    pre_rendered_paths: list[Path] = []
+    if motion_graphic_segments:
+        engine.report_progress(
+            5, "Preparing export",
+            f"Pre-rendering {len(motion_graphic_segments)} motion-graphic clip"
+            f"{'s' if len(motion_graphic_segments) != 1 else ''}",
+        )
+        public_dir = _common_public_dir([segment["path"] for _, segment in motion_graphic_segments])
+        try:
+            if public_dir is not None:
+                batch_items = []
+                for index, segment in motion_graphic_segments:
+                    raw_path = work_dir / f"motion_pre_{index}.raw.mp4"
+                    media_path = Path(segment["path"]).resolve().relative_to(public_dir)
+                    batch_items.append({
+                        "id": str(index),
+                        "mediaPath": str(media_path).replace("\\", "/"),
+                        "sourceKind": "video" if segment["kind"] == "video" else "image",
+                        "recipe": segment["motionGraphicSettings"],
+                        "durationInFrames": segment.get("_originalFrames", segment["frames"]),
+                        "fps": fps, "width": width, "height": height,
+                        "outPath": str(raw_path),
+                    })
+                errors = _batch_render_motion_graphics(batch_items, public_dir, work_dir)
+                for item, (index, segment) in zip(batch_items, motion_graphic_segments):
+                    if item["id"] not in errors:
+                        segment["_preRenderedRawPath"] = item["outPath"]
+                        pre_rendered_paths.append(Path(item["outPath"]))
+        except Exception as error:  # noqa: BLE001 - batching is a pure optimization, never fatal
+            engine.report_progress(
+                5, "Preparing export",
+                f"Motion-graphics pre-render skipped ({error}) — rendering per clip instead",
+            )
+
+    engine.report_progress(10, "Preparing export", f"{len(segments)} segments to render")
     # Each segment is an independent ffmpeg process (its own frame range,
     # nothing shared with its neighbors), so encoding them concurrently
     # instead of one-at-a-time is a straightforward, safe way to cut export
@@ -1349,12 +1490,21 @@ def run(manifest_path: Path, output_path: Path) -> None:
             nonlocal completed
             with completed_lock:
                 completed += 1
-                percent = 5 + round((completed / len(segments)) * 65)
+                percent = 10 + round((completed / len(segments)) * 60)
                 engine.report_progress(percent, "Rendering stills", f"Segment {completed}/{len(segments)}")
 
         for future in futures:
             future.add_done_callback(_on_done)
         segment_paths: list[Path] = [future.result() for future in futures]
+
+    # Pre-rendered motion-graphic raw clips (see above) are each consumed by
+    # exactly one segment above and never reused — `_encode_segment_to_path`
+    # deliberately leaves them on disk (unlike its own per-clip raw_path,
+    # which it always cleans up itself) so a batch failure partway through
+    # still leaves every successfully pre-rendered clip usable; cleaned up
+    # here instead, once every segment that could need one has run.
+    for raw_path in pre_rendered_paths:
+        raw_path.unlink(missing_ok=True)
 
     segments_list_path = work_dir / "segments.txt"
     segments_list_path.write_text(

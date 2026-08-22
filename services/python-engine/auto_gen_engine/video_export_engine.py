@@ -569,12 +569,37 @@ def _resolve_node_bin(name: str) -> str:
     return resolved
 
 
+def _motion_engine_installed() -> bool:
+    """Whether services/motion-engine's `npm install`/`npm ci` actually
+    produced a usable `remotion` CLI — checking that `node_modules` merely
+    *exists* (the old check) was too weak: an install interrupted partway
+    (network drop, disk space, antivirus interference, npm itself crashing)
+    can leave a `node_modules` folder behind that's missing the `remotion`
+    package's bin entirely, and that folder's mere existence then
+    permanently short-circuits every future install attempt too — the exact
+    shape of a real user's report: 'npx: could not determine executable to
+    run', which is npm's confusing way of saying it couldn't find `remotion`
+    locally and didn't know what registry package to fall back to. Checking
+    for the concrete file the render step actually depends on catches a
+    broken partial install and triggers a real (re)install instead of
+    silently trusting a folder that's there but empty/incomplete. This app
+    only ships for Windows (see CLAUDE.md), so the `.cmd` shim is the only
+    variant that matters here."""
+    return (MOTION_ENGINE_DIR / "node_modules" / ".bin" / "remotion.cmd").exists()
+
+
 def _ensure_motion_engine_ready() -> None:
-    """One-time `npm install` for services/motion-engine, mirroring this
-    module's own `_check_deps()`-style self-installing philosophy — a fresh
-    checkout/install shouldn't need a manual setup step before AI motion
-    graphics can render for the first time."""
-    if (MOTION_ENGINE_DIR / "node_modules").exists():
+    """One-time (or self-healing) `npm ci`/`npm install` for
+    services/motion-engine, mirroring this module's own `_check_deps()`-style
+    self-installing philosophy — a fresh checkout/install shouldn't need a
+    manual setup step before AI motion graphics can render for the first
+    time. Prefers `npm ci` over `npm install` whenever the bundled
+    `package-lock.json` resource is present: besides being the deterministic,
+    lockfile-exact install, `npm ci` always deletes any existing
+    `node_modules` first — which is exactly what turns a broken partial
+    install (see `_motion_engine_installed`'s doc comment) into a clean one
+    on the very next export attempt, with no manual intervention needed."""
+    if _motion_engine_installed():
         return
     if not MOTION_ENGINE_DIR.is_dir():
         # `cwd=` below only ever raises the cryptic OS-level
@@ -588,13 +613,21 @@ def _ensure_motion_engine_ready() -> None:
             "this keeps happening, the app package is missing the motion-engine "
             "resource."
         )
+    npm = _resolve_node_bin("npm")
+    install_args = ["ci"] if (MOTION_ENGINE_DIR / "package-lock.json").exists() else ["install"]
     result = subprocess.run(
-        [_resolve_node_bin("npm"), "install"], cwd=str(MOTION_ENGINE_DIR),
+        [npm, *install_args], cwd=str(MOTION_ENGINE_DIR),
         capture_output=True, text=True, **_subprocess_kwargs(),
     )
     if result.returncode != 0:
         raise RuntimeError(
             f"Could not install the motion-graphics render engine: {result.stderr[-2000:]}"
+        )
+    if not _motion_engine_installed():
+        raise RuntimeError(
+            "The motion-graphics render engine installed but 'remotion' still "
+            f"isn't available at {MOTION_ENGINE_DIR}\\node_modules\\.bin\\remotion.cmd — "
+            "try the export again; if this keeps happening, reinstall Auto Gen Studio."
         )
 
 
@@ -639,7 +672,13 @@ def _render_motion_graphic(
     try:
         result = subprocess.run(
             [
-                _resolve_node_bin("npx"), "remotion", "render", "src/index.ts", "MotionClip", str(out_path),
+                # `--no-install` (npx's own flag, not Remotion's): never fall
+                # back to an ad-hoc registry install if `remotion` isn't
+                # resolved locally — `_ensure_motion_engine_ready` above is
+                # what's responsible for that; if it's somehow still missing
+                # here, fail with a clear "not found" instead of npx's
+                # confusing "could not determine executable to run".
+                _resolve_node_bin("npx"), "--no-install", "remotion", "render", "src/index.ts", "MotionClip", str(out_path),
                 f"--props={props_path}",
                 f"--public-dir={media_file.parent}",
                 "--log=error",

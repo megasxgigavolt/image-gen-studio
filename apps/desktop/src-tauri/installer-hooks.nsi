@@ -12,7 +12,7 @@
   DetailPrint " "
   DetailPrint "=========================================================="
   DetailPrint "  AUTO GEN STUDIO  -  Installing Dependencies"
-  DetailPrint "  This may take 5-15 minutes on a fresh machine."
+  DetailPrint "  This may take 5-20 minutes on a fresh machine."
   DetailPrint "  Please wait. Do not close this window."
   DetailPrint "=========================================================="
   DetailPrint " "
@@ -73,8 +73,8 @@
   FileWrite $R7 '}$\n'
   FileWrite $R7 '$\n'
 
-  ; -- [1/5] PYTHON --
-  FileWrite $R7 'Log "[1/5] PYTHON - locating Python 3.10 or later ..."$\n'
+  ; -- [1/7] PYTHON --
+  FileWrite $R7 'Log "[1/7] PYTHON - locating Python 3.10 or later ..."$\n'
   FileWrite $R7 '$pyExe = Find-Python$\n'
   FileWrite $R7 'if (-not $pyExe) {$\n'
   FileWrite $R7 '  Log "   [--] Python not found. Installing Python 3.11 via winget (please wait) ..."$\n'
@@ -91,8 +91,8 @@
   FileWrite $R7 'Log "   [OK] Python found: $pyExe"$\n'
   FileWrite $R7 'Log ""$\n'
 
-  ; -- [2/5] PACKAGES --
-  FileWrite $R7 'Log "[2/5] PACKAGES - core libraries ..."$\n'
+  ; -- [2/7] PACKAGES --
+  FileWrite $R7 'Log "[2/7] PACKAGES - core libraries ..."$\n'
   FileWrite $R7 '& $pyExe "-c" "import openai, pydantic, dotenv, xlsxwriter, imageio_ffmpeg" 2>$null$\n'
   FileWrite $R7 'if ($LASTEXITCODE -eq 0) {$\n'
   FileWrite $R7 '  Log "   [OK] openai, pydantic, python-dotenv, xlsxwriter, imageio-ffmpeg already present"$\n'
@@ -104,8 +104,8 @@
   FileWrite $R7 '}$\n'
   FileWrite $R7 'Log ""$\n'
 
-  ; -- [3/5] WHISPER --
-  FileWrite $R7 'Log "[3/5] WHISPER - speech-to-text engine (~1 GB, optional) ..."$\n'
+  ; -- [3/7] WHISPER --
+  FileWrite $R7 'Log "[3/7] WHISPER - speech-to-text engine (~1 GB, optional) ..."$\n'
   FileWrite $R7 '& $pyExe "-c" "import whisper" 2>$null$\n'
   FileWrite $R7 'if ($LASTEXITCODE -eq 0) {$\n'
   FileWrite $R7 '  Log "   [OK] openai-whisper already installed"$\n'
@@ -116,14 +116,14 @@
   FileWrite $R7 '}$\n'
   FileWrite $R7 'Log ""$\n'
 
-  ; -- [4/5] MODEL --
-  FileWrite $R7 'Log "[4/5] MODEL - caching Whisper base model (~140 MB) ..."$\n'
+  ; -- [4/7] MODEL --
+  FileWrite $R7 'Log "[4/7] MODEL - caching Whisper base model (~140 MB) ..."$\n'
   FileWrite $R7 '& $pyExe "-c" "import whisper; whisper.load_model($\'base$\')" 2>$null$\n'
   FileWrite $R7 'if ($LASTEXITCODE -eq 0) { Log "   [OK] Whisper base model cached" } else { Log "   [--] Model will download on first Visual Plan use" }$\n'
   FileWrite $R7 'Log ""$\n'
 
-  ; -- [5/5] FFMPEG --
-  FileWrite $R7 'Log "[5/5] FFMPEG - audio processing ..."$\n'
+  ; -- [5/7] FFMPEG --
+  FileWrite $R7 'Log "[5/7] FFMPEG - audio processing ..."$\n'
   FileWrite $R7 '$ffmpeg = $null$\n'
   FileWrite $R7 'try { $ffmpeg = (Get-Command ffmpeg -ErrorAction Stop).Source } catch {}$\n'
   FileWrite $R7 'if ($ffmpeg) {$\n'
@@ -134,6 +134,58 @@
   FileWrite $R7 '  if ($LASTEXITCODE -eq 0) { Log "   [OK] FFmpeg ready in %LOCALAPPDATA%\AutoGenStudio\bin" } else { Log "   [!!] FFmpeg setup failed - install manually from https://ffmpeg.org" }$\n'
   FileWrite $R7 '}$\n'
   FileWrite $R7 'Log ""$\n'
+
+  ; -- [6/7] NODE.JS --
+  ; Required to render AI-assigned Camera Effect / motion-graphics
+  ; treatments (services/motion-engine is a Remotion project, invoked via
+  ; npx from video_export_engine.py). Missing Node.js used to only surface
+  ; as an export-time failure with no install path — same self-installing
+  ; treatment as Python above, via winget's official Node.js LTS package.
+  FileWrite $R7 'Log "[6/7] NODE.JS - required for AI camera-effect rendering ..."$\n'
+  FileWrite $R7 '$nodeExe = $null$\n'
+  FileWrite $R7 'try { $nodeExe = (Get-Command node -ErrorAction Stop).Source } catch {}$\n'
+  FileWrite $R7 'if (-not $nodeExe) {$\n'
+  FileWrite $R7 '  $env:PATH = [Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [Environment]::GetEnvironmentVariable("PATH","User")$\n'
+  FileWrite $R7 '  try { $nodeExe = (Get-Command node -ErrorAction Stop).Source } catch {}$\n'
+  FileWrite $R7 '}$\n'
+  FileWrite $R7 'if ($nodeExe) {$\n'
+  FileWrite $R7 '  Log "   [OK] Node.js found: $nodeExe"$\n'
+  FileWrite $R7 '} else {$\n'
+  FileWrite $R7 '  Log "   [--] Node.js not found. Installing Node.js LTS via winget (please wait) ..."$\n'
+  FileWrite $R7 '  winget install --id OpenJS.NodeJS.LTS --silent --accept-package-agreements --accept-source-agreements --scope user --no-upgrade 2>&1 | ForEach-Object { Log "        $_" }$\n'
+  FileWrite $R7 '  Start-Sleep 2$\n'
+  FileWrite $R7 '  $env:PATH = [Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [Environment]::GetEnvironmentVariable("PATH","User")$\n'
+  FileWrite $R7 '  try { $nodeExe = (Get-Command node -ErrorAction Stop).Source } catch {}$\n'
+  FileWrite $R7 '  if ($nodeExe) { Log "   [OK] Node.js installed: $nodeExe" } else { Log "   [!!] Node.js could not be installed automatically. Install it from https://nodejs.org (LTS) and re-run this installer - camera-effect/motion-graphics exports will fail until then." }$\n'
+  FileWrite $R7 '}$\n'
+  FileWrite $R7 'Log ""$\n'
+
+  ; -- [7/7] MOTION ENGINE --
+  ; Pre-warms services/motion-engine's own npm install here, with full
+  ; visibility in the installer log, instead of leaving it to happen lazily
+  ; (and silently) on the first export. `_ensure_motion_engine_ready` in
+  ; video_export_engine.py is still the runtime safety net if this step is
+  ; skipped (no Node.js yet) or fails here.
+  FileWrite $R7 'Log "[7/7] MOTION ENGINE - preparing the AI camera-effects render engine (may take a few minutes) ..."$\n'
+  FileWrite $R7 'if ($nodeExe) {$\n'
+  FileWrite $R7 '  $npmCmd = $null$\n'
+  FileWrite $R7 '  try { $npmCmd = (Get-Command npm -ErrorAction Stop).Source } catch {}$\n'
+  FileWrite $R7 '  if (-not $npmCmd) { $npmCmd = Join-Path (Split-Path $nodeExe) "npm.cmd" }$\n'
+  FileWrite $R7 '  $motionDir = "$INSTDIR\motion-engine"$\n'
+  FileWrite $R7 '  if (Test-Path $motionDir) {$\n'
+  FileWrite $R7 '    Push-Location $motionDir$\n'
+  FileWrite $R7 '    if (Test-Path "package-lock.json") { & $npmCmd "ci" 2>&1 | ForEach-Object { Log "        $_" } } else { & $npmCmd "install" 2>&1 | ForEach-Object { Log "        $_" } }$\n'
+  FileWrite $R7 '    $npmExit = $LASTEXITCODE$\n'
+  FileWrite $R7 '    Pop-Location$\n'
+  FileWrite $R7 '    if ($npmExit -eq 0 -and (Test-Path "$motionDir\node_modules\.bin\remotion.cmd")) { Log "   [OK] Motion engine dependencies installed" } else { Log "   [!!] Motion engine setup failed - the app will retry automatically on first export" }$\n'
+  FileWrite $R7 '  } else {$\n'
+  FileWrite $R7 '    Log "   [!!] Motion engine folder not found at $motionDir - camera-effect exports will fail. Reinstall the app."$\n'
+  FileWrite $R7 '  }$\n'
+  FileWrite $R7 '} else {$\n'
+  FileWrite $R7 '  Log "   [--] Skipped (Node.js unavailable) - the app will retry automatically once Node.js is installed"$\n'
+  FileWrite $R7 '}$\n'
+  FileWrite $R7 'Log ""$\n'
+
   FileWrite $R7 'Log "All dependency steps complete."$\n'
   FileWrite $R7 'exit 0$\n'
   FileClose $R7

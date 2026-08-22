@@ -10,6 +10,9 @@ own directory on sys.path.
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 ENGINE_DIR = Path(__file__).parents[1] / "auto_gen_engine"
 if str(ENGINE_DIR) not in sys.path:
@@ -184,6 +187,119 @@ def test_without_extended_path_prefix_strips_the_unc_variant():
 def test_without_extended_path_prefix_leaves_a_plain_path_unchanged():
     plain = Path("D:\\Rahim\\Business\\YouTube\\Auto Gen Studio\\motion-engine")
     assert export_engine._without_extended_path_prefix(plain) == plain
+
+
+# Root-cause coverage for another real user's export failure: "Motion-graphics
+# render failed ... npm error could not determine executable to run". The old
+# readiness check only asked whether MOTION_ENGINE_DIR/node_modules *existed*
+# — an install interrupted partway (network drop, disk space, antivirus) can
+# leave that folder behind without the `remotion` package actually in it,
+# and its mere existence then permanently skipped every future (re)install
+# attempt too, so the broken state never healed on its own.
+def test_motion_engine_installed_is_false_when_node_modules_missing_entirely(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    assert export_engine._motion_engine_installed() is False
+
+
+def test_motion_engine_installed_is_false_for_a_broken_partial_install(tmp_path, monkeypatch):
+    # node_modules exists (the old check's entire signal) but the actual
+    # remotion bin never got written into it — exactly the shape of an
+    # interrupted npm install.
+    (tmp_path / "node_modules").mkdir()
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    assert export_engine._motion_engine_installed() is False
+
+
+def test_motion_engine_installed_is_true_once_the_remotion_bin_exists(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "remotion.cmd").write_text("@echo off", encoding="utf-8")
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    assert export_engine._motion_engine_installed() is True
+
+
+def _mark_installed(tmp_path: Path) -> None:
+    bin_dir = tmp_path / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "remotion.cmd").write_text("@echo off", encoding="utf-8")
+
+
+def test_ensure_motion_engine_ready_skips_install_when_already_healthy(tmp_path, monkeypatch):
+    _mark_installed(tmp_path)
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not run npm")))
+    export_engine._ensure_motion_engine_ready()  # no exception == no (re)install attempted
+
+
+def test_ensure_motion_engine_ready_prefers_npm_ci_when_lockfile_bundled(tmp_path, monkeypatch):
+    (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        _mark_installed(tmp_path)  # simulate npm actually installing it
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    export_engine._ensure_motion_engine_ready()
+    assert calls == [["/fake/npm", "ci"]]
+
+
+def test_ensure_motion_engine_ready_falls_back_to_npm_install_without_a_lockfile(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        _mark_installed(tmp_path)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    export_engine._ensure_motion_engine_ready()
+    assert calls == [["/fake/npm", "install"]]
+
+
+def test_ensure_motion_engine_ready_raises_a_clear_error_when_npm_itself_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1, stderr="network error"))
+    with pytest.raises(RuntimeError, match="Could not install"):
+        export_engine._ensure_motion_engine_ready()
+
+
+def test_ensure_motion_engine_ready_raises_when_npm_reports_success_but_bin_still_missing(tmp_path, monkeypatch):
+    # A successful npm exit code that somehow still didn't produce a usable
+    # remotion bin (e.g. a registry/optional-dependency quirk) must not be
+    # silently trusted — it should surface as an actionable error rather
+    # than letting a later render fail with the confusing npx error again.
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stderr=""))
+    with pytest.raises(RuntimeError, match="isn't available"):
+        export_engine._ensure_motion_engine_ready()
+
+
+def test_render_motion_graphic_passes_no_install_to_npx_so_failures_are_clear(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    media = tmp_path / "still.png"
+    media.write_bytes(b"fake")
+    export_engine._render_motion_graphic(str(media), "image", "Manual: Push In", {}, 48, 24, 1920, 1080, tmp_path / "out.mp4")
+
+    assert calls[0][0] == "/fake/npx"
+    assert "--no-install" in calls[0]
+    assert calls[0].index("--no-install") < calls[0].index("remotion")
 
 
 # Root-cause coverage for the new "transition intensity" slider (global

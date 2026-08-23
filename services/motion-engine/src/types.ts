@@ -156,6 +156,20 @@ export interface MotionClipProps {
   sourceKind: "image" | "video";
   recipe: MotionRecipe;
   durationInFrames: number;
+  /** How many frames the camera move normalises its 0->1 progress over,
+   * when that differs from `durationInFrames` (the number of frames actually
+   * rendered). Defaults to `durationInFrames`.
+   *
+   * Only a join transition's "tail window" sets this. video_export_engine.py
+   * renders the outgoing clip virtually extended past its nominal end so the
+   * blend has footage to work with (see `expand_join_transitions`); without
+   * this the extended render also STRETCHED the camera move over the longer
+   * length, so the tail was a different curve from the clip's own segment
+   * and the picture jumped at the moment the transition started. Keeping the
+   * motion normalised to the clip's real length makes the tail the exact
+   * continuation of it — and since the progress interpolation clamps, the
+   * extra frames hold at the fully-eased end pose. */
+  motionDurationInFrames?: number;
   fps: number;
   width: number;
   height: number;

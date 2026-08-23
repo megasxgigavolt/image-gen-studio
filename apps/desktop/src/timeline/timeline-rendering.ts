@@ -47,6 +47,14 @@ export const CAPTION_STYLE_PRESETS: { label: string; style: Partial<CaptionStyle
 // shadowBlur radius (px) that 100% maps to.
 export const MAX_SHADOW_BLUR_PX = 20;
 
+// The font-size a default style (fontSizePx 22) produces at drawCaptionText's
+// own formula, evaluated at height=540 (the default 16:9 preview canvas) —
+// used purely as a fixed anchor so shadow distance/blur can scale
+// proportionally to fontSize (see drawCaptionText's shadow block below)
+// without changing how a default-style caption looks at the default preview
+// size. Matches video_export_engine.py's `_REFERENCE_FONT_SIZE_PX` exactly.
+const REFERENCE_FONT_SIZE_PX = 540 * 0.045;
+
 /** Shallow-merges a partial style onto a base — mirrors the Rust merge_style. */
 export function resolveCaptionStyle(base: CaptionStyle, overlay?: CaptionStyle | null): Required<CaptionStyle> {
   return { ...DEFAULT_CAPTION_STYLE, ...base, ...(overlay ?? {}) };
@@ -323,7 +331,17 @@ export function drawCaptionText(
   activeWordIndex: number | null,
 ) {
   const fontSize = Math.max(14, Math.round((style.fontSizePx / 22) * height * 0.045));
-  const weight = style.bold ? 900 : 400;
+  // 700, not 900. The export burns captions through libass, whose only
+  // notion of weight is ASS's boolean `Bold` flag — it resolves that to the
+  // family's Bold (700) face, and the bundled fonts folder the export points
+  // it at (services/python-engine/auto_gen_engine/fonts) ships exactly
+  // Rubik-Regular + Rubik-Bold. Asking the canvas for 900 made the preview
+  // pick a heavier face than the export ever can: main.tsx imports
+  // @fontsource/rubik 400-800, so CSS weight matching resolved 900 to the
+  // 800 ExtraBold face (measured: identical 865px advance at both 900 and
+  // 800, against 843px at 700) — a visibly heavier preview caption than the
+  // burned-in one. Requesting 700 makes both sides render the same face.
+  const weight = style.bold ? 700 : 400;
   ctx.font = `${weight} ${fontSize}px "${style.fontFamily}", Arial, sans-serif`;
   ctx.textBaseline = "alphabetic";
   const maxWidth = width * 0.86;
@@ -374,10 +392,20 @@ export function drawCaptionText(
         ctx.strokeText(word, x, y);
       }
       if (style.shadow.enabled) {
-        const distance = style.shadow.distance ?? 2;
+        // Scaled by fontSize — itself already proportional to the frame's
+        // own height, see fontSize above — the same way outlineWidth
+        // already is. Previously a RAW, unscaled canvas-pixel distance/blur:
+        // looked fine at this small preview canvas, but the export (see
+        // `_resolve_shadow` in video_export_engine.py) scales shadows up to
+        // match the export's real, much larger resolution, so an unscaled
+        // preview shadow reads noticeably weaker than what actually gets
+        // burned in. REFERENCE_FONT_SIZE_PX anchors the scale so a
+        // default-style caption at the default preview size is unchanged.
+        const shadowScale = fontSize / REFERENCE_FONT_SIZE_PX;
+        const distance = (style.shadow.distance ?? 2) * shadowScale;
         const angleRad = ((style.shadow.angle ?? 90) * Math.PI) / 180;
         ctx.shadowColor = withAlpha(style.shadow.color ?? "#000000", style.shadow.opacity ?? 70);
-        ctx.shadowBlur = ((style.shadow.blur ?? 30) / 100) * MAX_SHADOW_BLUR_PX;
+        ctx.shadowBlur = ((style.shadow.blur ?? 30) / 100) * MAX_SHADOW_BLUR_PX * shadowScale;
         ctx.shadowOffsetX = distance * Math.cos(angleRad);
         ctx.shadowOffsetY = distance * Math.sin(angleRad);
       } else {

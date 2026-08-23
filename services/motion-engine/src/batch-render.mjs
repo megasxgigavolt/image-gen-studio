@@ -10,7 +10,7 @@
 //
 // batchSpecPath: JSON array of
 //   { id, mediaPath (relative to publicDir), sourceKind, recipe,
-//     durationInFrames, fps, width, height, outPath }
+//     durationInFrames, motionDurationInFrames?, fps, width, height, outPath }
 // resultsPath: where this script writes back a JSON array of
 //   { id, ok, error? } — one entry per input item, always written even if
 //   some items failed, mirroring this repo's existing
@@ -65,6 +65,12 @@ async function main() {
         sourceKind: item.sourceKind,
         recipe: item.recipe,
         durationInFrames,
+        // Only a join transition's tail window sets this (see
+        // motionDurationInFrames in types.ts); omitted elsewhere so
+        // MotionClip falls back to durationInFrames exactly as before.
+        ...(item.motionDurationInFrames
+          ? { motionDurationInFrames: Math.max(1, item.motionDurationInFrames) }
+          : {}),
         fps: item.fps,
         width: item.width,
         height: item.height,
@@ -98,6 +104,12 @@ async function main() {
       } catch (error) {
         results.push({ id: item.id, ok: false, error: String((error && error.stack) || error) });
       }
+      // One line per completed item, on its own — video_export_engine.py's
+      // _batch_render_motion_graphics streams stdout and turns this into
+      // export progress (5%-10% band) as each clip finishes, instead of the
+      // whole batch reporting nothing until every item is done (which reads
+      // as "stuck" on a timeline with several Tier 2/4/5 clips in a row).
+      process.stdout.write(`PROGRESS ${results.length} ${items.length}\n`);
     }
   } finally {
     await browser.close({ silent: true });

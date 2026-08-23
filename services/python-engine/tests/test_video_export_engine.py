@@ -59,6 +59,50 @@ def test_write_captions_ass_uses_scaled_margin_not_hardcoded_ten(tmp_path):
     assert margin_v != 10
 
 
+# Root-cause coverage for "captions have a stronger shadow ... than what the
+# preview shows": _resolve_shadow used to scale distance/blur by
+# height/540 while the canvas preview (drawCaptionText in
+# timeline-rendering.ts) applied NO scaling to shadow at all — a real,
+# unrelated-formula mismatch, not just an approximation gap. Both sides now
+# scale by the same quantity (font_size, relative to _REFERENCE_FONT_SIZE_PX)
+# so a shadow tuned in preview matches what's actually burned in.
+def test_resolve_shadow_disabled_returns_zeros():
+    style = {"shadow": {"enabled": False}}
+    assert export_engine._resolve_shadow(style, 24.3) == (0.0, 0.0, 0, "#000000", 255)
+
+
+def test_resolve_shadow_unchanged_at_the_reference_font_size():
+    style = {"shadow": {"enabled": True, "distance": 4.0, "angle": 0, "blur": 25, "opacity": 70, "color": "#000000"}}
+    xshad, yshad, blur, color, alpha = export_engine._resolve_shadow(style, export_engine._REFERENCE_FONT_SIZE_PX)
+    assert xshad == 4.0  # angle=0 -> pure X offset, scale=1 at the reference size
+    assert yshad == 0.0
+
+
+def test_resolve_shadow_scales_with_font_size_not_a_fixed_height():
+    style = {"shadow": {"enabled": True, "distance": 4.0, "angle": 0, "blur": 25, "opacity": 70, "color": "#000000"}}
+    small_xshad, *_ = export_engine._resolve_shadow(style, export_engine._REFERENCE_FONT_SIZE_PX)
+    large_xshad, *_ = export_engine._resolve_shadow(style, export_engine._REFERENCE_FONT_SIZE_PX * 2)
+    assert large_xshad == pytest.approx(small_xshad * 2)
+
+
+# Root-cause coverage for "the caption outline is way bolder than what I
+# picked": timeline-rendering.ts's canvas preview strokes the outline with
+# `ctx.lineWidth` — a CENTERED stroke, only half of it visible outside the
+# glyph fill — but ASS's `\bord` paints the full value as an outward-only
+# border. Confirmed empirically (a real ASS burn at the un-corrected value
+# next to a halved one — the un-corrected one is roughly 2x heavier). The
+# extra 0.5x here is ASS-specific and must never be mirrored into the
+# canvas preview's own (already-centered, needs-no-correction) formula.
+def test_scaled_outline_width_applies_the_ass_outward_border_correction():
+    style = {"outlineWidthPx": 2}
+    # (2/2)*100*0.16*0.5 — the *0.5 is the correction; without it this would be 16.0.
+    assert export_engine._scaled_outline_width(style, 100.0) == pytest.approx(8.0)
+
+
+def test_scaled_outline_width_zero_stays_zero():
+    assert export_engine._scaled_outline_width({"outlineWidthPx": 0}, 100.0) == 0.0
+
+
 # Root-cause coverage for "motion effect only applies on stills — once a
 # still is replaced with an animation/imported clip, the Camera Effect
 # setting does nothing": build_segments used to only forward
@@ -110,7 +154,11 @@ def test_encode_segment_routes_video_with_recipe_through_motion_graphic_render(t
 
     segment = {
         "kind": "video", "path": "/tmp/clip.mp4", "start": 0.0, "end": 2.0, "frames": 48,
-        "motionGraphicEffect": "Manual: Zoom In", "motionGraphicSettings": {"cameraEffect": "zoom_in"},
+        "motionGraphicEffect": "Manual: Zoom In",
+        # A Tier 2 accent (depthEffect) on top of the camera move — not
+        # Tier-1-only, so this must still take the real Remotion render (see
+        # the ffmpeg-native-video test below for the Tier-1-only case).
+        "motionGraphicSettings": {"cameraEffect": "zoom_in", "depthEffect": "parallax_3d"},
         "sourceDurationSeconds": 2.0, "transitionIn": "cut", "transitionOut": "cut",
     }
     export_engine._encode_segment_to_path(segment, tmp_path / "out.ts", 1920, 1080, 24)
@@ -176,11 +224,7 @@ def test_is_ffmpeg_native_recipe_true_with_only_camera_move_customized():
     {"depthEffect": "parallax_3d"},
     {"storyEffect": "freeze_frame"},
     {"environmentEffect": "snow"},
-    {"environmentIntensity": 0.5},
     {"maskShape": "circle"},
-    {"vignette": 0.3},
-    {"fadeInFrames": 12},
-    {"fadeOutFrames": 12},
     {"motionBlurStrength": 0.4},
     {"shakeAmount": 0.2},
     {"speedCurve": "punch_in_hold"},
@@ -190,9 +234,45 @@ def test_is_ffmpeg_native_recipe_true_with_only_camera_move_customized():
     {"pathPoints": [{"x": 0, "y": 0}, {"x": 10, "y": 10}]},
     {"easing": "elastic"},
     {"rotationFromDeg": 0, "rotationToDeg": 15},
+    # Root-cause coverage for a real, shipped-then-reverted bug: an earlier
+    # attempt at a native ffmpeg vignette equivalent (see
+    # _FFMPEG_NATIVE_NEUTRAL_RECIPE's own comment) produced a dramatically
+    # wrong-shaped/wrong-strength effect on a real export (confirmed via a
+    # live repro against a real source image: a "subtle" 0.15 intensity
+    # rendered as a near-maximum-strength, pillarbox-looking dark vignette).
+    # ffmpeg's `vignette` filter is a full-frame radial lens model; Motion-
+    # Clip.tsx's real effect is a thin edge-only inset box-shadow — no
+    # parameter combination reproduces one with the other, so vignette stays
+    # Remotion-gated, correctly, and must keep disqualifying the fast path.
+    {"vignette": 0.15},
+    {"vignette": 1.0},
 ])
 def test_is_ffmpeg_native_recipe_false_when_any_higher_tier_field_is_active(overrides):
     assert export_engine._is_ffmpeg_native_recipe(_neutral_recipe(**overrides)) is False
+
+
+# Root-cause coverage for "why is it pushing all stills into Remotion for no
+# reason": the AI applies fadeInFrames/fadeOutFrames broadly as an "always
+# on" envelope, not a rare accent — so requiring them at exactly 0 used to
+# disqualify nearly every real clip from the ffmpeg-native fast path
+# regardless of anything else. Has a native, EXACT ffmpeg equivalent (see
+# build_recipe_zoompan_filter) and must NOT disqualify the fast path on its
+# own — unlike vignette (see the parametrized test above), which does.
+@pytest.mark.parametrize("overrides", [
+    {"fadeInFrames": 12},
+    {"fadeOutFrames": 12},
+    {"fadeInFrames": 12, "fadeOutFrames": 12},
+])
+def test_is_ffmpeg_native_recipe_true_for_fade_envelope(overrides):
+    assert export_engine._is_ffmpeg_native_recipe(_neutral_recipe(**overrides)) is True
+
+
+# environmentIntensity is inert whenever environmentEffect=="none" (already
+# required for the fast path) — a nonzero leftover/default intensity value
+# with no effect selected must not disqualify the clip. A real
+# environmentEffect still does (covered by the parametrized test above).
+def test_is_ffmpeg_native_recipe_true_with_inert_environment_intensity():
+    assert export_engine._is_ffmpeg_native_recipe(_neutral_recipe(environmentIntensity=0.35)) is True
 
 
 def test_build_recipe_zoompan_filter_produces_a_zoompan_chain():
@@ -227,6 +307,32 @@ def test_build_recipe_zoompan_filter_reduces_to_the_existing_anchor_formula_with
     assert "(ih-ih/zoom)*0.650000-(ih/zoom)*(0.000000+" in vf
 
 
+def test_build_recipe_zoompan_filter_omits_envelope_fade_when_off():
+    vf = export_engine.build_recipe_zoompan_filter(_neutral_recipe(), 1920, 1080, 24, 3.0, 72)
+    assert "vignette=" not in vf  # never emitted — vignette stays Remotion-gated (see _FFMPEG_NATIVE_NEUTRAL_RECIPE)
+    assert "fade=" not in vf
+
+
+def test_build_recipe_zoompan_filter_adds_fade_envelope_timed_in_frames():
+    # 72 frames @ 24fps = 3.0s clip; fadeInFrames=24 -> 1.0s fade-in from t=0,
+    # fadeOutFrames=12 -> 0.5s fade-out starting at (72-12)/24 = 2.5s. Timed
+    # off `frames`/fps (this recipe's own timeline), not the segment's
+    # `duration` param — pass a different duration to prove that.
+    vf = export_engine.build_recipe_zoompan_filter(
+        _neutral_recipe(fadeInFrames=24, fadeOutFrames=12), 1920, 1080, 24, 999.0, 72,
+    )
+    assert "fade=t=in:st=0:d=1.000:color=black" in vf
+    assert "fade=t=out:st=2.500:d=0.500:color=black" in vf
+
+
+def test_build_recipe_zoompan_filter_clamps_envelope_fade_to_half_the_clip():
+    # fadeInFrames requesting more than half of a 72-frame clip clamps to 36.
+    vf = export_engine.build_recipe_zoompan_filter(
+        _neutral_recipe(fadeInFrames=1000), 1920, 1080, 24, 3.0, 72,
+    )
+    assert f"fade=t=in:st=0:d={36 / 24:.3f}:color=black" in vf
+
+
 # Root-cause coverage for the branch-selection half: an eligible "image"
 # segment must skip Remotion/_render_motion_graphic entirely and go
 # straight to a single run_ffmpeg call using the zoompan filter — this is
@@ -247,6 +353,100 @@ def test_encode_segment_routes_a_simple_image_recipe_through_ffmpeg_native(tmp_p
     assert len(calls) == 1
     vf = calls[0][calls[0].index("-vf") + 1]
     assert "zoompan=" in vf
+
+
+# Root-cause coverage for the "export stuck at 5% for ages" fix: Tier 1
+# (camera move) is mandatory on every AI-composed recipe per the SOP, so
+# every animation/imported-clip ("video" kind) segment used to be sent
+# through the slow, sequential, Chromium-backed Remotion batch pre-render
+# unconditionally — even a plain push-in with nothing else set. A "video"
+# segment must get the exact same ffmpeg-native fast-path treatment an
+# "image" segment already does whenever its recipe is Tier-1-only.
+def test_encode_segment_routes_a_simple_video_recipe_through_ffmpeg_native(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_render_motion_graphic", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not call Remotion")))
+    calls = []
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
+
+    segment = {
+        "kind": "video", "path": "/tmp/clip.mp4", "start": 0.0, "end": 3.0, "frames": 72,
+        "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": _neutral_recipe(),
+        "sourceDurationSeconds": 3.0, "transitionIn": "cut", "transitionOut": "cut",
+    }
+    export_engine._encode_segment_to_path(segment, tmp_path / "out.ts", 1920, 1080, 24)
+
+    assert len(calls) == 1
+    args = calls[0]
+    assert "-loop" not in args  # real video stream, not a looped still
+    assert "-an" in args  # this clip's own audio is never used, same as the plain (no-recipe) video branch
+    vf = args[args.index("-vf") + 1]
+    assert "zoompan=" in vf
+    assert "d=1:" in vf  # one output frame per real input frame, not "hold for the whole clip"
+
+
+def test_encode_segment_routes_a_complex_video_recipe_through_remotion_as_before(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(export_engine, "_render_motion_graphic", lambda *args, **kwargs: calls.append("motion_graphic"))
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append("ffmpeg"))
+
+    segment = {
+        "kind": "video", "path": "/tmp/clip.mp4", "start": 0.0, "end": 3.0, "frames": 72,
+        "motionGraphicEffect": "Manual: Snow",
+        "motionGraphicSettings": _neutral_recipe(environmentEffect="snow", environmentIntensity=0.5),
+        "sourceDurationSeconds": 3.0, "transitionIn": "cut", "transitionOut": "cut",
+    }
+    export_engine._encode_segment_to_path(segment, tmp_path / "out.ts", 1920, 1080, 24)
+
+    assert calls[0] == "motion_graphic"
+
+
+def test_encode_segment_video_ffmpeg_native_pads_a_stale_short_source(tmp_path, monkeypatch):
+    # Same stale-asset tpad safety net as the plain (no-recipe) "video"
+    # branch — a source clip shorter than its timeline slot (e.g. the slot
+    # was resized after the last "Adjust animation to duration" click) must
+    # still get its last frame cloned to fill the remainder.
+    calls = []
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
+
+    segment = {
+        "kind": "video", "path": "/tmp/clip.mp4", "start": 0.0, "end": 3.0, "frames": 72,
+        "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": _neutral_recipe(),
+        "sourceDurationSeconds": 2.0, "transitionIn": "cut", "transitionOut": "cut",
+    }
+    export_engine._encode_segment_to_path(segment, tmp_path / "out.ts", 1920, 1080, 24)
+
+    vf = calls[0][calls[0].index("-vf") + 1]
+    assert "tpad=stop_mode=clone:stop_duration=1.000" in vf
+
+
+def test_build_recipe_zoompan_filter_holds_one_frame_when_source_is_already_a_video():
+    vf = export_engine.build_recipe_zoompan_filter(
+        _neutral_recipe(), 1920, 1080, 24, 3.0, 72, zoompan_hold_frames=1,
+    )
+    assert "d=1:" in vf
+
+
+# Root-cause coverage for a real bug found via a live repro against an
+# actual 24fps/185-frame Veo-generated clip feeding a 30fps/260-frame slot:
+# zoompan's own `fps=` OPTION only sets the pacing zoompan itself uses for
+# `on` — with `d=1` (real video source, not an image loop) it does NOT
+# resample the incoming stream, so without an explicit `fps=` FILTER first,
+# the real (24fps) source simply ran out of frames before reaching the
+# requested output count, silently truncating the segment and desyncing
+# everything after it in the final concat.
+def test_build_recipe_zoompan_filter_resamples_fps_explicitly_for_a_video_source():
+    vf = export_engine.build_recipe_zoompan_filter(
+        _neutral_recipe(), 1920, 1080, 30, 3.0, 72, zoompan_hold_frames=1,
+    )
+    assert vf.startswith("fps=30,")
+
+
+def test_build_recipe_zoompan_filter_image_loop_has_no_fps_resample_filter():
+    # The image-loop case doesn't need it — zoompan's own d={frames} already
+    # fully controls output frame count independent of any source rate, and
+    # an `-loop 1` input has no "native fps" to mismatch against anyway.
+    vf = export_engine.build_recipe_zoompan_filter(_neutral_recipe(), 1920, 1080, 30, 3.0, 72)
+    assert not vf.startswith("fps=30,")
+    assert ",fps=30," not in vf
 
 
 def test_encode_segment_routes_a_complex_image_recipe_through_remotion_as_before(tmp_path, monkeypatch):
@@ -275,16 +475,17 @@ def test_encode_segment_reuses_a_pre_rendered_raw_path_when_present(tmp_path, mo
     monkeypatch.setattr(export_engine, "_render_motion_graphic", lambda *args, **kwargs: calls.append("motion_graphic"))
     monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
 
-    # "video" kind — always goes through Remotion regardless of how simple
-    # the recipe is (the ffmpeg-native fast path is image-only, see
-    # _is_ffmpeg_native_recipe's call site), so this exercises the
-    # pre-render/fallback machinery unconditionally rather than depending on
-    # the recipe's own field values.
+    # "video" kind with a Tier 2 accent (depthEffect), so it's still routed
+    # through the Remotion pre-render/fallback machinery rather than the
+    # Tier-1-only ffmpeg-native fast path (see _is_ffmpeg_native_recipe's
+    # call site) — this test is about the pre-render reuse, not about which
+    # path a plain camera-move recipe takes.
     pre_rendered = tmp_path / "pre.raw.mp4"
     pre_rendered.write_bytes(b"fake-video")
     segment = {
         "kind": "video", "path": "/tmp/clip.mp4", "start": 0.0, "end": 2.0, "frames": 48,
-        "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": {"cameraEffect": "push_in"},
+        "motionGraphicEffect": "Manual: Push In",
+        "motionGraphicSettings": {"cameraEffect": "push_in", "depthEffect": "parallax_3d"},
         "transitionIn": "cut", "transitionOut": "cut", "_preRenderedRawPath": str(pre_rendered),
     }
     export_engine._encode_segment_to_path(segment, tmp_path / "out.ts", 1920, 1080, 24)
@@ -302,7 +503,8 @@ def test_encode_segment_falls_back_to_render_when_pre_rendered_path_is_missing(t
 
     segment = {
         "kind": "video", "path": "/tmp/clip.mp4", "start": 0.0, "end": 2.0, "frames": 48,
-        "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": {"cameraEffect": "push_in"},
+        "motionGraphicEffect": "Manual: Push In",
+        "motionGraphicSettings": {"cameraEffect": "push_in", "depthEffect": "parallax_3d"},
         "transitionIn": "cut", "transitionOut": "cut",
         "_preRenderedRawPath": str(tmp_path / "does-not-exist.mp4"),
     }
@@ -343,16 +545,36 @@ def test_batch_render_motion_graphics_returns_empty_dict_for_no_items(tmp_path):
     assert export_engine._batch_render_motion_graphics([], tmp_path, tmp_path) == {}
 
 
+# _batch_render_motion_graphics streams the child process's stdout/stderr
+# via subprocess.Popen (rather than blocking on subprocess.run) so it can
+# turn batch-render.mjs's per-clip "PROGRESS n total" lines into export
+# progress — see that function's own doc comment. This fake stands in for
+# the Popen handle: `stdout`/`stderr` are plain iterators (matching how the
+# real code only ever iterates them line-by-line), and results_path is
+# written eagerly in the constructor since nothing in these tests needs to
+# distinguish "process started" from "process finished".
+class _FakeBatchProcess:
+    def __init__(self, args, returncode=0, stdout_lines=(), stderr_lines=(), write_results=None):
+        if write_results is not None:
+            Path(args[3]).write_text(json.dumps(write_results), encoding="utf-8")
+        self.stdout = iter(stdout_lines)
+        self.stderr = iter(stderr_lines)
+        self.returncode = returncode
+
+    def wait(self):
+        pass
+
+
 def test_batch_render_motion_graphics_reports_no_errors_on_full_success(tmp_path, monkeypatch):
     monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
     monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
-
-    def fake_run(args, **kwargs):
-        results_path = Path(args[3])
-        results_path.write_text(json.dumps([{"id": "0", "ok": True}, {"id": "1", "ok": True}]), encoding="utf-8")
-        return SimpleNamespace(returncode=0, stderr="")
-
-    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        export_engine.subprocess, "Popen",
+        lambda args, **kwargs: _FakeBatchProcess(
+            args, stdout_lines=["PROGRESS 1 2\n", "PROGRESS 2 2\n"],
+            write_results=[{"id": "0", "ok": True}, {"id": "1", "ok": True}],
+        ),
+    )
     items = [
         {"id": "0", "mediaPath": "a.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "0.mp4")},
         {"id": "1", "mediaPath": "b.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "1.mp4")},
@@ -363,10 +585,39 @@ def test_batch_render_motion_graphics_reports_no_errors_on_full_success(tmp_path
     assert not (tmp_path / "motion_batch_results.json").exists()
 
 
+def test_batch_render_motion_graphics_reports_progress_as_clips_complete(tmp_path, monkeypatch):
+    # Root-cause coverage for the "stuck at 5% for ages" fix: each
+    # "PROGRESS done total" line from the child process must turn into an
+    # engine.report_progress call, not just get silently consumed — this is
+    # what keeps a batch of genuinely Remotion-bound clips (Tier 2/4/5)
+    # visibly moving instead of parking the export bar at a fixed percent
+    # for the whole batch's wall-clock time.
+    monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(
+        export_engine.subprocess, "Popen",
+        lambda args, **kwargs: _FakeBatchProcess(
+            args, stdout_lines=["PROGRESS 1 2\n", "PROGRESS 2 2\n"],
+            write_results=[{"id": "0", "ok": True}, {"id": "1", "ok": True}],
+        ),
+    )
+    reported = []
+    monkeypatch.setattr(export_engine.engine, "report_progress", lambda percent, *a: reported.append(percent))
+    items = [
+        {"id": "0", "mediaPath": "a.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "0.mp4")},
+        {"id": "1", "mediaPath": "b.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "1.mp4")},
+    ]
+    export_engine._batch_render_motion_graphics(items, tmp_path, tmp_path)
+    assert reported == [7, 10]  # 5 + round((1/2)*5), 5 + round((2/2)*5)
+
+
 def test_batch_render_motion_graphics_all_items_fall_back_when_the_process_itself_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
     monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
-    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1, stderr="node crashed"))
+    monkeypatch.setattr(
+        export_engine.subprocess, "Popen",
+        lambda args, **kwargs: _FakeBatchProcess(args, returncode=1, stderr_lines=["node crashed\n"]),
+    )
 
     items = [{"id": "0", "mediaPath": "a.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "0.mp4")}]
     errors = export_engine._batch_render_motion_graphics(items, tmp_path, tmp_path)
@@ -376,18 +627,15 @@ def test_batch_render_motion_graphics_all_items_fall_back_when_the_process_itsel
 def test_batch_render_motion_graphics_reports_only_the_items_that_actually_failed(tmp_path, monkeypatch):
     monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
     monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
-
-    def fake_run(args, **kwargs):
-        results_path = Path(args[3])
-        # id "1" never reported at all (crashed mid-batch) — must still
-        # surface as a failure for that one item, not silently trusted.
-        results_path.write_text(json.dumps([
-            {"id": "0", "ok": True},
-            {"id": "2", "ok": False, "error": "render failed"},
-        ]), encoding="utf-8")
-        return SimpleNamespace(returncode=0, stderr="")
-
-    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        export_engine.subprocess, "Popen",
+        lambda args, **kwargs: _FakeBatchProcess(
+            args,
+            # id "1" never reported at all (crashed mid-batch) — must still
+            # surface as a failure for that one item, not silently trusted.
+            write_results=[{"id": "0", "ok": True}, {"id": "2", "ok": False, "error": "render failed"}],
+        ),
+    )
     items = [
         {"id": "0", "mediaPath": "a.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "0.mp4")},
         {"id": "1", "mediaPath": "b.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 10, "fps": 24, "width": 1920, "height": 1080, "outPath": str(tmp_path / "1.mp4")},
@@ -424,6 +672,87 @@ def test_encode_segment_pads_a_virtually_extended_video_tail_with_a_cloned_last_
     vf = calls[0][calls[0].index("-vf") + 1]
     assert "tpad=stop_mode=clone" in vf
     assert calls[0][calls[0].index("-frames:v") + 1] == str(transition_frames)
+
+
+# Root-cause coverage for a real crash: "Error opening input file
+# ...seg_0002_a.ts ... Invalid data found when processing input". On a
+# timeline with many recipe-bearing clips, every join transition's tail/head
+# window used to fall back to `_render_motion_graphic`'s own fresh Node/
+# webpack/Chromium cold start, all running concurrently (one per
+# ThreadPoolExecutor worker) alongside every other segment — dozens of
+# simultaneous Chromium processes on a real multi-clip export, occasionally
+# producing a truncated (invalid) intermediate file under the resulting
+# memory/handle pressure. Folding transition tail/head windows into the same
+# upfront batch as every other motion-graphic clip (see run()'s own comment)
+# removes the concurrency entirely; these two tests cover the two new pieces
+# that make that possible.
+def test_transition_tail_head_segments_matches_the_shapes_build_transition_segment_encodes():
+    fps = 24
+    transition_frames = 12
+    segment_a = {
+        "kind": "video", "path": "/tmp/a.mp4", "start": 0.0, "end": 4.0,
+        "frames": 96, "_originalFrames": 96, "sourceDurationSeconds": 4.0,
+        "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": {"cameraEffect": "push_in"},
+    }
+    segment_b = {
+        "kind": "image", "path": "/tmp/b.png", "start": 4.0, "end": 7.0,
+        "frames": 60, "_originalFrames": 72, "_trimStartFrames": 12,
+        "motionGraphicEffect": "Manual: Zoom Out", "motionGraphicSettings": {"cameraEffect": "zoom_out"},
+    }
+    transition = {
+        "kind": "transition", "frames": transition_frames, "transitionType": "cross-fade",
+        "segmentA": segment_a, "segmentB": segment_b,
+    }
+    tail, head = export_engine._transition_tail_head_segments(transition, fps)
+    assert tail["end"] == 4.0 + transition_frames / fps
+    assert tail["frames"] == transition_frames
+    assert tail["_originalFrames"] == 96 + transition_frames
+    assert tail["_trimStartFrames"] == 96
+    assert tail["motionGraphicSettings"] is segment_a["motionGraphicSettings"]
+    assert head["frames"] == transition_frames
+    assert head["_originalFrames"] == 72
+    assert head["_trimStartFrames"] == 0
+    assert head["motionGraphicSettings"] is segment_b["motionGraphicSettings"]
+
+
+def test_build_transition_segment_reuses_pre_rendered_tail_and_head_raw_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        export_engine, "_render_motion_graphic",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not fall back to a per-clip Remotion render")),
+    )
+    calls = []
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
+
+    fps = 24
+    tail_raw = tmp_path / "tail.raw.mp4"
+    head_raw = tmp_path / "head.raw.mp4"
+    tail_raw.write_bytes(b"fake-tail")
+    head_raw.write_bytes(b"fake-head")
+    segment_a = {
+        "kind": "video", "path": "/tmp/a.mp4", "start": 0.0, "end": 4.0,
+        "frames": 96, "_originalFrames": 96, "sourceDurationSeconds": 4.0,
+        "colorFilter": "none", "colorFilterIntensity": 50.0,
+        "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": {"cameraEffect": "push_in", "depthEffect": "parallax_3d"},
+    }
+    segment_b = {
+        "kind": "image", "path": "/tmp/b.png", "start": 4.0, "end": 7.0,
+        "frames": 60, "_originalFrames": 72, "_trimStartFrames": 0,
+        "colorFilter": "none", "colorFilterIntensity": 50.0,
+        "motionGraphicEffect": "Manual: Zoom Out", "motionGraphicSettings": {"cameraEffect": "zoom_out", "depthEffect": "parallax_3d"},
+    }
+    transition = {
+        "kind": "transition", "frames": 12, "transitionType": "cross-fade",
+        "segmentA": segment_a, "segmentB": segment_b,
+        "_preRenderedTailRawPath": str(tail_raw), "_preRenderedHeadRawPath": str(head_raw),
+    }
+    out_path = tmp_path / "seg_0002.ts"
+    export_engine._build_transition_segment(transition, 2, 1920, 1080, fps, tmp_path, out_path)
+
+    # Both intermediate encodes (tail + head) fed straight from the
+    # pre-rendered raw clips into ffmpeg, plus the final xfade combine call.
+    assert len(calls) == 3
+    assert str(tail_raw) in calls[0]
+    assert str(head_raw) in calls[1]
 
 
 # Root-cause coverage for a real user's export failure: "Could not install
@@ -805,3 +1134,260 @@ def test_expand_join_transitions_creates_a_transition_for_video_to_video():
     assert transition["segmentA"]["kind"] == "video"
     assert transition["segmentB"]["kind"] == "video"
     assert transition["transitionType"] == "whip-pan"
+
+
+# Root-cause coverage for "there is some extra transition which I never set".
+# Every MotionRecipe carries a fade-in/out opacity envelope that defaults to
+# 14 frames at BOTH ends, and the export applied it (natively via `fade=`,
+# and through MotionClip.tsx's opacity ramp over Remotion's black backdrop)
+# while the Timeline canvas preview renders no such thing — applyMotionRecipe
+# returns only a rect+blur, and fadeOverlay fades only for an explicit
+# "fade"/"dip-to-white" transition. Measured on the user's own completed
+# export with ffmpeg signalstats: a boundary set to a plain CUT ran
+# YAVG 49.7 -> 0.5 -> 51.1 (a full dip to black), and a cross-fade boundary
+# faded to black, popped back to full brightness, and only then cross-faded.
+# Clip boundaries in the baked video are governed by transitionIn/Out alone.
+def test_strip_recipe_fade_envelope_zeroes_both_ends():
+    segments = [{
+        "kind": "image",
+        "motionGraphicSettings": {"fadeInFrames": 14, "fadeOutFrames": 14, "scaleTo": 1.2},
+    }]
+    export_engine.strip_recipe_fade_envelope(segments)
+    settings = segments[0]["motionGraphicSettings"]
+    assert settings["fadeInFrames"] == 0
+    assert settings["fadeOutFrames"] == 0
+    # Everything else about the recipe must survive untouched.
+    assert settings["scaleTo"] == 1.2
+
+
+def test_strip_recipe_fade_envelope_leaves_segments_without_a_recipe_alone():
+    segments = [{"kind": "black"}, {"kind": "image", "motionGraphicSettings": None}]
+    export_engine.strip_recipe_fade_envelope(segments)  # must not raise
+    assert segments[0].get("motionGraphicSettings") is None
+    assert segments[1]["motionGraphicSettings"] is None
+
+
+def test_strip_recipe_fade_envelope_does_not_mutate_the_callers_dict():
+    # build_segments forwards the manifest still's own settings dict by
+    # reference; the asset-bundle export must not inherit this stripping.
+    original = {"fadeInFrames": 14, "fadeOutFrames": 14}
+    segments = [{"kind": "image", "motionGraphicSettings": original}]
+    export_engine.strip_recipe_fade_envelope(segments)
+    assert original == {"fadeInFrames": 14, "fadeOutFrames": 14}
+
+
+def test_build_recipe_zoompan_filter_emits_no_envelope_fade_once_stripped():
+    recipe = {"scaleFrom": 1.0, "scaleTo": 1.2, "fadeInFrames": 0, "fadeOutFrames": 0}
+    vf = export_engine.build_recipe_zoompan_filter(recipe, 1920, 1080, 30, 4.0, 120)
+    assert "fade=t=in" not in vf
+    assert "fade=t=out" not in vf
+
+
+# Root-cause coverage for "the caption looks different than the preview —
+# even the style looks different". A Canvas2D `Npx` font sets the EM SQUARE
+# to N px; ASS's `\fs N` does not, because libass reproduces VSFilter's
+# sizing convention and ends up drawing glyphs at
+# `fs * unitsPerEm / (usWinAscent + usWinDescent)` px. For the bundled Rubik
+# that factor is 0.653, so captions burned in ~35% smaller than preview at
+# every resolution. Measured on real burns of the real project's captions.ass:
+# \fs66 rendered a 439px-wide line where the canvas draws 671px; scaling
+# \fs by the reciprocal lands it at 671px exactly.
+def test_libass_font_size_scale_matches_the_bundled_rubik_metrics():
+    metrics = export_engine._font_metrics("Rubik")
+    assert metrics is not None, "the bundled Rubik-Bold.ttf must be readable"
+    assert metrics == (1000, 1066, 466)
+    assert export_engine._libass_font_size_scale("Rubik") == pytest.approx(1532 / 1000)
+
+
+def test_libass_font_size_scale_is_a_noop_for_an_unresolvable_font():
+    # Never silently mis-size a font we cannot measure — fall back to the
+    # pre-fix behavior rather than guessing.
+    assert export_engine._libass_font_size_scale("NoSuchFontFamilyAnywhere") == 1.0
+
+
+def test_write_captions_ass_scales_fs_up_by_the_libass_font_metric(tmp_path):
+    out_path = tmp_path / "captions.ass"
+    style = {"fontFamily": "Rubik", "fontSizePx": 30, "bold": True, "position": "bottom"}
+    captions = [{"start": 0.0, "end": 1.0, "text": "Hello", "style": style}]
+    export_engine.write_captions_ass(captions, out_path, 1920, 1080, style)
+
+    ass_text = out_path.read_text(encoding="utf-8")
+    # Canvas draws this style at (30/22)*1080*0.045 == 66px.
+    canvas_px = export_engine._scaled_font_size(style, 1080)
+    assert round(canvas_px) == 66
+    expected = round(canvas_px * export_engine._libass_font_size_scale("Rubik"))
+    assert expected == 102
+    assert "\\fs{}".format(expected) in ass_text
+    assert "\\fs66" not in ass_text  # the un-corrected value that burned in too small
+
+
+# Root-cause coverage for the same report's line-break half: libass defaults
+# to WrapStyle 0 ("smart" wrapping, which balances a wrapped caption into
+# roughly equal-length lines), but drawCaptionText wraps greedily. Measured
+# on a real two-line caption: libass's default broke it 1235px/1221px where
+# the canvas breaks it 1492px/951px. WrapStyle 1 is greedy end-of-line
+# wrapping and reproduces the canvas's own breaks to within a few pixels.
+def test_write_captions_ass_requests_greedy_wrapping(tmp_path):
+    out_path = tmp_path / "captions.ass"
+    captions = [{"start": 0.0, "end": 1.0, "text": "Hello there", "style": None}]
+    export_engine.write_captions_ass(captions, out_path, 1920, 1080, export_engine._FALLBACK_CAPTION_STYLE)
+    assert "WrapStyle: 1" in out_path.read_text(encoding="utf-8")
+
+
+# Root-cause coverage for the same report's "the style looks different"
+# half: ASS's `\blur` softens the WHOLE rendered glyph (fill and outline),
+# whereas the canvas preview's ctx.shadowBlur softens only the drop shadow
+# and leaves the text razor-sharp. Emitting `\blur` on the text layer
+# visibly fuzzed the outline in every export. The shadow now gets its own
+# lower Dialogue layer with the fill/outline made fully transparent, so the
+# blur only ever touches the shadow.
+def test_write_captions_ass_keeps_the_text_layer_sharp_and_shadow_on_its_own_layer(tmp_path):
+    out_path = tmp_path / "captions.ass"
+    style = {
+        "fontFamily": "Rubik", "fontSizePx": 30, "bold": True, "position": "bottom",
+        "shadow": {"enabled": True, "color": "#000000", "opacity": 70, "blur": 30, "distance": 2, "angle": 90},
+    }
+    captions = [{"start": 0.0, "end": 1.0, "text": "Hello", "style": style}]
+    export_engine.write_captions_ass(captions, out_path, 1920, 1080, style)
+
+    events = [line for line in out_path.read_text(encoding="utf-8").splitlines() if line.startswith("Dialogue:")]
+    shadow_line = next(line for line in events if line.startswith("Dialogue: 0,"))
+    text_line = next(line for line in events if line.startswith("Dialogue: 1,"))
+    # The shadow layer carries the blur and hides its own fill/outline.
+    assert "\\blur" in shadow_line
+    assert "\\1a&HFF&" in shadow_line and "\\3a&HFF&" in shadow_line
+    # The text layer must be sharp, and must not double-draw a shadow.
+    assert "\\blur" not in text_line
+    assert "\\shad0" in text_line
+
+
+def test_write_captions_ass_emits_no_shadow_layer_when_shadow_is_disabled(tmp_path):
+    out_path = tmp_path / "captions.ass"
+    style = {"fontFamily": "Rubik", "fontSizePx": 30, "shadow": {"enabled": False}}
+    captions = [{"start": 0.0, "end": 1.0, "text": "Hello", "style": style}]
+    export_engine.write_captions_ass(captions, out_path, 1920, 1080, style)
+
+    events = [line for line in out_path.read_text(encoding="utf-8").splitlines() if line.startswith("Dialogue:")]
+    assert len(events) == 1
+    assert events[0].startswith("Dialogue: 1,")
+
+
+# Root-cause coverage for the caption sitting higher in the export than in
+# preview: drawCaptionText reserves exactly 0.25 * fontSize of descent below
+# a bottom-aligned block's last baseline (lineHeight is fontSize * 1.25, and
+# it offsets by lineHeight * 0.2), while libass reserves the font's own
+# usWinDescent — 0.466 em for Rubik. That put an \an2 line a measured 15px
+# too high at 1080p with the default style; correcting MarginV by the
+# difference lines the two up to within a pixel.
+def test_libass_margin_v_correction_lifts_a_bottom_caption_by_the_descent_difference():
+    correction = export_engine._libass_margin_v_correction("Rubik", "bottom", 66.0)
+    assert correction == pytest.approx((466 / 1000 - 0.25) * 66.0)
+    assert round(correction) == 14
+
+
+def test_libass_margin_v_correction_is_zero_for_middle_and_unknown_fonts():
+    # \an5 centres vertically and ignores MarginV entirely.
+    assert export_engine._libass_margin_v_correction("Rubik", "middle", 66.0) == 0.0
+    assert export_engine._libass_margin_v_correction("NoSuchFont", "bottom", 66.0) == 0.0
+
+
+def test_write_captions_ass_emits_the_corrected_margin_on_each_dialogue(tmp_path):
+    out_path = tmp_path / "captions.ass"
+    style = {"fontFamily": "Rubik", "fontSizePx": 30, "position": "bottom", "shadow": {"enabled": False}}
+    captions = [{"start": 0.0, "end": 1.0, "text": "Hello", "style": style}]
+    export_engine.write_captions_ass(captions, out_path, 1920, 1080, style)
+
+    text_line = next(
+        line for line in out_path.read_text(encoding="utf-8").splitlines() if line.startswith("Dialogue: 1,")
+    )
+    # Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+    margin_v = int(text_line.split(",")[7])
+    nominal = round(1080 * 0.05)
+    assert margin_v == round(nominal - export_engine._libass_margin_v_correction("Rubik", "bottom", 66.0))
+    assert margin_v < nominal
+
+
+# Root-cause coverage for "the cross fade transition when rendered shows a
+# jitter on the screen as well ... I don't see it in the preview it only
+# happens in the fully rendered video". "cross-fade" used to map onto
+# ffmpeg's xfade "dissolve", on the (backwards) belief that it was a truer
+# A-to-B blend than xfade's "fade". ffmpeg's `dissolve` is a RANDOM
+# PER-PIXEL dissolve — each pixel independently flips from A to B against a
+# random threshold — so every blended frame is a fresh field of static and
+# the transition crawls with full-screen noise. Measured by xfading two FLAT
+# solid colours: at the midpoint `fade` yields exactly 1 distinct colour
+# where `dissolve` yields 98,542 (per-channel std ~91); on the user's real
+# export, per-frame high-frequency energy ran 1.8 -> 146.7 across the 13
+# blended frames. Both have the same MEAN brightness, which is why a
+# brightness-over-time check reads as a smooth ramp and misses it entirely.
+# The canvas preview cross-fades with `ctx.globalAlpha = progress`
+# (drawJoinTransitionFrame), i.e. a plain linear blend == xfade's "fade".
+def test_cross_fade_maps_to_the_linear_xfade_not_the_random_dissolve():
+    assert export_engine._XFADE_TRANSITION_NAMES["cross-fade"] == "fade"
+    # "dissolve" is ffmpeg's randomised noise dissolve — it must never be
+    # what a user-facing "cross-fade" resolves to.
+    assert "dissolve" not in export_engine._XFADE_TRANSITION_NAMES.values()
+
+
+def test_every_join_transition_has_an_xfade_mapping():
+    # A missing entry silently falls back to `_build_transition_segment`'s
+    # own default, which would quietly render the wrong transition.
+    for transition in export_engine.JOIN_TRANSITIONS:
+        assert transition in export_engine._XFADE_TRANSITION_NAMES
+
+
+# Root-cause coverage for the second half of "the cross fade transition when
+# rendered shows a jitter on the screen": a join transition renders the
+# outgoing clip virtually extended past its nominal end so the blend has
+# footage (see expand_join_transitions), and the camera move used to
+# normalise its 0->1 progress over that LONGER length. The same clip
+# therefore ran a different, slower curve inside the transition than in its
+# own segment, and the picture jumped backwards at the join. Measured on a
+# real 4K export: the transition's first frame is pure clip A (xfade
+# progress 0, no blending at all) yet differed from the frame before it by
+# 13.7x the local per-frame motion; across the 87-still project's 86
+# transitions the implied jump was a median 3.6px and up to 8.8px of edge
+# displacement. The render length (_originalFrames) still has to stay
+# extended so a video source keeps playing real footage instead of freezing;
+# only the motion normalisation (_motionFrames) pins to the clip's own length.
+def test_transition_tail_pins_motion_to_the_clips_own_length():
+    fps = 30
+    segments = [
+        {"kind": "image", "start": 0.0, "end": 10.0, "frames": 300, "transitionOut": "cross-fade"},
+        {"kind": "image", "start": 10.0, "end": 20.0, "frames": 300},
+    ]
+    expanded = export_engine.expand_join_transitions(segments, fps)
+    transition = next(s for s in expanded if s["kind"] == "transition")
+    tail, head = export_engine._transition_tail_head_segments(transition, fps)
+    t_frames = transition["frames"]
+    # The render window still runs past the nominal end...
+    assert tail["_originalFrames"] == 300 + t_frames
+    # ...but the camera move stays normalised to the clip's real length, so
+    # the tail is the exact continuation of the clip's own segment.
+    assert tail["_motionFrames"] == 300
+    # The incoming side was always correct — it re-uses its own clip's real
+    # length — and must stay that way.
+    assert head["_originalFrames"] == 300
+    assert head.get("_motionFrames", 300) == 300
+
+
+def test_build_recipe_zoompan_filter_normalises_progress_to_motion_frames():
+    recipe = {"scaleFrom": 1.0, "scaleTo": 1.2}
+    # Rendering 314 frames but normalising the move over the clip's real 300.
+    vf = export_engine.build_recipe_zoompan_filter(
+        recipe, 1920, 1080, 30, 10.47, 314, motion_frames=300
+    )
+    assert "min(1,on/299)" in vf
+    assert "min(1,on/313)" not in vf  # the stretched curve that caused the pop
+    # zoompan must still emit the full rendered length.
+    assert "d=314" in vf
+
+
+def test_build_recipe_zoompan_filter_defaults_motion_frames_to_the_render_length():
+    recipe = {"scaleFrom": 1.0, "scaleTo": 1.2}
+    plain = export_engine.build_recipe_zoompan_filter(recipe, 1920, 1080, 30, 10.0, 300)
+    explicit = export_engine.build_recipe_zoompan_filter(
+        recipe, 1920, 1080, 30, 10.0, 300, motion_frames=300
+    )
+    assert plain == explicit
+    assert "min(1,on/299)" in plain

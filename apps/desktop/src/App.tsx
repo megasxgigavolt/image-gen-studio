@@ -87,6 +87,7 @@ import {
 } from "./infrastructure/projects-client";
 import { TimelineView } from "./TimelineView";
 import { AnimateView } from "./AnimateView";
+import { ExportMiniBadge } from "./ExportMiniBadge";
 import { PreferencesModal } from "./PreferencesModal";
 
 const navItems: { stage: AppStage; label: string; icon: typeof Home }[] = [
@@ -723,7 +724,7 @@ function HomeView() {
       <aside className="launcher-panel">
         <h1>{getGreeting()}</h1>
         <p>Select a project or start something new.</p>
-        {error && <div className="inline-error">{error}</div>}
+        {error && <div className="inline-error dismissible"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss">×</button></div>}
         {loading && <div className="empty-state compact">Loading local workspace…</div>}
         {!loading && channels.length === 0 && (
           <div className="empty-state compact"><FolderOpen size={26} /><h2>Create your first channel</h2><p>Videos and assets will be stored locally in its project folder.</p></div>
@@ -1075,7 +1076,7 @@ function InputsView() {
         )}
       </div>
       {!activeVideoId && <div className="inline-error">Open or create a video before adding source material.</div>}
-      {error && <div className="inline-error">{error}</div>}
+      {error && <div className="inline-error dismissible"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss">×</button></div>}
       <div className="inputs-grid">
         <article className="panel script-panel">
           <div className="panel-heading"><div><h2>Script</h2><p>Paste narration or import a UTF-8 text file.</p></div><button className="secondary" onClick={() => void importScript()}><Upload size={15} />Import</button></div>
@@ -4383,8 +4384,34 @@ export function App() {
     theme,
     activeChannelId,
     activeVideoId,
+    exportState,
+    exportCollapsed,
+    setStage,
+    setExportCollapsed,
   } = useAppStore();
   const [startupNotice, setStartupNotice] = useState<string | null>(null);
+  // Subscribed once, for the app's whole lifetime — NOT inside TimelineView,
+  // which the stage router fully unmounts on every tab switch. The export
+  // itself keeps running in the backend regardless of what's mounted; this
+  // is what lets progress keep updating (and the mini badge below show it)
+  // no matter which tab the user is actually looking at. See app-store.ts's
+  // ExportState doc comment for the full rationale.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        unlisten = await listen<{ videoId: string; percent: number; stage: string; detail: string }>(
+          "export-progress",
+          ({ payload }) => {
+            useAppStore.getState().updateExportProgress(payload.videoId, payload.percent, payload.stage, payload.detail);
+          },
+        );
+      } catch {
+        // Browser preview has no native event bridge.
+      }
+    })();
+    return () => { unlisten?.(); };
+  }, []);
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
   // Proportional UI scaling: keep the exact same layout/proportions on every screen,
   // simply scaled down on smaller displays. Uses the NATIVE webview zoom (true
@@ -4445,6 +4472,12 @@ export function App() {
       <TitleBar />
       {stage !== "home" && <Sidebar />}
       <main><Header />{startupNotice && <div className="startup-notice">{startupNotice}<button onClick={() => setStartupNotice(null)}>Dismiss</button></div>}<UpdateBanner />{stage === "home" && <HomeView />}{["inputs", "visual-plan"].includes(stage) && <ProductionView />}{stage === "images" && <ImagesView />}{stage === "animate" && <AnimateView />}{stage === "timeline" && <TimelineView />}</main>
+      {exportState && (stage !== "timeline" || exportCollapsed) && (
+        <ExportMiniBadge
+          exportState={exportState}
+          onExpand={() => { setStage("timeline"); setExportCollapsed(false); }}
+        />
+      )}
       <ToastDisplay />
     </div>
   );

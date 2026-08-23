@@ -148,7 +148,14 @@ export function useTimelinePlayback(params: {
       clipDuration = clip.endSeconds - clip.startSeconds;
       const clipIndex = stillsClips.indexOf(clip);
       nextClip = clipIndex >= 0 ? stillsClips[clipIndex + 1] : undefined;
-      const joinableKind = (kind: string) => kind === "still" || kind === "imported-still" || kind === "animation";
+      // Matches expand_join_transitions in video_export_engine.py, which
+      // explicitly supports a video outgoing/incoming side "(Veo animation /
+      // imported clip)" — "imported-clip" was missing here, so an imported
+      // video clip's real cross-fade/slide/zoom-blur export never showed in
+      // preview at all (silently fell back to a plain cut or a generic
+      // fade-overlay, see fadeOverlay's own isFadeLike check).
+      const joinableKind = (kind: string) =>
+        kind === "still" || kind === "imported-still" || kind === "animation" || kind === "imported-clip";
       canJoin = !!nextClip
         && joinableKind(clip.clipKind)
         && joinableKind(nextClip.clipKind)

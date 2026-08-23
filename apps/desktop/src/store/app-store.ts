@@ -36,6 +36,30 @@ export type Theme = "light" | "dark";
 
 type Toast = { id: number; message: string; kind: "success" | "error" | "info"; durationMs: number };
 
+export type ExportKind = "video" | "project";
+export type ExportUiResult = { kind: "success"; path: string } | { kind: "failure"; error: string };
+
+/** Tracks an in-flight (or just-finished, until dismissed) timeline export.
+ * Lives in the store — not TimelineView's own local state — specifically so
+ * it survives the Editor tab unmounting: the stage router (App.tsx) fully
+ * unmounts TimelineView on every stage switch, but the export itself keeps
+ * running regardless (it's a single long-awaited backend invoke; nothing
+ * about navigating away cancels it), and the `export-progress` Tauri event
+ * is a plain window-level subscription with no tie to any component's
+ * lifecycle either — before this, switching tabs mid-export just meant the
+ * UI silently lost all track of it until you happened to come back. See
+ * App.tsx's own `export-progress` listener (subscribed once, for the app's
+ * whole lifetime) and the persistent mini export badge it renders. */
+export type ExportState = {
+  videoId: string;
+  kind: ExportKind;
+  percent: number;
+  stage: string;
+  detail: string;
+  cancelling: boolean;
+  result: ExportUiResult | null;
+};
+
 type AppState = {
   stage: AppStage;
   theme: Theme;
@@ -64,6 +88,18 @@ type AppState = {
   clearActiveProject: () => void;
   addToast: (message: string, kind?: Toast["kind"], durationMs?: number) => void;
   dismissToast: () => void;
+  exportState: ExportState | null;
+  /** Manually collapsed (chevron in the Editor tab) to just the mini badge
+   * while still on the Editor tab — separate from "not on the Editor tab at
+   * all", which shows the same badge for a different reason. Reset false on
+   * every new export so a fresh export always opens expanded. */
+  exportCollapsed: boolean;
+  beginExport: (videoId: string, kind: ExportKind) => void;
+  updateExportProgress: (videoId: string, percent: number, stage: string, detail: string) => void;
+  setExportCancelling: (videoId: string, cancelling: boolean) => void;
+  finishExport: (videoId: string, result: ExportUiResult | null) => void;
+  clearExport: () => void;
+  setExportCollapsed: (collapsed: boolean) => void;
 };
 
 const cloneOriginalPlan = () =>
@@ -114,6 +150,33 @@ export const useAppStore = create<AppState>((set) => ({
   addToast: (message, kind = "info", durationMs = 4500) =>
     set({ toast: { id: ++toastCounter, message, kind, durationMs } }),
   dismissToast: () => set({ toast: null }),
+  exportState: null,
+  exportCollapsed: false,
+  beginExport: (videoId, kind) =>
+    set({
+      exportState: { videoId, kind, percent: 0, stage: "Preparing export", detail: "", cancelling: false, result: null },
+      exportCollapsed: false,
+    }),
+  updateExportProgress: (videoId, percent, stage, detail) =>
+    set((state) =>
+      state.exportState?.videoId === videoId
+        ? { exportState: { ...state.exportState, percent, stage, detail } }
+        : state,
+    ),
+  setExportCancelling: (videoId, cancelling) =>
+    set((state) =>
+      state.exportState?.videoId === videoId
+        ? { exportState: { ...state.exportState, cancelling } }
+        : state,
+    ),
+  finishExport: (videoId, result) =>
+    set((state) =>
+      state.exportState?.videoId === videoId
+        ? { exportState: { ...state.exportState, result, cancelling: false } }
+        : state,
+    ),
+  clearExport: () => set({ exportState: null, exportCollapsed: false }),
+  setExportCollapsed: (collapsed) => set({ exportCollapsed: collapsed }),
   moveSentence: (sentenceId, targetGroupId) =>
     set((state) => {
       const sourceIndex = state.visualPlan.findIndex((group) =>

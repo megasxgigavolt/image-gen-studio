@@ -23,7 +23,8 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
   const [appVersion, setAppVersion] = useState("");
   const [saveLocation, setSaveLocation] = useState("");
   const [autosaveInterval, setAutosaveInterval] = useState<AutosaveInterval>("30s");
-  const [exportResolution, setExportResolution] = useState<ExportResolution>("1080p");
+  // "No downscaling by default" — 2160p (4K) is the highest offered option.
+  const [exportResolution, setExportResolution] = useState<ExportResolution>("2160p");
   const [exportQuality, setExportQuality] = useState<ExportQuality>("balanced");
   const [exportCaptions, setExportCaptions] = useState<ExportCaptionsMode>("burned-in");
   const [openaiConfigured, setOpenaiConfigured] = useState(false);

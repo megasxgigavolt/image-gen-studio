@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, CheckCircle2, Clock, Download, FolderOpen, LoaderCircle, Play, Square, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Clock, Download, FolderOpen, LoaderCircle, Minimize2, Play, Square, X } from "lucide-react";
 import type { ExportCaptionsMode, ExportQuality, ExportResolution, ExportSettingsRecord } from "../infrastructure/projects-client";
 
 type ExportResult = { kind: "success"; path: string } | { kind: "failure"; error: string };
@@ -33,6 +33,7 @@ function formatEta(seconds: number): string {
 export function ExportDrawer({
   open,
   onClose,
+  onCollapse,
   hasClips,
   hasMusic,
   exporting,
@@ -51,6 +52,11 @@ export function ExportDrawer({
 }: {
   open: boolean;
   onClose: () => void;
+  /** Present only while an export is actually running — collapses this
+   * drawer to the app-wide mini export badge (see App.tsx) without
+   * touching the export itself, which keeps running in the background.
+   * `undefined` (not exporting, or nothing to collapse) hides the button. */
+  onCollapse?: () => void;
   hasClips: boolean;
   hasMusic: boolean;
   exporting: boolean;
@@ -91,7 +97,14 @@ export function ExportDrawer({
     <div className="tl-export-drawer" role="dialog" aria-label="Export video">
       <div className="tl-export-drawer-header">
         <strong><Download size={15} />Export video</strong>
-        <button className="tl-icon-btn" onClick={onClose} disabled={exporting} aria-label="Close"><X size={16} /></button>
+        <div className="tl-export-drawer-header-actions">
+          {onCollapse && (
+            <button className="tl-icon-btn" onClick={onCollapse} title="Collapse — keep exporting in the background" aria-label="Collapse export progress">
+              <Minimize2 size={15} />
+            </button>
+          )}
+          <button className="tl-icon-btn" onClick={onClose} disabled={exporting} aria-label="Close"><X size={16} /></button>
+        </div>
       </div>
 
       {result?.kind === "success" && (

@@ -4,6 +4,7 @@ import {
   Keyboard,
   LoaderCircle,
   Lock,
+  Minimize2,
   Move,
   MoreHorizontal,
   Play,
@@ -77,17 +78,43 @@ function formatSavedRelativeTime(isoTimestamp: string): string {
 
 export function TimelineView() {
   const { activeVideoId, activeVideoTitle, addToast, setTitlebarActions, setStage } = useAppStore();
+  // Export tracking lives in the store, not local state — it must survive
+  // this whole component unmounting when the user switches tabs mid-export
+  // (the stage router fully unmounts TimelineView on every stage switch,
+  // but the export itself keeps running regardless). See app-store.ts's
+  // own doc comment on ExportState for the full rationale.
+  const exportState = useAppStore((state) => state.exportState);
+  const exportCollapsed = useAppStore((state) => state.exportCollapsed);
+  const beginExport = useAppStore((state) => state.beginExport);
+  const setExportCancellingStore = useAppStore((state) => state.setExportCancelling);
+  const finishExport = useAppStore((state) => state.finishExport);
+  const clearExport = useAppStore((state) => state.clearExport);
+  const setExportCollapsed = useAppStore((state) => state.setExportCollapsed);
+  const exportKind = exportState?.kind ?? null;
+  const exporting = exportState !== null && exportState.result === null;
+  const exportCancelling = exportState?.cancelling ?? false;
+  const exportProgress = {
+    percent: exportState?.percent ?? 0,
+    stage: exportState?.stage ?? "Preparing export",
+    detail: exportState?.detail ?? "",
+  };
+  const exportResult = exportState?.result ?? null;
 
   const [selectedClip, setSelectedClip] = useState<TimelineClipRecord | null>(null);
   const [selectedClipRenders, setSelectedClipRenders] = useState<ImageRenderRecord[]>([]);
   const [confirmExportProject, setConfirmExportProject] = useState(false);
-  const [exportDrawerOpen, setExportDrawerOpen] = useState(false);
-  const [exportKind, setExportKind] = useState<"video" | "project" | null>(null);
-  const [exporting, setExporting] = useState(false);
-  const [exportCancelling, setExportCancelling] = useState(false);
-  const [exportProgress, setExportProgress] = useState({ percent: 0, stage: "Preparing export", detail: "" });
+  // Reopens automatically on remount whenever a video export is genuinely
+  // still active and the user hasn't explicitly collapsed it — i.e.
+  // "was this hidden only because the whole tab was hidden?" — see the
+  // collapse toggle further down and app-store.ts's ExportState comment.
+  const [exportDrawerOpen, setExportDrawerOpen] = useState(
+    () => exportState?.kind === "video" && !exportCollapsed,
+  );
   const [exportSettings, setExportSettings] = useState<ExportSettingsRecord>({
-    resolution: "1080p", quality: "high", captionsMode: "burned-in", includeNarration: true, includeMusic: true,
+    // "No downscaling by default" — 2160p (4K) is the highest offered
+    // option, so a user who never touches this panel never has their
+    // export capped below whatever their source assets can support.
+    resolution: "2160p", quality: "high", captionsMode: "burned-in", includeNarration: true, includeMusic: true,
   });
   // Preferences' Export Defaults pre-fill the panel once per mount — after
   // that the user's own picks in this session take priority, so this must
@@ -108,7 +135,6 @@ export function TimelineView() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const [exportResult, setExportResult] = useState<{ kind: "success"; path: string } | { kind: "failure"; error: string } | null>(null);
   const [exportHistoryOpen, setExportHistoryOpen] = useState(false);
   const [activeTool, setActiveTool] = useState<ToolKind | null>(null);
   const [titlebarMenuOpen, setTitlebarMenuOpen] = useState(false);
@@ -1020,22 +1046,10 @@ export function TimelineView() {
     }
   }
 
-  useEffect(() => {
-    if (!exporting || !activeVideoId) return;
-    let unlisten: (() => void) | undefined;
-    (async () => {
-      try {
-        unlisten = await listen<{ videoId: string; percent: number; stage: string; detail: string }>("export-progress", ({ payload }) => {
-          if (payload.videoId === activeVideoId) {
-            setExportProgress({ percent: payload.percent, stage: payload.stage, detail: payload.detail });
-          }
-        });
-      } catch {
-        // Browser preview has no native event bridge.
-      }
-    })();
-    return () => { unlisten?.(); };
-  }, [exporting, activeVideoId]);
+  // The `export-progress` Tauri event itself is subscribed once for the
+  // app's whole lifetime in App.tsx (never here) — a per-component listener
+  // gated on `exporting` would drop events the instant this view unmounts,
+  // exactly the bug this whole store-backed ExportState exists to fix.
 
   async function startExport() {
     if (!activeVideoId) return;
@@ -1056,21 +1070,13 @@ export function TimelineView() {
     const folder = destinationPath.slice(0, Math.max(destinationPath.lastIndexOf("/"), destinationPath.lastIndexOf("\\")));
     if (folder) await projectsClient.saveAppSetting("export_last_folder", folder);
     pausePreview();
-    setExportKind("video");
-    setExporting(true);
-    setExportCancelling(false);
-    setExportProgress({ percent: 0, stage: "Preparing export", detail: "" });
-    setExportResult(null);
+    beginExport(activeVideoId, "video");
     setError(null);
     try {
       const savedPath = await projectsClient.exportTimelineVideo(activeVideoId, destinationPath, exportSettings);
-      if (savedPath) setExportResult({ kind: "success", path: savedPath });
+      finishExport(activeVideoId, savedPath ? { kind: "success", path: savedPath } : null);
     } catch (caught) {
-      setExportResult({ kind: "failure", error: String(caught) });
-    } finally {
-      setExporting(false);
-      setExportCancelling(false);
-      setExportKind(null);
+      finishExport(activeVideoId, { kind: "failure", error: String(caught) });
     }
   }
 
@@ -1079,10 +1085,7 @@ export function TimelineView() {
     const destinationPath = await projectsClient.pickExportProjectDestination();
     if (!destinationPath) return;
     pausePreview();
-    setExportKind("project");
-    setExporting(true);
-    setExportCancelling(false);
-    setExportProgress({ percent: 0, stage: "Preparing export", detail: "" });
+    beginExport(activeVideoId, "project");
     setError(null);
     try {
       const savedPath = await projectsClient.exportTimelineProject(activeVideoId, destinationPath);
@@ -1091,15 +1094,16 @@ export function TimelineView() {
     } catch (caught) {
       setError(String(caught));
     } finally {
-      setExporting(false);
-      setExportCancelling(false);
-      setExportKind(null);
+      // Unlike a video export, a project (asset-bundle) export has no
+      // lingering result panel — it reports via toast and returns straight
+      // to idle, so there's nothing for ExportState.result to hold onto.
+      clearExport();
     }
   }
 
   async function cancelExport() {
     if (!activeVideoId) return;
-    setExportCancelling(true);
+    setExportCancellingStore(activeVideoId, true);
     await projectsClient.cancelTimelineExport(activeVideoId);
   }
 
@@ -1238,7 +1242,7 @@ export function TimelineView() {
           <h1>Editor</h1>
         </div>
       </div>
-      {error && <div className="inline-error">{error}</div>}
+      {error && <div className="inline-error dismissible"><span>{error}</span><button type="button" onClick={() => setError(null)} aria-label="Dismiss">×</button></div>}
       {confirmExportProject && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setConfirmExportProject(false)}>
           <section className="modal" onMouseDown={(event) => event.stopPropagation()}>
@@ -1256,9 +1260,17 @@ export function TimelineView() {
           </section>
         </div>
       )}
-      {exporting && exportKind === "project" && (
+      {exporting && exportKind === "project" && !exportCollapsed && (
         <div className="loading-overlay" role="status" aria-live="polite">
           <div className="loading-card generation-progress">
+            <button
+              className="tl-icon-btn loading-card-collapse-btn"
+              onClick={() => setExportCollapsed(true)}
+              title="Collapse — keep exporting in the background"
+              aria-label="Collapse export progress"
+            >
+              <Minimize2 size={14} />
+            </button>
             <div className="progress-heading">
               <LoaderCircle className="spin" size={26} />
               <strong>{exportCancelling ? "Cancelling…" : exportProgress.stage}</strong>
@@ -1395,7 +1407,12 @@ export function TimelineView() {
             onAddLibraryAsset={(asset) => void addLibraryAssetToTimeline(asset)}
             addToast={addToast}
           />
-          <TimelinePreview hasStillsClips={stillsClips.length > 0} canvasRef={previewCanvasRef} canvasSize={canvasSize} />
+          <TimelinePreview
+            hasStillsClips={stillsClips.length > 0}
+            canvasRef={previewCanvasRef}
+            canvasSize={canvasSize}
+            onCanvasResized={() => redrawRequestRef.current()}
+          />
           <aside className="tl-inspector-pane">
             {activeTool === "captions" && (
               <CaptionsInspector
@@ -1659,8 +1676,9 @@ export function TimelineView() {
         <ContextMenu x={contextMenu.x} y={contextMenu.y} items={contextMenu.items} onClose={() => setContextMenu(null)} />
       )}
       <ExportDrawer
-        open={exportDrawerOpen}
-        onClose={() => { setExportDrawerOpen(false); setExportResult(null); }}
+        open={exportDrawerOpen && !exportCollapsed}
+        onClose={() => { setExportDrawerOpen(false); clearExport(); }}
+        onCollapse={exporting && exportKind === "video" ? () => setExportCollapsed(true) : undefined}
         hasClips={Boolean(timeline.clips.length)}
         hasMusic={Boolean(timeline.musicClips.length)}
         exporting={exporting && exportKind === "video"}
@@ -1673,7 +1691,7 @@ export function TimelineView() {
         result={exportResult}
         onStart={() => void startExport()}
         onCancel={() => void cancelExport()}
-        onExportAgain={() => { setExportResult(null); void startExport(); }}
+        onExportAgain={() => void startExport()}
         onShowInFolder={(path) => void projectsClient.revealInFileManager(path)}
         onOpenHistory={() => setExportHistoryOpen(true)}
       />

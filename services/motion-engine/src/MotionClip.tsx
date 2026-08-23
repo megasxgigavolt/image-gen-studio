@@ -253,24 +253,29 @@ function EnvironmentOverlay({ effect, intensity, frame, width, height }: { effec
   );
 }
 
-export const MotionClip: React.FC<MotionClipProps> = ({ mediaPath, sourceKind, recipe, durationInFrames, width, height }) => {
+export const MotionClip: React.FC<MotionClipProps> = ({ mediaPath, sourceKind, recipe, durationInFrames, motionDurationInFrames, width, height }) => {
   const frame = useCurrentFrame();
   const src = staticFile(mediaPath);
   const diagonal = Math.sqrt(width * width + height * height);
   const easingFn = mapEasing(recipe.easing);
+  // The clip's own natural length for camera-move purposes, which is only
+  // shorter than the rendered length for a join transition's tail window —
+  // see `motionDurationInFrames` in types.ts. Everything driven by the
+  // recipe's 0->1 progress normalises against THIS, never the render length.
+  const motionFrames = Math.max(1, motionDurationInFrames ?? durationInFrames);
 
   // --- Tier-4 pacing: freeze-frame hold, then speed-ramp curve, both
   // layered on top of the base easing. Only the camera-move-driving progress
   // below is affected — the fade envelope always runs on real time. ---
   const freezeStart = recipe.storyEffect === "freeze_frame"
-    ? Math.max(1, Math.min(Math.round(recipe.freezeAtProgress * durationInFrames), durationInFrames - 2))
+    ? Math.max(1, Math.min(Math.round(recipe.freezeAtProgress * motionFrames), motionFrames - 2))
     : 0;
   const freezeHold = recipe.storyEffect === "freeze_frame"
-    ? Math.max(0, Math.min(recipe.freezeHoldFrames, durationInFrames - freezeStart - 1))
+    ? Math.max(0, Math.min(recipe.freezeHoldFrames, motionFrames - freezeStart - 1))
     : 0;
-  const effectiveFrame = remapFrameForFreeze(frame, durationInFrames, freezeStart, freezeHold);
+  const effectiveFrame = remapFrameForFreeze(frame, motionFrames, freezeStart, freezeHold);
 
-  let overallProgress = interpolate(effectiveFrame, [0, durationInFrames], [0, 1], {
+  let overallProgress = interpolate(effectiveFrame, [0, motionFrames], [0, 1], {
     easing: easingFn,
     extrapolateLeft: "clamp",
     extrapolateRight: "clamp",
@@ -280,26 +285,38 @@ export const MotionClip: React.FC<MotionClipProps> = ({ mediaPath, sourceKind, r
   }
 
   // Fade envelope — clamp each half to at most half the clip so a very short
-  // clip with generous fade settings can't invert. Remotion's `interpolate`
-  // requires strictly increasing breakpoints, so a recipe with fadeIn/
-  // fadeOutFrames at or near 0 (a valid, deliberate "hard cut" choice) gets
-  // nudged apart by a sub-frame epsilon rather than colliding into duplicate
-  // breakpoints, which would otherwise crash the render outright. Always
-  // driven by the real `frame`, never the freeze-remapped one.
-  const EPSILON_FRAMES = 0.001;
+  // clip with generous fade settings can't invert. Always driven by the real
+  // `frame`, never the freeze-remapped one, and deliberately against
+  // `durationInFrames` (the RENDERED length) rather than `motionFrames`:
+  // normalising a fade-out to a shorter motion length would drive the extra
+  // frames past the end of the ramp and clamp them to opacity 0, i.e. black.
+  //
+  // Each half is its own two-point interpolation, and a half with no fade at
+  // all is simply a constant 1. This used to be ONE four-point interpolation
+  // over [0, fadeInEnd, fadeOutStart, durationInFrames] -> [0, 1, 1, 0], with
+  // fadeInEnd nudged to a sub-frame epsilon when fadeInFrames was 0 (Remotion's
+  // `interpolate` requires strictly increasing breakpoints). But the output
+  // range still STARTED at 0, so `frame === 0` landed exactly on that first
+  // breakpoint and rendered the clip fully transparent — a one-frame black
+  // flash on every clip with no fade-in, i.e. at every hard cut. Invisible
+  // while the AI's default 14-frame fade was still being applied at export,
+  // and immediately visible once it stopped (see
+  // strip_recipe_fade_envelope in video_export_engine.py). Splitting the
+  // halves removes the degenerate breakpoint entirely and matches
+  // `build_recipe_zoompan_filter`'s native `fade=` path, which has always
+  // emitted no filter at all for a zero-length fade.
   const fadeIn = Math.max(0, Math.min(recipe.fadeInFrames, durationInFrames / 2));
   const fadeOut = Math.max(0, Math.min(recipe.fadeOutFrames, durationInFrames / 2));
-  const fadeInEnd = Math.max(EPSILON_FRAMES, fadeIn);
-  const fadeOutStart = Math.min(
-    durationInFrames - EPSILON_FRAMES,
-    Math.max(fadeInEnd + EPSILON_FRAMES, durationInFrames - fadeOut)
-  );
-  const envelopeOpacity = interpolate(
-    frame,
-    [0, fadeInEnd, fadeOutStart, durationInFrames],
-    [0, 1, 1, 0],
-    { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
-  );
+  const fadeInOpacity = fadeIn > 0
+    ? interpolate(frame, [0, fadeIn], [0, 1], { extrapolateLeft: "clamp", extrapolateRight: "clamp" })
+    : 1;
+  const fadeOutOpacity = fadeOut > 0
+    ? interpolate(frame, [durationInFrames - fadeOut, durationInFrames], [1, 0], {
+        extrapolateLeft: "clamp",
+        extrapolateRight: "clamp",
+      })
+    : 1;
+  const envelopeOpacity = Math.min(fadeInOpacity, fadeOutOpacity);
 
   // --- Tier 1: camera move. Tier-4 path_animation overrides the pan with a
   // multi-waypoint route; everything else still comes from the plain 2-point

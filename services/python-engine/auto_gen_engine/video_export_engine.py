@@ -205,11 +205,30 @@ def assign_frame_counts(segments: list[dict], fps: int) -> None:
 # blur dissolve. Documented as an approximation, not exact optical blur.
 JOIN_TRANSITIONS = {"cross-fade", "slide-left", "slide-right", "zoom-blur", "whip-pan", "blur-transition"}
 _XFADE_TRANSITION_NAMES = {
-    # "dissolve" (a direct A-to-B blend) reads as a truer cross-dissolve than
-    # xfade's "fade" (which itself is already a plain crossfade, just named
-    # confusingly close to the unrelated per-clip fade-to-black transition
-    # elsewhere in this module).
-    "cross-fade": "dissolve",
+    # Root cause for "the cross fade transition when rendered shows a jitter
+    # on the screen ... I don't see it in the preview". This used to map to
+    # xfade's "dissolve" on the belief that it was "a direct A-to-B blend"
+    # and therefore a truer cross-dissolve than xfade's "fade". That is
+    # backwards: ffmpeg's `dissolve` is a RANDOM PER-PIXEL dissolve — every
+    # pixel independently flips from A to B against a random threshold — so
+    # each frame of the blend is a fresh field of static, and the transition
+    # crawls with full-screen noise. Measured by xfading two FLAT solid
+    # colours: at the midpoint `fade` produces exactly 1 distinct colour
+    # (a clean 50/50 blend) while `dissolve` produces 98,542 distinct
+    # colours with a per-channel std of ~91. On the user's own real export
+    # the per-frame high-frequency energy ran 1.8 -> 146.7 (56x baseline)
+    # across the 13 blended frames, peaking at the midpoint exactly as a
+    # random dissolve does. Both have the same MEAN brightness, which is why
+    # a brightness-over-time check reads as a perfectly smooth ramp and
+    # misses it entirely.
+    #
+    # xfade's "fade" is the plain linear cross-dissolve, which is exactly
+    # what the canvas preview does (`ctx.globalAlpha = progress` over clip A
+    # in drawJoinTransitionFrame). Confusingly named next to the unrelated
+    # per-clip fade-to-black transition elsewhere in this module, but it is
+    # the correct filter. Every other mapping below was verified clean by
+    # the same flat-colour test (high-frequency energy ~0).
+    "cross-fade": "fade",
     "slide-left": "slideleft",
     "slide-right": "slideright",
     # xfade has no literal "zoom + motion blur" preset; "zoomin" (the
@@ -299,6 +318,47 @@ def expand_join_transitions(segments: list[dict], fps: int) -> list[dict]:
             "segmentB": next_segment,
         })
     return expanded
+
+
+def strip_recipe_fade_envelope(segments: list[dict]) -> None:
+    """Zeroes every clip's `fadeInFrames`/`fadeOutFrames` for the single
+    baked video, in place.
+
+    Root cause for "there is some extra transition which I never set". Every
+    MotionRecipe carries a fade-in/out opacity envelope, defaulting to 14
+    frames at BOTH ends (see services/motion-engine/src/types.ts and
+    projects-client.ts). MotionClip.tsx ramps the clip's opacity over Remotion's
+    implicit black backdrop, and `build_recipe_zoompan_filter` reproduces that
+    natively with `fade=` — so on the timeline every clip fades to black at
+    its own end and back up from black at the next clip's start. The Timeline
+    canvas preview renders NO such envelope: `applyMotionRecipe` returns only
+    a rect and a blur, and `fadeOverlay` fades only for an explicit
+    transitionIn/Out of "fade"/"dip-to-white".
+
+    Measured on the user's own completed export (per-frame YAVG through
+    ffmpeg's signalstats): at a clip boundary the user had set to a plain
+    CUT, brightness ran 49.7 -> 0.5 -> 51.1 over ~0.4s — a full dip to black
+    where the preview hard-cuts. At a boundary set to cross-fade it was
+    worse: the outgoing clip faded to black (91.7 -> 6.4), hard-popped back
+    to full brightness, and only then cross-faded — because the clip's own
+    segment and the transition's virtually-extended tail window (see
+    `expand_join_transitions`) each run the envelope over their own separate
+    frame timeline.
+
+    Clip boundaries in the baked video are governed by transitionIn/
+    transitionOut alone — exactly the model the preview implements — so the
+    envelope is dropped here. An explicit "fade"/"dip-to-white" transition
+    still fades, through `_scaled_fade_seconds`, and still shows in preview.
+    Applied to segments (not to the manifest's stills) so the asset-bundle
+    export, which hands each clip to another editor as its own standalone
+    file, is left untouched."""
+    for segment in segments:
+        settings = segment.get("motionGraphicSettings")
+        if not settings:
+            continue
+        if not (settings.get("fadeInFrames") or settings.get("fadeOutFrames")):
+            continue
+        segment["motionGraphicSettings"] = {**settings, "fadeInFrames": 0, "fadeOutFrames": 0}
 
 
 def close_gaps(stills: list[dict], duration_seconds: float) -> list[dict]:
@@ -525,25 +585,50 @@ def _ease_expr(easing: str, t_expr: str) -> str:
 
 # Every field here left at its neutral/off value is what makes a MotionRecipe
 # eligible for `build_recipe_zoompan_filter` — see `_is_ffmpeg_native_recipe`.
+# `fadeInFrames`/`fadeOutFrames` are deliberately NOT in this dict even
+# though they're real, commonly-nonzero fields — the AI applies them
+# broadly (an "always-on unless disabled" envelope, not an optional accent
+# like Tier 2/4/5), so requiring them at exactly 0 used to route almost
+# every real clip through Remotion regardless of anything else. Reproduced
+# exactly via a plain `fade=` filter (see build_recipe_zoompan_filter), so
+# it's checked and handled there instead of disqualifying the fast path.
+#
+# `vignette` stays in this dict (i.e. still disqualifying) on purpose,
+# despite motion_graphics_engine.py's own Pydantic model defaulting it to
+# 0.15 on every recipe — an earlier attempt at a native ffmpeg equivalent
+# was reverted after live testing against a real export: MotionClip.tsx
+# renders this as a thin inset box-shadow (edges only, rest of the frame
+# untouched), but ffmpeg's own `vignette` filter is a full-frame radial lens
+# model with no parameter combination that reproduces a thin edge-only
+# darkening — at the low intensities this is actually used at, it either
+# does nothing or (the direction that first shipped, briefly) produces a
+# dramatically stronger, wrong-shaped effect that reads as pillarboxing on
+# a 16:9 frame. Left Remotion-gated, correctly, until a real native
+# equivalent exists.
 _FFMPEG_NATIVE_NEUTRAL_RECIPE = {
     "depthEffect": "none", "storyEffect": "none", "environmentEffect": "none",
-    "environmentIntensity": 0.0, "maskShape": "none", "vignette": 0.0,
-    "fadeInFrames": 0.0, "fadeOutFrames": 0.0, "motionBlurStrength": 0.0, "shakeAmount": 0.0,
+    "maskShape": "none", "vignette": 0.0, "motionBlurStrength": 0.0, "shakeAmount": 0.0,
     "speedCurve": "linear_pace", "saturationFrom": 1.0, "saturationTo": 1.0,
 }
 
 
 def _is_ffmpeg_native_recipe(recipe: dict) -> bool:
     """Whether a MotionRecipe uses ONLY Tier 1 (camera move — see
-    Motion_Graphics_SOP_v1.md's tier catalog) and can therefore render via
-    `build_recipe_zoompan_filter` — plain ffmpeg, no Remotion/Chromium
-    involved at all — instead of the real Remotion composition. This is a
-    pure opt-in fast path, never a capability regression: any field below
-    left at other than its neutral/off default routes the clip through
-    Remotion exactly as before, unchanged. Deliberately conservative —
-    Tier 2 (depth), Tier 4 (story), Tier 5 (environment), masks, glow,
-    rotation, motion blur/shake, and 'elastic' easing (see `_ease_expr`)
-    all still need the real render."""
+    Motion_Graphics_SOP_v1.md's tier catalog), plus optionally a fade-in/out
+    envelope (has a native, exact ffmpeg equivalent — see
+    `build_recipe_zoompan_filter`), and can therefore render via that
+    function — plain ffmpeg, no Remotion/Chromium involved at all — instead
+    of the real Remotion composition. This is a pure opt-in fast path, never
+    a capability regression: any field below left at other than its
+    neutral/off default routes the clip through Remotion exactly as before,
+    unchanged. Deliberately conservative — Tier 2 (depth), Tier 4 (story),
+    Tier 5 (environment), masks, glow, rotation, vignette, motion blur/
+    shake, and 'elastic' easing (see `_ease_expr`) all still need the real
+    render.
+    `environmentIntensity` is deliberately never checked here — it's inert
+    whenever `environmentEffect` is "none" (already required above), exactly
+    like a mask's own sub-fields (maskFromRadius/maskSoftness/...) are never
+    checked once maskShape=="none" already disqualifies nothing on its own."""
     for key, neutral in _FFMPEG_NATIVE_NEUTRAL_RECIPE.items():
         value = recipe.get(key, neutral)
         if isinstance(neutral, str):
@@ -566,6 +651,7 @@ def build_recipe_zoompan_filter(
     recipe: dict, width: int, height: int, fps: int, duration: float, frames: int,
     color_filter: str = "none", color_filter_intensity: float = 50.0,
     transition_in: str = "cut", transition_out: str = "cut", transition_intensity: float = 50.0,
+    zoompan_hold_frames: int | None = None, motion_frames: int | None = None,
 ) -> str:
     """FFmpeg-native equivalent of a Tier-1-only MotionRecipe — mathematically
     derived from timeline-rendering.ts's `applyMotionRecipe` (translate-then-
@@ -580,9 +666,44 @@ def build_recipe_zoompan_filter(
     — lets that clip skip the Remotion/Chromium render entirely, which by
     clip *count* is most of them (Tier 1 is required on every recipe; Tiers
     2/4/5 are optional accents per the SOP's own diversity guidance, not
-    the default shape)."""
+    the default shape).
+
+    `zoompan_hold_frames` controls zoompan's own `d=` option — how many
+    output frames it holds each incoming source frame for. Left `None`
+    (the default), it's `frames`: correct for an "image" segment, whose
+    input is a single still fed through `-loop 1`, so zoompan itself has to
+    stretch that one real input frame across the whole clip. A "video"
+    segment's input is already a real, already-moving video stream at one
+    input frame per output frame — holding each of ITS frames for `frames`
+    output frames would replay the same source frame `frames` times over
+    (freezing the video, and blowing up the frame count to roughly
+    frames**2). The `video`-segment call site passes `zoompan_hold_frames=1`
+    so each source frame maps to exactly one (zoomed/panned) output frame,
+    same as any ordinary ffmpeg filter on a video stream.
+
+    `recipe["fadeInFrames"]`/`["fadeOutFrames"]` are also handled natively
+    here rather than disqualifying the clip (see `_FFMPEG_NATIVE_NEUTRAL_
+    RECIPE`'s own comment on why — an "always on unless disabled" default on
+    a real recipe, not a rare accent): MotionClip.tsx ramps this clip's own
+    opacity 0->1->1->0 over the given frame counts at each end, composited
+    onto Remotion's implicit black backdrop — i.e. exactly a fade-to-black
+    envelope, reproduced exactly (not an approximation) via the same `fade=`
+    filter every other fade in this module already uses, timed in frames
+    (this recipe's own natural timeline) rather than the segment's trimmed
+    output duration — same clamp-to-half-the-clip rule as MotionClip.tsx's
+    own `fadeIn`/`fadeOut` to match its behavior exactly. `recipe["vignette"]`
+    is deliberately NOT handled here — see `_FFMPEG_NATIVE_NEUTRAL_RECIPE`'s
+    own comment on the reverted native attempt; any nonzero vignette still
+    disqualifies the whole clip from this function being reached at all."""
     frames = max(1, frames)
-    t_expr = f"min(1,on/{max(1, frames - 1)})"
+    # How many frames the camera move normalises its 0->1 progress over, when
+    # that differs from how many frames actually get rendered. Only a join
+    # transition's tail window sets this (see `_transition_tail_head_segments`);
+    # everywhere else it is exactly `frames`, i.e. unchanged behavior. The
+    # `min(1, ...)` clamp means the extra rendered frames hold at the
+    # fully-eased end pose instead of running a stretched, slower curve.
+    motion_span = max(1, (motion_frames if motion_frames else frames) - 1)
+    t_expr = f"min(1,on/{motion_span})"
     eased = _ease_expr(recipe.get("easing", "ease"), t_expr)
     scale_from = float(recipe.get("scaleFrom", 1.0))
     scale_to = float(recipe.get("scaleTo", 1.0))
@@ -602,13 +723,25 @@ def build_recipe_zoompan_filter(
     x_expr = f"(iw-iw/zoom)*{sx:.6f}-(iw/zoom)*{px_expr}"
     y_expr = f"(ih-ih/zoom)*{sy:.6f}-(ih/zoom)*{py_expr}"
 
+    # The recipe's own fade-in/out opacity envelope (see this function's own
+    # doc comment) — timed against `frames` (this recipe's natural
+    # timeline), independent of `duration`/the transitionIn/Out fades below.
+    # Same half-the-clip clamp as MotionClip.tsx's `fadeIn`/`fadeOut`.
+    fades: list[str] = []
+    fade_in_frames = max(0.0, min(float(recipe.get("fadeInFrames", 0.0) or 0.0), frames / 2))
+    fade_out_frames = max(0.0, min(float(recipe.get("fadeOutFrames", 0.0) or 0.0), frames / 2))
+    if fade_in_frames > 0:
+        fades.append(f"fade=t=in:st=0:d={fade_in_frames / fps:.3f}:color=black")
+    if fade_out_frames > 0:
+        envelope_fade_out_start = max(0.0, frames / fps - fade_out_frames / fps)
+        fades.append(f"fade=t=out:st={envelope_fade_out_start:.3f}:d={fade_out_frames / fps:.3f}:color=black")
+
     # Same fade-to-black/white handling as build_image_filter, and the same
     # transition-intensity scaling (_scaled_fade_seconds) every other
     # segment kind already gets — a Tier-1-only recipe still has its own
     # transitionIn/Out like any other still.
     fade_in_duration = _scaled_fade_seconds(duration, transition_intensity)
     fade_out_duration = _scaled_fade_seconds(duration, transition_intensity)
-    fades = []
     if transition_in in ("fade", "dip-to-white"):
         in_color = "white" if transition_in == "dip-to-white" else "black"
         fades.append(f"fade=t=in:st=0:d={fade_in_duration:.3f}:color={in_color}")
@@ -622,9 +755,24 @@ def build_recipe_zoompan_filter(
     pre_scale = max(width, height) * 8
     color_vf = build_color_filter_vf(color_filter, color_filter_intensity)
     color_node = f",{color_vf}" if color_vf else ""
+    hold = frames if zoompan_hold_frames is None else max(1, zoompan_hold_frames)
+    # zoompan's own `fps=` option only sets the OUTPUT timebase/pacing for
+    # `on`'s time math — with `d=1` (a real video source, one output frame
+    # per real input frame) it does NOT resample the stream, unlike the
+    # image-loop case where zoompan's `d={frames}` already fully controls
+    # frame count independent of any source rate. A real source clip's own
+    # native fps very often differs from the export's target fps (confirmed
+    # against a real Veo-generated clip: 24fps/185 frames feeding a 30fps/
+    # 260-frame slot) — without resampling first, zoompan just runs out of
+    # real input frames early, silently emitting fewer output frames than
+    # `-frames:v` asked for and desyncing every segment after it in the
+    # final concat. An explicit `fps=` FILTER (not zoompan's option) before
+    # scale/zoompan forces the real resample, exactly like build_video_filter
+    # already does for a video with no recipe at all.
+    fps_resample_node = f"fps={fps}," if zoompan_hold_frames is not None else ""
     return (
-        f"scale={pre_scale}:-2,zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
-        f"d={frames}:s={width}x{height}:fps={fps}{color_node}{fade}"
+        f"{fps_resample_node}scale={pre_scale}:-2,zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
+        f"d={hold}:s={width}x{height}:fps={fps}{color_node}{fade}"
     )
 
 
@@ -845,6 +993,7 @@ def _ensure_motion_engine_ready() -> None:
 def _render_motion_graphic(
     media_path: str, source_kind: str, effect: str, settings: dict,
     frames: int, fps: int, width: int, height: int, out_path: Path,
+    motion_frames: int | None = None,
 ) -> None:
     """Renders one clip's AI-composed (or manually overridden) motion recipe
     via services/motion-engine's generalized `MotionClip` composition,
@@ -874,6 +1023,10 @@ def _render_motion_graphic(
         "sourceKind": source_kind,
         "recipe": settings,
         "durationInFrames": max(1, frames),
+        # Omitted unless it actually differs — MotionClip falls back to
+        # durationInFrames, i.e. unchanged behavior for every ordinary clip.
+        **({"motionDurationInFrames": max(1, motion_frames)}
+           if motion_frames and motion_frames != frames else {}),
         "fps": fps,
         "width": width,
         "height": height,
@@ -948,43 +1101,83 @@ def _encode_segment_to_path(
     duration = max(0.05, segment["end"] - segment["start"])
     output_frames = segment["frames"]
     original_frames = segment.get("_originalFrames", output_frames)
+    # Normally identical to `original_frames`; only a join transition's tail
+    # window renders MORE frames than the clip's camera move is normalised
+    # over (see `_transition_tail_head_segments`).
+    motion_frames = segment.get("_motionFrames", original_frames)
     trim_start_frames = segment.get("_trimStartFrames", 0)
     if (
-        segment["kind"] == "image"
+        segment["kind"] in ("image", "video")
         and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings")
         and _is_ffmpeg_native_recipe(segment["motionGraphicSettings"])
     ):
         # Tier-1-only recipe (see _is_ffmpeg_native_recipe) — one plain
         # ffmpeg pass via build_recipe_zoompan_filter, no Remotion/Chromium
-        # involved at all. Mirrors the plain "image" branch below exactly
-        # (same -loop 1 input, same trim handling) with the recipe-derived
-        # zoompan filter standing in for build_image_filter's discrete
-        # presets.
-        vf = build_recipe_zoompan_filter(
-            segment["motionGraphicSettings"], width, height, fps, duration, original_frames,
-            segment.get("colorFilter", "none"), segment.get("colorFilterIntensity", 50.0),
-            segment.get("transitionIn", "cut"), segment.get("transitionOut", "cut"),
-            segment.get("transitionIntensity", 50.0),
-        )
-        if trim_start_frames > 0:
-            vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
-        run_ffmpeg([
-            "-y", "-loop", "1", "-t", f"{duration + 1:.3f}", "-i", segment["path"],
-            "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
-            "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
-        ])
+        # involved at all. Originally "image"-only; a "video" segment
+        # (an animation/imported clip carrying nothing beyond the mandatory
+        # Tier-1 camera move — the common case, since Tiers 2/4/5 are
+        # optional accents) qualifies exactly the same way and used to fall
+        # through to the Remotion branch below unconditionally regardless of
+        # how simple its recipe was — the dominant cost of a real export on
+        # any timeline built mostly from animation clips, each paying
+        # Remotion's per-clip render even for a plain push-in.
+        if segment["kind"] == "image":
+            # Mirrors the plain "image" branch below exactly (same -loop 1
+            # input, same trim handling) with the recipe-derived zoompan
+            # filter standing in for build_image_filter's discrete presets.
+            vf = build_recipe_zoompan_filter(
+                segment["motionGraphicSettings"], width, height, fps, duration, original_frames,
+                segment.get("colorFilter", "none"), segment.get("colorFilterIntensity", 50.0),
+                segment.get("transitionIn", "cut"), segment.get("transitionOut", "cut"),
+                segment.get("transitionIntensity", 50.0),
+                motion_frames=motion_frames,
+            )
+            if trim_start_frames > 0:
+                vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
+            run_ffmpeg([
+                "-y", "-loop", "1", "-t", f"{duration + 1:.3f}", "-i", segment["path"],
+                "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+                "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
+            ])
+        else:
+            # "video" source — already a real, moving video stream (one
+            # input frame per output frame), unlike the "image" branch's
+            # `-loop 1` single still. `zoompan_hold_frames=1` tells zoompan
+            # to hold each incoming frame for exactly one output frame
+            # instead of stretching a single source frame across the whole
+            # clip (see build_recipe_zoompan_filter's own doc comment).
+            vf = build_recipe_zoompan_filter(
+                segment["motionGraphicSettings"], width, height, fps, duration, original_frames,
+                segment.get("colorFilter", "none"), segment.get("colorFilterIntensity", 50.0),
+                segment.get("transitionIn", "cut"), segment.get("transitionOut", "cut"),
+                segment.get("transitionIntensity", 50.0),
+                zoompan_hold_frames=1, motion_frames=motion_frames,
+            )
+            # Same stale-asset safety net + trim handling as the plain
+            # (no-recipe) "video" branch below — see its own comments.
+            source_duration = segment.get("sourceDurationSeconds")
+            if source_duration is not None and source_duration < duration - 0.05:
+                vf = f"tpad=stop_mode=clone:stop_duration={duration - source_duration:.3f},{vf}"
+            if trim_start_frames > 0:
+                vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
+            run_ffmpeg([
+                "-y", "-i", segment["path"],
+                "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+                "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
+            ])
     elif segment["kind"] in ("image", "video") and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings"):
-        # AI-composed (or manually overridden) motion recipe: render the real
+        # AI-composed (or manually overridden) motion recipe that actually
+        # needs Tier 2/4/5 (depth/story/environment/mask/glow/rotation/
+        # elastic easing — see _is_ffmpeg_native_recipe): render the real
         # thing via services/motion-engine instead of approximating it with
-        # a zoompan preset (image) or leaving it static (video — see
-        # build_video_filter's own docstring), then apply this segment's own
-        # color filter and transition fades on top in an ordinary second
-        # ffmpeg pass — same post-processing every other segment kind already
-        # gets. A still replaced by an animation/imported clip keeps
-        # whatever Camera Effect was set on it (see build_segments), so a
-        # "video" segment goes through the exact same Remotion render as an
-        # "image" one — just with a video source (`source_kind="video"`,
-        # see `_render_motion_graphic`) instead of a static one.
+        # a zoompan preset, then apply this segment's own color filter and
+        # transition fades on top in an ordinary second ffmpeg pass — same
+        # post-processing every other segment kind already gets. A "video"
+        # segment goes through the exact same Remotion render as an "image"
+        # one — just with a video source (`source_kind="video"`, see
+        # `_render_motion_graphic`) instead of a static one. A Tier-1-only
+        # recipe on either kind is handled entirely by the branch above and
+        # never reaches here.
         # `run()` pre-renders every motion-graphic clip it can up front, in
         # one batched Node process that bundles once and reuses one browser
         # across all of them (see `_batch_render_motion_graphics`) — far
@@ -1004,7 +1197,7 @@ def _encode_segment_to_path(
             _render_motion_graphic(
                 segment["path"], "video" if segment["kind"] == "video" else "image",
                 segment["motionGraphicEffect"], segment["motionGraphicSettings"],
-                original_frames, fps, width, height, raw_path,
+                original_frames, fps, width, height, raw_path, motion_frames,
             )
         vf_parts = []
         color_vf = build_color_filter_vf(
@@ -1105,28 +1298,45 @@ def _encode_segment_to_path(
         ])
 
 
-def _build_transition_segment(
-    segment: dict, index: int, width: int, height: int, fps: int, work_dir: Path, out_path: Path,
-) -> None:
-    """Renders a join transition (cross-fade/slide-left/slide-right/
-    zoom-blur) as an `xfade` blend of the outgoing clip's tail window and the
-    incoming clip's head window — each rendered as its own short clip first
-    (reusing `_encode_segment_to_path` with the trim/frame-count tricks that
-    give exactly the tail or head of that clip's own motion timeline), then
-    combined in one more ffmpeg pass. The "tail window" is rendered from a
-    virtually-extended copy of the outgoing clip (see `expand_join_transitions`
-    for why) — its own independent segment elsewhere is untouched."""
+def _transition_tail_head_segments(segment: dict, fps: int) -> tuple[dict, dict]:
+    """Builds the two synthetic segments a join transition renders and blends
+    (see `_build_transition_segment`): a `tail_segment` covering the last
+    `transition_frames` of the outgoing clip's own motion timeline (from a
+    virtually-extended copy — see `expand_join_transitions` for why) and a
+    `head_segment` covering the first `transition_frames` of the incoming
+    clip's. Factored out so `run()` can compute the exact same shapes to
+    fold their Remotion renders into the upfront batch pre-render (see its
+    own call site) — the transition-encoding path itself doesn't care
+    whether `_encode_segment_to_path` reaches Remotion via a pre-rendered
+    raw clip or its own per-clip fallback, only that the segment shapes it
+    encodes are exactly these."""
     transition_frames = segment["frames"]
     segment_a = segment["segmentA"]
     segment_b = segment["segmentB"]
-    tail_path = work_dir / f"seg_{index:04d}_a.ts"
-    head_path = work_dir / f"seg_{index:04d}_b.ts"
     nominal_a_frames = segment_a["_originalFrames"]
     tail_segment = {
         **segment_a,
         "end": segment_a["end"] + transition_frames / fps,
         "frames": transition_frames,
         "_originalFrames": nominal_a_frames + transition_frames,
+        # Root-cause coverage for a visible pop at the instant every join
+        # transition starts. The tail is rendered LONGER than the clip's own
+        # segment (it continues past the nominal end so the blend has
+        # footage), and the camera move used to normalise its 0->1 progress
+        # over that longer length — so the same clip ran a DIFFERENT, slower
+        # curve inside the transition than it did in its own segment, and the
+        # picture jumped backwards at the join. Measured on a real 4K export:
+        # the transition's first frame is pure clip A (xfade progress 0, no
+        # blending at all) yet differed from the preceding frame by 13.7x the
+        # local per-frame motion; across the 87-still project's 86
+        # transitions the implied jump was a median 3.6px and up to 8.8px of
+        # edge displacement. Pinning the motion to the clip's real length
+        # makes the tail the exact continuation of its own segment; because
+        # the progress interpolation clamps at 1, the extra frames hold at
+        # the fully-eased end pose. `_originalFrames` above still governs the
+        # RENDER length, so a video source keeps playing real footage here
+        # rather than freezing.
+        "_motionFrames": nominal_a_frames,
         "_trimStartFrames": nominal_a_frames,
         "transitionIn": "cut", "transitionOut": "cut",
     }
@@ -1137,8 +1347,36 @@ def _build_transition_segment(
         "_trimStartFrames": 0,
         "transitionIn": "cut", "transitionOut": "cut",
     }
+    return tail_segment, head_segment
+
+
+def _build_transition_segment(
+    segment: dict, index: int, width: int, height: int, fps: int, work_dir: Path, out_path: Path,
+) -> None:
+    """Renders a join transition (cross-fade/slide-left/slide-right/
+    zoom-blur) as an `xfade` blend of the outgoing clip's tail window and the
+    incoming clip's head window — each rendered as its own short clip first
+    (reusing `_encode_segment_to_path` with the trim/frame-count tricks that
+    give exactly the tail or head of that clip's own motion timeline), then
+    combined in one more ffmpeg pass. The "tail window" is rendered from a
+    virtually-extended copy of the outgoing clip (see `expand_join_transitions`
+    for why) — its own independent segment elsewhere is untouched.
+
+    `segment["_preRenderedTailRawPath"]`/`_preRenderedHeadRawPath`, when
+    present (set by `run()`'s upfront batch pre-render — see its own call
+    site), are forwarded onto the tail/head segment's `_preRenderedRawPath`
+    so `_encode_segment_to_path`'s existing pre-render-reuse branch picks
+    them up instead of falling back to a fresh per-clip Remotion render."""
+    tail_path = work_dir / f"seg_{index:04d}_a.ts"
+    head_path = work_dir / f"seg_{index:04d}_b.ts"
+    tail_segment, head_segment = _transition_tail_head_segments(segment, fps)
+    if segment.get("_preRenderedTailRawPath"):
+        tail_segment["_preRenderedRawPath"] = segment["_preRenderedTailRawPath"]
+    if segment.get("_preRenderedHeadRawPath"):
+        head_segment["_preRenderedRawPath"] = segment["_preRenderedHeadRawPath"]
     _encode_segment_to_path(tail_segment, tail_path, width, height, fps)
     _encode_segment_to_path(head_segment, head_path, width, height, fps)
+    transition_frames = segment["frames"]
     xfade_name = _XFADE_TRANSITION_NAMES.get(segment["transitionType"], "fade")
     transition_seconds = transition_frames / fps
     try:
@@ -1213,6 +1451,193 @@ def escape_subtitles_path(path: Path) -> str:
 _BUNDLED_FONTS_DIR = _without_extended_path_prefix(Path(__file__).resolve().parent / "fonts")
 
 
+def _read_font_metrics(path: Path) -> tuple[str, int, int, int] | None:
+    """Reads (family_name_lowercased, unitsPerEm, usWinAscent, usWinDescent)
+    straight out of a TrueType/OpenType file's `head`, `OS/2` and `name`
+    tables. Deliberately hand-rolled rather than pulling in fontTools: these
+    are three fixed-offset reads from a table directory, and the export
+    engine's dependency set is intentionally small. Returns None for
+    anything that isn't a font we can parse — every caller treats that as
+    "apply no correction", i.e. exactly the pre-existing behavior."""
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(12)
+            if len(header) < 12:
+                return None
+            if header[:4] == b"ttcf":  # font collection — use its first face
+                handle.seek(12)
+                first_offset = int.from_bytes(handle.read(4), "big")
+                handle.seek(first_offset)
+                header = handle.read(12)
+                table_base = first_offset + 12
+            else:
+                table_base = 12
+            if header[:4] not in (b"\x00\x01\x00\x00", b"OTTO", b"true"):
+                return None
+            table_count = int.from_bytes(header[4:6], "big")
+            handle.seek(table_base)
+            directory = handle.read(16 * table_count)
+            tables: dict[bytes, int] = {}
+            for i in range(table_count):
+                record = directory[i * 16:(i + 1) * 16]
+                if len(record) < 16:
+                    break
+                tables[record[:4]] = int.from_bytes(record[8:12], "big")
+            if not {b"head", b"OS/2", b"name"} <= tables.keys():
+                return None
+
+            handle.seek(tables[b"head"] + 18)
+            units_per_em = int.from_bytes(handle.read(2), "big")
+            # usWinAscent/usWinDescent live at a fixed offset in every OS/2
+            # table version (they were present from version 0 onward).
+            handle.seek(tables[b"OS/2"] + 74)
+            win_ascent = int.from_bytes(handle.read(2), "big")
+            win_descent = int.from_bytes(handle.read(2), "big")
+
+            name_offset = tables[b"name"]
+            handle.seek(name_offset)
+            _format, record_count, strings_offset = (
+                int.from_bytes(handle.read(2), "big") for _ in range(3)
+            )
+            records = handle.read(12 * record_count)
+            family = ""
+            for i in range(record_count):
+                record = records[i * 12:(i + 1) * 12]
+                if len(record) < 12:
+                    break
+                platform_id = int.from_bytes(record[0:2], "big")
+                name_id = int.from_bytes(record[6:8], "big")
+                if name_id != 1:  # 1 == font family name
+                    continue
+                length = int.from_bytes(record[8:10], "big")
+                offset = int.from_bytes(record[10:12], "big")
+                handle.seek(name_offset + strings_offset + offset)
+                raw = handle.read(length)
+                decoded = raw.decode("utf-16-be" if platform_id == 3 else "latin-1", "ignore")
+                if decoded:
+                    family = decoded
+                    if platform_id == 3:  # prefer the Windows/Unicode record
+                        break
+            if not family or units_per_em <= 0:
+                return None
+            return family.strip().lower(), units_per_em, win_ascent, win_descent
+    except (OSError, ValueError):
+        return None
+
+
+def _font_search_dirs() -> list[Path]:
+    """Bundled fonts first — those are the ones libass is explicitly pointed
+    at via the `ass` filter's `fontsdir` — then the OS font directories that
+    supply everything in CAPTION_FONT_OPTIONS other than Rubik."""
+    dirs = [_BUNDLED_FONTS_DIR]
+    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+    if system_root:
+        dirs.append(Path(system_root) / "Fonts")
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        dirs.append(Path(local_app_data) / "Microsoft" / "Windows" / "Fonts")
+    return dirs
+
+
+_FONT_METRICS_CACHE: dict[str, tuple[int, int, int]] | None = None
+
+
+def _font_metrics_index() -> dict[str, tuple[int, int, int]]:
+    """family_lowercased -> (unitsPerEm, usWinAscent, usWinDescent), built
+    once per process. Bundled fonts win over identically-named system ones,
+    matching libass's own precedence when handed a `fontsdir`."""
+    global _FONT_METRICS_CACHE
+    if _FONT_METRICS_CACHE is not None:
+        return _FONT_METRICS_CACHE
+    index: dict[str, tuple[int, int, int]] = {}
+    for directory in _font_search_dirs():
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.suffix.lower() not in (".ttf", ".otf", ".ttc"):
+                continue
+            parsed = _read_font_metrics(entry)
+            if not parsed:
+                continue
+            family, units_per_em, win_ascent, win_descent = parsed
+            index.setdefault(family, (units_per_em, win_ascent, win_descent))
+    _FONT_METRICS_CACHE = index
+    return index
+
+
+def _font_metrics(font_family: str) -> tuple[int, int, int] | None:
+    return _font_metrics_index().get((font_family or "").strip().lower())
+
+
+# Root-cause coverage for "the caption in the export looks nothing like the
+# preview — even the style looks different".
+#
+# A Canvas2D `ctx.font = "66px Rubik"` sets the EM SQUARE to 66 device
+# pixels. ASS's `\fs66` does NOT mean the same thing: libass reproduces
+# VSFilter's historical sizing convention (see libass's own
+# `ass_face_set_size`), which scales the requested size by
+# `(hheaAscender - hheaDescender) / (usWinAscent + usWinDescent)` and then
+# asks FreeType for a REAL_DIM size — one where ascender+descender, not the
+# em square, equals the request. Those two steps collapse to
+#
+#     rendered_em_px == fs * unitsPerEm / (usWinAscent + usWinDescent)
+#
+# For the bundled Rubik (unitsPerEm 1000, usWinAscent 1066, usWinDescent
+# 466) that factor is 0.653, so a caption tuned in the preview burned in
+# roughly 35% too small at every resolution. Measured on real burns of the
+# real project's own captions.ass: at `\fs66` the rendered line is 439px
+# wide where the canvas preview draws 671px; multiplying \fs by the
+# reciprocal below lands the burn at 671px — an exact match.
+#
+# Every OTHER ASS quantity (\bord, \xshad/\yshad, \blur, margins) is in
+# plain script units == pixels and must NOT be scaled by this, which is why
+# the correction is applied only where \fs / Fontsize are emitted, and
+# `_scaled_font_size` keeps returning the canvas-space pixel size that the
+# outline/shadow formulas are calibrated against.
+def _libass_font_size_scale(font_family: str) -> float:
+    metrics = _font_metrics(font_family)
+    if not metrics:
+        return 1.0
+    units_per_em, win_ascent, win_descent = metrics
+    win_total = win_ascent + win_descent
+    if units_per_em <= 0 or win_total <= 0:
+        return 1.0
+    return win_total / units_per_em
+
+
+# drawCaptionText places a bottom-aligned block's last baseline at
+# `height - margin - lineHeight*0.2`, and lineHeight is `fontSize * 1.25` —
+# i.e. it reserves exactly 0.25 * fontSize of descent below the last
+# baseline. libass instead reserves the font's own `usWinDescent`, which for
+# Rubik is 0.466 em — so an `\an2` line sits ~0.216 * fontSize higher in the
+# frame than the same caption does in preview (a measured 15px at 1080p with
+# the default style). Correcting MarginV by the difference lines the two up
+# to within a pixel across every font size tested.
+_CANVAS_BOTTOM_DESCENT_FRACTION = 0.25
+# drawCaptionText's top-aligned baseline is `margin + lineHeight*0.8`, i.e.
+# it reserves exactly 1.0 * fontSize of ascent above the first baseline,
+# against libass's own `usWinAscent`.
+_CANVAS_TOP_ASCENT_FRACTION = 1.0
+
+
+def _libass_margin_v_correction(font_family: str, position: str, font_size: float) -> float:
+    """Pixels to subtract from the nominal 5%-of-height caption margin so an
+    ASS `\\an2`/`\\an8` line lands where the canvas preview draws it."""
+    metrics = _font_metrics(font_family)
+    if not metrics:
+        return 0.0
+    units_per_em, win_ascent, win_descent = metrics
+    if units_per_em <= 0:
+        return 0.0
+    if position == "top":
+        return (win_ascent / units_per_em - _CANVAS_TOP_ASCENT_FRACTION) * font_size
+    if position == "middle":
+        return 0.0  # \an5 centres vertically and ignores MarginV entirely
+    return (win_descent / units_per_em - _CANVAS_BOTTOM_DESCENT_FRACTION) * font_size
+
+
 def to_ass_ts(seconds: float) -> str:
     """ASS timestamp: H:MM:SS.cc (centiseconds) — distinct from SRT's
     HH:MM:SS,mmm, hours is not zero-padded to a fixed width."""
@@ -1258,6 +1683,19 @@ def _opacity_to_alpha_byte(opacity_percent) -> int:
 # the exact on-screen proportion at whatever the export's real height is.
 _REFERENCE_CAPTION_HEIGHT = 540.0
 
+# What a default style (fontSizePx 22) produces at _scaled_font_size,
+# evaluated at _REFERENCE_CAPTION_HEIGHT — used to scale shadow distance/blur
+# proportionally to font_size (see _resolve_shadow) rather than to height
+# directly, so it stays correct for BOTH portrait and landscape exports (a
+# height-only reference silently assumed 540 meant "the landscape preview
+# canvas", which isn't true for a 9:16 project's own, taller, preview
+# canvas). Matches timeline-rendering.ts's `REFERENCE_FONT_SIZE_PX` exactly.
+_REFERENCE_FONT_SIZE_PX = _REFERENCE_CAPTION_HEIGHT * 0.045
+
+# The canvas shadowBlur (px) that the 0-100% "Blur" slider maps to at 100% —
+# mirrors timeline-rendering.ts's `MAX_SHADOW_BLUR_PX` exactly.
+MAX_SHADOW_BLUR_PX = 20.0
+
 
 def _scaled_font_size(style: dict, height: int) -> float:
     raw = float(_style_value(style, "fontSizePx", 22) or 22)
@@ -1265,8 +1703,20 @@ def _scaled_font_size(style: dict, height: int) -> float:
 
 
 def _scaled_outline_width(style: dict, font_size: float) -> float:
+    """Root-cause coverage for "the caption outline is way bolder than what I
+    picked": timeline-rendering.ts's canvas preview draws the outline with
+    `ctx.lineWidth` — a CENTERED stroke, so only half of that width is
+    actually visible outside the glyph fill (the other half is painted over
+    by the fill). ASS's `\\bord` is a different convention: libass paints the
+    full value as an outward-only border with nothing centered over the
+    fill — confirmed empirically (burned a real ASS file at this formula's
+    un-corrected value next to a halved one; the un-corrected one is
+    visibly, roughly 2x heavier). The `* 0.5` here corrects specifically for
+    that renderer difference — it does NOT exist in timeline-rendering.ts's
+    matching formula, and must not be added there; canvas already needs no
+    correction since its stroke is centered to begin with."""
     raw = float(_style_value(style, "outlineWidthPx", 2) or 0)
-    return max(0.0, (raw / 2.0) * font_size * 0.16)
+    return max(0.0, (raw / 2.0) * font_size * 0.16 * 0.5)
 
 
 # The Timeline's canvas preview keeps captions a fixed 5% of the canvas's own
@@ -1285,46 +1735,91 @@ def _scaled_caption_margins(width: int, height: int) -> tuple[int, int, int]:
     return margin_lr, margin_lr, margin_v
 
 
-def _resolve_shadow(style: dict, height: int) -> tuple[float, float, int, str, int]:
+def _resolve_shadow(style: dict, font_size: float) -> tuple[float, float, int, str, int]:
     """Maps our {enabled, color, opacity, blur%, distance, angle} shadow shape
     onto ASS's independent \\xshad/\\yshad offsets (computed from distance +
     angle, unlike classic ASS's single diagonal \\shad depth) plus a \\blur
     softness and a shadow color/alpha for \\4c/\\4a. Distance and blur scale
-    with height the same way font size does (see _scaled_font_size), so a
-    shadow tuned in preview stays proportionally the same size at any export
-    resolution instead of shrinking to nothing at 1080p/1920px. Returns
-    (xshad, yshad, blur, shadow_color_hex, shadow_alpha_byte)."""
+    with font_size (see _scaled_font_size) — the SAME quantity
+    timeline-rendering.ts's canvas preview now also scales its own shadow by
+    (previously the canvas left shadow completely unscaled while this
+    scaled it by height/540, so the export always rendered a stronger,
+    differently-sized shadow than what preview showed) — so a shadow tuned
+    in preview matches what actually gets burned in, at any resolution or
+    aspect ratio. Returns (xshad, yshad, blur, shadow_color_hex, shadow_alpha_byte)."""
     shadow = _style_value(style, "shadow", {}) or {}
     if not shadow.get("enabled"):
-        return 0.0, 0.0, 0, "#000000", 255
-    scale = height / _REFERENCE_CAPTION_HEIGHT
+        return 0.0, 0.0, 0.0, "#000000", 255
+    scale = font_size / _REFERENCE_FONT_SIZE_PX
     distance = float(shadow.get("distance", 2) or 0) * scale
     angle_rad = math.radians(float(shadow.get("angle", 90) or 0))
     xshad = round(distance * math.cos(angle_rad), 2)
     yshad = round(distance * math.sin(angle_rad), 2)
-    # ASS's \blur is a small softness radius, not a percentage — this keeps
-    # the same practical 0-4 range (at the reference height) the export was
-    # already tuned against, just fed from a 0-100% slider instead of a raw
-    # 0-12 unit value.
-    blur = max(0, min(4, round((float(shadow.get("blur", 30) or 0) / 100) * 8 * scale)))
+    # timeline-rendering.ts sets `ctx.shadowBlur` to
+    # `(blur%/100) * MAX_SHADOW_BLUR_PX(20) * scale` — and per the canvas
+    # spec `shadowBlur` is TWICE the gaussian standard deviation, whereas
+    # libass's `\blur` IS that standard deviation. Halving converts between
+    # the two conventions; confirmed by burning the real style at a sweep of
+    # \blur values and picking the one closest to the canvas render (the
+    # error curve is flat between 5 and 8, and this lands at 8.15).
+    blur = round((float(shadow.get("blur", 30) or 0) / 100) * (MAX_SHADOW_BLUR_PX / 2) * scale, 2)
     shadow_alpha = _opacity_to_alpha_byte(shadow.get("opacity", 70))
     return xshad, yshad, blur, shadow.get("color") or "#000000", shadow_alpha
 
 
-def _ass_override_tags(style: dict, height: int) -> str:
+def _ass_line_geometry(style: dict, width: int, height: int) -> tuple[str, int, int, int, int]:
+    """(base_tags, ass_font_size, alignment, margin_lr, margin_v) shared by a
+    caption's text layer and its shadow layer, so the two always lay out
+    identically and overlay exactly."""
     font_family = _style_value(style, "fontFamily", "Arial Black")
-    font_size = round(_scaled_font_size(style, height))
+    font_size = _scaled_font_size(style, height)              # canvas-space px
+    ass_font_size = max(1, round(font_size * _libass_font_size_scale(font_family)))
     bold = 1 if _style_value(style, "bold", True) else 0
+    position = _style_value(style, "position", "bottom")
+    alignment = _ASS_ALIGNMENT.get(position, 2)
+    outline_width = round(_scaled_outline_width(style, font_size), 2)
+    margin_lr, _, nominal_margin_v = _scaled_caption_margins(width, height)
+    margin_v = max(
+        1, round(nominal_margin_v - _libass_margin_v_correction(font_family, position, font_size))
+    )
+    base = f"\\fn{font_family}\\fs{ass_font_size}\\b{bold}\\bord{outline_width}\\an{alignment}"
+    return base, ass_font_size, alignment, margin_lr, margin_v
+
+
+def _ass_override_tags(style: dict, height: int, width: int = 1920) -> str:
+    """Override block for a caption's TEXT layer — sharp glyphs, no shadow.
+
+    The shadow moves to its own lower Dialogue layer (see
+    `_ass_shadow_layer_tags`): ASS's `\\blur` softens the whole rendered
+    glyph — fill AND outline — whereas the canvas preview's `ctx.shadowBlur`
+    softens ONLY the drop shadow and leaves the text razor-sharp. Emitting
+    `\\blur` on the text itself (what this used to do) visibly fuzzed the
+    outline in every export, which is a large part of "the caption looks
+    different than the preview". `\\shad0` here guarantees the text layer
+    never draws a shadow of its own on top of the dedicated shadow layer."""
+    base, *_ = _ass_line_geometry(style, width, height)
     blend_alpha = _opacity_to_alpha_byte(_style_value(style, "opacity", 100))
     color = _to_ass_color(_style_value(style, "color", "#FFFFFF"), blend_alpha)
     outline_color = _to_ass_color(_style_value(style, "outlineColor", "#000000"), blend_alpha)
-    outline_width = round(_scaled_outline_width(style, font_size), 2)
-    alignment = _ASS_ALIGNMENT.get(_style_value(style, "position", "bottom"), 2)
-    xshad, yshad, blur, shadow_color, shadow_alpha = _resolve_shadow(style, height)
-    shadow_color_ass = _to_ass_color(shadow_color, shadow_alpha)
+    return "{" + base + f"\\c{color}\\3c{outline_color}\\shad0" + "}"
+
+
+def _ass_shadow_layer_tags(style: dict, height: int, width: int = 1920) -> str | None:
+    """Override block for a caption's SHADOW layer, or None when the style
+    has no shadow. Fill and outline are made fully transparent (`\\1a`/`\\3a`
+    at &HFF&) so only the offset, blurred shadow copy renders — reproducing
+    the canvas's "sharp text + soft shadow" exactly, which single-layer ASS
+    cannot express."""
+    font_size = _scaled_font_size(style, height)
+    xshad, yshad, blur, shadow_color, shadow_alpha = _resolve_shadow(style, font_size)
+    if not (xshad or yshad or blur):
+        return None
+    base, *_ = _ass_line_geometry(style, width, height)
+    shadow_color_ass = _to_ass_color(shadow_color, 0)
     tags = (
-        f"\\fn{font_family}\\fs{font_size}\\b{bold}\\c{color}\\3c{outline_color}\\4c{shadow_color_ass}"
-        f"\\bord{outline_width}\\xshad{xshad}\\yshad{yshad}\\an{alignment}"
+        base
+        + "\\1a&HFF&\\3a&HFF&"
+        + f"\\4a&H{shadow_alpha:02X}&\\4c{shadow_color_ass}\\xshad{xshad}\\yshad{yshad}"
     )
     if blur:
         tags += f"\\blur{blur}"
@@ -1340,6 +1835,7 @@ def _escape_ass_text(text: str) -> str:
 
 def _karaoke_dialogue_lines(
     chunk: dict, style: dict, base_tags: str, base_color: str, highlight_color: str,
+    margin_l: int, margin_v: int,
 ) -> list[str]:
     """One Dialogue event per word-window, each showing the FULL caption text
     with only that window's word colored as the highlight — unlike classic
@@ -1360,7 +1856,10 @@ def _karaoke_dialogue_lines(
             for j, w in enumerate(words)
         ]
         text = base_tags + " ".join(segments)
-        lines.append(f"Dialogue: 0,{to_ass_ts(seg_start)},{to_ass_ts(seg_end)},Default,,0,0,0,,{text}\n")
+        lines.append(
+            f"Dialogue: 1,{to_ass_ts(seg_start)},{to_ass_ts(seg_end)},Default,,"
+            f"{margin_l},{margin_l},{margin_v},,{text}\n"
+        )
     return lines
 
 
@@ -1374,18 +1873,14 @@ def write_captions_ass(
     with no override at all."""
     default_style = default_style or _FALLBACK_CAPTION_STYLE
     default_font = _style_value(default_style, "fontFamily", "Arial Black")
-    default_size = round(_scaled_font_size(default_style, height))
+    default_canvas_size = _scaled_font_size(default_style, height)
+    default_size = max(1, round(default_canvas_size * _libass_font_size_scale(default_font)))
     default_bold = 1 if _style_value(default_style, "bold", True) else 0
     default_blend_alpha = _opacity_to_alpha_byte(_style_value(default_style, "opacity", 100))
     default_color = _to_ass_color(_style_value(default_style, "color", "#FFFFFF"), default_blend_alpha)
     default_outline_color = _to_ass_color(_style_value(default_style, "outlineColor", "#000000"), default_blend_alpha)
-    default_outline_width = round(_scaled_outline_width(default_style, default_size), 2)
+    default_outline_width = round(_scaled_outline_width(default_style, default_canvas_size), 2)
     default_alignment = _ASS_ALIGNMENT.get(_style_value(default_style, "position", "bottom"), 2)
-    # The base [V4+ Styles] entry only supports a single diagonal shadow
-    # depth (no separate X/Y) — irrelevant in practice since every Dialogue
-    # line below always carries its own full \xshad/\yshad override anyway.
-    default_xshad, default_yshad, _, _, _ = _resolve_shadow(default_style, height)
-    default_shadow_depth = round((abs(default_xshad) + abs(default_yshad)) / 2)
     margin_l, margin_r, margin_v = _scaled_caption_margins(width, height)
 
     header = (
@@ -1394,14 +1889,26 @@ def write_captions_ass(
         f"PlayResX: {width}\n"
         f"PlayResY: {height}\n"
         "ScaledBorderAndShadow: yes\n"
+        # WrapStyle 1 == greedy end-of-line wrapping. libass's DEFAULT is
+        # WrapStyle 0, "smart" wrapping that balances a wrapped caption into
+        # roughly equal-length lines — but drawCaptionText wraps greedily
+        # (fill each line to 86% of the frame, then break). Measured on a
+        # real two-line caption: libass's default broke it 1235px/1221px
+        # where the canvas breaks it 1492px/951px, i.e. visibly different
+        # line breaks for the same text. WrapStyle 1 reproduces the canvas's
+        # own breaks to within a few pixels.
+        "WrapStyle: 1\n"
         "\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        # Shadow depth is a flat 0 here: shadows are drawn by their own
+        # dedicated Dialogue layer (see _ass_shadow_layer_tags), never by
+        # the style entry or the text layer.
         f"Style: Default,{default_font},{default_size},{default_color},&H000000FF&,"
         f"{default_outline_color},&H00000000&,{default_bold},0,0,0,100,100,0,0,1,"
-        f"{default_outline_width},{default_shadow_depth},{default_alignment},{margin_l},{margin_r},{margin_v},1\n"
+        f"{default_outline_width},0,{default_alignment},{margin_l},{margin_r},{margin_v},1\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -1412,16 +1919,39 @@ def write_captions_ass(
         style = chunk.get("style") or {}
         word_highlight = _style_value(style, "wordHighlight", {}) or {}
         words = chunk.get("words") or []
-        if word_highlight.get("enabled") and words:
-            base_tags = _ass_override_tags(style, height)
+        _, _, _, line_margin_l, line_margin_v = _ass_line_geometry(style, width, height)
+        karaoke = bool(word_highlight.get("enabled")) and bool(words)
+        # The shadow is the same shape for the whole chunk regardless of
+        # which word is currently highlighted, so one Layer-0 event spanning
+        # the chunk covers every karaoke window underneath. It has to be laid
+        # out from the SAME string the text layer builds, or the two layers
+        # would wrap differently and the shadow would sit under the wrong
+        # glyphs — the karaoke path joins `words`, which is not guaranteed to
+        # reproduce `chunk["text"]` verbatim.
+        shadow_text = (
+            " ".join(_escape_ass_text(w["text"]) for w in words)
+            if karaoke else _escape_ass_text(chunk["text"])
+        )
+        shadow_tags = _ass_shadow_layer_tags(style, height, width)
+        if shadow_tags:
+            lines.append(
+                f"Dialogue: 0,{to_ass_ts(chunk['start'])},{to_ass_ts(chunk['end'])},Default,,"
+                f"{line_margin_l},{line_margin_l},{line_margin_v},,"
+                f"{shadow_tags}{shadow_text}\n"
+            )
+        if karaoke:
+            base_tags = _ass_override_tags(style, height, width)
             blend_alpha = _opacity_to_alpha_byte(_style_value(style, "opacity", 100))
             base_color = _to_ass_color(_style_value(style, "color", "#FFFFFF"), blend_alpha)
             highlight_color = _to_ass_color(word_highlight.get("color", "#FFEB3B"), blend_alpha)
-            lines.extend(_karaoke_dialogue_lines(chunk, style, base_tags, base_color, highlight_color))
+            lines.extend(_karaoke_dialogue_lines(
+                chunk, style, base_tags, base_color, highlight_color, line_margin_l, line_margin_v,
+            ))
         else:
-            text = _ass_override_tags(style, height) + _escape_ass_text(chunk["text"])
+            text = _ass_override_tags(style, height, width) + _escape_ass_text(chunk["text"])
             lines.append(
-                f"Dialogue: 0,{to_ass_ts(chunk['start'])},{to_ass_ts(chunk['end'])},Default,,0,0,0,,{text}\n"
+                f"Dialogue: 1,{to_ass_ts(chunk['start'])},{to_ass_ts(chunk['end'])},Default,,"
+                f"{line_margin_l},{line_margin_l},{line_margin_v},,{text}\n"
             )
     out_path.write_text("".join(lines), encoding="utf-8")
 
@@ -1495,7 +2025,15 @@ def _batch_render_motion_graphics(items: list[dict], public_dir: Path, work_dir:
     un-batched, if this whole step raised) item's `_preRenderedRawPath`
     unset, so `_encode_segment_to_path` silently falls back to the slower
     but already-proven per-clip path for just that one clip instead of
-    failing the whole export."""
+    failing the whole export.
+
+    Streams the child process's stdout rather than blocking on it as one
+    lump (`subprocess.run(capture_output=True)`, the previous approach):
+    batch-render.mjs prints one `PROGRESS <done> <total>` line per clip as
+    it finishes (see that script), which turns into `engine.report_progress`
+    calls across export's 5%-10% band — without this, a timeline with
+    several Tier 2/4/5 clips in a row reports nothing for the whole batch's
+    wall-clock time, reading as the export hanging."""
     if not items:
         return {}
     _ensure_motion_engine_ready()
@@ -1504,23 +2042,50 @@ def _batch_render_motion_graphics(items: list[dict], public_dir: Path, work_dir:
     batch_path.write_text(json.dumps([
         {
             "id": item["id"], "mediaPath": item["mediaPath"], "sourceKind": item["sourceKind"],
-            "recipe": item["recipe"], "durationInFrames": item["durationInFrames"], "fps": item["fps"],
+            "recipe": item["recipe"], "durationInFrames": item["durationInFrames"],
+            "motionDurationInFrames": item.get("motionDurationInFrames", item["durationInFrames"]),
+            "fps": item["fps"],
             "width": item["width"], "height": item["height"], "outPath": item["outPath"],
         }
         for item in items
     ]), encoding="utf-8")
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             [
                 _resolve_node_bin("node"), "src/batch-render.mjs",
                 str(batch_path), str(results_path), str(public_dir),
             ],
-            cwd=str(MOTION_ENGINE_DIR), capture_output=True, text=True, **_subprocess_kwargs(),
+            cwd=str(MOTION_ENGINE_DIR),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            **_subprocess_kwargs(),
         )
-        if result.returncode != 0 or not results_path.exists():
+        stderr_lines: list[str] = []
+
+        def drain_stderr() -> None:
+            if process.stderr is None:
+                return
+            for line in process.stderr:
+                stderr_lines.append(line)
+
+        stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        assert process.stdout is not None
+        for line in process.stdout:
+            match = re.match(r"PROGRESS (\d+) (\d+)", line.strip())
+            if match:
+                done, total = int(match.group(1)), max(1, int(match.group(2)))
+                percent = 5 + round((done / total) * 5)
+                engine.report_progress(
+                    percent, "Preparing export", f"Pre-rendering motion-graphic clip {done}/{total}"
+                )
+
+        process.wait()
+        stderr_thread.join(timeout=5)
+        if process.returncode != 0 or not results_path.exists():
             # The whole batch process itself failed to run (not an
             # individual clip within it) — every item falls back.
-            message = (result.stderr or "")[-500:] or "the batch render process did not run"
+            message = "".join(stderr_lines)[-500:] or "the batch render process did not run"
             return {item["id"]: message for item in items}
         raw_results = json.loads(results_path.read_text(encoding="utf-8"))
         errors: dict[str, str] = {}
@@ -1569,39 +2134,83 @@ def run(manifest_path: Path, output_path: Path) -> None:
         segments[0]["transitionIn"] = "cut"
     if segments[-1]["kind"] == "image":
         segments[-1]["transitionOut"] = "cut"
+    # Drop each recipe's own fade-to-black envelope before anything derives
+    # further segments from these — the join-transition tail/head windows
+    # below are shallow copies, so doing it here covers them too, and every
+    # consumer (the native `fade=` path and the Remotion props alike) reads
+    # `motionGraphicSettings` from the segment. See its own doc comment.
+    strip_recipe_fade_envelope(segments)
     # Only the single baked video gets blended join transitions — the
     # asset-bundle export (see below) hands each clip to another editor as
     # its own separate file, where a cross-fade/slide/zoom-blur has nothing
     # meaningful to mean.
     segments = expand_join_transitions(segments, fps)
 
-    # Pre-render every motion-graphic clip this early scan can see (the vast
-    # majority — everything except a join-transition's tail/head window,
-    # synthesized later by _build_transition_segment, still just falls back
-    # to the older per-clip path below) in one batched pass — see
-    # `_batch_render_motion_graphics`'s doc comment for why this exists.
-    # Skipped entirely (silently, same per-clip fallback) if the motion
-    # engine isn't ready yet or the common-public-dir computation fails —
-    # neither should ever actually block an export that would have worked
-    # before this batching existed.
-    # A Tier-1-only recipe on an "image" segment never reaches Remotion at
-    # all now (see _is_ffmpeg_native_recipe / build_recipe_zoompan_filter in
-    # _encode_segment_to_path) — excluded here so the batch below isn't
-    # spent on clips that don't need it.
+    # Pre-render every motion-graphic clip this early scan can see in one
+    # batched pass — see `_batch_render_motion_graphics`'s doc comment for
+    # why this exists. Skipped entirely (silently, same per-clip fallback)
+    # if the motion engine isn't ready yet or the common-public-dir
+    # computation fails — neither should ever actually block an export that
+    # would have worked before this batching existed.
+    # A Tier-1-only recipe never reaches Remotion at all now, on either an
+    # "image" or a "video" segment (see _is_ffmpeg_native_recipe /
+    # build_recipe_zoompan_filter in _encode_segment_to_path) — excluded
+    # here so the batch below isn't spent on clips that don't need it. This
+    # is the common case for "video" segments specifically: Tier 1 (camera
+    # move) is mandatory on every recipe per the SOP, so an animation/
+    # imported clip with no Tier 2/4/5 accent applied — the majority, since
+    # those are optional diversity accents, not the default shape — used to
+    # be sent through Remotion unconditionally regardless of how simple its
+    # recipe was.
     motion_graphic_segments = [
         (index, segment) for index, segment in enumerate(segments)
         if segment["kind"] in ("image", "video")
         and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings")
-        and not (segment["kind"] == "image" and _is_ffmpeg_native_recipe(segment["motionGraphicSettings"]))
+        and not _is_ffmpeg_native_recipe(segment["motionGraphicSettings"])
     ]
+    # A join transition's tail/head window (see _transition_tail_head_segments)
+    # used to be entirely excluded from this batch — always falling back to
+    # `_render_motion_graphic`'s own fresh Node/webpack/Chromium cold start,
+    # ONE PER WINDOW, run concurrently (up to MAX_ENCODE_WORKERS at a time)
+    # alongside every other segment in the ThreadPoolExecutor loop below.
+    # On a timeline with many transitions between recipe-bearing clips (the
+    # common case — Tier 1 is mandatory on every recipe), that meant dozens
+    # of simultaneous full Chromium processes: the dominant cost behind
+    # exports that never seemed to move past a low percent, and — under
+    # enough concurrent memory/handle pressure — an occasional truncated
+    # render (a corrupt intermediate .ts ffmpeg then can't even open).
+    # Folding these into the same one-bundle-one-browser batch as everything
+    # else removes both problems at once.
+    transition_segments = [
+        (index, segment) for index, segment in enumerate(segments) if segment["kind"] == "transition"
+    ]
+    transition_tail_heads: dict[int, tuple[dict, dict]] = {
+        index: _transition_tail_head_segments(segment, fps) for index, segment in transition_segments
+    }
+    transition_motion_items: list[tuple[int, str, dict]] = []
+    for index, (tail_segment, head_segment) in transition_tail_heads.items():
+        if (
+            tail_segment.get("motionGraphicEffect") and tail_segment.get("motionGraphicSettings")
+            and not _is_ffmpeg_native_recipe(tail_segment["motionGraphicSettings"])
+        ):
+            transition_motion_items.append((index, "tail", tail_segment))
+        if (
+            head_segment.get("motionGraphicEffect") and head_segment.get("motionGraphicSettings")
+            and not _is_ffmpeg_native_recipe(head_segment["motionGraphicSettings"])
+        ):
+            transition_motion_items.append((index, "head", head_segment))
+
     pre_rendered_paths: list[Path] = []
-    if motion_graphic_segments:
+    if motion_graphic_segments or transition_motion_items:
+        total_items = len(motion_graphic_segments) + len(transition_motion_items)
         engine.report_progress(
             5, "Preparing export",
-            f"Pre-rendering {len(motion_graphic_segments)} motion-graphic clip"
-            f"{'s' if len(motion_graphic_segments) != 1 else ''}",
+            f"Pre-rendering {total_items} motion-graphic clip{'s' if total_items != 1 else ''}",
         )
-        public_dir = _common_public_dir([segment["path"] for _, segment in motion_graphic_segments])
+        all_source_paths = [segment["path"] for _, segment in motion_graphic_segments] + [
+            segment["path"] for _, _, segment in transition_motion_items
+        ]
+        public_dir = _common_public_dir(all_source_paths)
         try:
             if public_dir is not None:
                 batch_items = []
@@ -1614,13 +2223,47 @@ def run(manifest_path: Path, output_path: Path) -> None:
                         "sourceKind": "video" if segment["kind"] == "video" else "image",
                         "recipe": segment["motionGraphicSettings"],
                         "durationInFrames": segment.get("_originalFrames", segment["frames"]),
+                        # Differs only for a join transition's tail window —
+                        # see `_transition_tail_head_segments`.
+                        "motionDurationInFrames": segment.get(
+                            "_motionFrames", segment.get("_originalFrames", segment["frames"])
+                        ),
+                        "fps": fps, "width": width, "height": height,
+                        "outPath": str(raw_path),
+                    })
+                for index, side, segment in transition_motion_items:
+                    item_id = f"t{index}{side[0]}"  # "t3t" (tail) / "t3h" (head) — distinct from plain int ids
+                    raw_path = work_dir / f"motion_pre_{item_id}.raw.mp4"
+                    media_path = Path(segment["path"]).resolve().relative_to(public_dir)
+                    batch_items.append({
+                        "id": item_id,
+                        "mediaPath": str(media_path).replace("\\", "/"),
+                        "sourceKind": "video" if segment["kind"] == "video" else "image",
+                        "recipe": segment["motionGraphicSettings"],
+                        "durationInFrames": segment.get("_originalFrames", segment["frames"]),
+                        # Differs only for a join transition's tail window —
+                        # see `_transition_tail_head_segments`.
+                        "motionDurationInFrames": segment.get(
+                            "_motionFrames", segment.get("_originalFrames", segment["frames"])
+                        ),
                         "fps": fps, "width": width, "height": height,
                         "outPath": str(raw_path),
                     })
                 errors = _batch_render_motion_graphics(batch_items, public_dir, work_dir)
-                for item, (index, segment) in zip(batch_items, motion_graphic_segments):
+                item_index = 0
+                for _, segment in motion_graphic_segments:
+                    item = batch_items[item_index]
+                    item_index += 1
                     if item["id"] not in errors:
                         segment["_preRenderedRawPath"] = item["outPath"]
+                        pre_rendered_paths.append(Path(item["outPath"]))
+                for index, side, _ in transition_motion_items:
+                    item = batch_items[item_index]
+                    item_index += 1
+                    if item["id"] not in errors:
+                        transition_segment = segments[index]
+                        key = "_preRenderedTailRawPath" if side == "tail" else "_preRenderedHeadRawPath"
+                        transition_segment[key] = item["outPath"]
                         pre_rendered_paths.append(Path(item["outPath"]))
         except Exception as error:  # noqa: BLE001 - batching is a pure optimization, never fatal
             engine.report_progress(

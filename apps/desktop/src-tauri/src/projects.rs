@@ -1466,7 +1466,11 @@ pub struct ExportSettings {
 impl Default for ExportSettings {
     fn default() -> Self {
         Self {
-            resolution: "1080p".into(),
+            // "No downscaling by default" — 2160p (4K) is the highest
+            // offered option, so a user who never touches this setting
+            // never has their export capped below whatever their source
+            // assets can actually support.
+            resolution: "2160p".into(),
             quality: "high".into(),
             captions_mode: "burned-in".into(),
             include_narration: true,
@@ -14243,14 +14247,22 @@ fn request_gemini_image(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| format!("Could not initialize Gemini client: {e}"))?;
+    // "1K" (~1024px long edge) used to be hardcoded here — fine on its own,
+    // but the export can go up to 2160p (~3840px), so a still generated at
+    // 1K was upscaled nearly 4x to fill that frame, visibly softening it
+    // (more noticeably once 2160p became the export default). "2K"
+    // (~2048px) is a meaningfully sharper source for a real quality
+    // improvement without the extra generation cost/latency "4K" would add
+    // for every still in a bulk run — the existing retry-without-imageSize
+    // fallback right below still covers a model/auth combo that rejects it.
     let (request, aspect_ratio, image_size) = match auth {
         GeminiAuth::ApiKey(api_key) => (client
             .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"))
-            .header("x-goog-api-key", api_key), aspect_ratio, "1K"),
+            .header("x-goog-api-key", api_key), aspect_ratio, "2K"),
         GeminiAuth::Vertex { access_token, project_id } => {
             let url = format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model}:generateContent");
             let vertex_ratio = if aspect_ratio == "9:16" { "ASPECT_RATIO_9_16" } else { "ASPECT_RATIO_16_9" };
-            (client.post(url).bearer_auth(access_token), vertex_ratio, "IMAGE_SIZE_1K")
+            (client.post(url).bearer_auth(access_token), vertex_ratio, "IMAGE_SIZE_2K")
         }
     };
     let response = request
@@ -14341,15 +14353,18 @@ fn request_gemini_image_with_source(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| format!("Could not initialize Gemini client: {e}"))?;
+    // See request_gemini_image's comment: "1K" upscaled nearly 4x to fill a
+    // 2160p export frame, visibly softening it — "2K" is a meaningfully
+    // sharper source without "4K"'s extra cost/latency on every edit.
     let (request, aspect_ratio, image_size) = match auth {
         GeminiAuth::ApiKey(api_key) => (client
             .post(format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"))
-            .header("x-goog-api-key", api_key), aspect_ratio, "1K"),
+            .header("x-goog-api-key", api_key), aspect_ratio, "2K"),
         GeminiAuth::Vertex { access_token, project_id } => {
             let vertex_ratio = if aspect_ratio == "9:16" { "ASPECT_RATIO_9_16" } else { "ASPECT_RATIO_16_9" };
             (client
                 .post(format!("https://aiplatform.googleapis.com/v1/projects/{project_id}/locations/global/publishers/google/models/{model}:generateContent"))
-                .bearer_auth(access_token), vertex_ratio, "IMAGE_SIZE_1K")
+                .bearer_auth(access_token), vertex_ratio, "IMAGE_SIZE_2K")
         },
     };
     let mut parts = vec![

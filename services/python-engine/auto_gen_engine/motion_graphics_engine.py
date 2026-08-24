@@ -257,7 +257,18 @@ class MotionRecipe(BaseModel):
     glow_y: float = 0.5
     glow_opacity: float = 0.0
     glow_flicker: float = 0.0
-    vignette: float = 0.15
+    # Optional accent, same as Tiers 2/4/5 — defaults to "off" rather than a
+    # baseline "always a little on" (0.15, until this changed): the prompt
+    # below used to describe it as a spectrum with no true off position
+    # ("higher for tense/dramatic, lower/near-0 for bright/neutral"), so the
+    # model rarely emitted an exact 0.0 even for a plain neutral shot. That
+    # silently defeated `_is_ffmpeg_native_recipe` in video_export_engine.py
+    # (vignette used to be the one field in that gate with no real "none"),
+    # forcing nearly every real clip through the slow Remotion/Chromium path
+    # regardless of how simple the rest of its recipe was — independent of
+    # (and compounding with) that gate's own vignette rendering, which is now
+    # implemented natively either way (see `_apply_vignette_filter`).
+    vignette: float = 0.0
 
     # --- Envelope ---
     fade_in_frames: float = 14.0
@@ -400,8 +411,10 @@ default 0.35) controls how strong/dense it reads.
 COLOR / LIGHT: saturationFrom/To (1 = normal; push down for something ominous/somber, up for vivid), \
 glowColor (a css rgba string, or leave unset for none), glowX/Y (fraction 0-1), glowOpacity, \
 glowFlicker (0 = steady glow, >0 = organic flicker — good for firelight or any moody atmospheric shot, \
-but don't put it on a bright, neutral, plainly-lit image), vignette (0-1, higher for tense/dramatic, \
-lower/near-0 for bright/neutral).
+but don't put it on a bright, neutral, plainly-lit image), vignette (0-1, default 0 — an optional accent \
+like Tiers 2/4/5, not a baseline every clip needs: leave it at 0 for an ordinary, plainly-lit shot, and \
+only bring in a touch, 0.1-0.3, when the scene is genuinely tense/dramatic/intimate and framing attention \
+toward the center actually serves it — most clips should stay at 0).
 
 ENVELOPE: fadeInFrames/fadeOutFrames — how long this clip's opacity takes to fade in/out at its own \
 edges (independent of the Tier-3 transitionOut, which is about the handoff between clips). Leave at \

@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -385,6 +386,29 @@ MAX_SCALE_REFERENCE_DURATION = 60.0  # only bounds pathological cases; must
 # stay well beyond any realistic still duration so zoom never visibly freezes
 # mid-clip (the old `1 + amount*3` cap froze zoom at exactly 15s elapsed).
 
+# How far every zoompan preset below (and build_recipe_zoompan_filter's own)
+# upscales its source before cropping — see each call site's own comment for
+# why any upscale at all: zoompan crops at integer-pixel granularity in its
+# source's coordinate space, so a slow zoom/pan at output resolution moves
+# less than one pixel per frame, rounding most frames to the exact same crop
+# and producing a "still, still, jump" stutter instead of steady motion.
+# Previously 8 — reduced after measuring the ACTUAL cost, not just the
+# smoothness benefit, of that value: a real 4K still through this exact
+# filter chain (scale then zoompan, `-loop 1` re-running the scale on every
+# repeated frame — there is only one real source frame, but nothing dedupes
+# across the loop) ran at 8x=5fps, 6x=9.4fps, 5x=13fps, 4x=19fps, 3x=27fps —
+# roughly the quadratic cost you'd expect from a 2D upscale (8x has 64x the
+# pixels of 1x; 3x has 9x). On a real project export (87 clips, all
+# ffmpeg-native, zero needing Remotion) this was measured as THE dominant
+# remaining cost behind a 10-minute video taking 30-40 minutes to export —
+# bigger than the Remotion/vignette fix and the final-pass hardware
+# encode/decode work combined. The original tuning comment's own measured
+# sub-pixel-drift standard deviation (lower = smoother: 3x~0.29, 6x~0.17,
+# 8x~0.12, 10x~0.10) shows sharply diminishing returns well before 8x; 4x
+# keeps most of that smoothness (extrapolating the same curve, meaningfully
+# closer to 6x's 0.17 than to 3x's 0.29) for roughly a 4x speedup.
+_ZOOMPAN_PRE_SCALE_FACTOR = 4
+
 
 # Matches TimelineView.tsx's COLOR_FILTER_TARGETS exactly (brightness
 # additive to line up with ffmpeg eq's -1..1 range, contrast/saturation
@@ -525,7 +549,7 @@ def build_image_filter(
             (1 - subject_x, 1 - subject_y, min(max_scale, peak + 0.3)),
         ]
         cx, cy, cscale = cut_anchors[cut_index % len(cut_anchors)]
-        pre_scale = max(width, height) * 8
+        pre_scale = max(width, height) * _ZOOMPAN_PRE_SCALE_FACTOR
         return (
             f"scale={pre_scale}:-2,zoompan=z='{cscale:.5f}':"
             f"{anchored_xy(cx, cy)}:"
@@ -539,12 +563,10 @@ def build_image_filter(
         # finally crosses a whole pixel — producing a "still, still, jump"
         # stutter rather than steady motion. Scaling the source up well
         # beyond the output resolution first gives each frame far more
-        # sub-pixel headroom before that rounding happens. Measured (a
-        # reference vertical line's tracked position across frames, std dev
-        # of frame-to-frame deltas — lower is smoother): 3x ~0.29, 6x ~0.17,
-        # 8x ~0.12, 10x ~0.10. 8x is the point past which further headroom
-        # stops paying for the added scale/encode cost.
-        pre_scale = max(width, height) * 8
+        # sub-pixel headroom before that rounding happens — see
+        # `_ZOOMPAN_PRE_SCALE_FACTOR`'s own comment for the speed/smoothness
+        # tradeoff behind its exact value.
+        pre_scale = max(width, height) * _ZOOMPAN_PRE_SCALE_FACTOR
         return (
             f"scale={pre_scale}:-2,zoompan={zoompan_presets[motion]}:"
             f"d={frames}:s={width}x{height}:fps={fps}{color_node}{fade}"
@@ -593,21 +615,22 @@ def _ease_expr(easing: str, t_expr: str) -> str:
 # exactly via a plain `fade=` filter (see build_recipe_zoompan_filter), so
 # it's checked and handled there instead of disqualifying the fast path.
 #
-# `vignette` stays in this dict (i.e. still disqualifying) on purpose,
-# despite motion_graphics_engine.py's own Pydantic model defaulting it to
-# 0.15 on every recipe — an earlier attempt at a native ffmpeg equivalent
-# was reverted after live testing against a real export: MotionClip.tsx
-# renders this as a thin inset box-shadow (edges only, rest of the frame
-# untouched), but ffmpeg's own `vignette` filter is a full-frame radial lens
-# model with no parameter combination that reproduces a thin edge-only
-# darkening — at the low intensities this is actually used at, it either
-# does nothing or (the direction that first shipped, briefly) produces a
-# dramatically stronger, wrong-shaped effect that reads as pillarboxing on
-# a 16:9 frame. Left Remotion-gated, correctly, until a real native
-# equivalent exists.
+# `vignette` is deliberately NOT in this dict (i.e. no longer disqualifying)
+# despite motion_graphics_engine.py's Pydantic model historically defaulting
+# it to 0.15 on every recipe (now 0.0 — see MotionRecipe's own comment) — an
+# earlier attempt at a native ffmpeg equivalent was reverted after live
+# testing against a real export used ffmpeg's own built-in `vignette` filter:
+# a full-frame radial lens model with no parameter combination that
+# reproduces MotionClip.tsx's real rendering (a thin inset box-shadow, edges
+# only) — it either did nothing or produced a dramatically stronger,
+# wrong-shaped effect that read as pillarboxing on a 16:9 frame. This time
+# it's handled correctly, as its own dedicated compositing step in
+# `_apply_vignette_filter` (see that function's own comment for the exact
+# geometry) rather than by ffmpeg's `vignette` filter at all — any vignette
+# value, including a dramatic one, can now take this fast path.
 _FFMPEG_NATIVE_NEUTRAL_RECIPE = {
     "depthEffect": "none", "storyEffect": "none", "environmentEffect": "none",
-    "maskShape": "none", "vignette": 0.0, "motionBlurStrength": 0.0, "shakeAmount": 0.0,
+    "maskShape": "none", "motionBlurStrength": 0.0, "shakeAmount": 0.0,
     "speedCurve": "linear_pace", "saturationFrom": 1.0, "saturationTo": 1.0,
 }
 
@@ -622,9 +645,11 @@ def _is_ffmpeg_native_recipe(recipe: dict) -> bool:
     a capability regression: any field below left at other than its
     neutral/off default routes the clip through Remotion exactly as before,
     unchanged. Deliberately conservative — Tier 2 (depth), Tier 4 (story),
-    Tier 5 (environment), masks, glow, rotation, vignette, motion blur/
-    shake, and 'elastic' easing (see `_ease_expr`) all still need the real
-    render.
+    Tier 5 (environment), masks, glow, rotation, motion blur/shake, and
+    'elastic' easing (see `_ease_expr`) all still need the real render.
+    Vignette is NOT in that list — any value renders correctly via
+    `_apply_vignette_filter`'s own compositing step, layered on top of
+    whatever this function returns (see its own doc comment).
     `environmentIntensity` is deliberately never checked here — it's inert
     whenever `environmentEffect` is "none" (already required above), exactly
     like a mask's own sub-fields (maskFromRadius/maskSoftness/...) are never
@@ -750,9 +775,10 @@ def build_recipe_zoompan_filter(
         fades.append(f"fade=t=out:st={max(0.0, duration - fade_out_duration):.3f}:d={fade_out_duration:.3f}:color={out_color}")
     fade = "".join(f",{f}" for f in fades)
 
-    # Same 8x pre-scale sub-pixel-stutter fix as every other zoompan preset
-    # above — see that comment for the measured rationale.
-    pre_scale = max(width, height) * 8
+    # Same pre-scale sub-pixel-stutter fix as every other zoompan preset
+    # above — see `_ZOOMPAN_PRE_SCALE_FACTOR`'s own comment for the measured
+    # speed/smoothness rationale behind its exact value.
+    pre_scale = max(width, height) * _ZOOMPAN_PRE_SCALE_FACTOR
     color_vf = build_color_filter_vf(color_filter, color_filter_intensity)
     color_node = f",{color_vf}" if color_vf else ""
     hold = frames if zoompan_hold_frames is None else max(1, zoompan_hold_frames)
@@ -774,6 +800,134 @@ def build_recipe_zoompan_filter(
         f"{fps_resample_node}scale={pre_scale}:-2,zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
         f"d={hold}:s={width}x{height}:fps={fps}{color_node}{fade}"
     )
+
+
+# Generation resolution (long edge, px) for the cached vignette mask built by
+# `_ensure_vignette_mask` — a smooth, position-only gradient loses nothing
+# visible at this size, and generating it once here (then letting a cheap
+# `scale`+`blend` upsample/apply it to every real output frame) is what keeps
+# this fast. Measured on a real 4K zoompan clip: computing the exact same
+# per-pixel expression directly on every full-resolution output frame via
+# `geq` ran at ~1.7fps (a ~45x slowdown vs. ~78fps with no vignette at all —
+# i.e. reintroducing the exact "hours to export" problem this whole fast path
+# exists to avoid); this two-stage approach measured identical to the
+# no-vignette baseline (~79fps).
+_VIGNETTE_MASK_LONG_EDGE = 480
+
+
+def _vignette_mask_geometry(width: int, height: int, vignette: float) -> tuple[int, int, str]:
+    """Computes the small mask's own pixel dimensions and the `geq` luma
+    expression that renders it: the exact greyscale "keep factor" (0-255,
+    255 = untouched) for MotionClip.tsx's own vignette overlay —
+    `boxShadow: inset 0 0 {blurPx}px {blurPx*0.55}px rgba(0,0,0,0.7)` where
+    `blurPx = interpolate(vignette, [0,1], [0,190])` (see
+    services/motion-engine/src/MotionClip.tsx) — composited onto opaque
+    content. `rgba(0,0,0,a)` painted over any opaque color C reduces to
+    `C*(1-a)` (black contributes nothing), so the whole effect is just a
+    per-pixel multiply by `(1-a)` — computed here as a reusable greyscale
+    mask instead of carrying a real alpha channel through the pipeline.
+
+    CSS inset box-shadow geometry: `spread` shrinks the (invisible) shadow
+    rectangle inward from each edge by `spread` px before blurring; that hard
+    step — zero shadow outside the shrunk rect, full shadow color inside —
+    is then Gaussian-blurred by `blur`. Approximated here, like every eased
+    camera-move curve elsewhere in this module (see `_ease_expr`'s own
+    comment on why that's fine for a soft, position-only visual with no hard
+    edge to get wrong), with a plain smoothstep instead of a true Gaussian.
+    `edge0`/`edge1` bracket that smoothstep symmetrically around the spread
+    boundary, `blur`-px wide (roughly a Gaussian's own effective falloff
+    width), clamped so it never starts before the true frame edge (`d=0`).
+
+    Distance-to-nearest-edge — `min` of both axes independently, never a
+    radial/elliptical falloff — is what keeps this a true rectangular
+    vignette at any aspect ratio, unlike ffmpeg's own built-in `vignette`
+    filter (a full-frame radial lens model whose only prior use here read as
+    pillarboxing on a 16:9 frame; see `_FFMPEG_NATIVE_NEUTRAL_RECIPE`'s own
+    comment on that reverted attempt)."""
+    aspect = width / height
+    if width >= height:
+        mask_w = _VIGNETTE_MASK_LONG_EDGE
+        mask_h = max(2, round(_VIGNETTE_MASK_LONG_EDGE / aspect))
+    else:
+        mask_h = _VIGNETTE_MASK_LONG_EDGE
+        mask_w = max(2, round(_VIGNETTE_MASK_LONG_EDGE * aspect))
+    # Downscaled by the same factor the mask itself is downsized by, so the
+    # blur/spread band's width in real OUTPUT pixels (after the per-clip
+    # `scale` back up to `width`x`height`) matches MotionClip.tsx's own
+    # px math exactly, not `mask_w`-relative.
+    scale = mask_w / width
+    blur_px = max(0.0, min(1.0, vignette)) * 190.0 * scale
+    spread_px = blur_px * 0.55
+    edge0 = max(0.0, spread_px - blur_px / 2)
+    span = max((spread_px + blur_px / 2) - edge0, 1e-3)
+    distance_to_edge = "min(min(X,W-1-X),min(Y,H-1-Y))"
+    progress = f"clip(({distance_to_edge}-{edge0:.4f})/{span:.4f},0,1)"
+    smoothstep = f"({progress}*{progress}*(3-2*({progress})))"
+    keep_expr = f"(255*(1-0.7*(1-{smoothstep})))"
+    return mask_w, mask_h, keep_expr
+
+
+def _ensure_vignette_mask(mask_dir: Path, width: int, height: int, vignette: float) -> Path:
+    """Materializes (or reuses an already-cached) small greyscale PNG for
+    `_vignette_mask_geometry`'s own keep-factor mask, generated once via a
+    single-frame `geq` pass — cheap regardless of `geq`'s own slow per-pixel
+    evaluator (see `_VIGNETTE_MASK_LONG_EDGE`'s own comment), since it only
+    ever runs at that fixed low resolution, exactly once per distinct
+    (aspect ratio, vignette value) pair across a whole export — every later
+    clip sharing that pair reuses the same cached file in `mask_dir`, keyed
+    by filename. See `_apply_vignette_filter` for how each clip applies it."""
+    mask_w, mask_h, keep_expr = _vignette_mask_geometry(width, height, vignette)
+    mask_path = mask_dir / f"_vignette_mask_{mask_w}x{mask_h}_{max(0.0, min(1.0, vignette)):.3f}.png"
+    if not mask_path.exists():
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=white:s={mask_w}x{mask_h}:d=1",
+                "-vf", f"format=gray,geq=lum='{keep_expr}'", "-frames:v", "1", str(mask_path),
+            ],
+            capture_output=True, text=True, **_subprocess_kwargs(),
+        )
+    return mask_path
+
+
+def _apply_vignette_filter(
+    vf: str, vignette: float, width: int, height: int, duration_bound: float, mask_dir: Path,
+) -> tuple[list[str], list[str]]:
+    """Wraps an existing single-input `-vf` chain (as built by
+    `build_recipe_zoompan_filter`) so its output also gets this recipe's own
+    vignette multiplied on top, when it has one. Returns
+    `(extra_input_args, video_output_args)`:
+    - When `vignette <= 0` (the common case — most clips carry no vignette at
+      all, see `MotionRecipe.vignette`'s own comment): `([], ["-vf", vf])`,
+      i.e. completely unchanged behavior.
+    - Otherwise: `extra_input_args` is a real second `-i` for a generated
+      mask file that the CALLER must splice into its own ffmpeg command's
+      input args, immediately after its one real source `-i` (so it lands at
+      input index 1 — this function's own filtergraph assumes exactly that
+      layout), and `video_output_args` switches from `-vf` to
+      `-filter_complex`/`-map` to combine the two. `-vf`'s own single-input
+      "simple filtergraph" parser rejects a second, unconnected source filter
+      — confirmed empirically: even a source-only `movie=` node with no `-i`
+      of its own errors with "expected exactly 1 input and 1 output" — so a
+      real filter_complex is unavoidable here, unlike the plain `-vf` chains
+      used everywhere else in this module.
+
+    The mask input is `-loop 1`-ed the same way an ordinary still image
+    already is elsewhere in this module, bounded by `duration_bound` (the
+    caller's own longest possible real frame count in seconds, WITH
+    headroom — must cover at least as much as `vf`'s own output can ever
+    produce, e.g. a join-transition tail's motion-extended frame count, not
+    just the segment's nominal duration) so `blend`'s own `shortest=1` never
+    truncates the real clip early by running out of mask frames first."""
+    if vignette <= 0:
+        return [], ["-vf", vf]
+    mask_path = _ensure_vignette_mask(mask_dir, width, height, vignette)
+    extra_input_args = ["-loop", "1", "-t", f"{duration_bound:.3f}", "-i", str(mask_path)]
+    filter_complex = (
+        f"[0:v]{vf}[_vgz];"
+        f"[1:v]scale={width}:{height}:flags=bicubic,format=yuv420p[_vgm];"
+        f"[_vgz][_vgm]blend=all_mode=multiply:shortest=1,format=yuv420p[_vgout]"
+    )
+    return extra_input_args, ["-filter_complex", filter_complex, "-map", "[_vgout]"]
 
 
 def build_video_filter(
@@ -1134,9 +1288,14 @@ def _encode_segment_to_path(
             )
             if trim_start_frames > 0:
                 vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
+            vignette_inputs, video_args = _apply_vignette_filter(
+                vf, float(segment["motionGraphicSettings"].get("vignette", 0.0) or 0.0),
+                width, height, max(duration, original_frames / fps) + 1.0, out_path.parent,
+            )
             run_ffmpeg([
                 "-y", "-loop", "1", "-t", f"{duration + 1:.3f}", "-i", segment["path"],
-                "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+                *vignette_inputs, *video_args,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
                 "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
             ])
         else:
@@ -1160,9 +1319,14 @@ def _encode_segment_to_path(
                 vf = f"tpad=stop_mode=clone:stop_duration={duration - source_duration:.3f},{vf}"
             if trim_start_frames > 0:
                 vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
+            vignette_inputs, video_args = _apply_vignette_filter(
+                vf, float(segment["motionGraphicSettings"].get("vignette", 0.0) or 0.0),
+                width, height, max(duration, original_frames / fps) + 1.0, out_path.parent,
+            )
             run_ffmpeg([
                 "-y", "-i", segment["path"],
-                "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+                *vignette_inputs, *video_args, "-an",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
                 "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
             ])
     elif segment["kind"] in ("image", "video") and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings"):
@@ -1956,6 +2120,209 @@ def write_captions_ass(
     out_path.write_text("".join(lines), encoding="utf-8")
 
 
+# (encoder name, extra args for the tiny real probe encode in
+# `_detect_hardware_encoder`) in priority order — NVIDIA NVENC first (fastest,
+# most broadly reliable of the three), then Intel Quick Sync, then AMD AMF.
+_HW_ENCODER_CANDIDATES: list[tuple[str, list[str]]] = [
+    ("h264_nvenc", ["-preset", "p4"]),
+    ("h264_qsv", []),
+    ("h264_amf", []),
+]
+_HW_ENCODER_NAMES = {name for name, _ in _HW_ENCODER_CANDIDATES}
+# Human-readable label per `video_encode_args[1]` value (the codec name,
+# whatever `_final_pass_video_routing` chose) — surfaced in the "Rendering
+# video" progress detail (see its own call site) purely so a user watching
+# an export can tell which of the three paths it actually took, since
+# they otherwise look identical from the progress bar alone.
+_ENCODER_LABELS = {
+    "copy": "no re-encode needed",
+    "libx264": "CPU",
+    "h264_nvenc": "hardware: NVIDIA",
+    "h264_qsv": "hardware: Intel Quick Sync",
+    "h264_amf": "hardware: AMD",
+}
+# `None` = not probed yet this process; `{}` = probed, nothing usable (or
+# disabled after a real failure — see `_disable_hardware_encoder`);
+# otherwise `{"name": <encoder>}`.
+_hw_encoder_cache: dict | None = None
+
+
+def _detect_hardware_encoder() -> str | None:
+    """Probes, once per process, for a working hardware H.264 encoder ffmpeg
+    can actually use on this machine, trying `_HW_ENCODER_CANDIDATES` in
+    order and returning the first that actually works — or `None`, meaning
+    "use libx264", if none do.
+
+    Being listed in `ffmpeg -encoders` does NOT mean usable: confirmed on a
+    real dev machine with no discrete GPU, `h264_amf` is listed but fails the
+    moment it's actually asked to open a device ("DLL amfrt64.dll failed to
+    open"). So this runs a real, tiny encode instead of trusting the encoder
+    list — same "verify it actually works, not just that it's present"
+    approach `_ensure_motion_engine_ready`/`_ensure_remotion_browser_
+    downloaded` already take for the Remotion toolchain.
+
+    Deliberately scoped to the FINAL export pass only (its one call site,
+    inside `run()`) — never the many-way-concurrent per-segment encodes in
+    `_encode_segment_to_path`. Consumer GPUs cap how many simultaneous
+    hardware encode sessions they'll run at all (commonly ~2-5 sessions on
+    stock NVIDIA drivers before new ones start failing outright); the final
+    pass is always exactly one process for the whole export, so it can never
+    hit that ceiling, but handing every one of `MAX_ENCODE_WORKERS` concurrent
+    per-segment workers the same hardware encoder could silently serialize or
+    start failing well before that. Measured on a real (Intel iGPU, no
+    discrete GPU) dev machine: a 4K final pass at matched quality went from
+    ~20fps on libx264 "fast" to ~83fps on Quick Sync — independent of, and
+    compounding with, the Remotion/vignette fast-path fix above; either one
+    alone can be the difference between an export finishing in minutes vs.
+    hours."""
+    global _hw_encoder_cache
+    if _hw_encoder_cache is not None:
+        return _hw_encoder_cache.get("name")
+    for name, probe_args in _HW_ENCODER_CANDIDATES:
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=0.2",
+                    "-frames:v", "3", "-c:v", name, *probe_args, "-f", "null", "-",
+                ],
+                capture_output=True, text=True, timeout=15, **_subprocess_kwargs(),
+            )
+            if result.returncode == 0:
+                _hw_encoder_cache = {"name": name}
+                return name
+        except Exception:
+            continue
+    _hw_encoder_cache = {}
+    return None
+
+
+def _disable_hardware_encoder() -> None:
+    """Called when the final pass's REAL hardware-encoded attempt fails at
+    runtime despite passing `_detect_hardware_encoder`'s own tiny probe (the
+    probe only proves the encoder can open at all, not that it handles this
+    export's actual resolution/settings) — permanently falls back to libx264
+    for the rest of this process rather than re-probing (and likely
+    re-failing) the same way again."""
+    global _hw_encoder_cache
+    _hw_encoder_cache = {}
+
+
+def _final_pass_video_encode_args(preset: str, crf: int) -> list[str]:
+    """`-c:v ...` args for the final muxing pass: a detected hardware
+    encoder's own equivalent quality/rate-control flags for `crf` when one's
+    available (see `_detect_hardware_encoder`), else the same plain libx264
+    args this used unconditionally before. `crf`'s 0-51 (lower = higher
+    quality) scale is reused as-is for NVENC's `-cq` and (offset slightly,
+    empirically closer at matched settings) QSV's `-global_quality` — both
+    are documented as the same ICQ-style scale libx264's own CRF uses, so
+    this isn't an exact perceptual match across encoders, but is a reasonable
+    default a user can already retune via the existing quality dropdown
+    (see `quality_crf_preset` in projects.rs)."""
+    hw = _detect_hardware_encoder()
+    if hw == "h264_nvenc":
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", str(crf), "-b:v", "0", "-pix_fmt", "yuv420p"]
+    if hw == "h264_qsv":
+        return ["-c:v", "h264_qsv", "-global_quality", str(crf + 2), "-pix_fmt", "nv12"]
+    if hw == "h264_amf":
+        return ["-c:v", "h264_amf", "-rc", "cqp", "-qp_i", str(crf), "-qp_p", str(crf), "-quality", "quality", "-pix_fmt", "nv12"]
+    return ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
+
+
+def _final_pass_video_routing(video_filter: str | None, preset: str, crf: int, fps: int) -> tuple[list[str], list[str]]:
+    """Returns `(video_map_args, video_encode_args)` for the final concat
+    pass's own video stream — factored out of `run()` so the "skip the
+    re-encode entirely when there's nothing to filter" decision is directly
+    testable. `video_filter is None` (no caption burn-in, and no other
+    global video filter exists yet) means every segment's own already-exact
+    fps/pix_fmt (see `_encode_segment_to_path`'s `-r`/`-pix_fmt` on each one)
+    can be stream-copied straight through with `-map 0:v -c:v copy` — a real,
+    bit-for-bit-exact skip of a full second full-resolution decode+encode
+    pass over the entire video, not an approximation. Otherwise, routes the
+    concat's `[0:v]` through `video_filter` into `[v]` and encodes it for
+    real (hardware-accelerated when available — see
+    `_final_pass_video_encode_args`)."""
+    if video_filter:
+        return ["-map", "[v]"], _final_pass_video_encode_args(preset, crf) + ["-r", str(fps)]
+    return ["-map", "0:v"], ["-c:v", "copy"]
+
+
+# `None` = not probed yet this process; otherwise `True`/`False`. Separate
+# from `_hw_encoder_cache` — see `_detect_hwaccel_decode`'s own comment on
+# why decode acceleration is worth trying independently of whether an
+# encoder is also available.
+_hwaccel_decode_cache: bool | None = None
+
+
+def _detect_hwaccel_decode() -> bool:
+    """Probes, once per process, whether this machine can actually decode
+    H.264 via D3D11VA. Worth trying independently of `_detect_hardware_
+    encoder`: unlike a hardware ENCODER (real hardware AND a specific SDK/
+    driver stack both have to line up), D3D11-accelerated H.264 DECODE is
+    close to universal on Windows — works with essentially any GPU driver
+    from the last decade, on a machine that may have no usable hardware
+    ENCODER at all (an integrated GPU with old/minimal drivers, a VM with
+    partial GPU passthrough, etc.). Applying it is a pure decode-side
+    offload with zero effect on the encoded output — same libx264 encode,
+    same CRF/preset, same bytes out — it only exists to free CPU cycles that
+    would otherwise go to software H.264 decode, leaving more for the encode
+    itself. Measured on a real (Intel iGPU, no discrete GPU, CPU-only
+    encode) dev machine: the exact same libx264 encode at the exact same
+    settings went from ~24fps to ~64fps at 4K purely from this.
+
+    Needs a real (tiny) H.264 file to decode, unlike the encoder probe
+    (which can encode from a synthetic `color=` source directly) —
+    `-hwaccel` has nothing to accelerate against a raw generated frame, only
+    a real decode."""
+    global _hwaccel_decode_cache
+    if _hwaccel_decode_cache is not None:
+        return _hwaccel_decode_cache
+    _hwaccel_decode_cache = False
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            probe_input = Path(tmp_dir) / "probe.mp4"
+            encode = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=0.2",
+                    "-c:v", "libx264", "-preset", "ultrafast", str(probe_input),
+                ],
+                capture_output=True, text=True, timeout=15, **_subprocess_kwargs(),
+            )
+            if encode.returncode != 0 or not probe_input.exists():
+                return False
+            decode = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11",
+                    "-i", str(probe_input), "-vf", "hwdownload,format=nv12", "-f", "null", "-",
+                ],
+                capture_output=True, text=True, timeout=15, **_subprocess_kwargs(),
+            )
+            _hwaccel_decode_cache = decode.returncode == 0
+    except Exception:
+        _hwaccel_decode_cache = False
+    return _hwaccel_decode_cache
+
+
+def _disable_hwaccel_decode() -> None:
+    """Same pattern as `_disable_hardware_encoder` — called when the final
+    pass's REAL attempt fails at runtime despite passing the tiny probe."""
+    global _hwaccel_decode_cache
+    _hwaccel_decode_cache = False
+
+
+def _final_pass_input_hwaccel_args(needs_decode: bool) -> tuple[list[str], str]:
+    """`-hwaccel` args to insert before the final pass's concat `-i`, plus
+    the `-vf` prefix that must come before any content filter (`ass=`, which
+    needs software pixel data — libass can't operate on hardware frames) to
+    bring decoded frames back to normal software frames first. Returns
+    `([], "")` unchanged when there's nothing to filter at all
+    (`needs_decode=False` — the `-c:v copy` path from `_final_pass_video_
+    routing`, which never decodes a single frame) or when hardware-
+    accelerated decode isn't available (see `_detect_hwaccel_decode`)."""
+    if not needs_decode or not _detect_hwaccel_decode():
+        return [], ""
+    return ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"], "hwdownload,format=nv12,format=yuv420p,"
+
+
 def run_final_pass(args: list[str], duration_seconds: float) -> None:
     process = subprocess.Popen(
         ["ffmpeg", *args],
@@ -2330,7 +2697,6 @@ def run(manifest_path: Path, output_path: Path) -> None:
         write_captions_ass(captions, ass_path, width, height, default_style)
 
     engine.report_progress(72, "Rendering video", "Muxing audio and captions")
-    final_args = ["-y", "-f", "concat", "-safe", "0", "-i", str(segments_list_path)]
 
     # Every audio source (narration + each music clip) becomes its own ffmpeg
     # input and its own labeled filter chain (trim/fade/volume/delay), then
@@ -2405,22 +2771,82 @@ def run(manifest_path: Path, output_path: Path) -> None:
         final_audio_label = "[aout]"
 
     video_filter = f"ass='{escape_subtitles_path(ass_path)}':fontsdir='{escape_subtitles_path(_BUNDLED_FONTS_DIR)}'" if has_captions else None
-    graph_parts.insert(0, f"[0:v]{video_filter}[v]" if video_filter else "[0:v]copy[v]")
+    # No caption burn-in (and no other global video filter exists yet): every
+    # segment was already encoded at this export's own exact fps/pix_fmt (see
+    # `_encode_segment_to_path`'s own `-r fps`/`-pix_fmt yuv420p` on each
+    # one), so the concatenated video stream needs no further processing at
+    # all — a real `-c:v copy` here is bit-for-bit exact, not an
+    # approximation, and skips a full second full-resolution decode+encode
+    # pass over the ENTIRE video for nothing. Previously this went through
+    # `[0:v]copy[v]` in the filtergraph regardless — a no-op *filter*, but
+    # still one that forces `-c:v libx264` to fully decode and re-encode
+    # every frame right after `_encode_segment_to_path` already encoded it
+    # once, on every single export.
+    audio_graph_parts = graph_parts
 
-    final_args += audio_input_args
-    final_args += ["-filter_complex", ";".join(graph_parts), "-map", "[v]"]
-    if final_audio_label:
-        final_args += ["-map", final_audio_label]
-    final_args += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p", "-r", str(fps)]
-    final_args += ["-c:a", "aac", "-b:a", "192k"] if final_audio_label else ["-an"]
-    # Video's own length is exact and authoritative (see assign_frame_counts);
-    # `-t` here is a safety net in case the mixed/padded audio ever overruns
-    # it, not something that should ever actually need to trim the picture.
-    final_args += [
-        "-t", f"{duration_seconds:.3f}", "-movflags", "+faststart",
-        "-progress", "pipe:1", "-nostats", str(output_path),
-    ]
-    run_final_pass(final_args, duration_seconds)
+    def _build_and_run_final_pass() -> None:
+        """Builds the full final-pass command fresh and runs it — factored
+        into its own closure (rather than a plain one-shot list build) so a
+        hardware-acceleration failure (see the `except` block below) can
+        simply disable whichever cache(s) were involved and call this again:
+        every hardware decision below re-reads `_detect_hardware_encoder`/
+        `_detect_hwaccel_decode`, so a second call after disabling one
+        naturally rebuilds as a fully plain CPU command instead of needing
+        to surgically patch the previous argument list."""
+        hwaccel_input_args, hwaccel_filter_prefix = _final_pass_input_hwaccel_args(bool(video_filter))
+        video_map_args, video_encode_args = _final_pass_video_routing(video_filter, preset, crf, fps)
+        # Visible confirmation of which paths this export actually took —
+        # otherwise there's no way for a user comparing export times across
+        # machines/settings to tell "no re-encode needed" from "hardware
+        # encoder" from "plain CPU", or whether decode acceleration kicked
+        # in, just by watching the progress bar.
+        detail = f"Encoding ({_ENCODER_LABELS.get(video_encode_args[1], video_encode_args[1])}"
+        detail += ", hardware-accelerated decode)" if hwaccel_input_args else ")"
+        engine.report_progress(72, "Rendering video", detail)
+
+        args = ["-y", *hwaccel_input_args, "-f", "concat", "-safe", "0", "-i", str(segments_list_path)]
+        args += audio_input_args
+        parts = list(audio_graph_parts)
+        if video_filter:
+            parts.insert(0, f"[0:v]{hwaccel_filter_prefix}{video_filter}[v]")
+        if parts:
+            args += ["-filter_complex", ";".join(parts)]
+        args += video_map_args
+        if final_audio_label:
+            args += ["-map", final_audio_label]
+        args += video_encode_args
+        args += ["-c:a", "aac", "-b:a", "192k"] if final_audio_label else ["-an"]
+        # Video's own length is exact and authoritative (see
+        # assign_frame_counts); `-t` here is a safety net in case the
+        # mixed/padded audio ever overruns it, not something that should
+        # ever actually need to trim the picture.
+        args += [
+            "-t", f"{duration_seconds:.3f}", "-movflags", "+faststart",
+            "-progress", "pipe:1", "-nostats", str(output_path),
+        ]
+        run_final_pass(args, duration_seconds)
+
+    try:
+        _build_and_run_final_pass()
+    except RuntimeError:
+        # A hardware encoder and/or hardware-accelerated decode passed its
+        # own tiny probe but failed on this export's real resolution/
+        # settings/media — disable whichever of the two were actually in
+        # play and retry ONCE on a fully plain CPU pass, rather than fail
+        # the whole export over an optimization. If neither was in play
+        # (already plain CPU, e.g. the `-c:v copy` path, or both already
+        # disabled from an earlier segment/export in this same process),
+        # retrying would just fail identically — re-raise instead.
+        used_hw_encoder = bool(_hw_encoder_cache and _hw_encoder_cache.get("name"))
+        used_hwaccel_decode = bool(_hwaccel_decode_cache)
+        if not used_hw_encoder and not used_hwaccel_decode:
+            raise
+        if used_hw_encoder:
+            _disable_hardware_encoder()
+        if used_hwaccel_decode:
+            _disable_hwaccel_decode()
+        engine.report_progress(72, "Rendering video", "Hardware acceleration failed - retrying on plain CPU")
+        _build_and_run_final_pass()
 
     for path in segment_paths:
         path.unlink(missing_ok=True)

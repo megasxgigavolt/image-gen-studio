@@ -234,18 +234,6 @@ def test_is_ffmpeg_native_recipe_true_with_only_camera_move_customized():
     {"pathPoints": [{"x": 0, "y": 0}, {"x": 10, "y": 10}]},
     {"easing": "elastic"},
     {"rotationFromDeg": 0, "rotationToDeg": 15},
-    # Root-cause coverage for a real, shipped-then-reverted bug: an earlier
-    # attempt at a native ffmpeg vignette equivalent (see
-    # _FFMPEG_NATIVE_NEUTRAL_RECIPE's own comment) produced a dramatically
-    # wrong-shaped/wrong-strength effect on a real export (confirmed via a
-    # live repro against a real source image: a "subtle" 0.15 intensity
-    # rendered as a near-maximum-strength, pillarbox-looking dark vignette).
-    # ffmpeg's `vignette` filter is a full-frame radial lens model; Motion-
-    # Clip.tsx's real effect is a thin edge-only inset box-shadow — no
-    # parameter combination reproduces one with the other, so vignette stays
-    # Remotion-gated, correctly, and must keep disqualifying the fast path.
-    {"vignette": 0.15},
-    {"vignette": 1.0},
 ])
 def test_is_ffmpeg_native_recipe_false_when_any_higher_tier_field_is_active(overrides):
     assert export_engine._is_ffmpeg_native_recipe(_neutral_recipe(**overrides)) is False
@@ -257,13 +245,27 @@ def test_is_ffmpeg_native_recipe_false_when_any_higher_tier_field_is_active(over
 # disqualify nearly every real clip from the ffmpeg-native fast path
 # regardless of anything else. Has a native, EXACT ffmpeg equivalent (see
 # build_recipe_zoompan_filter) and must NOT disqualify the fast path on its
-# own — unlike vignette (see the parametrized test above), which does.
+# own.
 @pytest.mark.parametrize("overrides", [
     {"fadeInFrames": 12},
     {"fadeOutFrames": 12},
     {"fadeInFrames": 12, "fadeOutFrames": 12},
 ])
 def test_is_ffmpeg_native_recipe_true_for_fade_envelope(overrides):
+    assert export_engine._is_ffmpeg_native_recipe(_neutral_recipe(**overrides)) is True
+
+
+# Root-cause coverage for the OTHER half of "why is it pushing all stills
+# into Remotion for no reason": vignette used to disqualify the fast path
+# unconditionally (an earlier attempt at a native ffmpeg equivalent, using
+# ffmpeg's own built-in `vignette` filter, was reverted after it produced a
+# dramatically wrong-shaped/wrong-strength effect — a full-frame radial lens
+# model standing in for MotionClip.tsx's real thin edge-only inset
+# box-shadow). It's now handled correctly via `_apply_vignette_filter`'s own
+# compositing step instead (see its tests below), so ANY vignette value must
+# no longer disqualify the fast path on its own.
+@pytest.mark.parametrize("overrides", [{"vignette": 0.15}, {"vignette": 1.0}])
+def test_is_ffmpeg_native_recipe_true_for_any_vignette(overrides):
     assert export_engine._is_ffmpeg_native_recipe(_neutral_recipe(**overrides)) is True
 
 
@@ -281,6 +283,21 @@ def test_build_recipe_zoompan_filter_produces_a_zoompan_chain():
     assert "d=72" in vf
     assert "s=1920x1080" in vf
     assert "fps=24" in vf
+
+
+# Root-cause coverage for "even with zero clips needing Remotion, a 10-minute
+# 4K video still takes 30-40 minutes to export": every zoompan filter here
+# pre-scales its source before cropping (see `_ZOOMPAN_PRE_SCALE_FACTOR`'s
+# own comment for why any upscale is needed at all), and `-loop 1` re-runs
+# that scale on every one of a still's repeated output frames, not once —
+# the pre-scale factor was 8x, uncovered as the actual dominant cost on a
+# real project export via direct measurement (8x=5fps, 4x=19fps, roughly the
+# quadratic cost a 2D upscale would predict). Pinned at a small value here so
+# a future "let's improve smoothness a bit" tweak can't silently reintroduce
+# a ~4x-or-worse regression — that tradeoff needs to be made with the actual
+# render-time cost in view, not just the smoothness benefit.
+def test_zoompan_pre_scale_factor_stays_small():
+    assert export_engine._ZOOMPAN_PRE_SCALE_FACTOR <= 4
 
 
 def test_build_recipe_zoompan_filter_includes_fade_when_transition_requests_it():
@@ -309,7 +326,10 @@ def test_build_recipe_zoompan_filter_reduces_to_the_existing_anchor_formula_with
 
 def test_build_recipe_zoompan_filter_omits_envelope_fade_when_off():
     vf = export_engine.build_recipe_zoompan_filter(_neutral_recipe(), 1920, 1080, 24, 3.0, 72)
-    assert "vignette=" not in vf  # never emitted — vignette stays Remotion-gated (see _FFMPEG_NATIVE_NEUTRAL_RECIPE)
+    # build_recipe_zoompan_filter never renders vignette itself — that's a
+    # separate compositing step layered on top by _apply_vignette_filter,
+    # not ffmpeg's own (wrong-shaped, for this) `vignette` filter.
+    assert "vignette=" not in vf
     assert "fade=" not in vf
 
 
@@ -381,6 +401,119 @@ def test_encode_segment_routes_a_simple_video_recipe_through_ffmpeg_native(tmp_p
     vf = args[args.index("-vf") + 1]
     assert "zoompan=" in vf
     assert "d=1:" in vf  # one output frame per real input frame, not "hold for the whole clip"
+
+
+# Root-cause coverage for the OTHER half of "why is Remotion still running
+# for a clip whose recipe is nothing but a plain push-in": vignette used to
+# unconditionally disqualify the whole recipe from this fast path even
+# though the AI used to attach a small vignette to nearly every real clip by
+# default. A recipe with a vignette on top of an otherwise Tier-1-only
+# camera move must still take this fast path, with the vignette applied as
+# its own extra compositing stage instead of sending the whole clip through
+# Remotion (see _apply_vignette_filter's own tests for that stage itself).
+def test_encode_segment_applies_vignette_via_filter_complex_on_ffmpeg_native_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_render_motion_graphic", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not call Remotion")))
+    monkeypatch.setattr(export_engine, "_ensure_vignette_mask", lambda mask_dir, width, height, vignette: mask_dir / "mask.png")
+    calls = []
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
+
+    segment = {
+        "kind": "image", "path": "/tmp/still.png", "start": 0.0, "end": 3.0, "frames": 72,
+        "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": _neutral_recipe(vignette=0.2),
+        "transitionIn": "cut", "transitionOut": "cut",
+    }
+    export_engine._encode_segment_to_path(segment, tmp_path / "out.ts", 1920, 1080, 24)
+
+    assert len(calls) == 1
+    args = calls[0]
+    # Two real inputs now: the still, and the (mocked) vignette mask.
+    assert args.count("-i") == 2
+    assert "-vf" not in args
+    filter_graph = args[args.index("-filter_complex") + 1]
+    assert "zoompan=" in filter_graph
+    assert "blend=all_mode=multiply" in filter_graph
+    assert args[args.index("-map") + 1] == "[_vgout]"
+
+
+def test_encode_segment_ffmpeg_native_path_skips_vignette_wrapping_when_absent(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
+
+    segment = {
+        "kind": "image", "path": "/tmp/still.png", "start": 0.0, "end": 3.0, "frames": 72,
+        "motionGraphicEffect": "Manual: Push In", "motionGraphicSettings": _neutral_recipe(),
+        "transitionIn": "cut", "transitionOut": "cut",
+    }
+    export_engine._encode_segment_to_path(segment, tmp_path / "out.ts", 1920, 1080, 24)
+
+    args = calls[0]
+    assert "-vf" in args
+    assert "-filter_complex" not in args
+    assert args.count("-i") == 1
+
+
+def test_vignette_mask_geometry_matches_aspect_ratio():
+    long_edge = export_engine._VIGNETTE_MASK_LONG_EDGE
+    mask_w, mask_h, _ = export_engine._vignette_mask_geometry(3840, 2160, 0.4)
+    assert mask_w == long_edge
+    assert mask_h == round(long_edge * 2160 / 3840)
+
+    # Portrait (9:16) — long edge tracks height instead, never a radial/
+    # aspect-agnostic mask (see _vignette_mask_geometry's own comment on why
+    # that's what avoids the previous ffmpeg `vignette`-filter's pillarboxing).
+    mask_w2, mask_h2, _ = export_engine._vignette_mask_geometry(1080, 1920, 0.4)
+    assert mask_h2 == long_edge
+    assert mask_w2 == round(long_edge * 1080 / 1920)
+
+
+def test_vignette_mask_geometry_higher_vignette_widens_the_falloff_band():
+    # Larger vignette -> larger blur/spread -> the smoothstep's own
+    # denominator ("span") grows, i.e. the darkened band reaches further in
+    # from the edge — the correct (monotonic) direction, unlike the previous
+    # ffmpeg `vignette`-filter attempt, which read backwards.
+    import re
+
+    def _span(vignette):
+        _, _, expr = export_engine._vignette_mask_geometry(1920, 1080, vignette)
+        return float(re.search(r"/([0-9.]+),0,1\)", expr).group(1))
+
+    assert _span(0.8) > _span(0.1) > 0
+
+
+def test_apply_vignette_filter_returns_plain_vf_unchanged_when_no_vignette(tmp_path):
+    extra_inputs, video_args = export_engine._apply_vignette_filter("zoompan=z=1", 0.0, 1920, 1080, 4.0, tmp_path)
+    assert extra_inputs == []
+    assert video_args == ["-vf", "zoompan=z=1"]
+
+
+def test_apply_vignette_filter_builds_a_second_input_and_filter_complex(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_vignette_mask", lambda mask_dir, width, height, vignette: tmp_path / "mask.png")
+
+    extra_inputs, video_args = export_engine._apply_vignette_filter("zoompan=z=1", 0.3, 1920, 1080, 4.0, tmp_path)
+
+    assert extra_inputs == ["-loop", "1", "-t", "4.000", "-i", str(tmp_path / "mask.png")]
+    assert video_args[0] == "-filter_complex"
+    assert "[0:v]zoompan=z=1[_vgz]" in video_args[1]
+    assert "[1:v]scale=1920:1080" in video_args[1]
+    assert "blend=all_mode=multiply:shortest=1" in video_args[1]
+    assert video_args[2:] == ["-map", "[_vgout]"]
+
+
+def test_ensure_vignette_mask_reuses_a_cached_file_across_calls(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        Path(args[-1]).write_bytes(b"fake-png")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+
+    first = export_engine._ensure_vignette_mask(tmp_path, 1920, 1080, 0.25)
+    second = export_engine._ensure_vignette_mask(tmp_path, 1920, 1080, 0.25)
+
+    assert first == second
+    assert len(calls) == 1  # second call reused the cached file — no repeat ffmpeg invocation
 
 
 def test_encode_segment_routes_a_complex_video_recipe_through_remotion_as_before(tmp_path, monkeypatch):
@@ -1391,3 +1524,189 @@ def test_build_recipe_zoompan_filter_defaults_motion_frames_to_the_render_length
     )
     assert plain == explicit
     assert "min(1,on/299)" in plain
+
+
+# --- Hardware-accelerated final pass + the no-caption stream-copy skip -----
+# Root-cause coverage for "even without Remotion, a 4K high-quality export
+# takes hours": the final concat pass always fully decoded+re-encoded the
+# WHOLE video via CPU libx264, even when there was nothing to filter.
+# Measured on a real (no discrete GPU) dev machine: a matched-quality 4K
+# final pass went from ~20fps on libx264 "fast" to ~83fps on Quick Sync.
+
+
+@pytest.fixture(autouse=True)
+def _reset_hardware_encoder_cache():
+    """`_hw_encoder_cache`/`_hwaccel_decode_cache` are process-lifetime
+    caches (see `_detect_hardware_encoder`/`_detect_hwaccel_decode`'s own
+    comments on why) — reset them around every test in this module so one
+    test's monkeypatched probe result can never leak into another's."""
+    export_engine._hw_encoder_cache = None
+    export_engine._hwaccel_decode_cache = None
+    yield
+    export_engine._hw_encoder_cache = None
+    export_engine._hwaccel_decode_cache = None
+
+
+def test_detect_hardware_encoder_returns_the_first_working_candidate(monkeypatch):
+    def fake_run(args, **kwargs):
+        return SimpleNamespace(returncode=0 if "h264_qsv" in args else 1)
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    assert export_engine._detect_hardware_encoder() == "h264_qsv"
+
+
+def test_detect_hardware_encoder_caches_the_result(monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0 if "h264_nvenc" in args else 1)
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    assert export_engine._detect_hardware_encoder() == "h264_nvenc"
+    calls_after_first_probe = len(calls)
+    assert export_engine._detect_hardware_encoder() == "h264_nvenc"
+    assert len(calls) == calls_after_first_probe  # no re-probe on the second call
+
+
+def test_detect_hardware_encoder_returns_none_when_every_candidate_fails(monkeypatch):
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1))
+    assert export_engine._detect_hardware_encoder() is None
+
+
+def test_detect_hardware_encoder_treats_an_exception_as_unusable(monkeypatch):
+    # A candidate LISTED in `ffmpeg -encoders` can still fail at the actual
+    # subprocess level (confirmed on a real machine: h264_amf raised past its
+    # own "DLL failed to open" error) — must be treated the same as a clean
+    # non-zero exit, not propagate and abort the whole probe.
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError("no such device")))
+    assert export_engine._detect_hardware_encoder() is None
+
+
+def test_disable_hardware_encoder_forces_libx264_for_the_rest_of_the_process(monkeypatch):
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0))
+    assert export_engine._detect_hardware_encoder() is not None
+    export_engine._disable_hardware_encoder()
+    assert export_engine._detect_hardware_encoder() is None
+
+
+def test_final_pass_video_encode_args_uses_libx264_when_no_hardware(monkeypatch):
+    monkeypatch.setattr(export_engine, "_detect_hardware_encoder", lambda: None)
+    assert export_engine._final_pass_video_encode_args("fast", 18) == [
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
+    ]
+
+
+def test_final_pass_video_encode_args_uses_nvenc_constant_quality_when_detected(monkeypatch):
+    monkeypatch.setattr(export_engine, "_detect_hardware_encoder", lambda: "h264_nvenc")
+    args = export_engine._final_pass_video_encode_args("fast", 18)
+    assert args[:2] == ["-c:v", "h264_nvenc"]
+    assert args[args.index("-cq") + 1] == "18"
+
+
+def test_final_pass_video_encode_args_uses_qsv_global_quality_when_detected(monkeypatch):
+    monkeypatch.setattr(export_engine, "_detect_hardware_encoder", lambda: "h264_qsv")
+    args = export_engine._final_pass_video_encode_args("fast", 18)
+    assert args[:2] == ["-c:v", "h264_qsv"]
+    assert "nv12" in args
+
+
+def test_final_pass_video_routing_stream_copies_when_theres_nothing_to_filter(monkeypatch):
+    monkeypatch.setattr(export_engine, "_detect_hardware_encoder", lambda: None)
+    video_map_args, video_encode_args = export_engine._final_pass_video_routing(None, "fast", 18, 30)
+    assert video_map_args == ["-map", "0:v"]
+    assert video_encode_args == ["-c:v", "copy"]
+
+
+def test_final_pass_video_routing_filters_and_encodes_when_captions_are_burned_in(monkeypatch):
+    monkeypatch.setattr(export_engine, "_detect_hardware_encoder", lambda: None)
+    video_map_args, video_encode_args = export_engine._final_pass_video_routing(
+        "ass='captions.ass'", "fast", 18, 30
+    )
+    assert video_map_args == ["-map", "[v]"]
+    assert video_encode_args[:2] == ["-c:v", "libx264"]
+    assert video_encode_args[-2:] == ["-r", "30"]
+
+
+# --- Hardware-accelerated DECODE for the final pass -------------------
+# Root-cause coverage for "I have no [discrete] GPU, CPU export is still too
+# slow": decode acceleration (D3D11VA) is close to universal on Windows even
+# on machines with no usable hardware ENCODER — a pure decode-side offload
+# with zero effect on the encoded output, worth trying independently of
+# _detect_hardware_encoder. Measured on a real (Intel iGPU, no discrete GPU)
+# dev machine: the same CPU libx264 encode, same settings, went from ~24fps
+# to ~64fps at 4K purely from this.
+
+
+def _fake_run_writing_probe_file(args, **kwargs):
+    """Stands in for `subprocess.run` in `_detect_hwaccel_decode` tests: the
+    first call is the probe's own tiny libx264 encode, which must actually
+    create the output file (`_detect_hwaccel_decode` checks `.exists()`, not
+    just the exit code) for a mocked "success" to read as real."""
+    if "-c:v" in args and "libx264" in args:
+        Path(args[-1]).write_bytes(b"fake-mp4")
+    return SimpleNamespace(returncode=0)
+
+
+def test_detect_hwaccel_decode_true_when_probe_encode_and_decode_both_succeed(monkeypatch):
+    monkeypatch.setattr(export_engine.subprocess, "run", _fake_run_writing_probe_file)
+    assert export_engine._detect_hwaccel_decode() is True
+
+
+def test_detect_hwaccel_decode_false_when_the_probe_encode_itself_fails(monkeypatch):
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1))
+    assert export_engine._detect_hwaccel_decode() is False
+
+
+def test_detect_hwaccel_decode_false_when_decode_fails_but_encode_succeeds(monkeypatch):
+    def fake_run(args, **kwargs):
+        if "-c:v" in args and "libx264" in args:
+            Path(args[-1]).write_bytes(b"fake-mp4")
+            return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=1)  # the real d3d11va decode attempt
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    assert export_engine._detect_hwaccel_decode() is False
+
+
+def test_detect_hwaccel_decode_treats_an_exception_as_unusable(monkeypatch):
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError("no such device")))
+    assert export_engine._detect_hwaccel_decode() is False
+
+
+def test_detect_hwaccel_decode_caches_the_result(monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return _fake_run_writing_probe_file(args)
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    assert export_engine._detect_hwaccel_decode() is True
+    calls_after_first_probe = len(calls)
+    assert export_engine._detect_hwaccel_decode() is True
+    assert len(calls) == calls_after_first_probe  # no re-probe on the second call
+
+
+def test_disable_hwaccel_decode_forces_false_for_the_rest_of_the_process(monkeypatch):
+    monkeypatch.setattr(export_engine.subprocess, "run", _fake_run_writing_probe_file)
+    assert export_engine._detect_hwaccel_decode() is True
+    export_engine._disable_hwaccel_decode()
+    assert export_engine._detect_hwaccel_decode() is False
+
+
+def test_final_pass_input_hwaccel_args_empty_when_nothing_to_decode(monkeypatch):
+    monkeypatch.setattr(export_engine, "_detect_hwaccel_decode", lambda: True)
+    assert export_engine._final_pass_input_hwaccel_args(False) == ([], "")
+
+
+def test_final_pass_input_hwaccel_args_empty_when_unavailable(monkeypatch):
+    monkeypatch.setattr(export_engine, "_detect_hwaccel_decode", lambda: False)
+    assert export_engine._final_pass_input_hwaccel_args(True) == ([], "")
+
+
+def test_final_pass_input_hwaccel_args_when_available_and_needed(monkeypatch):
+    monkeypatch.setattr(export_engine, "_detect_hwaccel_decode", lambda: True)
+    extra_input_args, filter_prefix = export_engine._final_pass_input_hwaccel_args(True)
+    assert extra_input_args == ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
+    assert filter_prefix == "hwdownload,format=nv12,format=yuv420p,"

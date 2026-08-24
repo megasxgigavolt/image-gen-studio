@@ -512,7 +512,9 @@ export const DEFAULT_MOTION_RECIPE: MotionRecipe = {
   saturationFrom: 1, saturationTo: 1,
   glowColor: null,
   glowX: 0.5, glowY: 0.5, glowOpacity: 0, glowFlicker: 0,
-  vignette: 0.15,
+  // Optional accent, off by default — matches services/motion-engine's own
+  // DEFAULT_RECIPE and motion_graphics_engine.py's MotionRecipe.vignette.
+  vignette: 0,
   fadeInFrames: 14, fadeOutFrames: 14,
 };
 

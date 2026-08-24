@@ -66,7 +66,9 @@ def test_motion_recipe_dumps_camelcase_settings_with_defaults():
     assert settings["environmentEffect"] == "none"
     assert settings["transitionOut"] == "cut"
     assert settings["pathPoints"] is None
-    assert settings["vignette"] == 0.15
+    # Optional accent, off by default (like Tiers 2/4/5) — see MotionRecipe's
+    # own comment on why this changed from an always-a-little-on 0.15.
+    assert settings["vignette"] == 0.0
 
 
 def test_motion_recipe_serializes_path_points():

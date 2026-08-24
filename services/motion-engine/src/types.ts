@@ -230,7 +230,9 @@ export const DEFAULT_RECIPE: MotionRecipe = {
   glowY: 0.5,
   glowOpacity: 0,
   glowFlicker: 0,
-  vignette: 0.15,
+  // Optional accent, off by default (matches motion_graphics_engine.py's
+  // MotionRecipe.vignette) — not a baseline every clip needs.
+  vignette: 0,
   fadeInFrames: 14,
   fadeOutFrames: 14,
 };

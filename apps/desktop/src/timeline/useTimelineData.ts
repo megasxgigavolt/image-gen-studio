@@ -34,6 +34,26 @@ export function useTimelineData(
     setHistoryAvailability({ canUndo: undoStackRef.current.length > 0, canRedo: redoStackRef.current.length > 0 });
   }
 
+  // Mirrors `timeline` state, updated SYNCHRONOUSLY at every write (see
+  // setTimelineAndRef below) rather than via a useEffect reacting to state —
+  // an effect-based mirror still has a one-tick lag: two `refresh()` calls
+  // fired back-to-back (e.g. drag-resizing one clip then immediately
+  // dragging a second) could both read `before` from the closed-over
+  // `timeline` state before either update had flowed through a re-render,
+  // corrupting the undo stack with a duplicate/skipped entry. Reading from
+  // this ref instead guarantees a second, near-simultaneous `refresh()` call
+  // always sees the first call's result, even before React has re-rendered.
+  const timelineRef = useRef<TimelineRecord | null>(null);
+  function setTimelineAndRef(value: TimelineRecord | null | ((previous: TimelineRecord | null) => TimelineRecord | null)) {
+    setTimeline((previous) => {
+      const next = typeof value === "function"
+        ? (value as (previous: TimelineRecord | null) => TimelineRecord | null)(previous)
+        : value;
+      timelineRef.current = next;
+      return next;
+    });
+  }
+
   useEffect(() => {
     if (!activeVideoId) return;
     let cancelled = false;
@@ -41,6 +61,7 @@ export function useTimelineData(
     onVideoChange?.();
     undoStackRef.current = [];
     redoStackRef.current = [];
+    timelineRef.current = null;
     setHistoryAvailability({ canUndo: false, canRedo: false });
 
     // Stale-while-revalidate: show whatever we already have for this video
@@ -49,7 +70,7 @@ export function useTimelineData(
     const cachedTimeline = getCachedData<TimelineRecord>(`tl-timeline:${activeVideoId}`);
     const cachedCaptions = getCachedData<CaptionSetRecord | null>(`tl-captions:${activeVideoId}`);
     if (cachedWorkspace) setWorkspace(cachedWorkspace);
-    if (cachedTimeline) setTimeline(cachedTimeline);
+    if (cachedTimeline) setTimelineAndRef(cachedTimeline);
     if (cachedCaptions !== undefined) setCaptionSet(cachedCaptions);
     setLoading(!cachedWorkspace || !cachedTimeline);
 
@@ -89,7 +110,7 @@ export function useTimelineData(
         }
         if (!cancelled) {
           setCachedData(`tl-timeline:${activeVideoId}`, loadedTimeline);
-          setTimeline(loadedTimeline);
+          setTimelineAndRef(loadedTimeline);
         }
       } catch (caught) {
         if (!cancelled) setError(String(caught));
@@ -105,12 +126,14 @@ export function useTimelineData(
    * changes (fired on every wheel tick / slider drag) and the undo/redo
    * restore itself (which would otherwise re-push the state it's replacing). */
   async function refresh(promise: Promise<TimelineRecord>, options?: { skipHistory?: boolean }) {
-    const before = timeline;
+    // Read from the ref, not the `timeline` state closed over when `refresh`
+    // was called — see timelineRef's own comment on why.
+    const before = timelineRef.current;
     setSavingCount((count) => count + 1);
     try {
       const next = await promise;
       if (activeVideoId) setCachedData(`tl-timeline:${activeVideoId}`, next);
-      setTimeline(next);
+      setTimelineAndRef(next);
       if (before && !options?.skipHistory) {
         undoStackRef.current.push(before);
         if (undoStackRef.current.length > 50) undoStackRef.current.shift();
@@ -126,25 +149,27 @@ export function useTimelineData(
   }
 
   async function undo() {
-    if (!activeVideoId || !timeline || !undoStackRef.current.length) return;
+    const current = timelineRef.current;
+    if (!activeVideoId || !current || !undoStackRef.current.length) return;
     const previous = undoStackRef.current.pop()!;
-    redoStackRef.current.push(timeline);
+    redoStackRef.current.push(current);
     if (redoStackRef.current.length > 50) redoStackRef.current.shift();
     await refresh(projectsClient.restoreTimelineSnapshot(activeVideoId, previous), { skipHistory: true });
     syncHistoryAvailability();
   }
 
   async function redo() {
-    if (!activeVideoId || !timeline || !redoStackRef.current.length) return;
+    const current = timelineRef.current;
+    if (!activeVideoId || !current || !redoStackRef.current.length) return;
     const next = redoStackRef.current.pop()!;
-    undoStackRef.current.push(timeline);
+    undoStackRef.current.push(current);
     if (undoStackRef.current.length > 50) undoStackRef.current.shift();
     await refresh(projectsClient.restoreTimelineSnapshot(activeVideoId, next), { skipHistory: true });
     syncHistoryAvailability();
   }
 
   return {
-    timeline, setTimeline,
+    timeline, setTimeline: setTimelineAndRef,
     workspace,
     captionSet, setCaptionSet,
     audioDataUrl,

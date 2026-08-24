@@ -2597,6 +2597,27 @@ function VisualizationTypesModal({ types, hardRule, onChange, onClose }: {
   );
 }
 
+// Module-level (outside ImagesView), keyed by videoId — must survive
+// ImagesView unmounting entirely, not just re-rendering. Root-cause fix for
+// a real double-runner bug: this used to be a per-mount useRef, reset to
+// "stopped" on every mount. If Bulk Generation's queue runner (see
+// runQueueRunner) was still in its PLANNING phase (before a
+// "generationStarted" result) when the user navigated to another tab,
+// nothing stopped its background while-loop — it kept running against the
+// OLD ref. Navigating back to Visuals remounted the component with a FRESH
+// ref defaulting to "stopped", so the mount-time resume logic started a
+// SECOND runQueueRunner loop, racing the first to advance the same
+// plan_index cursor. Keeping this map at module scope means a remount reads
+// the SAME "running" state the still-live background loop is maintaining,
+// so its own guard correctly blocks the second start.
+const bulkPlanControlByVideo = new Map<string, "running" | "paused" | "stopped">();
+function getBulkPlanControl(videoId: string | null): "running" | "paused" | "stopped" {
+  return bulkPlanControlByVideo.get(videoId ?? "") ?? "stopped";
+}
+function setBulkPlanControl(videoId: string | null, value: "running" | "paused" | "stopped") {
+  bulkPlanControlByVideo.set(videoId ?? "", value);
+}
+
 function ImagesView() {
   const { activeVideoId, addToast, setStage } = useAppStore();
   const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
@@ -2645,7 +2666,6 @@ function ImagesView() {
   // request is currently active in the durable, backend-owned queue
   // instead of a single in-memory task.
   const [bulkPlanStatus, setBulkPlanStatus] = useState<"running" | "paused" | null>(null);
-  const bulkPlanControl = useRef<"running" | "paused" | "stopped">("stopped");
   const [bulkQueue, setBulkQueue] = useState<BulkGenerationRequestRecord[]>([]);
   // Collapsed by default — the merged status bar shows just a "+N queued"
   // toggle; this expands it into the compact reorder/cancel list.
@@ -3192,8 +3212,9 @@ function ImagesView() {
   // once it starts generating, this hands off to the existing job-status
   // polling effect and stops, exactly like the old single-request flow did.
   async function runQueueRunner() {
-    if (!activeVideoId || bulkPlanControl.current === "running") return;
-    bulkPlanControl.current = "running";
+    if (!activeVideoId || getBulkPlanControl(activeVideoId) === "running") return;
+    const videoId = activeVideoId;
+    setBulkPlanControl(videoId, "running");
     setBulkPlanStatus("running");
     // A single advanceBulkGenerationQueue call can legitimately take a long
     // time to resolve (a "high effort" Claude CLI planning call especially)
@@ -3204,11 +3225,11 @@ function ImagesView() {
     // the first real result overwrites this right away.
     setBulkProgress({ current: 0, total: 0, label: "Starting Bulk Generation…" });
     try {
-      while (bulkPlanControl.current === "running") {
-        const result = await projectsClient.advanceBulkGenerationQueue(activeVideoId);
-        if (bulkPlanControl.current !== "running") break;
+      while (getBulkPlanControl(videoId) === "running") {
+        const result = await projectsClient.advanceBulkGenerationQueue(videoId);
+        if (getBulkPlanControl(videoId) !== "running") break;
         if (result.kind === "idle") {
-          bulkPlanControl.current = "stopped";
+          setBulkPlanControl(videoId, "stopped");
           setBulkPlanStatus(null);
           setBulkProgress(null);
           break;
@@ -3221,9 +3242,9 @@ function ImagesView() {
         // existing job-status UI/polling takes over from here.
         setBulkPlanStatus(null);
         setBulkProgress(null);
-        bulkPlanControl.current = "stopped";
-        const live = await projectsClient.getImageWorkspace(activeVideoId);
-        setCached(activeVideoId, live);
+        setBulkPlanControl(videoId, "stopped");
+        const live = await projectsClient.getImageWorkspace(videoId);
+        setCached(videoId, live);
         setWorkspace(live);
         if (selectedGroupId) {
           const group = live.groups.find((g) => g.group.id === selectedGroupId);
@@ -3231,11 +3252,11 @@ function ImagesView() {
           if (pv) {
             setImageSettings(parseImageSettings(pv.settingsJson));
             setUserPrompt(pv.userPrompt);
-            const videoDirective = live.settings.find((s) => s.key === `system_prompt.${activeVideoId}`)?.value;
+            const videoDirective = live.settings.find((s) => s.key === `system_prompt.${videoId}`)?.value;
             setSystemPrompt(videoDirective ?? pv.systemPrompt ?? systemPrompt);
           }
         }
-        const latestJob = await projectsClient.getLatestImageJob(activeVideoId);
+        const latestJob = await projectsClient.getLatestImageJob(videoId);
         setJob(latestJob && ["queued", "running", "paused", "stopped", "failed"].includes(latestJob.status) ? latestJob : null);
         if (result.kind === "generationStarted") addToast("Bulk Generation started", "success");
         break;
@@ -3244,7 +3265,7 @@ function ImagesView() {
       setError(String(caught));
       // Leave the request exactly where it is (its plan_index cursor is
       // already durable on the backend) — Resume just calls this again.
-      bulkPlanControl.current = "paused";
+      setBulkPlanControl(videoId, "paused");
       setBulkPlanStatus("paused");
     } finally {
       await refreshBulkQueue();
@@ -3253,12 +3274,12 @@ function ImagesView() {
 
   function controlBulkPlan(action: "pause" | "resume" | "stop") {
     if (action === "pause") {
-      bulkPlanControl.current = "paused";
+      setBulkPlanControl(activeVideoId, "paused");
       setBulkPlanStatus("paused");
     } else if (action === "resume") {
       void runQueueRunner();
     } else if (action === "stop") {
-      bulkPlanControl.current = "stopped";
+      setBulkPlanControl(activeVideoId, "stopped");
       setBulkPlanStatus(null);
       setBulkProgress(null);
       // Abandons only the request that's actively planning right now — the
@@ -4400,10 +4421,10 @@ export function App() {
     let unlisten: (() => void) | undefined;
     (async () => {
       try {
-        unlisten = await listen<{ videoId: string; percent: number; stage: string; detail: string }>(
+        unlisten = await listen<{ videoId: string; exportId: string; percent: number; stage: string; detail: string }>(
           "export-progress",
           ({ payload }) => {
-            useAppStore.getState().updateExportProgress(payload.videoId, payload.percent, payload.stage, payload.detail);
+            useAppStore.getState().updateExportProgress(payload.videoId, payload.exportId, payload.percent, payload.stage, payload.detail);
           },
         );
       } catch {

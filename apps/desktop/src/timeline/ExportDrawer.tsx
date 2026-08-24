@@ -39,6 +39,7 @@ export function ExportDrawer({
   exporting,
   exportCancelling,
   exportProgress,
+  startedAt,
   settings,
   onSettingsChange,
   fileName,
@@ -62,6 +63,11 @@ export function ExportDrawer({
   exporting: boolean;
   exportCancelling?: boolean;
   exportProgress: { percent: number; stage: string; detail: string };
+  /** From the shared store's ExportState.startedAt (not local state) — so
+   * elapsed-time/ETA survives this drawer remounting mid-export (e.g.
+   * collapsing/reopening the Editor tab) instead of resetting to ~0. Null
+   * while nothing is exporting. */
+  startedAt: number | null;
   settings: ExportSettingsRecord;
   onSettingsChange: (patch: Partial<ExportSettingsRecord>) => void;
   fileName: string;
@@ -73,13 +79,7 @@ export function ExportDrawer({
   onShowInFolder: (path: string) => void;
   onOpenHistory: () => void;
 }) {
-  const [startedAt, setStartedAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
-
-  useEffect(() => {
-    if (exporting) setStartedAt((current) => current ?? Date.now());
-    else setStartedAt(null);
-  }, [exporting]);
 
   useEffect(() => {
     if (!exporting) return;

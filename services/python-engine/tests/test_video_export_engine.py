@@ -8,8 +8,12 @@ ffmpeg discovery at module import time that only behaves correctly with its
 own directory on sys.path.
 """
 
+import hashlib
 import json
+import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -493,10 +497,34 @@ def test_apply_vignette_filter_builds_a_second_input_and_filter_complex(tmp_path
 
     assert extra_inputs == ["-loop", "1", "-t", "4.000", "-i", str(tmp_path / "mask.png")]
     assert video_args[0] == "-filter_complex"
-    assert "[0:v]zoompan=z=1[_vgz]" in video_args[1]
+    assert "[0:v]zoompan=z=1,format=gbrp[_vgz]" in video_args[1]
     assert "[1:v]scale=1920:1080" in video_args[1]
     assert "blend=all_mode=multiply:shortest=1" in video_args[1]
     assert video_args[2:] == ["-map", "[_vgout]"]
+
+
+def test_apply_vignette_filter_blends_in_rgb_not_yuv_to_avoid_green_chroma_cast(tmp_path, monkeypatch):
+    # Regression test for a real user-reported bug: exported clips with a
+    # vignette came out solid green. `blend=all_mode=multiply` runs
+    # per-PLANE — in yuv420p that multiplies the U/V chroma planes (neutral
+    # at 128) by the mask's own neutral-128 chroma, pulling U/V toward 0,
+    # which isn't neutral chroma but a heavily saturated (green) color. The
+    # blend must happen in planar RGB (`gbrp`), where the mask's grey value
+    # scales R/G/B together and only dims brightness, before converting back
+    # to yuv420p for encoding.
+    monkeypatch.setattr(export_engine, "_ensure_vignette_mask", lambda mask_dir, width, height, vignette: tmp_path / "mask.png")
+
+    _, video_args = export_engine._apply_vignette_filter("zoompan=z=1", 0.3, 1920, 1080, 4.0, tmp_path)
+
+    filter_graph = video_args[1]
+    # Both the clip and the mask must be converted to gbrp BEFORE the
+    # multiply blend runs — never blended directly in yuv420p.
+    assert re.search(r"\[0:v\][^;]*format=gbrp\[_vgz\]", filter_graph)
+    assert re.search(r"\[1:v\][^;]*format=gbrp\[_vgm\]", filter_graph)
+    blend_stage = filter_graph.split(";")[-1]
+    assert "[_vgz][_vgm]blend=all_mode=multiply" in blend_stage
+    # Only converted back to yuv420p AFTER the blend, for the encoder.
+    assert blend_stage.endswith("format=yuv420p[_vgout]")
 
 
 def test_ensure_vignette_mask_reuses_a_cached_file_across_calls(tmp_path, monkeypatch):
@@ -935,22 +963,42 @@ def test_motion_engine_installed_is_false_for_a_broken_partial_install(tmp_path,
 
 
 def test_motion_engine_installed_is_true_once_the_remotion_bin_exists(tmp_path, monkeypatch):
-    bin_dir = tmp_path / "node_modules" / ".bin"
-    bin_dir.mkdir(parents=True)
-    (bin_dir / "remotion.cmd").write_text("@echo off", encoding="utf-8")
     monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    _mark_installed(tmp_path)
     assert export_engine._motion_engine_installed() is True
+
+
+# Root-cause coverage for MOTION_ENGINE_DIR now persisting across app
+# updates (see its own comment): a `remotion.cmd` left over from an OLDER
+# version's install must not be trusted once the current version's
+# package-lock.json (synced in by `_sync_motion_engine_source`) no longer
+# matches what it was actually installed against.
+def test_motion_engine_installed_is_false_when_lockfile_no_longer_matches(tmp_path, monkeypatch):
+    (tmp_path / "package-lock.json").write_text('{"v": 1}', encoding="utf-8")
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    _mark_installed(tmp_path)
+    assert export_engine._motion_engine_installed() is True
+
+    # A newer app version synced in a package-lock.json with different deps
+    # — the leftover node_modules (never actually reinstalled) is now stale.
+    (tmp_path / "package-lock.json").write_text('{"v": 2}', encoding="utf-8")
+    assert export_engine._motion_engine_installed() is False
 
 
 def _mark_installed(tmp_path: Path) -> None:
     bin_dir = tmp_path / "node_modules" / ".bin"
     bin_dir.mkdir(parents=True)
     (bin_dir / "remotion.cmd").write_text("@echo off", encoding="utf-8")
+    lockfile = tmp_path / "package-lock.json"
+    fingerprint = hashlib.sha256(lockfile.read_bytes()).hexdigest() if lockfile.exists() else ""
+    (tmp_path / "node_modules" / ".installed-lockfile-hash").write_text(fingerprint, encoding="utf-8")
 
 
 def test_ensure_motion_engine_ready_skips_install_when_already_healthy(tmp_path, monkeypatch):
     _mark_installed(tmp_path)
     monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_RESOURCE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_sync_motion_engine_source", lambda: None)
     monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not run npm")))
     monkeypatch.setattr(export_engine, "_ensure_remotion_browser_downloaded", lambda: None)
     export_engine._ensure_motion_engine_ready()  # no exception == no (re)install attempted
@@ -959,6 +1007,8 @@ def test_ensure_motion_engine_ready_skips_install_when_already_healthy(tmp_path,
 def test_ensure_motion_engine_ready_prefers_npm_ci_when_lockfile_bundled(tmp_path, monkeypatch):
     (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_RESOURCE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_sync_motion_engine_source", lambda: None)
     monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
     monkeypatch.setattr(export_engine, "_ensure_remotion_browser_downloaded", lambda: None)
     calls = []
@@ -975,6 +1025,8 @@ def test_ensure_motion_engine_ready_prefers_npm_ci_when_lockfile_bundled(tmp_pat
 
 def test_ensure_motion_engine_ready_falls_back_to_npm_install_without_a_lockfile(tmp_path, monkeypatch):
     monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_RESOURCE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_sync_motion_engine_source", lambda: None)
     monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
     monkeypatch.setattr(export_engine, "_ensure_remotion_browser_downloaded", lambda: None)
     calls = []
@@ -991,6 +1043,8 @@ def test_ensure_motion_engine_ready_falls_back_to_npm_install_without_a_lockfile
 
 def test_ensure_motion_engine_ready_raises_a_clear_error_when_npm_itself_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_RESOURCE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_sync_motion_engine_source", lambda: None)
     monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
     monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1, stderr="network error"))
     with pytest.raises(RuntimeError, match="Could not install"):
@@ -1008,6 +1062,8 @@ def test_ensure_motion_engine_ready_cleans_up_and_retries_after_a_broken_npm_ci(
     stale_node_modules = tmp_path / "node_modules"
     (stale_node_modules / "webpack").mkdir(parents=True)  # left-behind partial state
     monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_RESOURCE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_sync_motion_engine_source", lambda: None)
     monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
     monkeypatch.setattr(export_engine, "_ensure_remotion_browser_downloaded", lambda: None)
     calls = []
@@ -1083,10 +1139,43 @@ def test_ensure_motion_engine_ready_raises_when_npm_reports_success_but_bin_stil
     # silently trusted — it should surface as an actionable error rather
     # than letting a later render fail with the confusing npx error again.
     monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_RESOURCE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_sync_motion_engine_source", lambda: None)
     monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
     monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stderr=""))
     with pytest.raises(RuntimeError, match="isn't available"):
         export_engine._ensure_motion_engine_ready()
+
+
+# Root-cause coverage for a real user's report: "setup downloads chrome
+# headless everytime its so stupid" — MOTION_ENGINE_DIR being a persistent,
+# version-independent working copy (see its own comment) only helps if the
+# small versioned source files still get kept in sync with whatever app
+# version is actually running; this covers that half of the fix in
+# isolation from the (real-filesystem) resource dir.
+def test_sync_motion_engine_source_copies_manifests_and_src_tree(tmp_path, monkeypatch):
+    resource_dir = tmp_path / "resource"
+    (resource_dir / "src").mkdir(parents=True)
+    (resource_dir / "package.json").write_text('{"name": "motion-engine"}', encoding="utf-8")
+    (resource_dir / "package-lock.json").write_text('{"lockfileVersion": 3}', encoding="utf-8")
+    (resource_dir / "tsconfig.json").write_text("{}", encoding="utf-8")
+    (resource_dir / "src" / "index.ts").write_text("export {};", encoding="utf-8")
+
+    runtime_dir = tmp_path / "runtime"
+    # A stale node_modules from a previous version must survive untouched —
+    # this function only ever copies the small source files, never
+    # node_modules or the browser download inside it.
+    (runtime_dir / "node_modules" / ".bin").mkdir(parents=True)
+    (runtime_dir / "node_modules" / ".bin" / "remotion.cmd").write_text("@echo off", encoding="utf-8")
+
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_RESOURCE_DIR", resource_dir)
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", runtime_dir)
+
+    export_engine._sync_motion_engine_source()
+
+    assert (runtime_dir / "package.json").read_text(encoding="utf-8") == '{"name": "motion-engine"}'
+    assert (runtime_dir / "src" / "index.ts").read_text(encoding="utf-8") == "export {};"
+    assert (runtime_dir / "node_modules" / ".bin" / "remotion.cmd").exists()
 
 
 def test_render_motion_graphic_passes_no_install_to_npx_so_failures_are_clear(tmp_path, monkeypatch):
@@ -1797,3 +1886,180 @@ def test_final_pass_input_hwaccel_args_when_available_and_needed(monkeypatch):
     extra_input_args, filter_prefix = export_engine._final_pass_input_hwaccel_args(True)
     assert extra_input_args == ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"]
     assert filter_prefix == "hwdownload,format=nv12,format=yuv420p,"
+
+
+# --- Regression coverage for the critical/high-severity audit fixes ---
+
+def test_cross_process_file_lock_sequential_acquisitions_both_succeed(tmp_path):
+    lock_path = tmp_path / "test.lock"
+    with export_engine._cross_process_file_lock(lock_path):
+        assert lock_path.exists()
+    assert not lock_path.exists()  # released
+    # A second, later acquisition must succeed too — not permanently blocked
+    # by the first one having existed at some point.
+    with export_engine._cross_process_file_lock(lock_path):
+        assert lock_path.exists()
+    assert not lock_path.exists()
+
+
+def test_cross_process_file_lock_breaks_a_stale_lock_instead_of_hanging(tmp_path, monkeypatch):
+    lock_path = tmp_path / "test.lock"
+    # Simulate an abandoned lock from a crashed holder: a lock file that's
+    # already far older than stale_after.
+    lock_path.write_text(f"12345:{time.time() - 10_000}", encoding="utf-8")
+    monkeypatch.setattr(export_engine.time, "sleep", lambda *_: None)  # no real waiting in the test
+    with export_engine._cross_process_file_lock(lock_path, wait_timeout=5.0, stale_after=60.0):
+        pass  # must not hang — the stale lock is broken and reacquired
+
+
+def test_ensure_vignette_mask_only_generates_once_under_real_thread_concurrency(tmp_path, monkeypatch):
+    # Regression test for a real intermittent-corruption bug: concurrent
+    # segments sharing the same (width, height, vignette) used to both see
+    # the mask missing and both run `ffmpeg -y` on the same output path at
+    # once. Uses REAL threads (not sequential calls) so the lock is actually
+    # exercised under contention, not just logically reviewed.
+    calls = []
+    calls_lock = export_engine.threading.Lock()
+
+    def fake_run(args, **kwargs):
+        with calls_lock:
+            calls.append(args)
+        time.sleep(0.05)  # widens the race window the lock must close
+        Path(args[-1]).write_bytes(b"fake-png")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    # Fresh lock state for this specific mask key — module-level dict shared
+    # across tests otherwise.
+    monkeypatch.setattr(export_engine, "_vignette_mask_locks", {})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(export_engine._ensure_vignette_mask, tmp_path, 1920, 1080, 0.3) for _ in range(8)]
+        results = [f.result() for f in futures]
+
+    assert len(calls) == 1  # only ONE thread actually ran ffmpeg
+    assert len(set(results)) == 1  # every thread agrees on the same mask path
+    assert results[0].exists()
+
+
+def test_escape_subtitles_path_handles_an_apostrophe_in_the_path(tmp_path):
+    # Regression test for a real bug: any Windows account name or Projects
+    # folder containing an apostrophe (e.g. "O'Brien") broke the quoted
+    # `ass='...'` filter argument and failed every caption-burn export for
+    # that user.
+    path = tmp_path / "O'Brien" / "captions.ass"
+    escaped = export_engine.escape_subtitles_path(path)
+    # Must close the quote, escape the literal quote, and reopen it —
+    # never a bare, unescaped single quote.
+    assert "'\\''" in escaped
+    assert not re.search(r"(?<!\\)'(?!\\'')", escaped.replace("'\\''", ""))
+
+
+def test_escape_ass_text_escapes_backslashes_before_newline_substitution():
+    # A literal two-character "\n" already in caption text (not a real
+    # newline) must not be read by libass as a forced line break.
+    result = export_engine._escape_ass_text(r"C:\new\path")
+    assert result == r"C:\\new\\path"
+    # A REAL newline still becomes a proper ASS forced break, unaffected by
+    # the backslash-escaping happening first.
+    assert export_engine._escape_ass_text("line one\nline two") == "line one\\Nline two"
+
+
+def test_run_ffmpeg_raises_a_clear_error_on_timeout_instead_of_hanging(monkeypatch):
+    monkeypatch.setattr(export_engine, "_wait_for_memory_headroom", lambda: None)
+
+    def fake_run(*args, **kwargs):
+        raise export_engine.subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=600)
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError, match="timed out"):
+        export_engine.run_ffmpeg(["-y", "-i", "in.mp4", "out.mp4"])
+
+
+def test_run_final_pass_watchdog_kills_a_stalled_process_and_raises(monkeypatch):
+    monkeypatch.setattr(export_engine, "_wait_for_memory_headroom", lambda: None)
+
+    class _BlockingEmptyIterator:
+        """Simulates a hung ffmpeg's stdout: blocks (like a real unread pipe
+        with nothing written to it yet) until the watchdog's kill() unblocks
+        it, then ends — never yields a single progress line."""
+        def __init__(self, unblock_event):
+            self._unblock_event = unblock_event
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self._unblock_event.wait(timeout=5)
+            raise StopIteration
+
+    class FakeStalledProcess:
+        def __init__(self):
+            self._unblock_event = export_engine.threading.Event()
+            self.stdout = _BlockingEmptyIterator(self._unblock_event)
+            self.stderr = iter([])
+            self.returncode = None
+            self.killed = False
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+            self._unblock_event.set()  # unblocks the stdout read loop, like a real killed process closing its pipe
+
+        def wait(self):
+            return self.returncode
+
+    fake_process = FakeStalledProcess()
+    monkeypatch.setattr(export_engine.subprocess, "Popen", lambda *a, **k: fake_process)
+    # Deadline effectively "now" so the watchdog fires almost immediately
+    # instead of the test actually waiting 30+ minutes. Captures the REAL
+    # Timer class before patching — the lambda body must not call the
+    # patched name itself, or every Timer construction recurses forever.
+    real_timer_cls = export_engine.threading.Timer
+    monkeypatch.setattr(export_engine.threading, "Timer", lambda _delay, fn: real_timer_cls(0.01, fn))
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        export_engine.run_final_pass(["-y", "-i", "in.ts", "out.mp4"], duration_seconds=10.0)
+    assert fake_process.killed
+
+
+def test_cleanup_transient_export_artifacts_removes_known_patterns_only(tmp_path):
+    (tmp_path / "seg_0001.ts").write_bytes(b"x")
+    (tmp_path / "seg_0002_a.ts").write_bytes(b"x")
+    (tmp_path / "segments.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "captions.ass").write_text("x", encoding="utf-8")
+    (tmp_path / "_vignette_mask_480x270_0.300.png").write_bytes(b"x")
+    keep = tmp_path / "output.mp4"  # never a transient artifact — must survive
+    keep.write_bytes(b"x")
+
+    export_engine._cleanup_transient_export_artifacts(tmp_path)
+
+    assert list(tmp_path.iterdir()) == [keep]
+
+
+def test_run_cleans_up_transient_artifacts_when_the_final_pass_fails(tmp_path, monkeypatch):
+    # End-to-end coverage of the try/except wrapping run()'s own export body:
+    # a failure well past segment encoding (the final mux pass) must still
+    # leave work_dir clean, not just a unit-tested cleanup helper in
+    # isolation.
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({
+        "width": 1920, "height": 1080, "fps": 30, "durationSeconds": 3.0,
+        "stills": [{"imagePath": "/tmp/a.png", "start": 0.0, "end": 3.0}],
+        "narrationAudioPath": "/tmp/narration.wav",
+    }), encoding="utf-8")
+    output_path = tmp_path / "output.mp4"
+
+    def fake_encode_segment(segment, index, width, height, fps, work_dir):
+        seg_path = work_dir / f"seg_{index:04d}.ts"
+        seg_path.write_bytes(b"x")
+        return seg_path
+
+    monkeypatch.setattr(export_engine, "encode_segment", fake_encode_segment)
+    monkeypatch.setattr(export_engine, "run_final_pass", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ffmpeg failed")))
+
+    with pytest.raises(RuntimeError, match="ffmpeg failed"):
+        export_engine.run(manifest_path, output_path)
+
+    leftover = [p.name for p in tmp_path.iterdir() if p.name not in ("manifest.json",)]
+    assert leftover == [], f"expected work_dir cleaned up after failure, found: {leftover}"

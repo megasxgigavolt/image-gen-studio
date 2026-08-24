@@ -3054,9 +3054,27 @@ impl ProjectRepository {
     }
 
     pub fn permanent_delete_video(&self, id: &str) -> Result<(), String> {
+        // Needed to locate the video's own asset folder below — assets live
+        // at projects_dir/<channel_id>/<video_id>/, not projects_dir/<video_id>/.
+        // Looked up before the DB rows are deleted so the video's channel_id
+        // is still there to query.
+        let channel_id: Option<String> = self
+            .connection
+            .query_row("SELECT channel_id FROM videos WHERE id = ?1", params![id], |row| row.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
         let tx = self.connection.unchecked_transaction().map_err(|e| e.to_string())?;
         let stmts = [
-            "DELETE FROM timeline_clips WHERE timeline_id IN (SELECT id FROM timelines WHERE video_id = ?1)",
+            // Discovered while adding a test for this function's own disk
+            // cleanup below: `timeline_clips` has no `timeline_id` column at
+            // all (see MIGRATION_007 — it has `video_id` directly, and
+            // `timelines`'s own primary key IS `video_id`, not a separate
+            // `id`), so this statement previously threw a SQL error on every
+            // single call — "permanently delete" was completely broken for
+            // any video, not just leaking files. Every other DELETE FROM
+            // timeline_clips call site in this file already uses the
+            // correct `video_id=?1` directly.
+            "DELETE FROM timeline_clips WHERE video_id = ?1",
             "DELETE FROM timelines WHERE video_id = ?1",
             "DELETE FROM image_job_items WHERE job_id IN (SELECT id FROM image_jobs WHERE video_id = ?1)",
             "DELETE FROM image_jobs WHERE video_id = ?1",
@@ -3076,13 +3094,25 @@ impl ProjectRepository {
             self.connection.execute(stmt, params![id]).map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
+        // Previously missing entirely (unlike permanent_delete_channel, which
+        // does the equivalent remove_dir_all right below) — every generated
+        // still/animation/audio/export asset for this video was left behind
+        // on disk forever after a "permanent delete", an unbounded leak.
+        // Best-effort: a filesystem error here shouldn't undo the DB delete
+        // that already committed successfully.
+        if let Some(channel_id) = channel_id {
+            let _ = fs::remove_dir_all(self.projects_dir.join(&channel_id).join(id));
+        }
         Ok(())
     }
 
     pub fn permanent_delete_channel(&self, id: &str) -> Result<(), String> {
         let tx = self.connection.unchecked_transaction().map_err(|e| e.to_string())?;
         let stmts = [
-            "DELETE FROM timeline_clips WHERE timeline_id IN (SELECT t.id FROM timelines t JOIN videos v ON v.id = t.video_id WHERE v.channel_id = ?1)",
+            // Same real bug as permanent_delete_video's identical statement
+            // — see its own comment. `timeline_clips` has no `timeline_id`
+            // column, so this threw a SQL error on every call.
+            "DELETE FROM timeline_clips WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
             "DELETE FROM timelines WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
             "DELETE FROM image_job_items WHERE job_id IN (SELECT j.id FROM image_jobs j JOIN videos v ON v.id = j.video_id WHERE v.channel_id = ?1)",
             "DELETE FROM image_jobs WHERE video_id IN (SELECT id FROM videos WHERE channel_id = ?1)",
@@ -3111,6 +3141,11 @@ impl ProjectRepository {
         serde_json::from_str::<serde_json::Value>(payload_json)
             .map_err(|_| "Snapshot payload must be valid JSON.".to_string())?;
         let id = Uuid::new_v4().to_string();
+        // Wrapped in a transaction (previously two independent statements) so
+        // a crash between the insert and the prune can't leave more than the
+        // documented 10 retained snapshots — matches the transactional
+        // pattern already used by permanent_delete_video/_channel.
+        let tx = self.connection.unchecked_transaction().map_err(|e| e.to_string())?;
         self.connection
             .execute(
                 "INSERT INTO video_snapshots(id, video_id, kind, payload_json, created_at)
@@ -3126,6 +3161,7 @@ impl ProjectRepository {
                 [video_id],
             )
             .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(id)
     }
 
@@ -6007,7 +6043,16 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
             credentials.apply_env(&mut command);
             #[cfg(windows)]
             command.creation_flags(0x08000000);
-            let output = command.output().map_err(|e| format!("Could not start the Python motion-graphics engine: {e}"))?;
+            // A longer deadline than the other engine calls above: this
+            // analyzes a whole batch of clips (MOTION_GRAPHICS_BATCH_SIZE),
+            // each involving a real AI vision call plus optional validation-
+            // frame rendering — plausibly minutes, not seconds, even when
+            // working correctly.
+            let output = run_subprocess_with_deadline(
+                command,
+                std::time::Duration::from_secs(600),
+                "Motion graphics analysis timed out after 600s.",
+            )?;
             if !output.status.success() {
                 return Err(format!("Motion graphics analysis failed. {}", String::from_utf8_lossy(&output.stderr).trim()));
             }
@@ -9295,7 +9340,10 @@ Return JSON only:
             &jsonwebtoken::EncodingKey::from_rsa_pem(account.private_key.as_bytes())
                 .map_err(|_| "Google service-account private key is invalid.".to_string())?,
         ).map_err(|error| format!("Could not sign Google authentication request: {error}"))?;
-        let response = reqwest::blocking::Client::new()
+        let response = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|error| format!("Could not build Google authentication client: {error}"))?
             .post(&account.token_uri)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
@@ -10785,6 +10833,17 @@ Return JSON only:
             let mut child = command
                 .spawn()
                 .map_err(|e| format!("Could not start the Python visual-plan engine: {e}"))?;
+            // This engine call streams progress line-by-line on the blocking
+            // read loop below rather than polling with a deadline directly
+            // (that loop drives the `progress()` callback in real time, so it
+            // can't be swapped for `run_subprocess_with_deadline` without
+            // losing that), so a side-car watchdog thread enforces the
+            // deadline instead — see its own doc comment. Without this, a
+            // stalled engine call (e.g. many chained AI calls across a long
+            // script) used to hang this Tauri command, and therefore the
+            // frontend awaiting it, forever.
+            let (visual_plan_timed_out, visual_plan_watchdog_cancel, visual_plan_watchdog) =
+                spawn_subprocess_watchdog(child.id(), std::time::Duration::from_secs(20 * 60));
             let stdout = child
                 .stdout
                 .take()
@@ -10833,6 +10892,11 @@ Return JSON only:
             let status = child
                 .wait()
                 .map_err(|e| format!("Could not wait for visual-plan engine: {e}"))?;
+            visual_plan_watchdog_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = visual_plan_watchdog.join();
+            if visual_plan_timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("Visual-plan engine timed out after 20 minutes and was stopped.".to_string());
+            }
             let raw_stderr = stderr_thread.join().unwrap_or_default();
             if !status.success() {
                 // Strip tqdm progress bars, Python UserWarning blocks, and blank
@@ -11147,6 +11211,11 @@ Return JSON only:
             let mut child = command
                 .spawn()
                 .map_err(|e| format!("Could not start the Python caption engine: {e}"))?;
+            // See the visual-plan engine call's own comment above on why a
+            // side-car watchdog, not `run_subprocess_with_deadline`, enforces
+            // the deadline here.
+            let (caption_engine_timed_out, caption_engine_watchdog_cancel, caption_engine_watchdog) =
+                spawn_subprocess_watchdog(child.id(), std::time::Duration::from_secs(20 * 60));
             let stdout = child
                 .stdout
                 .take()
@@ -11195,6 +11264,11 @@ Return JSON only:
             let status = child
                 .wait()
                 .map_err(|e| format!("Could not wait for caption engine: {e}"))?;
+            caption_engine_watchdog_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = caption_engine_watchdog.join();
+            if caption_engine_timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("Caption engine timed out after 20 minutes and was stopped.".to_string());
+            }
             let raw_stderr = stderr_thread.join().unwrap_or_default();
             if !status.success() {
                 let clean_stdout: Vec<&str> = output_lines
@@ -11593,9 +11667,11 @@ Return JSON only:
                 .stderr(Stdio::piped());
             #[cfg(windows)]
             command.creation_flags(0x08000000);
-            let output = command
-                .output()
-                .map_err(|e| format!("Could not start the video export engine: {e}"))?;
+            let output = run_subprocess_with_deadline(
+                command,
+                std::time::Duration::from_secs(180),
+                "Could not determine narration duration: the video export engine timed out after 180s.",
+            )?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(format!("Could not determine narration duration: {}", stderr.trim()));
@@ -11659,9 +11735,11 @@ Return JSON only:
                 .stderr(Stdio::piped());
             #[cfg(windows)]
             command.creation_flags(0x08000000);
-            let output = command
-                .output()
-                .map_err(|e| format!("Could not start the video export engine: {e}"))?;
+            let output = run_subprocess_with_deadline(
+                command,
+                std::time::Duration::from_secs(180),
+                "Could not detect the image's subject: the video export engine timed out after 180s.",
+            )?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(format!("Could not detect the image's subject: {}", stderr.trim()));
@@ -11719,9 +11797,11 @@ Return JSON only:
                 .stderr(Stdio::piped());
             #[cfg(windows)]
             command.creation_flags(0x08000000);
-            let output = command
-                .output()
-                .map_err(|e| format!("Could not start the video export engine: {e}"))?;
+            let output = run_subprocess_with_deadline(
+                command,
+                std::time::Duration::from_secs(180),
+                "Could not adjust the animation's duration: the video export engine timed out after 180s.",
+            )?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(format!("Could not adjust the animation's duration: {}", stderr.trim()));
@@ -11767,9 +11847,11 @@ Return JSON only:
                 .stderr(Stdio::piped());
             #[cfg(windows)]
             command.creation_flags(0x08000000);
-            let output = command
-                .output()
-                .map_err(|e| format!("Could not start the video export engine: {e}"))?;
+            let output = run_subprocess_with_deadline(
+                command,
+                std::time::Duration::from_secs(180),
+                "Could not remove background noise: the video export engine timed out after 180s.",
+            )?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(format!("Could not remove background noise: {}", stderr.trim()));
@@ -11865,6 +11947,15 @@ Return JSON only:
                 .spawn()
                 .map_err(|e| format!("Could not start the video export engine: {e}"))?;
             on_spawn(child.id());
+            // A deadline watchdog complements (doesn't replace) the PID-based
+            // Cancel button `on_spawn` wires up above — that only helps if a
+            // user actually notices and clicks Cancel; an unattended stall
+            // (app left running in the background) would otherwise hang this
+            // command forever with no automatic recovery. See the visual-plan
+            // engine call's own comment on why a side-car watchdog thread,
+            // not `run_subprocess_with_deadline`, is used here.
+            let (export_engine_timed_out, export_engine_watchdog_cancel, export_engine_watchdog) =
+                spawn_subprocess_watchdog(child.id(), std::time::Duration::from_secs(20 * 60));
             let stdout = child
                 .stdout
                 .take()
@@ -11913,6 +12004,11 @@ Return JSON only:
             let status = child
                 .wait()
                 .map_err(|e| format!("Could not wait for export engine: {e}"))?;
+            export_engine_watchdog_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = export_engine_watchdog.join();
+            if export_engine_timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("Video export timed out after 20 minutes and was stopped.".to_string());
+            }
             let raw_stderr = stderr_thread.join().unwrap_or_default();
             if !status.success() {
                 let clean_stdout: Vec<&str> = output_lines
@@ -12007,6 +12103,11 @@ Return JSON only:
                 .spawn()
                 .map_err(|e| format!("Could not start the video export engine: {e}"))?;
             on_spawn(child.id());
+            // See export_timeline_video_with_progress's own comment on why
+            // this deadline watchdog complements, rather than replaces, the
+            // PID-based Cancel button `on_spawn` wires up above.
+            let (bundle_export_timed_out, bundle_export_watchdog_cancel, bundle_export_watchdog) =
+                spawn_subprocess_watchdog(child.id(), std::time::Duration::from_secs(20 * 60));
             let stdout = child
                 .stdout
                 .take()
@@ -12055,6 +12156,11 @@ Return JSON only:
             let status = child
                 .wait()
                 .map_err(|e| format!("Could not wait for export engine: {e}"))?;
+            bundle_export_watchdog_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = bundle_export_watchdog.join();
+            if bundle_export_timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("Bundle export timed out after 20 minutes and was stopped.".to_string());
+            }
             let raw_stderr = stderr_thread.join().unwrap_or_default();
             if !status.success() {
                 let clean_stdout: Vec<&str> = output_lines
@@ -13072,7 +13178,10 @@ fn pick_veo_duration(gap_seconds: f64) -> i64 {
 }
 
 fn request_openai_text(api_key: &str, prompt: &str) -> Result<String, String> {
-    let response = reqwest::blocking::Client::new()
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(90))
+        .build()
+        .map_err(|error| format!("Could not build OpenAI client: {error}"))?
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(api_key)
         .json(&json!({
@@ -13851,6 +13960,109 @@ fn normalize_bulk_plan_response(cleaned: &str) -> Result<V2PlanChunkResponse, St
 /// the next. `extra_args` carries whatever a specific caller needs on top of
 /// the shared flags (e.g. `--effort high` for planning, or
 /// `--tools Read --allowedTools Read --add-dir <dir>` for vision).
+/// Runs `command` (already fully configured with args/env/cwd, and with
+/// `.stdout(Stdio::piped()).stderr(Stdio::piped())` set) to completion,
+/// enforcing `deadline` — `Command::output()` blocks indefinitely if the
+/// subprocess never exits, a real, observed failure mode (a stalled Python
+/// engine invocation, e.g. on a corrupt/edge-case input file), and with no
+/// cancellation path a stuck call used to hang its calling Tauri command
+/// (and therefore the frontend awaiting it) forever, with no Cancel button
+/// and no automatic recovery short of restarting the app. Extracted from
+/// `run_claude_cli`'s own hand-rolled version of this exact pattern so every
+/// caller gets the same guarantee: stdout/stderr are drained on separate
+/// threads concurrently with the wait (not after it) — otherwise a response
+/// larger than the OS pipe buffer would deadlock the child against an unread
+/// pipe well before the deadline ever got a chance to fire.
+#[cfg(not(test))]
+fn run_subprocess_with_deadline(
+    mut command: Command,
+    deadline: std::time::Duration,
+    timeout_message: &str,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    let mut child = command.spawn().map_err(|e| format!("Could not start the process: {e}"))?;
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || { let mut buf = Vec::new(); let _ = stdout_pipe.read_to_end(&mut buf); buf });
+    let stderr_reader = std::thread::spawn(move || { let mut buf = Vec::new(); let _ = stderr_pipe.read_to_end(&mut buf); buf });
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(timeout_message.to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => return Err(format!("Could not check the process: {e}")),
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(std::process::Output { status, stdout, stderr })
+}
+
+/// `taskkill /PID <pid> /T /F` — kills the whole process tree, same pattern
+/// already used by `cancel_timeline_export` (lib.rs) for user-initiated
+/// export cancellation. Shared here for `spawn_subprocess_watchdog`'s
+/// timeout-triggered kill.
+#[cfg(not(test))]
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        command.creation_flags(0x08000000);
+        let _ = command.status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+    }
+}
+
+/// For subprocess calls that stream progress via a blocking line-by-line
+/// stdout read on the calling thread (so a plain deadline-polling loop like
+/// `run_subprocess_with_deadline`'s can't be used without disturbing that
+/// read) — spawns a side-car thread that kills `pid` if it's still alive
+/// once `deadline` elapses, which unblocks the caller's blocking read by
+/// closing its stdout pipe. The caller must call `.store(true, SeqCst)` on
+/// the returned cancel flag once it's done waiting (e.g. right after
+/// `child.wait()` returns) so the watchdog thread stops promptly instead of
+/// idling until the deadline on every normal, successful run; the returned
+/// timed-out flag tells the caller whether the kill actually fired, so it
+/// can surface a clear timeout error instead of a generic "process failed".
+#[cfg(not(test))]
+fn spawn_subprocess_watchdog(
+    pid: u32,
+    deadline: std::time::Duration,
+) -> (std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let timed_out_writer = timed_out.clone();
+    let cancelled_reader = cancelled.clone();
+    let started = std::time::Instant::now();
+    let handle = std::thread::spawn(move || loop {
+        if cancelled_reader.load(Ordering::SeqCst) {
+            return;
+        }
+        if started.elapsed() >= deadline {
+            timed_out_writer.store(true, Ordering::SeqCst);
+            kill_process_tree(pid);
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    (timed_out, cancelled, handle)
+}
+
 fn run_claude_cli(prompt: &str, extra_args: &[&str]) -> Result<String, String> {
     #[cfg(test)]
     {
@@ -13871,7 +14083,6 @@ fn run_claude_cli(prompt: &str, extra_args: &[&str]) -> Result<String, String> {
             .stderr(Stdio::piped());
         #[cfg(windows)]
         command.creation_flags(0x08000000);
-        let mut child = command.spawn().map_err(|e| format!("Could not start the Claude CLI: {e}"))?;
         // `Command::output()` (used here previously) blocks indefinitely if the
         // subprocess never exits — a real, observed failure mode (the CLI
         // stalling, e.g. near a usage limit, or contending with another
@@ -13881,40 +14092,17 @@ fn run_claude_cli(prompt: &str, extra_args: &[&str]) -> Result<String, String> {
         // call used to just hang once: now it hangs the app every time it
         // starts, with no way out except clearing the request by hand. Poll
         // with an explicit deadline instead, so a stuck call surfaces as a
-        // normal, retryable error. Stdout/stderr are drained on separate
-        // threads concurrently with the wait (not after it) — otherwise a
-        // response larger than the OS pipe buffer would deadlock the child
-        // against an unread pipe well before this timeout ever got a chance
-        // to fire.
-        use std::io::Read;
-        let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
-        let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
-        let stdout_reader = std::thread::spawn(move || { let mut buf = Vec::new(); let _ = stdout_pipe.read_to_end(&mut buf); buf });
-        let stderr_reader = std::thread::spawn(move || { let mut buf = Vec::new(); let _ = stderr_pipe.read_to_end(&mut buf); buf });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        let _ = stdout_reader.join();
-                        let _ = stderr_reader.join();
-                        return Err("Claude CLI timed out after 180s — it may be stalled (e.g. a usage limit, or a conflicting Claude Code session on this machine). Try again, or add a Gemini API key in Settings as a fallback.".to_string());
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-                Err(e) => return Err(format!("Could not check the Claude CLI: {e}")),
-            }
-        };
-        let stdout_bytes = stdout_reader.join().unwrap_or_default();
-        let stderr_bytes = stderr_reader.join().unwrap_or_default();
-        if !status.success() {
-            let stderr = String::from_utf8_lossy(&stderr_bytes);
+        // normal, retryable error.
+        let output = run_subprocess_with_deadline(
+            command,
+            std::time::Duration::from_secs(180),
+            "Claude CLI timed out after 180s — it may be stalled (e.g. a usage limit, or a conflicting Claude Code session on this machine). Try again, or add a Gemini API key in Settings as a fallback.",
+        )?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!("Claude CLI exited with an error: {}", stderr.trim()));
         }
-        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let payload: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|_| {
             format!("Claude CLI returned non-JSON output: {}", stdout.chars().take(500).collect::<String>())
         })?;
@@ -15096,6 +15284,57 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(repo.snapshot_count(&video.id), 10);
+    }
+
+    // Regression test for a real bug: permanent_delete_video deleted the
+    // video's DB rows only — every generated asset under
+    // Projects/<channel>/<video>/ was left behind on disk forever, an
+    // unbounded leak, unlike permanent_delete_channel's own equivalent
+    // cleanup (which this test's sibling below confirms already worked).
+    #[test]
+    fn permanent_delete_video_removes_its_files_from_disk() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let source = temp.path().join("voice.wav");
+        fs::write(&source, b"audio").unwrap();
+        repo.import_asset(&video.id, &source, "audio").unwrap();
+
+        let video_dir = temp.path().join("Projects").join(&channel.id).join(&video.id);
+        assert!(
+            video_dir.exists(),
+            "import_asset should have created the video's own asset folder"
+        );
+
+        repo.trash_video(&video.id).unwrap();
+        repo.permanent_delete_video(&video.id).unwrap();
+
+        assert!(
+            !video_dir.exists(),
+            "permanent_delete_video must remove the video's files from disk, not just its DB rows"
+        );
+    }
+
+    // permanent_delete_channel had the identical broken DELETE FROM
+    // timeline_clips statement (see permanent_delete_video's own comment)
+    // and, before this test, zero coverage — nothing caught that
+    // "permanently delete a channel" threw a SQL error on every call too.
+    #[test]
+    fn permanent_delete_channel_removes_its_files_from_disk() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let source = temp.path().join("voice.wav");
+        fs::write(&source, b"audio").unwrap();
+        repo.import_asset(&video.id, &source, "audio").unwrap();
+
+        let channel_dir = temp.path().join("Projects").join(&channel.id);
+        assert!(channel_dir.exists());
+
+        repo.trash_channel(&channel.id).unwrap();
+        repo.permanent_delete_channel(&channel.id).unwrap();
+
+        assert!(!channel_dir.exists(), "permanent_delete_channel must remove the channel's files from disk");
     }
 
     #[test]

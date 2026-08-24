@@ -1313,8 +1313,11 @@ export const projectsClient = {
     if (isTauri()) return invoke("export_timeline_project", { videoId, destinationPath });
     throw new Error("Project export requires the native application.");
   },
-  async cancelTimelineExport(videoId: string): Promise<boolean> {
-    if (isTauri()) return invoke("cancel_timeline_export", { videoId });
+  /** `exportId` is the export-progress event's own "exportId" field, NOT the
+   * video id — two overlapping exports of the same video need distinct keys
+   * so cancelling one can never affect the other. */
+  async cancelTimelineExport(exportId: string): Promise<boolean> {
+    if (isTauri()) return invoke("cancel_timeline_export", { exportId });
     return false;
   },
   /** Creates a job for exactly `groupIds`, forced — every one becomes a job

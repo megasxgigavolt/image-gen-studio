@@ -101,6 +101,16 @@ export function useTimelinePlayback(params: {
   // in) is what actually runs, not whatever was current when playback started.
   const onTimeChangeRef = useRef(onTimeChange);
   useEffect(() => { onTimeChangeRef.current = onTimeChange; });
+  // Same reasoning as onTimeChangeRef above: `stepFrame` keeps re-invoking
+  // the SAME closure instance for the whole uninterrupted play session (it
+  // schedules its own next rAF tick by referencing itself, not by reading a
+  // freshly-rendered `stepFrame`), so a closed-over `totalDuration` would
+  // stay frozen at whatever it was when that play session started — a clip
+  // deleted/trimmed mid-playback (shrinking totalDuration) wouldn't stop
+  // playback at the new, shorter end; it would keep running past it drawing
+  // a black frame until the STALE, larger duration was reached.
+  const totalDurationRef = useRef(totalDuration);
+  useEffect(() => { totalDurationRef.current = totalDuration; }, [totalDuration]);
 
   useEffect(() => { previewTimeRef.current = previewTime; }, [previewTime]);
   useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
@@ -373,10 +383,11 @@ export function useTimelinePlayback(params: {
         playStartRef.current = null;
       }
     }
-    if (t >= totalDuration) {
-      previewTimeRef.current = totalDuration;
-      setPreviewTime(totalDuration);
-      drawFrameRef.current(totalDuration);
+    const currentTotalDuration = totalDurationRef.current;
+    if (t >= currentTotalDuration) {
+      previewTimeRef.current = currentTotalDuration;
+      setPreviewTime(currentTotalDuration);
+      drawFrameRef.current(currentTotalDuration);
       pausePreview();
       return;
     }

@@ -1,5 +1,5 @@
 import { Clapperboard, Move, Sparkles } from "lucide-react";
-import { memo, useEffect, type PointerEvent as ReactPointerEvent, type RefObject, type WheelEvent } from "react";
+import { memo, useEffect, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject, type WheelEvent } from "react";
 import { formatTime, secondsToPixels, pixelsToSeconds } from "../domain/timecode";
 import type { TimelineCaptionClipRecord, TimelineClipRecord } from "../infrastructure/projects-client";
 import { motionLabel } from "./timeline-rendering";
@@ -8,6 +8,20 @@ import type { ContextMenuItem } from "./ContextMenu";
 const NARRATION_LANE_HEIGHT = 28;
 const STILLS_LANE_HEIGHT = 72;
 const CAPTIONS_LANE_HEIGHT = 28;
+
+// Keyboard-nudge step for every resize handle/clip body/playhead below —
+// one frame at 30fps normally, a full second with Shift held for coarser
+// adjustments. This whole editing surface used to be entirely unreachable
+// by keyboard (plain <div onPointerDown> with no role/tabIndex/aria-label
+// anywhere) — these keyboard handlers route through the exact same
+// `refresh`/`updateTimelineClip` backend calls the pointer drag's own
+// commit does (see TimelineView.tsx's nudgeStillsClip/nudgeCaptionClip), so
+// a keyboard edit participates in undo history identically to a mouse edit.
+const NUDGE_STEP_SECONDS = 1 / 30;
+const NUDGE_STEP_SECONDS_LARGE = 1;
+function nudgeStepFor(event: { shiftKey: boolean }): number {
+  return event.shiftKey ? NUDGE_STEP_SECONDS_LARGE : NUDGE_STEP_SECONDS;
+}
 
 type DragPreview = { clipId: string; start: number; end: number } | null;
 
@@ -27,6 +41,7 @@ type TimelineLanesProps = {
   selectedClipId: string | null;
   sequenceLocked: boolean;
   onBeginStillsDrag: (clip: TimelineClipRecord, mode: "start" | "end" | "move", event: ReactPointerEvent) => void;
+  onNudgeStillsClip: (clip: TimelineClipRecord, mode: "start" | "end" | "move", deltaSeconds: number) => void;
   onSelectStillsClip: (clip: TimelineClipRecord, atSeconds: number) => void;
   onDuplicateStillsClip: (clip: TimelineClipRecord) => void;
   onRemoveStillsClip: (clip: TimelineClipRecord) => void;
@@ -35,6 +50,7 @@ type TimelineLanesProps = {
   captionDragPreview: DragPreview;
   selectedCaptionClipId: string | null;
   onBeginCaptionDrag: (clip: TimelineCaptionClipRecord, mode: "start" | "end" | "move", event: ReactPointerEvent) => void;
+  onNudgeCaptionClip: (clip: TimelineCaptionClipRecord, mode: "start" | "end" | "move", deltaSeconds: number) => void;
   onSeek: (time: number) => void;
   onSelectCaptionAndSeek: (clip: TimelineCaptionClipRecord) => void;
   onOpenCaptionsTool: () => void;
@@ -76,6 +92,10 @@ export function TimelineTracks({
   canvasScrollRef: RefObject<HTMLDivElement | null>;
   canvasInnerRef: RefObject<HTMLDivElement | null>;
 }) {
+  function playheadNudgeKeyDown(event: ReactKeyboardEvent) {
+    if (event.key === "ArrowLeft") { event.preventDefault(); onSeek(Math.max(0, previewTime - nudgeStepFor(event))); }
+    else if (event.key === "ArrowRight") { event.preventDefault(); onSeek(previewTime + nudgeStepFor(event)); }
+  }
   return (
     <div className="tl-canvas">
       <div className="tl-lane-gutter">
@@ -95,8 +115,24 @@ export function TimelineTracks({
           }}
         >
           <div className="tl-playhead" style={{ left: playheadPx }}>
-            <div className="tl-playhead-handle" onPointerDown={onBeginPlayheadDrag} />
-            <span className="tl-playhead-tag" onPointerDown={onBeginPlayheadDrag}>{formatTime(previewTime)}</span>
+            <div
+              className="tl-playhead-handle"
+              onPointerDown={onBeginPlayheadDrag}
+              role="slider"
+              tabIndex={0}
+              aria-label="Playhead — drag or use arrow keys to seek"
+              aria-valuenow={previewTime}
+              onKeyDown={playheadNudgeKeyDown}
+            />
+            <span
+              className="tl-playhead-tag"
+              onPointerDown={onBeginPlayheadDrag}
+              role="slider"
+              tabIndex={0}
+              aria-label="Playhead time — drag or use arrow keys to seek"
+              aria-valuenow={previewTime}
+              onKeyDown={playheadNudgeKeyDown}
+            >{formatTime(previewTime)}</span>
           </div>
           {snapIndicatorSeconds !== null && (
             <div className="tl-snap-indicator" style={{ left: secondsToPixels(snapIndicatorSeconds, pixelsPerSecond) }} />
@@ -154,6 +190,7 @@ const TimelineLanes = memo(function TimelineLanes({
   selectedClipId,
   sequenceLocked,
   onBeginStillsDrag,
+  onNudgeStillsClip,
   onSelectStillsClip,
   onDuplicateStillsClip,
   onRemoveStillsClip,
@@ -162,6 +199,7 @@ const TimelineLanes = memo(function TimelineLanes({
   captionDragPreview,
   selectedCaptionClipId,
   onBeginCaptionDrag,
+  onNudgeCaptionClip,
   onSeek,
   onSelectCaptionAndSeek,
   onOpenCaptionsTool,
@@ -172,6 +210,23 @@ const TimelineLanes = memo(function TimelineLanes({
   onEditCaptionClip,
   onDropOnTrack,
 }: TimelineLanesProps) {
+  // stopPropagation matters here: a resize handle sits INSIDE the clip's own
+  // move-nudge-bound div (both are independently focusable/tabbable), so
+  // without it, an arrow key handled by the resize handle would also bubble
+  // up and fire the parent clip's own "move" nudge on the same keypress —
+  // double-mutating the clip's timing from one key press.
+  function stillsNudgeKeyDown(clip: TimelineClipRecord, mode: "start" | "end" | "move") {
+    return (event: ReactKeyboardEvent) => {
+      if (event.key === "ArrowLeft") { event.preventDefault(); event.stopPropagation(); onNudgeStillsClip(clip, mode, -nudgeStepFor(event)); }
+      else if (event.key === "ArrowRight") { event.preventDefault(); event.stopPropagation(); onNudgeStillsClip(clip, mode, nudgeStepFor(event)); }
+    };
+  }
+  function captionNudgeKeyDown(clip: TimelineCaptionClipRecord, mode: "start" | "end" | "move") {
+    return (event: ReactKeyboardEvent) => {
+      if (event.key === "ArrowLeft") { event.preventDefault(); event.stopPropagation(); onNudgeCaptionClip(clip, mode, -nudgeStepFor(event)); }
+      else if (event.key === "ArrowRight") { event.preventDefault(); event.stopPropagation(); onNudgeCaptionClip(clip, mode, nudgeStepFor(event)); }
+    };
+  }
   return (
     <>
           <div
@@ -229,8 +284,20 @@ const TimelineLanes = memo(function TimelineLanes({
                     { label: "Remove clip", danger: true, onSelect: () => onRemoveStillsClip(clip) },
                     { label: "Go to this still in Visuals", onSelect: () => onGoToStillInVisuals(clip.groupId) },
                   ])}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`${clip.label} clip, ${sequenceLocked ? "sequence locked" : "use arrow keys to move"}`}
+                  onKeyDown={stillsNudgeKeyDown(clip, "move")}
                 >
-                  <div className="tl-clip-resize-handle left" onPointerDown={(event) => onBeginStillsDrag(clip, "start", event)} />
+                  <div
+                    className="tl-clip-resize-handle left"
+                    onPointerDown={(event) => onBeginStillsDrag(clip, "start", event)}
+                    role="slider"
+                    tabIndex={0}
+                    aria-label={`${clip.label} clip start — drag or use arrow keys to trim`}
+                    aria-valuenow={clip.startSeconds}
+                    onKeyDown={stillsNudgeKeyDown(clip, "start")}
+                  />
                   {(() => {
                     // 'animation' is deliberately excluded from the renderId
                     // lookup below even though it always still has one (see
@@ -249,7 +316,15 @@ const TimelineLanes = memo(function TimelineLanes({
                   {clip.transitionIn === "fade" && <span className="tl-clip-badge tl-clip-badge-fade" title="Fade in"><Sparkles size={10} /></span>}
                   {clip.motionPreset !== "none" && <span className="tl-clip-badge tl-clip-badge-motion" title={`Camera: ${motionLabel(clip.motionPreset)}`}><Move size={10} /></span>}
                   {clip.clipKind === "animation" && <span className="tl-clip-badge tl-clip-badge-animation" title="Animated with Veo"><Clapperboard size={10} /></span>}
-                  <div className="tl-clip-resize-handle right" onPointerDown={(event) => onBeginStillsDrag(clip, "end", event)} />
+                  <div
+                    className="tl-clip-resize-handle right"
+                    onPointerDown={(event) => onBeginStillsDrag(clip, "end", event)}
+                    role="slider"
+                    tabIndex={0}
+                    aria-label={`${clip.label} clip end — drag or use arrow keys to trim`}
+                    aria-valuenow={clip.endSeconds}
+                    onKeyDown={stillsNudgeKeyDown(clip, "end")}
+                  />
                 </div>
               );
             })}
@@ -285,10 +360,30 @@ const TimelineLanes = memo(function TimelineLanes({
                     { label: "Merge with next", onSelect: () => onMergeCaptionWithNext(clip) },
                     { label: "Delete", danger: true, onSelect: () => onDeleteCaptionClip(clip) },
                   ])}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`Caption: ${clip.text} — use arrow keys to move`}
+                  onKeyDown={captionNudgeKeyDown(clip, "move")}
                 >
-                  <div className="tl-clip-resize-handle left" onPointerDown={(event) => onBeginCaptionDrag(clip, "start", event)} />
+                  <div
+                    className="tl-clip-resize-handle left"
+                    onPointerDown={(event) => onBeginCaptionDrag(clip, "start", event)}
+                    role="slider"
+                    tabIndex={0}
+                    aria-label="Caption start — drag or use arrow keys to trim"
+                    aria-valuenow={clip.startSeconds}
+                    onKeyDown={captionNudgeKeyDown(clip, "start")}
+                  />
                   {clipWidth >= 46 && <span className="tl-clip-text">{clip.text}</span>}
-                  <div className="tl-clip-resize-handle right" onPointerDown={(event) => onBeginCaptionDrag(clip, "end", event)} />
+                  <div
+                    className="tl-clip-resize-handle right"
+                    onPointerDown={(event) => onBeginCaptionDrag(clip, "end", event)}
+                    role="slider"
+                    tabIndex={0}
+                    aria-label="Caption end — drag or use arrow keys to trim"
+                    aria-valuenow={clip.endSeconds}
+                    onKeyDown={captionNudgeKeyDown(clip, "end")}
+                  />
                 </div>
               );
             })}

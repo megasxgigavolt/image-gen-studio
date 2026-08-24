@@ -60,12 +60,20 @@ export function AnimateView() {
     setLoading(true);
     setError(null);
     try {
-      const [loadedWorkspace, assets] = await Promise.all([
+      const [loadedWorkspace, assets, latestJob] = await Promise.all([
         projectsClient.getImageWorkspace(activeVideoId),
         projectsClient.listVideoAssets(activeVideoId),
+        projectsClient.getLatestAnimationJob(activeVideoId),
       ]);
       setWorkspace(loadedWorkspace);
       setVideoAssets(assets);
+      // Restores an in-flight animation job on remount (e.g. navigating away
+      // mid-generation and back) — without this, `job` started every mount
+      // at null, so the Generate button re-enabled itself and clicking it
+      // again fired a second, duplicate (costly) Veo job for the same still
+      // with no indication one was already running. Mirrors ImagesView's own
+      // equivalent restore for image jobs (App.tsx).
+      setJob(latestJob && ["queued", "running", "paused", "stopped", "failed"].includes(latestJob.status) ? latestJob : null);
       if (!selectedGroupId && loadedWorkspace.groups[0]) setSelectedGroupId(loadedWorkspace.groups[0].group.id);
     } catch (caught) {
       setError(String(caught));

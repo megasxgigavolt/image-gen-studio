@@ -52,12 +52,23 @@ export type ExportUiResult = { kind: "success"; path: string } | { kind: "failur
  * whole lifetime) and the persistent mini export badge it renders. */
 export type ExportState = {
   videoId: string;
+  /** The export-progress event's own "exportId" — distinct from videoId so
+   * two overlapping exports of the same video can be told apart (each export
+   * attempt gets its own id backend-side). Null until the first progress
+   * event arrives (a narrow window right after beginExport, before the
+   * backend invoke has actually started the subprocess and reported back). */
+  exportId: string | null;
   kind: ExportKind;
   percent: number;
   stage: string;
   detail: string;
   cancelling: boolean;
   result: ExportUiResult | null;
+  /** Set once in beginExport and never touched again — kept in the shared
+   * store (not local component state) specifically so the elapsed-time/ETA
+   * display in ExportDrawer doesn't reset to ~0 if the drawer remounts (e.g.
+   * collapsing/reopening the Editor tab) mid-export. */
+  startedAt: number;
 };
 
 type AppState = {
@@ -95,7 +106,7 @@ type AppState = {
    * every new export so a fresh export always opens expanded. */
   exportCollapsed: boolean;
   beginExport: (videoId: string, kind: ExportKind) => void;
-  updateExportProgress: (videoId: string, percent: number, stage: string, detail: string) => void;
+  updateExportProgress: (videoId: string, exportId: string, percent: number, stage: string, detail: string) => void;
   setExportCancelling: (videoId: string, cancelling: boolean) => void;
   finishExport: (videoId: string, result: ExportUiResult | null) => void;
   clearExport: () => void;
@@ -154,13 +165,16 @@ export const useAppStore = create<AppState>((set) => ({
   exportCollapsed: false,
   beginExport: (videoId, kind) =>
     set({
-      exportState: { videoId, kind, percent: 0, stage: "Preparing export", detail: "", cancelling: false, result: null },
+      exportState: {
+        videoId, exportId: null, kind, percent: 0, stage: "Preparing export", detail: "",
+        cancelling: false, result: null, startedAt: Date.now(),
+      },
       exportCollapsed: false,
     }),
-  updateExportProgress: (videoId, percent, stage, detail) =>
+  updateExportProgress: (videoId, exportId, percent, stage, detail) =>
     set((state) =>
       state.exportState?.videoId === videoId
-        ? { exportState: { ...state.exportState, percent, stage, detail } }
+        ? { exportState: { ...state.exportState, exportId, percent, stage, detail } }
         : state,
     ),
   setExportCancelling: (videoId, cancelling) =>

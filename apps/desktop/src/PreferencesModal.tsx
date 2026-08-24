@@ -100,6 +100,13 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
       ]);
       addToast("Preferences saved", "success", 2000);
       onClose();
+    } catch (error) {
+      // Promise.all gives no indication which setting(s) actually failed
+      // (some may have partially succeeded) — surface the failure instead of
+      // letting it become an unhandled rejection with the modal just
+      // silently stopping its spinner. Deliberately no onClose() here so the
+      // user can see the error and retry.
+      addToast(`Could not save preferences: ${String(error)}`, "error");
     } finally {
       setSaving(false);
     }

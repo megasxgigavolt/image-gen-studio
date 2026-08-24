@@ -918,6 +918,49 @@ export function TimelineView() {
     await refresh(projectsClient.updateTimelineClip(activeVideoId, selectedClip.id, selectedClip.startSeconds, selectedClip.startSeconds + nextDuration));
   }
 
+  // Minimum a clip can be resized down to via nudge — mirrors the pointer
+  // drag's own implicit floor (nextDragBounds in timeline-drag-math.ts never
+  // lets a resize invert start/end either).
+  const MIN_CLIP_SECONDS = 0.1;
+
+  /** Keyboard equivalent of a pointer resize/move drag — ArrowLeft/Right (and
+   * Shift+Arrow for a bigger step) on a focused resize handle or clip body,
+   * see TimelineTracks' own onKeyDown wiring. Commits through the same
+   * `refresh`/`updateTimelineClip` call the pointer drag's `endDrag` uses,
+   * so keyboard edits participate in undo history identically to mouse
+   * edits — this app's primary editing surface was previously unreachable
+   * by keyboard at all. */
+  function nudgeStillsClip(clip: TimelineClipRecord, edge: "start" | "end" | "move", deltaSeconds: number) {
+    if (!activeVideoId) return;
+    if (edge === "move") {
+      if (timeline?.sequenceLocked) return; // matches beginStillsDrag's own guard
+      const duration = clip.endSeconds - clip.startSeconds;
+      const start = Math.max(0, clip.startSeconds + deltaSeconds);
+      void refresh(projectsClient.updateTimelineClip(activeVideoId, clip.id, start, start + duration));
+    } else if (edge === "start") {
+      const start = Math.max(0, Math.min(clip.startSeconds + deltaSeconds, clip.endSeconds - MIN_CLIP_SECONDS));
+      void refresh(projectsClient.updateTimelineClip(activeVideoId, clip.id, start, clip.endSeconds));
+    } else {
+      const end = Math.max(clip.startSeconds + MIN_CLIP_SECONDS, clip.endSeconds + deltaSeconds);
+      void refresh(projectsClient.updateTimelineClip(activeVideoId, clip.id, clip.startSeconds, end));
+    }
+  }
+
+  function nudgeCaptionClip(clip: TimelineCaptionClipRecord, edge: "start" | "end" | "move", deltaSeconds: number) {
+    if (!activeVideoId) return;
+    if (edge === "move") {
+      const duration = clip.endSeconds - clip.startSeconds;
+      const start = Math.max(0, clip.startSeconds + deltaSeconds);
+      void refresh(projectsClient.updateTimelineCaptionClip(activeVideoId, clip.id, start, start + duration));
+    } else if (edge === "start") {
+      const start = Math.max(0, Math.min(clip.startSeconds + deltaSeconds, clip.endSeconds - MIN_CLIP_SECONDS));
+      void refresh(projectsClient.updateTimelineCaptionClip(activeVideoId, clip.id, start, clip.endSeconds));
+    } else {
+      const end = Math.max(clip.startSeconds + MIN_CLIP_SECONDS, clip.endSeconds + deltaSeconds);
+      void refresh(projectsClient.updateTimelineCaptionClip(activeVideoId, clip.id, clip.startSeconds, end));
+    }
+  }
+
   async function duplicateStillsClip(clip: TimelineClipRecord) {
     if (!activeVideoId) return;
     await refresh(projectsClient.duplicateTimelineClip(activeVideoId, clip.id));
@@ -1103,8 +1146,21 @@ export function TimelineView() {
 
   async function cancelExport() {
     if (!activeVideoId) return;
+    // exportId is the backend's own per-attempt id (see app-store.ts's
+    // ExportState doc comment) — it's what cancel_timeline_export actually
+    // keys its PID registry by, not videoId, so two overlapping exports of
+    // the same video can be cancelled independently. It's briefly null right
+    // after an export starts, before the first progress event has arrived —
+    // there's nothing to cancel yet in that narrow window.
+    const exportId = exportState?.exportId;
+    if (!exportId) return;
     setExportCancellingStore(activeVideoId, true);
-    await projectsClient.cancelTimelineExport(activeVideoId);
+    try {
+      await projectsClient.cancelTimelineExport(exportId);
+    } catch (error) {
+      setExportCancellingStore(activeVideoId, false);
+      addToast(`Could not cancel the export: ${String(error)}`, "error");
+    }
   }
 
   // Recomputes the "Saved Xm ago" titlebar label periodically — the value
@@ -1159,6 +1215,12 @@ export function TimelineView() {
           return;
         case "delete":
           if (!activeVideoId) return;
+          // A deleted clip's region no longer exists for findClipAtTime to
+          // draw, and (belt-and-suspenders with useTimelinePlayback's own
+          // totalDurationRef fix) playback shouldn't keep running through a
+          // timeline that just changed out from under it — stop first,
+          // matching the "togglePlay" case above.
+          if (isPlaying) pausePreview();
           if (selectedMusicClip) {
             void refresh(projectsClient.deleteMusicClip(activeVideoId, selectedMusicClip.id));
             setSelectedMusicClip(null);
@@ -1645,6 +1707,7 @@ export function TimelineView() {
             selectedClipId={selectedClip?.id ?? null}
             sequenceLocked={timeline.sequenceLocked}
             onBeginStillsDrag={drag.beginStillsDrag}
+            onNudgeStillsClip={nudgeStillsClip}
             onSelectStillsClip={(_clip, atSeconds) => { setSelectedTrack(null); seekPreview(atSeconds); }}
             onDuplicateStillsClip={(clip) => void duplicateStillsClip(clip)}
             onRemoveStillsClip={(clip) => void removeStillsClip(clip)}
@@ -1654,6 +1717,7 @@ export function TimelineView() {
             selectedCaptionClipId={selectedCaptionClip?.id ?? null}
             snapIndicatorSeconds={drag.snapIndicatorSeconds}
             onBeginCaptionDrag={drag.beginCaptionDrag}
+            onNudgeCaptionClip={nudgeCaptionClip}
             onSeek={seekPreview}
             onSelectCaptionAndSeek={(clip) => { selectCaptionClip(clip); seekPreview(clip.startSeconds); }}
             onOpenCaptionsTool={() => setActiveTool("captions")}
@@ -1684,6 +1748,7 @@ export function TimelineView() {
         exporting={exporting && exportKind === "video"}
         exportCancelling={exportCancelling}
         exportProgress={exportProgress}
+        startedAt={exportState?.startedAt ?? null}
         settings={exportSettings}
         onSettingsChange={(patch) => setExportSettings((current) => ({ ...current, ...patch }))}
         fileName={exportFileName}

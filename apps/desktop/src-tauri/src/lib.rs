@@ -11,14 +11,15 @@ use projects::{
     Video, VideoAsset, VideoInputs, VideoProgress, VisualPlan,
 };
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::Duration;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
+use uuid::Uuid;
 
 #[tauri::command]
 fn application_version() -> &'static str {
@@ -27,6 +28,41 @@ fn application_version() -> &'static str {
 
 type RepositoryState = Mutex<ProjectRepository>;
 type ExportJobsState = Mutex<HashMap<String, u32>>;
+
+// In-memory registries of image/animation job ids that currently have a
+// worker thread running for them — root-cause fix for a real double-worker
+// bug: the DB-level guard on resume (`set_image_job_status`/
+// `set_animation_job_status`, projects.rs) only blocks `WHERE status !=
+// 'completed'`-style transitions, which still permits e.g. `running` ->
+// `queued` — nothing there prevented a double-click (or a retried IPC call)
+// on Resume from spawning a SECOND worker for a job that already has one
+// running, which reintroduces the exact concurrent-429 problem the
+// single-worker design (see spawn_job_workers's own comment) was built to
+// avoid. Two separate sets (not one shared one) so image/animation job ids
+// can never collide even in principle — job ids are UUIDs already unique
+// within their own domain, but nothing enforces uniqueness ACROSS the two.
+static ACTIVE_IMAGE_JOB_IDS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static ACTIVE_ANIMATION_JOB_IDS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// RAII guard: removes `job_id` from `set` when dropped, regardless of which
+/// path the holder exits through (an early `return`, a `break` out of the
+/// worker loop, or even a panic) — a plain "remove it as the last statement"
+/// approach would miss `spawn_job_workers`'/`spawn_animation_job_workers`'
+/// own early-return path (`ProjectRepository::open` failing), which would
+/// otherwise permanently strand the job id in the active set: the job could
+/// then never be resumed again, with no error surfaced to the user.
+struct ActiveJobGuard {
+    set: &'static Mutex<HashSet<String>>,
+    job_id: String,
+}
+impl Drop for ActiveJobGuard {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.job_id);
+    }
+}
 struct StartupState {
     recovery_backup: Option<PathBuf>,
 }
@@ -1687,11 +1723,25 @@ fn spawn_job_workers(
     // and stills stuck failing after 5 attempts because their retries kept colliding
     // with the other worker's requests. One worker paced by the 1s gap below avoids
     // that self-inflicted contention entirely.
+    //
+    // Guard against a SECOND worker for this same job_id (e.g. a double-
+    // clicked Resume, or a retried IPC call) — see ACTIVE_IMAGE_JOB_IDS's own
+    // comment. Checked synchronously on the calling thread, before spawning,
+    // so two racing calls are still correctly serialized: whichever wins the
+    // insert() spawns, the loser's insert() returns false and it returns
+    // immediately without spawning a second worker.
+    {
+        let mut active = ACTIVE_IMAGE_JOB_IDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(job_id.clone()) {
+            return;
+        }
+    }
     for _ in 0..1 {
         let database_path = database_path.clone();
         let projects_dir = projects_dir.clone();
         let job_id = job_id.clone();
         thread::spawn(move || {
+            let _active_guard = ActiveJobGuard { set: &ACTIVE_IMAGE_JOB_IDS, job_id: job_id.clone() };
             let Ok(repository) = ProjectRepository::open(&database_path, &projects_dir) else {
                 return;
             };
@@ -2052,12 +2102,21 @@ fn spawn_animation_job_workers(
     engine_dir: std::path::PathBuf,
     job_id: String,
 ) {
+    // See spawn_job_workers's own comment on ACTIVE_IMAGE_JOB_IDS — same
+    // double-worker guard, mirrored here for animation jobs.
+    {
+        let mut active = ACTIVE_ANIMATION_JOB_IDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.insert(job_id.clone()) {
+            return;
+        }
+    }
     for _ in 0..1 {
         let database_path = database_path.clone();
         let projects_dir = projects_dir.clone();
         let engine_dir = engine_dir.clone();
         let job_id = job_id.clone();
         thread::spawn(move || {
+            let _active_guard = ActiveJobGuard { set: &ACTIVE_ANIMATION_JOB_IDS, job_id: job_id.clone() };
             let Ok(repository) = ProjectRepository::open(&database_path, &projects_dir) else {
                 return;
             };
@@ -2599,8 +2658,15 @@ async fn export_timeline_video(
         let pid_app = app.clone();
         let cleanup_app = app.clone();
         let event_video_id = video_id.clone();
-        let pid_video_id = video_id.clone();
-        let cleanup_video_id = video_id.clone();
+        // Keyed by job_id (unique per export attempt), not video_id — two
+        // overlapping exports of the SAME video used to collide on a shared
+        // video_id key: the first export's completion cleanup would delete
+        // the second export's still-running PID entry, silently no-opping
+        // Cancel on the second export and orphaning its process. job_id
+        // (already minted above via create_export_job) is unique per call.
+        let pid_job_id = job_id.clone();
+        let cleanup_job_id = job_id.clone();
+        let event_job_id = job_id.clone();
         let (worker_database_path, worker_projects_dir) = (database_path.clone(), projects_dir.clone());
         let worker_video_id = video_id.clone();
         let result = tauri::async_runtime::spawn_blocking(move || {
@@ -2613,13 +2679,14 @@ async fn export_timeline_video(
                     let jobs = pid_app.state::<ExportJobsState>();
                     jobs.lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert(pid_video_id.clone(), pid);
+                        .insert(pid_job_id.clone(), pid);
                 },
                 move |percent, stage, detail| {
                     let _ = progress_app.emit(
                         "export-progress",
                         serde_json::json!({
                             "videoId": &event_video_id,
+                            "exportId": &event_job_id,
                             "percent": percent,
                             "stage": stage,
                             "detail": detail,
@@ -2630,7 +2697,7 @@ async fn export_timeline_video(
             let jobs = cleanup_app.state::<ExportJobsState>();
             jobs.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&cleanup_video_id);
+                .remove(&cleanup_job_id);
             result
         })
         .await
@@ -2682,12 +2749,18 @@ async fn export_timeline_project(
             .join("python-engine")
     };
     let destination_dir = PathBuf::from(destination_path);
+    // No export_jobs DB row for a bundle export (unlike export_timeline_video's
+    // create_export_job) — a plain fresh id is enough here, it's only ever
+    // used as the ExportJobsState key (see export_timeline_video's own
+    // comment on why job_id, not video_id, is the right key).
+    let job_id = Uuid::new_v4().to_string();
     let progress_app = app.clone();
     let pid_app = app.clone();
     let cleanup_app = app.clone();
     let event_video_id = video_id.clone();
-    let pid_video_id = video_id.clone();
-    let cleanup_video_id = video_id.clone();
+    let event_job_id = job_id.clone();
+    let pid_job_id = job_id.clone();
+    let cleanup_job_id = job_id.clone();
     let output_dir = tauri::async_runtime::spawn_blocking(move || {
         let repository = ProjectRepository::open(&database_path, &projects_dir)?;
         let result = repository.export_timeline_project_with_progress(
@@ -2698,13 +2771,14 @@ async fn export_timeline_project(
                 let jobs = pid_app.state::<ExportJobsState>();
                 jobs.lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(pid_video_id.clone(), pid);
+                    .insert(pid_job_id.clone(), pid);
             },
             move |percent, stage, detail| {
                 let _ = progress_app.emit(
                     "export-progress",
                     serde_json::json!({
                         "videoId": &event_video_id,
+                        "exportId": &event_job_id,
                         "percent": percent,
                         "stage": stage,
                         "detail": detail,
@@ -2715,7 +2789,7 @@ async fn export_timeline_project(
         let jobs = cleanup_app.state::<ExportJobsState>();
         jobs.lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&cleanup_video_id);
+            .remove(&cleanup_job_id);
         result
     })
     .await
@@ -2724,12 +2798,16 @@ async fn export_timeline_project(
 }
 
 #[tauri::command]
-fn cancel_timeline_export(app: tauri::AppHandle, video_id: String) -> Result<bool, String> {
+fn cancel_timeline_export(app: tauri::AppHandle, export_id: String) -> Result<bool, String> {
+    // Keyed by export_id (the export-progress event's own "exportId"), not
+    // video_id — see export_timeline_video's own comment on why: two
+    // overlapping exports of the same video would otherwise collide on a
+    // shared video_id key.
     let jobs = app.state::<ExportJobsState>();
     let pid = jobs
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .remove(&video_id);
+        .remove(&export_id);
     let Some(_pid) = pid else {
         return Ok(false);
     };
@@ -3342,4 +3420,60 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Auto Gen Studio");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression coverage for a real double-worker bug: resuming a job
+    // (e.g. a double-clicked Resume button, or a retried IPC call) used to
+    // spawn a SECOND worker thread for a job that already had one running,
+    // since the DB-level guard alone permitted a running -> queued
+    // transition and nothing else prevented a second spawn. This tests the
+    // ACTIVE_IMAGE_JOB_IDS guard/ActiveJobGuard mechanism in isolation, pure
+    // HashSet logic — no need to spin up real worker threads.
+    #[test]
+    fn active_job_guard_blocks_a_second_insert_until_the_first_drops() {
+        let job_id = "test-job-active-guard".to_string();
+        {
+            let mut active = ACTIVE_IMAGE_JOB_IDS.lock().unwrap();
+            active.clear(); // isolate from any other test that touched this shared static
+            assert!(active.insert(job_id.clone()), "first insert should succeed");
+        }
+        assert!(
+            !ACTIVE_IMAGE_JOB_IDS.lock().unwrap().insert(job_id.clone()),
+            "a second insert of the same job_id must be rejected while the first is still active"
+        );
+
+        // Dropping the guard must remove the job_id, even via an early-return
+        // style exit (not just falling off the end of a function) — this is
+        // exactly the gap a plain "remove it as the last statement" approach
+        // would have missed (see spawn_job_workers's own early return if
+        // ProjectRepository::open fails).
+        {
+            let _guard = ActiveJobGuard { set: &ACTIVE_IMAGE_JOB_IDS, job_id: job_id.clone() };
+            // _guard drops here at the end of this inner scope, simulating
+            // an early return from inside the spawned closure.
+        }
+        assert!(
+            ACTIVE_IMAGE_JOB_IDS.lock().unwrap().insert(job_id.clone()),
+            "the job_id must be resumable again once the guard has dropped"
+        );
+        ACTIVE_IMAGE_JOB_IDS.lock().unwrap().remove(&job_id); // cleanup
+    }
+
+    #[test]
+    fn active_job_guard_drops_are_independent_between_image_and_animation_sets() {
+        let job_id = "shared-id-different-domains".to_string();
+        assert!(ACTIVE_IMAGE_JOB_IDS.lock().unwrap().insert(job_id.clone()));
+        // The SAME id in the animation set must be unaffected — the two
+        // registries are deliberately separate statics, never shared.
+        assert!(
+            ACTIVE_ANIMATION_JOB_IDS.lock().unwrap().insert(job_id.clone()),
+            "image and animation job id sets must not collide with each other"
+        );
+        ACTIVE_IMAGE_JOB_IDS.lock().unwrap().remove(&job_id);
+        ACTIVE_ANIMATION_JOB_IDS.lock().unwrap().remove(&job_id);
+    }
 }

@@ -19,9 +19,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
 import json
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -867,6 +870,10 @@ def _vignette_mask_geometry(width: int, height: int, vignette: float) -> tuple[i
     return mask_w, mask_h, keep_expr
 
 
+_vignette_mask_locks: dict[Path, threading.Lock] = {}
+_vignette_mask_locks_guard = threading.Lock()
+
+
 def _ensure_vignette_mask(mask_dir: Path, width: int, height: int, vignette: float) -> Path:
     """Materializes (or reuses an already-cached) small greyscale PNG for
     `_vignette_mask_geometry`'s own keep-factor mask, generated once via a
@@ -875,17 +882,43 @@ def _ensure_vignette_mask(mask_dir: Path, width: int, height: int, vignette: flo
     ever runs at that fixed low resolution, exactly once per distinct
     (aspect ratio, vignette value) pair across a whole export — every later
     clip sharing that pair reuses the same cached file in `mask_dir`, keyed
-    by filename. See `_apply_vignette_filter` for how each clip applies it."""
+    by filename. See `_apply_vignette_filter` for how each clip applies it.
+
+    The existence check + generate is guarded by a per-mask-path lock (not
+    just the check alone) — this runs from inside `_encode_segment_to_path`,
+    called concurrently for up to `MAX_ENCODE_WORKERS` segments via the
+    export's own ThreadPoolExecutor. Multiple segments commonly share the
+    exact same (width, height, vignette) — every still in one export usually
+    shares resolution and often the same vignette intensity — so without the
+    lock, two threads could both see the mask missing and both run `ffmpeg
+    -y` on the SAME output path at once; one thread's blend read could then
+    hit a file truncated mid-write by the other thread's overwrite,
+    producing an intermittent, hard-to-reproduce corrupt-mask failure that
+    depends purely on thread scheduling. Purely in-process (this dict, and
+    `mask_dir`, both belong to one export's own Python process) — unlike
+    MOTION_ENGINE_DIR's cross-process race, a plain `threading.Lock` is
+    enough here, no file lock needed."""
     mask_w, mask_h, keep_expr = _vignette_mask_geometry(width, height, vignette)
     mask_path = mask_dir / f"_vignette_mask_{mask_w}x{mask_h}_{max(0.0, min(1.0, vignette)):.3f}.png"
-    if not mask_path.exists():
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=white:s={mask_w}x{mask_h}:d=1",
-                "-vf", f"format=gray,geq=lum='{keep_expr}'", "-frames:v", "1", str(mask_path),
-            ],
-            capture_output=True, text=True, **_subprocess_kwargs(),
-        )
+    with _vignette_mask_locks_guard:
+        lock = _vignette_mask_locks.setdefault(mask_path, threading.Lock())
+    with lock:
+        if not mask_path.exists():
+            # Rendered to a per-thread temp file first, then atomically
+            # renamed into place — defense in depth alongside the lock
+            # itself: no reader (including a future call site that might not
+            # go through this same lock) can ever observe a partially-written
+            # mask file.
+            tmp_path = mask_path.with_name(f"{mask_path.stem}.{os.getpid()}.{threading.get_ident()}.tmp.png")
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=white:s={mask_w}x{mask_h}:d=1",
+                    "-vf", f"format=gray,geq=lum='{keep_expr}'", "-frames:v", "1", str(tmp_path),
+                ],
+                capture_output=True, text=True, **_subprocess_kwargs(),
+            )
+            if tmp_path.exists():
+                os.replace(tmp_path, mask_path)
     return mask_path
 
 
@@ -922,9 +955,23 @@ def _apply_vignette_filter(
         return [], ["-vf", vf]
     mask_path = _ensure_vignette_mask(mask_dir, width, height, vignette)
     extra_input_args = ["-loop", "1", "-t", f"{duration_bound:.3f}", "-i", str(mask_path)]
+    # `blend=all_mode=multiply` runs per-PLANE, not per-color — in yuv420p
+    # that means it also multiplies the chroma (U/V) planes, which are
+    # centered at 128 ("no color"), not 0. The mask's own chroma is neutral
+    # 128 too (it started as a plain greyscale image), so anywhere the mask
+    # darkens (keep factor < 255) this pulled U/V from 128 toward 0 —
+    # 0/0 chroma isn't neutral, it's a strongly saturated color, and it
+    # rendered as a solid green cast over the whole vignetted region (a real
+    # user's report: "the final exported video is showing in all green").
+    # The original CSS math this mask encodes (`rgba(0,0,0,a)` over an opaque
+    # color reduces to `C*(1-a)`) is a per-CHANNEL RGB multiply, so doing the
+    # blend in `gbrp` (planar RGB) instead of yuv420p is what it actually
+    # means: the mask's R/G/B planes all carry the same grey value, so
+    # multiplying scales R, G, and B down together, dimming brightness while
+    # leaving hue untouched, then converting back to yuv420p for encoding.
     filter_complex = (
-        f"[0:v]{vf}[_vgz];"
-        f"[1:v]scale={width}:{height}:flags=bicubic,format=yuv420p[_vgm];"
+        f"[0:v]{vf},format=gbrp[_vgz];"
+        f"[1:v]scale={width}:{height}:flags=bicubic,format=gbrp[_vgm];"
         f"[_vgz][_vgm]blend=all_mode=multiply:shortest=1,format=yuv420p[_vgout]"
     )
     return extra_input_args, ["-filter_complex", filter_complex, "-map", "[_vgout]"]
@@ -1027,11 +1074,47 @@ def _wait_for_memory_headroom() -> None:
 _OOM_ERROR_SUBSTRINGS = ("malloc of size", "Cannot allocate memory", "bad_alloc", "out of memory")
 
 
+# Every transient, per-export intermediate this module writes directly into
+# work_dir (== manifest_path.parent, the user's real project export/
+# directory, NOT a system temp dir) — never output_path itself. Used by
+# `_cleanup_transient_export_artifacts` on `run`'s error path so a failed
+# export doesn't leave multi-hundred-MB files behind forever; a successful
+# export already cleans up segment_paths/segments_list_path itself, so this
+# only ever needs to run on failure.
+_TRANSIENT_EXPORT_ARTIFACT_GLOBS = (
+    "seg_*.ts", "segments.txt", "captions.ass", "_vignette_mask_*.png",
+    "motion_batch_spec.json", "motion_batch_results.json", "motion_pre_*.raw.mp4",
+)
+
+
+def _cleanup_transient_export_artifacts(work_dir: Path) -> None:
+    """Best-effort cleanup of one failed export's own per-run intermediates
+    — glob-based (not a list of paths threaded through from wherever the
+    failure happened) so it's robust regardless of which stage failed,
+    rather than depending on e.g. `segment_paths` having been fully
+    populated by the time the exception was raised."""
+    for pattern in _TRANSIENT_EXPORT_ARTIFACT_GLOBS:
+        for path in work_dir.glob(pattern):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass  # a locked file here shouldn't mask the real export error
+
+
 def run_ffmpeg(args: list[str], _retries_left: int = 2) -> None:
     _wait_for_memory_headroom()
-    result = subprocess.run(
-        ["ffmpeg", *args], capture_output=True, text=True, **_subprocess_kwargs()
-    )
+    try:
+        result = subprocess.run(
+            ["ffmpeg", *args], capture_output=True, text=True, timeout=600, **_subprocess_kwargs()
+        )
+    except subprocess.TimeoutExpired as error:
+        # A stuck ffmpeg process (a corrupt/edge-case input, a filter-graph
+        # deadlock) used to hang this call — and everything awaiting it —
+        # forever, with no automatic recovery short of killing the app.
+        # 600s is generous for one segment/transition; deliberately not
+        # folded into the OOM-retry path above, since a genuine hang isn't
+        # the kind of transient condition retrying identically would fix.
+        raise RuntimeError(f"ffmpeg timed out after 600s and was stopped: {' '.join(args[-3:])}") from error
     if result.returncode != 0:
         stderr = result.stderr[-2000:]
         if _retries_left > 0 and any(pattern in stderr for pattern in _OOM_ERROR_SUBSTRINGS):
@@ -1070,8 +1153,82 @@ def _without_extended_path_prefix(path: Path) -> Path:
 # free-form "motion recipe" motion_graphics_engine.py composed for a clip (see
 # that module's docstring — there's no fixed catalog of named treatments
 # anymore, just a shared vocabulary of independent primitives). Sibling of
-# python-engine under services/.
-MOTION_ENGINE_DIR = _without_extended_path_prefix(Path(__file__).resolve().parents[2] / "motion-engine")
+# python-engine under services/. This is the READ-ONLY bundled resource,
+# versioned together with the rest of the app — Tauri's NSIS installer wipes
+# and recreates this whole directory on every version upgrade. Nothing else
+# in this module uses this path directly except `_sync_motion_engine_source`
+# below — see `MOTION_ENGINE_DIR`'s own comment for why.
+MOTION_ENGINE_RESOURCE_DIR = _without_extended_path_prefix(Path(__file__).resolve().parents[2] / "motion-engine")
+
+# A persistent, version-independent working copy of the resource dir above,
+# under the same per-user app-data root scene_grouping_engine.py already
+# uses for its own downloaded ffmpeg binary. `_ensure_motion_engine_ready`
+# installs npm packages here — and Remotion downloads its own ~200MB
+# headless-Chromium here — instead of inside MOTION_ENGINE_RESOURCE_DIR:
+# root-cause fix for a real user's report, "setup downloads chrome headless
+# everytime its so stupid". The resource dir gets wiped and recreated by
+# every single app update (that's the whole point of it being a versioned
+# installer resource) — which used to take the already-downloaded browser
+# and the npm install down with it, forcing a full multi-hundred-MB
+# redownload after every update instead of just once, ever. This directory
+# lives entirely outside the versioned install, so it survives updates and
+# reinstalls; `_sync_motion_engine_source` keeps its small source files (not
+# node_modules, not the browser download) matching whatever version is
+# actually installed, on every render.
+MOTION_ENGINE_DIR = _without_extended_path_prefix(
+    Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "AutoGenStudio" / "motion-engine"
+)
+
+# Lock file guarding every access to MOTION_ENGINE_DIR — see
+# `_cross_process_file_lock` and `_ensure_motion_engine_ready`'s own
+# comments. Lives as a SIBLING of MOTION_ENGINE_DIR, not inside it, so it's
+# never touched by `_sync_motion_engine_source`'s copy or npm's own
+# node_modules churn.
+_MOTION_ENGINE_LOCK_PATH = MOTION_ENGINE_DIR.parent / "motion-engine.lock"
+
+
+@contextlib.contextmanager
+def _cross_process_file_lock(lock_path: Path, *, wait_timeout: float = 900.0, stale_after: float = 1800.0):
+    """A mutex usable across threads AND separate OS processes on Windows,
+    via an atomic exclusive-create lock file — `os.open(..., O_CREAT |
+    O_EXCL)` maps to `CreateFile`+`CREATE_NEW` on Windows, which atomically
+    fails with `FileExistsError` if the file already exists, no third-party
+    dependency needed (this app is Windows-only, see CLAUDE.md). The lock
+    file's content is `"pid:timestamp"`. A waiter that can't acquire within
+    `wait_timeout` — or finds a lock file already older than `stale_after`,
+    even before `wait_timeout` elapses — treats it as abandoned (the holder
+    crashed without cleaning up, e.g. the whole app was killed mid-render)
+    and force-removes it rather than waiting/blocking forever; `stale_after`
+    being independent of `wait_timeout` matters specifically so ONE crashed
+    holder doesn't force every future waiter to sit through the full
+    `wait_timeout` delay, forever, on every subsequent export."""
+    parent = lock_path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + wait_timeout
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            try:
+                os.write(fd, f"{os.getpid()}:{time.time()}".encode("utf-8"))
+            finally:
+                os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                held_since = float(lock_path.read_text(encoding="utf-8").split(":", 1)[1])
+                if time.time() - held_since > stale_after:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except (OSError, ValueError, IndexError):
+                pass  # unreadable / mid-write by the current holder — treat as still contended
+            if time.monotonic() >= deadline:
+                lock_path.unlink(missing_ok=True)  # force through rather than hang forever
+                continue
+            time.sleep(0.5 + random.random() * 0.5)  # jittered — avoids a thundering herd on release
+    try:
+        yield
+    finally:
+        lock_path.unlink(missing_ok=True)
 
 
 def _resolve_node_bin(name: str) -> str:
@@ -1088,23 +1245,79 @@ def _resolve_node_bin(name: str) -> str:
     return resolved
 
 
+def _motion_engine_lockfile_fingerprint() -> str:
+    """Hash of MOTION_ENGINE_DIR's currently-synced `package-lock.json`
+    (empty string if there isn't one), used by `_motion_engine_installed` to
+    detect a `node_modules` left over from a previous app version. A content
+    hash rather than an mtime comparison: `_sync_motion_engine_source`'s
+    plain file copy doesn't reliably preserve the resource's original mtime,
+    but the copied content is always byte-for-byte exact."""
+    lockfile = MOTION_ENGINE_DIR / "package-lock.json"
+    if not lockfile.exists():
+        return ""
+    return hashlib.sha256(lockfile.read_bytes()).hexdigest()
+
+
 def _motion_engine_installed() -> bool:
-    """Whether services/motion-engine's `npm install`/`npm ci` actually
-    produced a usable `remotion` CLI — checking that `node_modules` merely
-    *exists* (the old check) was too weak: an install interrupted partway
-    (network drop, disk space, antivirus interference, npm itself crashing)
-    can leave a `node_modules` folder behind that's missing the `remotion`
-    package's bin entirely, and that folder's mere existence then
+    """Whether MOTION_ENGINE_DIR's (the persistent working copy — see its
+    own comment) `npm install`/`npm ci` actually produced a usable
+    `remotion` CLI that still matches the currently-synced
+    `package-lock.json`. Checking that `node_modules` merely *exists* (the
+    old check) was too weak in two different ways: an install interrupted
+    partway (network drop, disk space, antivirus interference, npm itself
+    crashing) can leave a `node_modules` folder behind that's missing the
+    `remotion` package's bin entirely, and that folder's mere existence then
     permanently short-circuits every future install attempt too — the exact
     shape of a real user's report: 'npx: could not determine executable to
     run', which is npm's confusing way of saying it couldn't find `remotion`
-    locally and didn't know what registry package to fall back to. Checking
-    for the concrete file the render step actually depends on catches a
-    broken partial install and triggers a real (re)install instead of
-    silently trusting a folder that's there but empty/incomplete. This app
-    only ships for Windows (see CLAUDE.md), so the `.cmd` shim is the only
+    locally and didn't know what registry package to fall back to. And
+    because MOTION_ENGINE_DIR now persists across app updates (see its own
+    comment), an OLDER version's node_modules can still be sitting there,
+    installed against a DIFFERENT package-lock.json than the one the current
+    app version just synced in via `_sync_motion_engine_source` — the
+    lockfile-hash sentinel (written by `_ensure_motion_engine_ready` right
+    after a successful install) catches that mismatch and forces a real
+    reinstall instead of silently trusting stale dependencies. This app only
+    ships for Windows (see CLAUDE.md), so the `.cmd` shim is the only
     variant that matters here."""
-    return (MOTION_ENGINE_DIR / "node_modules" / ".bin" / "remotion.cmd").exists()
+    remotion_cli = MOTION_ENGINE_DIR / "node_modules" / ".bin" / "remotion.cmd"
+    if not remotion_cli.exists():
+        return False
+    sentinel = MOTION_ENGINE_DIR / "node_modules" / ".installed-lockfile-hash"
+    return (
+        sentinel.exists()
+        and sentinel.read_text(encoding="utf-8").strip() == _motion_engine_lockfile_fingerprint()
+    )
+
+
+# Everything `_ensure_motion_engine_ready` needs from the bundled resource
+# dir besides node_modules/the browser download itself — small enough (a
+# handful of .ts/.tsx/.mjs files plus 3 tiny JSON manifests) to just copy in
+# full on every call rather than diffing.
+_MOTION_ENGINE_SOURCE_ENTRIES = ("package.json", "package-lock.json", "tsconfig.json", "src")
+
+
+def _sync_motion_engine_source() -> None:
+    """Copies the small versioned source files (never `node_modules`, never
+    the downloaded browser) from the read-only bundled MOTION_ENGINE_RESOURCE_DIR
+    into the persistent MOTION_ENGINE_DIR working copy, so a render always
+    uses the motion-graphic recipe vocabulary that shipped with the
+    CURRENTLY installed app version, even though node_modules and the
+    browser download itself are deliberately reused across versions (see
+    MOTION_ENGINE_DIR's own comment). Cheap enough to run unconditionally on
+    every `_ensure_motion_engine_ready` call rather than trying to detect
+    staleness."""
+    MOTION_ENGINE_DIR.mkdir(parents=True, exist_ok=True)
+    for name in _MOTION_ENGINE_SOURCE_ENTRIES:
+        source = MOTION_ENGINE_RESOURCE_DIR / name
+        dest = MOTION_ENGINE_DIR / name
+        if not source.exists():
+            continue
+        if source.is_dir():
+            shutil.rmtree(dest, ignore_errors=True)
+            shutil.copytree(source, dest)
+        else:
+            shutil.copyfile(source, dest)
 
 
 def _robust_rmtree(path: Path, attempts: int = 5, delay_seconds: float = 1.0) -> None:
@@ -1178,50 +1391,75 @@ def _ensure_motion_engine_ready() -> None:
     `_robust_rmtree`'s doc comment) — this retries through that specific
     failure before giving up. Also verifies the actual headless-Chromium
     download Remotion needs at render time, not just the npm packages (see
-    `_ensure_remotion_browser_downloaded`)."""
-    if not MOTION_ENGINE_DIR.is_dir():
+    `_ensure_remotion_browser_downloaded`).
+
+    Everything after the resource-dir check runs under
+    `_cross_process_file_lock` — MOTION_ENGINE_DIR is a single directory
+    shared across every concurrent caller, in-process AND across separate OS
+    processes: `run_bundle`'s own ThreadPoolExecutor can call this from
+    multiple worker threads at once (unlike `run`, which pre-warms it
+    single-threaded before starting its own pool), and Rust can launch
+    motion_graphics_engine.py's validator as an entirely separate process
+    while a video export is also touching this same directory. Without the
+    lock, concurrent callers could race `_sync_motion_engine_source`'s own
+    `shutil.rmtree`/`copytree` against each other, or spawn overlapping `npm
+    ci`/`install` processes that each independently delete/rewrite
+    `node_modules` — corrupting the shared install (ENOTEMPTY/ENOENT/a
+    missing `remotion.cmd` afterward)."""
+    if not MOTION_ENGINE_RESOURCE_DIR.is_dir():
         # `cwd=` below only ever raises the cryptic OS-level
         # `[WinError 267] The directory name is invalid` if this is missing —
         # give a message that actually points at the fix (a packaging bug:
         # the motion-engine sidecar wasn't bundled as an app resource) rather
-        # than let that opaque error surface to the user.
+        # than let that opaque error surface to the user. Checked before the
+        # lock is even acquired — this never touches the shared directory.
         raise RuntimeError(
-            f"The motion-graphics render engine is missing from this install "
-            f"(expected at {MOTION_ENGINE_DIR}). Reinstall Auto Gen Studio; if "
-            "this keeps happening, the app package is missing the motion-engine "
-            "resource."
+            "The motion-graphics render engine is missing from this install "
+            f"(expected at {MOTION_ENGINE_RESOURCE_DIR}). Reinstall Auto Gen "
+            "Studio; if this keeps happening, the app package is missing the "
+            "motion-engine resource."
         )
-    if not _motion_engine_installed():
-        npm = _resolve_node_bin("npm")
-        install_args = ["ci"] if (MOTION_ENGINE_DIR / "package-lock.json").exists() else ["install"]
-        result = subprocess.run(
-            [npm, *install_args], cwd=str(MOTION_ENGINE_DIR),
-            capture_output=True, text=True, **_subprocess_kwargs(),
-        )
-        if result.returncode != 0:
-            node_modules = MOTION_ENGINE_DIR / "node_modules"
-            if node_modules.exists():
-                try:
-                    _robust_rmtree(node_modules)
-                except OSError:
-                    pass  # best-effort — the error below still fires if this didn't help
-                retry = subprocess.run(
-                    [npm, "install"], cwd=str(MOTION_ENGINE_DIR),
-                    capture_output=True, text=True, **_subprocess_kwargs(),
-                )
-                if retry.returncode == 0:
-                    result = retry
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Could not install the motion-graphics render engine: {result.stderr[-2000:]}"
-            )
+    with _cross_process_file_lock(_MOTION_ENGINE_LOCK_PATH):
+        _sync_motion_engine_source()
         if not _motion_engine_installed():
-            raise RuntimeError(
-                "The motion-graphics render engine installed but 'remotion' still "
-                f"isn't available at {MOTION_ENGINE_DIR}\\node_modules\\.bin\\remotion.cmd — "
-                "try the export again; if this keeps happening, reinstall Auto Gen Studio."
+            npm = _resolve_node_bin("npm")
+            install_args = ["ci"] if (MOTION_ENGINE_DIR / "package-lock.json").exists() else ["install"]
+            result = subprocess.run(
+                [npm, *install_args], cwd=str(MOTION_ENGINE_DIR),
+                capture_output=True, text=True, **_subprocess_kwargs(),
             )
-    _ensure_remotion_browser_downloaded()
+            if result.returncode != 0:
+                node_modules = MOTION_ENGINE_DIR / "node_modules"
+                if node_modules.exists():
+                    try:
+                        _robust_rmtree(node_modules)
+                    except OSError:
+                        pass  # best-effort — the error below still fires if this didn't help
+                    retry = subprocess.run(
+                        [npm, "install"], cwd=str(MOTION_ENGINE_DIR),
+                        capture_output=True, text=True, **_subprocess_kwargs(),
+                    )
+                    if retry.returncode == 0:
+                        result = retry
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Could not install the motion-graphics render engine: {result.stderr[-2000:]}"
+                )
+            if not _motion_engine_installed():
+                raise RuntimeError(
+                    "The motion-graphics render engine installed but 'remotion' still "
+                    f"isn't available at {MOTION_ENGINE_DIR}\\node_modules\\.bin\\remotion.cmd — "
+                    "try the export again; if this keeps happening, reinstall Auto Gen Studio."
+                )
+            # Recorded so a future call can tell a genuinely stale node_modules
+            # (this install's package-lock.json no longer matches — a real app
+            # update changed motion-engine's own npm deps) apart from one that's
+            # merely left over from an earlier version and still perfectly
+            # valid — see `_motion_engine_installed`'s own comment.
+            (MOTION_ENGINE_DIR / "node_modules" / ".installed-lockfile-hash").write_text(
+                _motion_engine_lockfile_fingerprint(), encoding="utf-8"
+            )
+        _ensure_remotion_browser_downloaded()
 
 
 def _render_motion_graphic(
@@ -1683,7 +1921,14 @@ def write_captions_srt(captions: list[dict], out_path: Path) -> None:
 
 
 def escape_subtitles_path(path: Path) -> str:
-    return str(path).replace("\\", "/").replace(":", "\\:")
+    escaped = str(path).replace("\\", "/").replace(":", "\\:")
+    # The caller wraps this in single quotes (`ass='...':fontsdir='...'`) —
+    # a literal ' must close the quote, insert an escaped literal quote,
+    # then reopen quoting (ffmpeg's own documented filtergraph escaping
+    # trick), or the whole filter string breaks. Any Windows account name or
+    # custom Projects-folder path containing an apostrophe (e.g. "O'Brien")
+    # used to corrupt every caption-burn export for that user.
+    return escaped.replace("'", r"'\''")
 
 
 # "Rubik" (the caption default font) isn't a built-in OS font — bundling it
@@ -2074,7 +2319,15 @@ def _escape_ass_text(text: str) -> str:
     # Braces open/close an ASS override block unconditionally — there's no
     # in-band escape for a literal brace, so swap them for lookalikes rather
     # than let user-edited caption text corrupt the line's styling.
-    return text.replace("{", "(").replace("}", ")").replace("\n", "\\N")
+    #
+    # Backslashes are escaped FIRST, before the newline substitution below —
+    # a literal two-character "\n" (or "\h") sequence already present in the
+    # caption text (e.g. from a script snippet mentioning a Windows path) is
+    # otherwise read by libass as a forced newline/hard-space even outside an
+    # override block, silently corrupting the caption's line layout. Doing
+    # this first means the backslash THIS function itself inserts for a real
+    # newline, right below, is never re-escaped.
+    return text.replace("\\", "\\\\").replace("{", "(").replace("}", ")").replace("\n", "\\N")
 
 
 def _karaoke_dialogue_lines(
@@ -2426,18 +2679,42 @@ def run_final_pass(args: list[str], duration_seconds: float) -> None:
     stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
     stderr_thread.start()
 
-    assert process.stdout is not None
-    for line in process.stdout:
-        match = re.match(r"out_time_ms=(\d+)", line.strip())
-        if match:
-            out_seconds = int(match.group(1)) / 1_000_000
-            percent = 72 + min(1.0, out_seconds / max(duration_seconds, 0.001)) * 28
-            engine.report_progress(
-                round(percent), "Rendering video", f"{out_seconds:.1f}s / {duration_seconds:.1f}s"
-            )
+    # The progress loop below blocks reading process.stdout line-by-line
+    # until ffmpeg closes it (normal exit) — a plain `timeout=` kwarg has
+    # nothing to attach to here, unlike run_ffmpeg's plain subprocess.run.
+    # A stuck final-mux pass used to hang this call, and the whole export
+    # with it, forever with no automatic recovery. A generous multiple of
+    # the video's own real-time duration (floored at 30 minutes) so this
+    # never fires on a genuinely long but working 4K export — the watchdog
+    # killing the process is what unblocks the stdout read loop below by
+    # closing its pipe.
+    deadline_seconds = max(1800.0, duration_seconds * 8)
+    timed_out = threading.Event()
 
-    process.wait()
+    def _kill_on_timeout() -> None:
+        timed_out.set()
+        process.kill()
+
+    watchdog = threading.Timer(deadline_seconds, _kill_on_timeout)
+    watchdog.daemon = True
+    watchdog.start()
+
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            match = re.match(r"out_time_ms=(\d+)", line.strip())
+            if match:
+                out_seconds = int(match.group(1)) / 1_000_000
+                percent = 72 + min(1.0, out_seconds / max(duration_seconds, 0.001)) * 28
+                engine.report_progress(
+                    round(percent), "Rendering video", f"{out_seconds:.1f}s / {duration_seconds:.1f}s"
+                )
+        process.wait()
+    finally:
+        watchdog.cancel()
     stderr_thread.join(timeout=5)
+    if timed_out.is_set():
+        raise RuntimeError(f"ffmpeg final render pass timed out after {deadline_seconds:.0f}s and was stopped.")
     if process.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {''.join(stderr_lines)[-2000:]}")
 
@@ -2571,366 +2848,379 @@ def run(manifest_path: Path, output_path: Path) -> None:
         raise ValueError("Timeline has no duration to export.")
 
     work_dir = manifest_path.parent
-    segments = build_segments(stills, duration_seconds)
-    if not segments:
-        raise ValueError("Nothing to export — the timeline has no stills.")
-    assign_frame_counts(segments, fps)
+    try:
+        segments = build_segments(stills, duration_seconds)
+        if not segments:
+            raise ValueError("Nothing to export — the timeline has no stills.")
+        assign_frame_counts(segments, fps)
 
-    # A fade-in/out at the two hard edges of the whole export has nothing to
-    # fade from/to — it just opens or closes on black — so ignore it there
-    # even if it was applied to every still via a bulk "apply to all" action.
-    # Only the true tail end counts for the closing fade: a fade-out into an
-    # actual trailing black gap further down the timeline is still legitimate.
-    if segments[0]["kind"] == "image":
-        segments[0]["transitionIn"] = "cut"
-    if segments[-1]["kind"] == "image":
-        segments[-1]["transitionOut"] = "cut"
-    # Drop each recipe's own fade-to-black envelope before anything derives
-    # further segments from these — the join-transition tail/head windows
-    # below are shallow copies, so doing it here covers them too, and every
-    # consumer (the native `fade=` path and the Remotion props alike) reads
-    # `motionGraphicSettings` from the segment. See its own doc comment.
-    strip_recipe_fade_envelope(segments)
-    # Only the single baked video gets blended join transitions — the
-    # asset-bundle export (see below) hands each clip to another editor as
-    # its own separate file, where a cross-fade/slide/zoom-blur has nothing
-    # meaningful to mean.
-    segments = expand_join_transitions(segments, fps)
+        # A fade-in/out at the two hard edges of the whole export has nothing to
+        # fade from/to — it just opens or closes on black — so ignore it there
+        # even if it was applied to every still via a bulk "apply to all" action.
+        # Only the true tail end counts for the closing fade: a fade-out into an
+        # actual trailing black gap further down the timeline is still legitimate.
+        if segments[0]["kind"] == "image":
+            segments[0]["transitionIn"] = "cut"
+        if segments[-1]["kind"] == "image":
+            segments[-1]["transitionOut"] = "cut"
+        # Drop each recipe's own fade-to-black envelope before anything derives
+        # further segments from these — the join-transition tail/head windows
+        # below are shallow copies, so doing it here covers them too, and every
+        # consumer (the native `fade=` path and the Remotion props alike) reads
+        # `motionGraphicSettings` from the segment. See its own doc comment.
+        strip_recipe_fade_envelope(segments)
+        # Only the single baked video gets blended join transitions — the
+        # asset-bundle export (see below) hands each clip to another editor as
+        # its own separate file, where a cross-fade/slide/zoom-blur has nothing
+        # meaningful to mean.
+        segments = expand_join_transitions(segments, fps)
 
-    # Pre-render every motion-graphic clip this early scan can see in one
-    # batched pass — see `_batch_render_motion_graphics`'s doc comment for
-    # why this exists. Skipped entirely (silently, same per-clip fallback)
-    # if the motion engine isn't ready yet or the common-public-dir
-    # computation fails — neither should ever actually block an export that
-    # would have worked before this batching existed.
-    # A Tier-1-only recipe never reaches Remotion at all now, on either an
-    # "image" or a "video" segment (see _is_ffmpeg_native_recipe /
-    # build_recipe_zoompan_filter in _encode_segment_to_path) — excluded
-    # here so the batch below isn't spent on clips that don't need it. This
-    # is the common case for "video" segments specifically: Tier 1 (camera
-    # move) is mandatory on every recipe per the SOP, so an animation/
-    # imported clip with no Tier 2/4/5 accent applied — the majority, since
-    # those are optional diversity accents, not the default shape — used to
-    # be sent through Remotion unconditionally regardless of how simple its
-    # recipe was.
-    motion_graphic_segments = [
-        (index, segment) for index, segment in enumerate(segments)
-        if segment["kind"] in ("image", "video")
-        and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings")
-        and not _is_ffmpeg_native_recipe(segment["motionGraphicSettings"])
-    ]
-    # A join transition's tail/head window (see _transition_tail_head_segments)
-    # used to be entirely excluded from this batch — always falling back to
-    # `_render_motion_graphic`'s own fresh Node/webpack/Chromium cold start,
-    # ONE PER WINDOW, run concurrently (up to MAX_ENCODE_WORKERS at a time)
-    # alongside every other segment in the ThreadPoolExecutor loop below.
-    # On a timeline with many transitions between recipe-bearing clips (the
-    # common case — Tier 1 is mandatory on every recipe), that meant dozens
-    # of simultaneous full Chromium processes: the dominant cost behind
-    # exports that never seemed to move past a low percent, and — under
-    # enough concurrent memory/handle pressure — an occasional truncated
-    # render (a corrupt intermediate .ts ffmpeg then can't even open).
-    # Folding these into the same one-bundle-one-browser batch as everything
-    # else removes both problems at once.
-    transition_segments = [
-        (index, segment) for index, segment in enumerate(segments) if segment["kind"] == "transition"
-    ]
-    transition_tail_heads: dict[int, tuple[dict, dict]] = {
-        index: _transition_tail_head_segments(segment, fps) for index, segment in transition_segments
-    }
-    transition_motion_items: list[tuple[int, str, dict]] = []
-    for index, (tail_segment, head_segment) in transition_tail_heads.items():
-        if (
-            tail_segment.get("motionGraphicEffect") and tail_segment.get("motionGraphicSettings")
-            and not _is_ffmpeg_native_recipe(tail_segment["motionGraphicSettings"])
-        ):
-            transition_motion_items.append((index, "tail", tail_segment))
-        if (
-            head_segment.get("motionGraphicEffect") and head_segment.get("motionGraphicSettings")
-            and not _is_ffmpeg_native_recipe(head_segment["motionGraphicSettings"])
-        ):
-            transition_motion_items.append((index, "head", head_segment))
-
-    pre_rendered_paths: list[Path] = []
-    if motion_graphic_segments or transition_motion_items:
-        total_items = len(motion_graphic_segments) + len(transition_motion_items)
-        engine.report_progress(
-            5, "Preparing export",
-            f"Pre-rendering {total_items} motion-graphic clip{'s' if total_items != 1 else ''}",
-        )
-        all_source_paths = [segment["path"] for _, segment in motion_graphic_segments] + [
-            segment["path"] for _, _, segment in transition_motion_items
+        # Pre-render every motion-graphic clip this early scan can see in one
+        # batched pass — see `_batch_render_motion_graphics`'s doc comment for
+        # why this exists. Skipped entirely (silently, same per-clip fallback)
+        # if the motion engine isn't ready yet or the common-public-dir
+        # computation fails — neither should ever actually block an export that
+        # would have worked before this batching existed.
+        # A Tier-1-only recipe never reaches Remotion at all now, on either an
+        # "image" or a "video" segment (see _is_ffmpeg_native_recipe /
+        # build_recipe_zoompan_filter in _encode_segment_to_path) — excluded
+        # here so the batch below isn't spent on clips that don't need it. This
+        # is the common case for "video" segments specifically: Tier 1 (camera
+        # move) is mandatory on every recipe per the SOP, so an animation/
+        # imported clip with no Tier 2/4/5 accent applied — the majority, since
+        # those are optional diversity accents, not the default shape — used to
+        # be sent through Remotion unconditionally regardless of how simple its
+        # recipe was.
+        motion_graphic_segments = [
+            (index, segment) for index, segment in enumerate(segments)
+            if segment["kind"] in ("image", "video")
+            and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings")
+            and not _is_ffmpeg_native_recipe(segment["motionGraphicSettings"])
         ]
-        public_dir = _common_public_dir(all_source_paths)
-        try:
-            if public_dir is not None:
-                batch_items = []
-                for index, segment in motion_graphic_segments:
-                    raw_path = work_dir / f"motion_pre_{index}.raw.mp4"
-                    media_path = Path(segment["path"]).resolve().relative_to(public_dir)
-                    batch_items.append({
-                        "id": str(index),
-                        "mediaPath": str(media_path).replace("\\", "/"),
-                        "sourceKind": "video" if segment["kind"] == "video" else "image",
-                        "recipe": segment["motionGraphicSettings"],
-                        "durationInFrames": segment.get("_originalFrames", segment["frames"]),
-                        # Differs only for a join transition's tail window —
-                        # see `_transition_tail_head_segments`.
-                        "motionDurationInFrames": segment.get(
-                            "_motionFrames", segment.get("_originalFrames", segment["frames"])
-                        ),
-                        "fps": fps, "width": width, "height": height,
-                        "outPath": str(raw_path),
-                    })
-                for index, side, segment in transition_motion_items:
-                    item_id = f"t{index}{side[0]}"  # "t3t" (tail) / "t3h" (head) — distinct from plain int ids
-                    raw_path = work_dir / f"motion_pre_{item_id}.raw.mp4"
-                    media_path = Path(segment["path"]).resolve().relative_to(public_dir)
-                    batch_items.append({
-                        "id": item_id,
-                        "mediaPath": str(media_path).replace("\\", "/"),
-                        "sourceKind": "video" if segment["kind"] == "video" else "image",
-                        "recipe": segment["motionGraphicSettings"],
-                        "durationInFrames": segment.get("_originalFrames", segment["frames"]),
-                        # Differs only for a join transition's tail window —
-                        # see `_transition_tail_head_segments`.
-                        "motionDurationInFrames": segment.get(
-                            "_motionFrames", segment.get("_originalFrames", segment["frames"])
-                        ),
-                        "fps": fps, "width": width, "height": height,
-                        "outPath": str(raw_path),
-                    })
-                errors = _batch_render_motion_graphics(batch_items, public_dir, work_dir)
-                item_index = 0
-                for _, segment in motion_graphic_segments:
-                    item = batch_items[item_index]
-                    item_index += 1
-                    if item["id"] not in errors:
-                        segment["_preRenderedRawPath"] = item["outPath"]
-                        pre_rendered_paths.append(Path(item["outPath"]))
-                for index, side, _ in transition_motion_items:
-                    item = batch_items[item_index]
-                    item_index += 1
-                    if item["id"] not in errors:
-                        transition_segment = segments[index]
-                        key = "_preRenderedTailRawPath" if side == "tail" else "_preRenderedHeadRawPath"
-                        transition_segment[key] = item["outPath"]
-                        pre_rendered_paths.append(Path(item["outPath"]))
-        except Exception as error:  # noqa: BLE001 - batching is a pure optimization, never fatal
+        # A join transition's tail/head window (see _transition_tail_head_segments)
+        # used to be entirely excluded from this batch — always falling back to
+        # `_render_motion_graphic`'s own fresh Node/webpack/Chromium cold start,
+        # ONE PER WINDOW, run concurrently (up to MAX_ENCODE_WORKERS at a time)
+        # alongside every other segment in the ThreadPoolExecutor loop below.
+        # On a timeline with many transitions between recipe-bearing clips (the
+        # common case — Tier 1 is mandatory on every recipe), that meant dozens
+        # of simultaneous full Chromium processes: the dominant cost behind
+        # exports that never seemed to move past a low percent, and — under
+        # enough concurrent memory/handle pressure — an occasional truncated
+        # render (a corrupt intermediate .ts ffmpeg then can't even open).
+        # Folding these into the same one-bundle-one-browser batch as everything
+        # else removes both problems at once.
+        transition_segments = [
+            (index, segment) for index, segment in enumerate(segments) if segment["kind"] == "transition"
+        ]
+        transition_tail_heads: dict[int, tuple[dict, dict]] = {
+            index: _transition_tail_head_segments(segment, fps) for index, segment in transition_segments
+        }
+        transition_motion_items: list[tuple[int, str, dict]] = []
+        for index, (tail_segment, head_segment) in transition_tail_heads.items():
+            if (
+                tail_segment.get("motionGraphicEffect") and tail_segment.get("motionGraphicSettings")
+                and not _is_ffmpeg_native_recipe(tail_segment["motionGraphicSettings"])
+            ):
+                transition_motion_items.append((index, "tail", tail_segment))
+            if (
+                head_segment.get("motionGraphicEffect") and head_segment.get("motionGraphicSettings")
+                and not _is_ffmpeg_native_recipe(head_segment["motionGraphicSettings"])
+            ):
+                transition_motion_items.append((index, "head", head_segment))
+
+        pre_rendered_paths: list[Path] = []
+        if motion_graphic_segments or transition_motion_items:
+            total_items = len(motion_graphic_segments) + len(transition_motion_items)
             engine.report_progress(
                 5, "Preparing export",
-                f"Motion-graphics pre-render skipped ({error}) — rendering per clip instead",
+                f"Pre-rendering {total_items} motion-graphic clip{'s' if total_items != 1 else ''}",
             )
+            all_source_paths = [segment["path"] for _, segment in motion_graphic_segments] + [
+                segment["path"] for _, _, segment in transition_motion_items
+            ]
+            public_dir = _common_public_dir(all_source_paths)
+            try:
+                if public_dir is not None:
+                    batch_items = []
+                    for index, segment in motion_graphic_segments:
+                        raw_path = work_dir / f"motion_pre_{index}.raw.mp4"
+                        media_path = Path(segment["path"]).resolve().relative_to(public_dir)
+                        batch_items.append({
+                            "id": str(index),
+                            "mediaPath": str(media_path).replace("\\", "/"),
+                            "sourceKind": "video" if segment["kind"] == "video" else "image",
+                            "recipe": segment["motionGraphicSettings"],
+                            "durationInFrames": segment.get("_originalFrames", segment["frames"]),
+                            # Differs only for a join transition's tail window —
+                            # see `_transition_tail_head_segments`.
+                            "motionDurationInFrames": segment.get(
+                                "_motionFrames", segment.get("_originalFrames", segment["frames"])
+                            ),
+                            "fps": fps, "width": width, "height": height,
+                            "outPath": str(raw_path),
+                        })
+                    for index, side, segment in transition_motion_items:
+                        item_id = f"t{index}{side[0]}"  # "t3t" (tail) / "t3h" (head) — distinct from plain int ids
+                        raw_path = work_dir / f"motion_pre_{item_id}.raw.mp4"
+                        media_path = Path(segment["path"]).resolve().relative_to(public_dir)
+                        batch_items.append({
+                            "id": item_id,
+                            "mediaPath": str(media_path).replace("\\", "/"),
+                            "sourceKind": "video" if segment["kind"] == "video" else "image",
+                            "recipe": segment["motionGraphicSettings"],
+                            "durationInFrames": segment.get("_originalFrames", segment["frames"]),
+                            # Differs only for a join transition's tail window —
+                            # see `_transition_tail_head_segments`.
+                            "motionDurationInFrames": segment.get(
+                                "_motionFrames", segment.get("_originalFrames", segment["frames"])
+                            ),
+                            "fps": fps, "width": width, "height": height,
+                            "outPath": str(raw_path),
+                        })
+                    errors = _batch_render_motion_graphics(batch_items, public_dir, work_dir)
+                    item_index = 0
+                    for _, segment in motion_graphic_segments:
+                        item = batch_items[item_index]
+                        item_index += 1
+                        if item["id"] not in errors:
+                            segment["_preRenderedRawPath"] = item["outPath"]
+                            pre_rendered_paths.append(Path(item["outPath"]))
+                    for index, side, _ in transition_motion_items:
+                        item = batch_items[item_index]
+                        item_index += 1
+                        if item["id"] not in errors:
+                            transition_segment = segments[index]
+                            key = "_preRenderedTailRawPath" if side == "tail" else "_preRenderedHeadRawPath"
+                            transition_segment[key] = item["outPath"]
+                            pre_rendered_paths.append(Path(item["outPath"]))
+            except Exception as error:  # noqa: BLE001 - batching is a pure optimization, never fatal
+                engine.report_progress(
+                    5, "Preparing export",
+                    f"Motion-graphics pre-render skipped ({error}) — rendering per clip instead",
+                )
 
-    engine.report_progress(10, "Preparing export", f"{len(segments)} segments to render")
-    # Each segment is an independent ffmpeg process (its own frame range,
-    # nothing shared with its neighbors), so encoding them concurrently
-    # instead of one-at-a-time is a straightforward, safe way to cut export
-    # wall-clock time on multi-still timelines.
-    worker_count = min(len(segments), max(1, os.cpu_count() or 1), MAX_ENCODE_WORKERS)
-    completed = 0
-    completed_lock = threading.Lock()
-    with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        futures = [
-            pool.submit(encode_segment, segment, index, width, height, fps, work_dir)
-            for index, segment in enumerate(segments, start=1)
-        ]
+        engine.report_progress(10, "Preparing export", f"{len(segments)} segments to render")
+        # Each segment is an independent ffmpeg process (its own frame range,
+        # nothing shared with its neighbors), so encoding them concurrently
+        # instead of one-at-a-time is a straightforward, safe way to cut export
+        # wall-clock time on multi-still timelines.
+        worker_count = min(len(segments), max(1, os.cpu_count() or 1), MAX_ENCODE_WORKERS)
+        completed = 0
+        completed_lock = threading.Lock()
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            futures = [
+                pool.submit(encode_segment, segment, index, width, height, fps, work_dir)
+                for index, segment in enumerate(segments, start=1)
+            ]
 
-        def _on_done(_future: object) -> None:
-            nonlocal completed
-            with completed_lock:
-                completed += 1
-                percent = 10 + round((completed / len(segments)) * 60)
-                engine.report_progress(percent, "Rendering stills", f"Segment {completed}/{len(segments)}")
+            def _on_done(_future: object) -> None:
+                nonlocal completed
+                with completed_lock:
+                    completed += 1
+                    percent = 10 + round((completed / len(segments)) * 60)
+                    engine.report_progress(percent, "Rendering stills", f"Segment {completed}/{len(segments)}")
 
-        for future in futures:
-            future.add_done_callback(_on_done)
-        segment_paths: list[Path] = [future.result() for future in futures]
+            for future in futures:
+                future.add_done_callback(_on_done)
+            segment_paths: list[Path] = [future.result() for future in futures]
 
-    # Pre-rendered motion-graphic raw clips (see above) are each consumed by
-    # exactly one segment above and never reused — `_encode_segment_to_path`
-    # deliberately leaves them on disk (unlike its own per-clip raw_path,
-    # which it always cleans up itself) so a batch failure partway through
-    # still leaves every successfully pre-rendered clip usable; cleaned up
-    # here instead, once every segment that could need one has run.
-    for raw_path in pre_rendered_paths:
-        raw_path.unlink(missing_ok=True)
+        # Pre-rendered motion-graphic raw clips (see above) are each consumed by
+        # exactly one segment above and never reused — `_encode_segment_to_path`
+        # deliberately leaves them on disk (unlike its own per-clip raw_path,
+        # which it always cleans up itself) so a batch failure partway through
+        # still leaves every successfully pre-rendered clip usable; cleaned up
+        # here instead, once every segment that could need one has run.
+        for raw_path in pre_rendered_paths:
+            raw_path.unlink(missing_ok=True)
 
-    segments_list_path = work_dir / "segments.txt"
-    segments_list_path.write_text(
-        "\n".join(f"file '{path.name}'" for path in segment_paths), encoding="utf-8"
-    )
+        segments_list_path = work_dir / "segments.txt"
+        segments_list_path.write_text(
+            "\n".join(f"file '{path.name}'" for path in segment_paths), encoding="utf-8"
+        )
 
-    music = manifest.get("music", [])
-    include_narration = bool(manifest.get("includeNarration", True))
-    narration_volume_percent = float(manifest.get("narrationVolumePercent", 100.0))
-    narration_trim_start = max(0.0, float(manifest.get("narrationTrimStartSeconds", 0.0)))
-    narration_trim_end = max(0.0, float(manifest.get("narrationTrimEndSeconds", 0.0)))
-    burn_captions = bool(manifest.get("burnCaptions", True))
-    write_srt = bool(manifest.get("writeSrt", False))
-    crf = int(manifest.get("crf", 18))
-    preset = str(manifest.get("preset", "fast"))
+        music = manifest.get("music", [])
+        include_narration = bool(manifest.get("includeNarration", True))
+        narration_volume_percent = float(manifest.get("narrationVolumePercent", 100.0))
+        narration_trim_start = max(0.0, float(manifest.get("narrationTrimStartSeconds", 0.0)))
+        narration_trim_end = max(0.0, float(manifest.get("narrationTrimEndSeconds", 0.0)))
+        burn_captions = bool(manifest.get("burnCaptions", True))
+        write_srt = bool(manifest.get("writeSrt", False))
+        crf = int(manifest.get("crf", 18))
+        preset = str(manifest.get("preset", "fast"))
 
-    if write_srt and captions:
-        write_captions_srt(captions, work_dir / "captions.srt")
+        if write_srt and captions:
+            write_captions_srt(captions, work_dir / "captions.srt")
 
-    ass_path = work_dir / "captions.ass"
-    has_captions = bool(captions) and burn_captions
-    if has_captions:
-        default_style = manifest.get("captionDefaultStyle") or _FALLBACK_CAPTION_STYLE
-        write_captions_ass(captions, ass_path, width, height, default_style)
+        ass_path = work_dir / "captions.ass"
+        has_captions = bool(captions) and burn_captions
+        if has_captions:
+            default_style = manifest.get("captionDefaultStyle") or _FALLBACK_CAPTION_STYLE
+            write_captions_ass(captions, ass_path, width, height, default_style)
 
-    engine.report_progress(72, "Rendering video", "Muxing audio and captions")
+        engine.report_progress(72, "Rendering video", "Muxing audio and captions")
 
-    # Every audio source (narration + each music clip) becomes its own ffmpeg
-    # input and its own labeled filter chain (trim/fade/volume/delay), then
-    # all of them are mixed with `amix` — a timeline with neither narration
-    # nor music included just exports silent (-an). `apad` on the mixed
-    # result guards against the audio ending before the video does (video's
-    # own length is always authoritative, fixed by the segments' exact frame
-    # count — narration/music simply go quiet for whatever's left over).
-    audio_input_args: list[str] = []
-    graph_parts: list[str] = []
-    next_input_index = 1
-    audio_labels: list[str] = []
+        # Every audio source (narration + each music clip) becomes its own ffmpeg
+        # input and its own labeled filter chain (trim/fade/volume/delay), then
+        # all of them are mixed with `amix` — a timeline with neither narration
+        # nor music included just exports silent (-an). `apad` on the mixed
+        # result guards against the audio ending before the video does (video's
+        # own length is always authoritative, fixed by the segments' exact frame
+        # count — narration/music simply go quiet for whatever's left over).
+        audio_input_args: list[str] = []
+        graph_parts: list[str] = []
+        next_input_index = 1
+        audio_labels: list[str] = []
 
-    if include_narration:
-        audio_input_args += ["-i", narration_audio_path]
-        narration_index = next_input_index
-        next_input_index += 1
-        chain = f"[{narration_index}:a]"
-        if narration_trim_start > 0 or narration_trim_end > 0:
-            narration_duration = float(manifest.get("narrationDurationSeconds", duration_seconds))
-            trim_end = max(narration_trim_start + 0.05, narration_duration - narration_trim_end)
-            chain += f"atrim=start={narration_trim_start:.3f}:end={trim_end:.3f},asetpts=PTS-STARTPTS,"
-        if narration_offset_seconds > 0:
-            delay_ms = round(narration_offset_seconds * 1000)
-            chain += f"adelay={delay_ms}|{delay_ms},"
-        volume_mult = max(0.0, narration_volume_percent) / 100.0
-        chain += f"volume={volume_mult:.4f}[narr]"
-        graph_parts.append(chain)
-        audio_labels.append("[narr]")
+        if include_narration:
+            audio_input_args += ["-i", narration_audio_path]
+            narration_index = next_input_index
+            next_input_index += 1
+            chain = f"[{narration_index}:a]"
+            if narration_trim_start > 0 or narration_trim_end > 0:
+                narration_duration = float(manifest.get("narrationDurationSeconds", duration_seconds))
+                trim_end = max(narration_trim_start + 0.05, narration_duration - narration_trim_end)
+                chain += f"atrim=start={narration_trim_start:.3f}:end={trim_end:.3f},asetpts=PTS-STARTPTS,"
+            if narration_offset_seconds > 0:
+                delay_ms = round(narration_offset_seconds * 1000)
+                chain += f"adelay={delay_ms}|{delay_ms},"
+            volume_mult = max(0.0, narration_volume_percent) / 100.0
+            chain += f"volume={volume_mult:.4f}[narr]"
+            graph_parts.append(chain)
+            audio_labels.append("[narr]")
 
-    for i, clip in enumerate(music):
-        clip_duration = max(0.05, float(clip["end"]) - float(clip["start"]))
-        if clip.get("loopEnabled"):
-            audio_input_args += ["-stream_loop", "-1", "-i", clip["path"]]
-        else:
-            audio_input_args += ["-i", clip["path"]]
-        clip_index = next_input_index
-        next_input_index += 1
-        chain = f"[{clip_index}:a]atrim=start=0:end={clip_duration:.3f},asetpts=PTS-STARTPTS"
-        fade_in = max(0.0, float(clip.get("fadeInSeconds", 0.0))) if clip.get("fadeInEnabled") else 0.0
-        if fade_in > 0:
-            chain += f",afade=t=in:st=0:d={fade_in:.3f}"
-        fade_out = max(0.0, float(clip.get("fadeOutSeconds", 0.0))) if clip.get("fadeOutEnabled") else 0.0
-        if fade_out > 0:
-            chain += f",afade=t=out:st={max(0.0, clip_duration - fade_out):.3f}:d={fade_out:.3f}"
-        volume_mult = max(0.0, float(clip.get("volumePercent", 100.0))) / 100.0
-        chain += f",volume={volume_mult:.4f}"
-        delay_ms = round(float(clip["start"]) * 1000)
-        if delay_ms > 0:
-            chain += f",adelay={delay_ms}|{delay_ms}"
-        duck_start, duck_end = clip.get("duckOverlapStart"), clip.get("duckOverlapEnd")
-        if duck_start is not None and duck_end is not None:
-            duck_multiplier = max(0.0, float(clip.get("duckMultiplier", 1.0)))
-            chain += (
-                f",volume=enable='between(t\\,{float(duck_start):.3f}\\,{float(duck_end):.3f})'"
-                f":volume={duck_multiplier:.4f}"
-            )
-        label = f"m{i}"
-        graph_parts.append(f"{chain}[{label}]")
-        audio_labels.append(f"[{label}]")
+        for i, clip in enumerate(music):
+            clip_duration = max(0.05, float(clip["end"]) - float(clip["start"]))
+            if clip.get("loopEnabled"):
+                audio_input_args += ["-stream_loop", "-1", "-i", clip["path"]]
+            else:
+                audio_input_args += ["-i", clip["path"]]
+            clip_index = next_input_index
+            next_input_index += 1
+            chain = f"[{clip_index}:a]atrim=start=0:end={clip_duration:.3f},asetpts=PTS-STARTPTS"
+            fade_in = max(0.0, float(clip.get("fadeInSeconds", 0.0))) if clip.get("fadeInEnabled") else 0.0
+            if fade_in > 0:
+                chain += f",afade=t=in:st=0:d={fade_in:.3f}"
+            fade_out = max(0.0, float(clip.get("fadeOutSeconds", 0.0))) if clip.get("fadeOutEnabled") else 0.0
+            if fade_out > 0:
+                chain += f",afade=t=out:st={max(0.0, clip_duration - fade_out):.3f}:d={fade_out:.3f}"
+            volume_mult = max(0.0, float(clip.get("volumePercent", 100.0))) / 100.0
+            chain += f",volume={volume_mult:.4f}"
+            delay_ms = round(float(clip["start"]) * 1000)
+            if delay_ms > 0:
+                chain += f",adelay={delay_ms}|{delay_ms}"
+            duck_start, duck_end = clip.get("duckOverlapStart"), clip.get("duckOverlapEnd")
+            if duck_start is not None and duck_end is not None:
+                duck_multiplier = max(0.0, float(clip.get("duckMultiplier", 1.0)))
+                chain += (
+                    f",volume=enable='between(t\\,{float(duck_start):.3f}\\,{float(duck_end):.3f})'"
+                    f":volume={duck_multiplier:.4f}"
+                )
+            label = f"m{i}"
+            graph_parts.append(f"{chain}[{label}]")
+            audio_labels.append(f"[{label}]")
 
-    final_audio_label = None
-    if audio_labels:
-        if len(audio_labels) > 1:
-            graph_parts.append(
-                f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=0[mixed]"
-            )
-            mixed_label = "[mixed]"
-        else:
-            mixed_label = audio_labels[0]
-        graph_parts.append(f"{mixed_label}apad[aout]")
-        final_audio_label = "[aout]"
+        final_audio_label = None
+        if audio_labels:
+            if len(audio_labels) > 1:
+                graph_parts.append(
+                    f"{''.join(audio_labels)}amix=inputs={len(audio_labels)}:duration=longest:dropout_transition=0[mixed]"
+                )
+                mixed_label = "[mixed]"
+            else:
+                mixed_label = audio_labels[0]
+            graph_parts.append(f"{mixed_label}apad[aout]")
+            final_audio_label = "[aout]"
 
-    video_filter = f"ass='{escape_subtitles_path(ass_path)}':fontsdir='{escape_subtitles_path(_BUNDLED_FONTS_DIR)}'" if has_captions else None
-    # No caption burn-in (and no other global video filter exists yet): every
-    # segment was already encoded at this export's own exact fps/pix_fmt (see
-    # `_encode_segment_to_path`'s own `-r fps`/`-pix_fmt yuv420p` on each
-    # one), so the concatenated video stream needs no further processing at
-    # all — a real `-c:v copy` here is bit-for-bit exact, not an
-    # approximation, and skips a full second full-resolution decode+encode
-    # pass over the ENTIRE video for nothing. Previously this went through
-    # `[0:v]copy[v]` in the filtergraph regardless — a no-op *filter*, but
-    # still one that forces `-c:v libx264` to fully decode and re-encode
-    # every frame right after `_encode_segment_to_path` already encoded it
-    # once, on every single export.
-    audio_graph_parts = graph_parts
+        video_filter = f"ass='{escape_subtitles_path(ass_path)}':fontsdir='{escape_subtitles_path(_BUNDLED_FONTS_DIR)}'" if has_captions else None
+        # No caption burn-in (and no other global video filter exists yet): every
+        # segment was already encoded at this export's own exact fps/pix_fmt (see
+        # `_encode_segment_to_path`'s own `-r fps`/`-pix_fmt yuv420p` on each
+        # one), so the concatenated video stream needs no further processing at
+        # all — a real `-c:v copy` here is bit-for-bit exact, not an
+        # approximation, and skips a full second full-resolution decode+encode
+        # pass over the ENTIRE video for nothing. Previously this went through
+        # `[0:v]copy[v]` in the filtergraph regardless — a no-op *filter*, but
+        # still one that forces `-c:v libx264` to fully decode and re-encode
+        # every frame right after `_encode_segment_to_path` already encoded it
+        # once, on every single export.
+        audio_graph_parts = graph_parts
 
-    def _build_and_run_final_pass() -> None:
-        """Builds the full final-pass command fresh and runs it — factored
-        into its own closure (rather than a plain one-shot list build) so a
-        hardware-acceleration failure (see the `except` block below) can
-        simply disable whichever cache(s) were involved and call this again:
-        every hardware decision below re-reads `_detect_hardware_encoder`/
-        `_detect_hwaccel_decode`, so a second call after disabling one
-        naturally rebuilds as a fully plain CPU command instead of needing
-        to surgically patch the previous argument list."""
-        hwaccel_input_args, hwaccel_filter_prefix = _final_pass_input_hwaccel_args(bool(video_filter))
-        video_map_args, video_encode_args = _final_pass_video_routing(video_filter, preset, crf, fps)
-        # Visible confirmation of which paths this export actually took —
-        # otherwise there's no way for a user comparing export times across
-        # machines/settings to tell "no re-encode needed" from "hardware
-        # encoder" from "plain CPU", or whether decode acceleration kicked
-        # in, just by watching the progress bar.
-        detail = f"Encoding ({_ENCODER_LABELS.get(video_encode_args[1], video_encode_args[1])}"
-        detail += ", hardware-accelerated decode)" if hwaccel_input_args else ")"
-        engine.report_progress(72, "Rendering video", detail)
+        def _build_and_run_final_pass() -> None:
+            """Builds the full final-pass command fresh and runs it — factored
+            into its own closure (rather than a plain one-shot list build) so a
+            hardware-acceleration failure (see the `except` block below) can
+            simply disable whichever cache(s) were involved and call this again:
+            every hardware decision below re-reads `_detect_hardware_encoder`/
+            `_detect_hwaccel_decode`, so a second call after disabling one
+            naturally rebuilds as a fully plain CPU command instead of needing
+            to surgically patch the previous argument list."""
+            hwaccel_input_args, hwaccel_filter_prefix = _final_pass_input_hwaccel_args(bool(video_filter))
+            video_map_args, video_encode_args = _final_pass_video_routing(video_filter, preset, crf, fps)
+            # Visible confirmation of which paths this export actually took —
+            # otherwise there's no way for a user comparing export times across
+            # machines/settings to tell "no re-encode needed" from "hardware
+            # encoder" from "plain CPU", or whether decode acceleration kicked
+            # in, just by watching the progress bar.
+            detail = f"Encoding ({_ENCODER_LABELS.get(video_encode_args[1], video_encode_args[1])}"
+            detail += ", hardware-accelerated decode)" if hwaccel_input_args else ")"
+            engine.report_progress(72, "Rendering video", detail)
 
-        args = ["-y", *hwaccel_input_args, "-f", "concat", "-safe", "0", "-i", str(segments_list_path)]
-        args += audio_input_args
-        parts = list(audio_graph_parts)
-        if video_filter:
-            parts.insert(0, f"[0:v]{hwaccel_filter_prefix}{video_filter}[v]")
-        if parts:
-            args += ["-filter_complex", ";".join(parts)]
-        args += video_map_args
-        if final_audio_label:
-            args += ["-map", final_audio_label]
-        args += video_encode_args
-        args += ["-c:a", "aac", "-b:a", "192k"] if final_audio_label else ["-an"]
-        # Video's own length is exact and authoritative (see
-        # assign_frame_counts); `-t` here is a safety net in case the
-        # mixed/padded audio ever overruns it, not something that should
-        # ever actually need to trim the picture.
-        args += [
-            "-t", f"{duration_seconds:.3f}", "-movflags", "+faststart",
-            "-progress", "pipe:1", "-nostats", str(output_path),
-        ]
-        run_final_pass(args, duration_seconds)
+            args = ["-y", *hwaccel_input_args, "-f", "concat", "-safe", "0", "-i", str(segments_list_path)]
+            args += audio_input_args
+            parts = list(audio_graph_parts)
+            if video_filter:
+                parts.insert(0, f"[0:v]{hwaccel_filter_prefix}{video_filter}[v]")
+            if parts:
+                args += ["-filter_complex", ";".join(parts)]
+            args += video_map_args
+            if final_audio_label:
+                args += ["-map", final_audio_label]
+            args += video_encode_args
+            args += ["-c:a", "aac", "-b:a", "192k"] if final_audio_label else ["-an"]
+            # Video's own length is exact and authoritative (see
+            # assign_frame_counts); `-t` here is a safety net in case the
+            # mixed/padded audio ever overruns it, not something that should
+            # ever actually need to trim the picture.
+            args += [
+                "-t", f"{duration_seconds:.3f}", "-movflags", "+faststart",
+                "-progress", "pipe:1", "-nostats", str(output_path),
+            ]
+            run_final_pass(args, duration_seconds)
 
-    try:
-        _build_and_run_final_pass()
-    except RuntimeError:
-        # A hardware encoder and/or hardware-accelerated decode passed its
-        # own tiny probe but failed on this export's real resolution/
-        # settings/media — disable whichever of the two were actually in
-        # play and retry ONCE on a fully plain CPU pass, rather than fail
-        # the whole export over an optimization. If neither was in play
-        # (already plain CPU, e.g. the `-c:v copy` path, or both already
-        # disabled from an earlier segment/export in this same process),
-        # retrying would just fail identically — re-raise instead.
-        used_hw_encoder = bool(_hw_encoder_cache and _hw_encoder_cache.get("name"))
-        used_hwaccel_decode = bool(_hwaccel_decode_cache)
-        if not used_hw_encoder and not used_hwaccel_decode:
-            raise
-        if used_hw_encoder:
-            _disable_hardware_encoder()
-        if used_hwaccel_decode:
-            _disable_hwaccel_decode()
-        engine.report_progress(72, "Rendering video", "Hardware acceleration failed - retrying on plain CPU")
-        _build_and_run_final_pass()
+        try:
+            _build_and_run_final_pass()
+        except RuntimeError:
+            # A hardware encoder and/or hardware-accelerated decode passed its
+            # own tiny probe but failed on this export's real resolution/
+            # settings/media — disable whichever of the two were actually in
+            # play and retry ONCE on a fully plain CPU pass, rather than fail
+            # the whole export over an optimization. If neither was in play
+            # (already plain CPU, e.g. the `-c:v copy` path, or both already
+            # disabled from an earlier segment/export in this same process),
+            # retrying would just fail identically — re-raise instead.
+            used_hw_encoder = bool(_hw_encoder_cache and _hw_encoder_cache.get("name"))
+            used_hwaccel_decode = bool(_hwaccel_decode_cache)
+            if not used_hw_encoder and not used_hwaccel_decode:
+                raise
+            if used_hw_encoder:
+                _disable_hardware_encoder()
+            if used_hwaccel_decode:
+                _disable_hwaccel_decode()
+            engine.report_progress(72, "Rendering video", "Hardware acceleration failed - retrying on plain CPU")
+            _build_and_run_final_pass()
+
+    except Exception:
+        # A failure anywhere in the block above (segment encoding, the
+        # final mux pass even after its own hardware-fallback retry)
+        # used to leave every per-segment .ts file, segments.txt,
+        # captions.ass, and any vignette mask behind FOREVER in work_dir
+        # -- the user's real project export/ directory, not a temp dir --
+        # since the only cleanup ran on the success path below. Glob-based
+        # so it's robust regardless of which stage failed, rather than
+        # depending on segment_paths having been fully populated.
+        _cleanup_transient_export_artifacts(work_dir)
+        raise
 
     for path in segment_paths:
         path.unlink(missing_ok=True)
@@ -2991,6 +3281,24 @@ def run_bundle(manifest_path: Path, destination_dir: Path) -> None:
 
     engine.report_progress(5, "Preparing export", f"{len(segments)} clips to render")
     worker_count = min(len(segments), max(1, os.cpu_count() or 1), MAX_ENCODE_WORKERS)
+    # Pre-warms the motion-engine install ONCE, single-threaded, before the
+    # pool below starts — mirrors `run()`'s own equivalent pre-warm
+    # (`_batch_render_motion_graphics`, called before ITS ThreadPoolExecutor).
+    # `_ensure_motion_engine_ready` is safe to call concurrently either way
+    # (see `_cross_process_file_lock`), but without this, every one of the
+    # first `worker_count` threads below would independently race to acquire
+    # that lock on a cold start instead of the first one just doing the work
+    # while the rest wait — belt-and-suspenders, not required for
+    # correctness. Only segments that actually need Remotion (not the
+    # ffmpeg-native fast path) count, so a bundle export with no motion
+    # graphics — or only ones simple enough to render natively — never pays
+    # this at all.
+    if any(
+        segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings")
+        and not _is_ffmpeg_native_recipe(segment["motionGraphicSettings"])
+        for segment in segments
+    ):
+        _ensure_motion_engine_ready()
     completed = 0
     completed_lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=worker_count) as pool:

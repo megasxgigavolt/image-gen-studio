@@ -956,12 +956,92 @@ def build_video_filter(
     )
 
 
-def run_ffmpeg(args: list[str]) -> None:
+def _available_memory_bytes() -> int | None:
+    """Free physical memory right now, via the Windows API — best-effort:
+    returns `None` on any failure (including simply not being on Windows),
+    so every caller degrades to "assume plenty available" rather than ever
+    blocking incorrectly on a platform/environment where this can't be read
+    (e.g. the Linux CI runner this same module's tests run under)."""
+    try:
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):  # type: ignore[attr-defined]
+            return None
+        return status.ullAvailPhys
+    except Exception:
+        return None
+
+
+# Backpressure threshold/cap for `_wait_for_memory_headroom` — deliberately a
+# conservative, labeled ESTIMATE, not a precisely measured per-worker budget
+# (ffmpeg's own real memory use depends on resolution, filter graph, and
+# look-ahead settings in ways this module can't predict exactly). Exists
+# specifically because of a real export failure: `x264 [error]: malloc of
+# size 26453440 failed` on a live 4K export, ~39 minutes into a run at the
+# normal 4-worker concurrency — a SMALL allocation (~25MB) that only fails
+# once the whole system is already critically low, which sustained 4-way
+# concurrent 4K encoding can build up to over a long export even though no
+# single moment looks unreasonable. 1.5GB is meant as "enough headroom for
+# one more concurrent 4K encode's own working buffers", not a hard limit.
+_LOW_MEMORY_THRESHOLD_BYTES = 1_500_000_000
+_LOW_MEMORY_MAX_WAIT_SECONDS = 20.0
+
+
+def _wait_for_memory_headroom() -> None:
+    """Best-effort backpressure, called right before starting a new ffmpeg
+    encode: if physical memory is already critically low, wait briefly
+    (polling, up to `_LOW_MEMORY_MAX_WAIT_SECONDS`) for one of the OTHER
+    already-running concurrent encodes to finish and free its own buffers,
+    instead of immediately piling another encode onto an already-strained
+    system. A no-op (returns immediately) whenever `_available_memory_bytes`
+    can't be read at all, or memory isn't actually low — the common case."""
+    waited = 0.0
+    while waited < _LOW_MEMORY_MAX_WAIT_SECONDS:
+        available = _available_memory_bytes()
+        if available is None or available >= _LOW_MEMORY_THRESHOLD_BYTES:
+            return
+        time.sleep(1.0)
+        waited += 1.0
+
+
+# Substrings that show up in a real ffmpeg/x264 stderr specifically for a
+# memory-exhaustion failure (confirmed against the real export failure this
+# whole retry exists for — see `_LOW_MEMORY_THRESHOLD_BYTES`'s own comment).
+# Deliberately narrow: only THESE failures are worth retrying, since they're
+# plausibly transient (the system may have more headroom a few seconds
+# later, once concurrent work finishes) — any other ffmpeg failure is a real
+# problem (bad input, a filter-graph bug, ...) that retrying identically
+# would just reproduce, so it should surface immediately instead of being
+# silently masked by a retry loop.
+_OOM_ERROR_SUBSTRINGS = ("malloc of size", "Cannot allocate memory", "bad_alloc", "out of memory")
+
+
+def run_ffmpeg(args: list[str], _retries_left: int = 2) -> None:
+    _wait_for_memory_headroom()
     result = subprocess.run(
         ["ffmpeg", *args], capture_output=True, text=True, **_subprocess_kwargs()
     )
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {result.stderr[-2000:]}")
+        stderr = result.stderr[-2000:]
+        if _retries_left > 0 and any(pattern in stderr for pattern in _OOM_ERROR_SUBSTRINGS):
+            # Give whatever else is using memory right now a few seconds to
+            # finish and free it, rather than retrying instantly into the
+            # same exhausted state.
+            time.sleep(3.0)
+            run_ffmpeg(args, _retries_left - 1)
+            return
+        raise RuntimeError(f"ffmpeg failed: {stderr}")
 
 
 def _without_extended_path_prefix(path: Path) -> Path:
@@ -2324,6 +2404,10 @@ def _final_pass_input_hwaccel_args(needs_decode: bool) -> tuple[list[str], str]:
 
 
 def run_final_pass(args: list[str], duration_seconds: float) -> None:
+    # Same backpressure as run_ffmpeg's own — the segment-encoding phase
+    # immediately before this can leave the system still under memory
+    # pressure for a few seconds after its own last process exits.
+    _wait_for_memory_headroom()
     process = subprocess.Popen(
         ["ffmpeg", *args],
         stdout=subprocess.PIPE,

@@ -1628,6 +1628,93 @@ def test_final_pass_video_routing_filters_and_encodes_when_captions_are_burned_i
     assert video_encode_args[-2:] == ["-r", "30"]
 
 
+# --- Memory-exhaustion resilience (run_ffmpeg's retry/backpressure) --------
+# Root-cause coverage for a real export crash: `x264 [error]: malloc of size
+# 26453440 failed` on a live 4K export, ~39 minutes into a run at the normal
+# 4-worker concurrency — a small allocation that only fails once the whole
+# system is already critically low on memory, which sustained concurrent 4K
+# encoding can build up to over a long export.
+
+
+def test_wait_for_memory_headroom_returns_immediately_when_plenty_available(monkeypatch):
+    monkeypatch.setattr(export_engine, "_available_memory_bytes", lambda: 8_000_000_000)
+    sleeps = []
+    monkeypatch.setattr(export_engine.time, "sleep", lambda s: sleeps.append(s))
+    export_engine._wait_for_memory_headroom()
+    assert sleeps == []
+
+
+def test_wait_for_memory_headroom_returns_immediately_when_unreadable(monkeypatch):
+    # Can't be read at all (e.g. non-Windows) -> must never block on it.
+    monkeypatch.setattr(export_engine, "_available_memory_bytes", lambda: None)
+    sleeps = []
+    monkeypatch.setattr(export_engine.time, "sleep", lambda s: sleeps.append(s))
+    export_engine._wait_for_memory_headroom()
+    assert sleeps == []
+
+
+def test_wait_for_memory_headroom_polls_until_memory_frees_up(monkeypatch):
+    readings = iter([100_000_000, 100_000_000, 8_000_000_000])
+    monkeypatch.setattr(export_engine, "_available_memory_bytes", lambda: next(readings))
+    sleeps = []
+    monkeypatch.setattr(export_engine.time, "sleep", lambda s: sleeps.append(s))
+    export_engine._wait_for_memory_headroom()
+    assert sleeps == [1.0, 1.0]  # polled twice before the third reading freed it up
+
+
+def test_wait_for_memory_headroom_gives_up_after_the_max_wait(monkeypatch):
+    monkeypatch.setattr(export_engine, "_available_memory_bytes", lambda: 0)
+    sleeps = []
+    monkeypatch.setattr(export_engine.time, "sleep", lambda s: sleeps.append(s))
+    export_engine._wait_for_memory_headroom()
+    assert len(sleeps) == int(export_engine._LOW_MEMORY_MAX_WAIT_SECONDS)
+
+
+def test_run_ffmpeg_retries_once_on_a_real_oom_failure_then_succeeds(monkeypatch):
+    monkeypatch.setattr(export_engine, "_wait_for_memory_headroom", lambda: None)
+    monkeypatch.setattr(export_engine.time, "sleep", lambda s: None)
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == 1:
+            return SimpleNamespace(returncode=1, stderr="x264 [error]: malloc of size 26453440 failed")
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    export_engine.run_ffmpeg(["-y", "-i", "in.mp4", "out.mp4"])  # must not raise
+    assert len(calls) == 2
+
+
+def test_run_ffmpeg_gives_up_after_exhausting_its_retries(monkeypatch):
+    monkeypatch.setattr(export_engine, "_wait_for_memory_headroom", lambda: None)
+    monkeypatch.setattr(export_engine.time, "sleep", lambda s: None)
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=1, stderr="x264 [error]: malloc of size 26453440 failed")
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError):
+        export_engine.run_ffmpeg(["-y", "-i", "in.mp4", "out.mp4"])
+    assert len(calls) == 3  # first attempt + 2 retries, then it actually raises
+
+
+def test_run_ffmpeg_does_not_retry_an_unrelated_failure(monkeypatch):
+    monkeypatch.setattr(export_engine, "_wait_for_memory_headroom", lambda: None)
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=1, stderr="Invalid argument")
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError):
+        export_engine.run_ffmpeg(["-y", "-i", "in.mp4", "out.mp4"])
+    assert len(calls) == 1  # a real (non-OOM) failure must surface immediately, not retry
+
+
 # --- Hardware-accelerated DECODE for the final pass -------------------
 # Root-cause coverage for "I have no [discrete] GPU, CPU export is still too
 # slow": decode acceleration (D3D11VA) is close to universal on Windows even

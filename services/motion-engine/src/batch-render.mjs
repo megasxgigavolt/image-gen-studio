@@ -27,6 +27,37 @@ import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Chromium's own compositor is a real GPU rendering pipeline — the same
+// mechanism CapCut/Clipchamp-style editors use for their own speed — but
+// Remotion never asks for it by default (`DEFAULT_OPENGL_RENDERER` in
+// @remotion/renderer is `null`, i.e. no explicit `--gl` override), which
+// leaves Chromium to fall back to software rasterization (SwiftShader) for
+// every render this module has ever done. "angle" is Remotion's own
+// documented GPU-accelerated option (ANGLE translates Chromium's GL calls to
+// the platform's native graphics API — Direct3D on Windows, this app's only
+// shipped target); "swiftshader" is Remotion's documented pure-software
+// renderer, used as the fallback for a machine with no usable GPU (an old
+// machine, certain VMs/sandboxes, or a broken/missing driver) — tried in
+// that order, once per export (this whole batch shares one browser launch),
+// not per-clip: a GPU that can't open at all fails at THIS launch step, not
+// partway through a specific clip's render.
+async function openBrowserWithGpuFallback() {
+  const candidates = ["angle", "swiftshader"];
+  let lastError;
+  for (const gl of candidates) {
+    try {
+      const browser = await openBrowser("chrome", { chromiumOptions: { gl } });
+      return { browser, gl };
+    } catch (error) {
+      lastError = error;
+      process.stderr.write(
+        `Chromium failed to launch with --gl=${gl}: ${(error && error.message) || error}\n`,
+      );
+    }
+  }
+  throw lastError;
+}
+
 async function main() {
   const [, , batchPath, resultsPath, publicDir] = process.argv;
   if (!batchPath || !resultsPath || !publicDir) {
@@ -46,7 +77,8 @@ async function main() {
     onProgress: () => {},
   });
 
-  const browser = await openBrowser("chrome");
+  const { browser, gl } = await openBrowserWithGpuFallback();
+  process.stdout.write(`GL_RENDERER ${gl}\n`);
   try {
     // Renders run one at a time against the shared browser/bundle —
     // confirmed by direct testing that overlapping concurrent renderMedia()

@@ -1466,11 +1466,17 @@ pub struct ExportSettings {
 impl Default for ExportSettings {
     fn default() -> Self {
         Self {
-            // "No downscaling by default" — 2160p (4K) is the highest
-            // offered option, so a user who never touches this setting
-            // never has their export capped below whatever their source
-            // assets can actually support.
-            resolution: "2160p".into(),
+            // Was 2160p ("no downscaling by default, since 4K is the
+            // highest offered option") — changed after a real user's own
+            // source stills/animations are natively 1080p, so 4K bought
+            // nothing but slower exports (real upscaling work with no
+            // extra real detail to show for it) unless explicitly opted
+            // into for a project that actually has higher-res source
+            // material. 1080p is a bundled preset (`resolution_dimensions`)
+            // and this default is only ever a starting point — 720p/4K stay
+            // one click away in both the export panel and Preferences'
+            // Export Defaults.
+            resolution: "1080p".into(),
             quality: "high".into(),
             captions_mode: "burned-in".into(),
             include_narration: true,
@@ -10842,8 +10848,12 @@ Return JSON only:
             // stalled engine call (e.g. many chained AI calls across a long
             // script) used to hang this Tauri command, and therefore the
             // frontend awaiting it, forever.
-            let (visual_plan_timed_out, visual_plan_watchdog_cancel, visual_plan_watchdog) =
-                spawn_subprocess_watchdog(child.id(), std::time::Duration::from_secs(20 * 60));
+            let (
+                visual_plan_timed_out,
+                visual_plan_watchdog_cancel,
+                _visual_plan_watchdog_activity,
+                visual_plan_watchdog,
+            ) = spawn_subprocess_watchdog(child.id(), std::time::Duration::from_secs(20 * 60));
             let stdout = child
                 .stdout
                 .take()
@@ -11214,8 +11224,12 @@ Return JSON only:
             // See the visual-plan engine call's own comment above on why a
             // side-car watchdog, not `run_subprocess_with_deadline`, enforces
             // the deadline here.
-            let (caption_engine_timed_out, caption_engine_watchdog_cancel, caption_engine_watchdog) =
-                spawn_subprocess_watchdog(child.id(), std::time::Duration::from_secs(20 * 60));
+            let (
+                caption_engine_timed_out,
+                caption_engine_watchdog_cancel,
+                _caption_engine_watchdog_activity,
+                caption_engine_watchdog,
+            ) = spawn_subprocess_watchdog(child.id(), std::time::Duration::from_secs(20 * 60));
             let stdout = child
                 .stdout
                 .take()
@@ -11954,8 +11968,12 @@ Return JSON only:
             // command forever with no automatic recovery. See the visual-plan
             // engine call's own comment on why a side-car watchdog thread,
             // not `run_subprocess_with_deadline`, is used here.
-            let (export_engine_timed_out, export_engine_watchdog_cancel, export_engine_watchdog) =
-                spawn_subprocess_watchdog(child.id(), std::time::Duration::from_secs(20 * 60));
+            let (
+                export_engine_timed_out,
+                export_engine_watchdog_cancel,
+                export_engine_watchdog_activity,
+                export_engine_watchdog,
+            ) = spawn_subprocess_watchdog(child.id(), std::time::Duration::from_secs(20 * 60));
             let stdout = child
                 .stdout
                 .take()
@@ -11991,6 +12009,16 @@ Return JSON only:
                 let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
                 if let Some(payload) = line.strip_prefix("AUTOGEN_PROGRESS ") {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                        // Real forward progress — extend the watchdog's
+                        // deadline from here rather than from process start,
+                        // so a large project that keeps making real progress
+                        // is never killed just for legitimately needing more
+                        // than 20 minutes total (see spawn_subprocess_
+                        // watchdog's own comment).
+                        *export_engine_watchdog_activity
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            std::time::Instant::now();
                         progress(
                             value["percent"].as_i64().unwrap_or(0),
                             value["stage"].as_str().unwrap_or("Exporting video"),
@@ -12007,7 +12035,10 @@ Return JSON only:
             export_engine_watchdog_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = export_engine_watchdog.join();
             if export_engine_timed_out.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err("Video export timed out after 20 minutes and was stopped.".to_string());
+                return Err(
+                    "Video export stalled (no progress for 20 minutes) and was stopped."
+                        .to_string(),
+                );
             }
             let raw_stderr = stderr_thread.join().unwrap_or_default();
             if !status.success() {
@@ -12106,8 +12137,12 @@ Return JSON only:
             // See export_timeline_video_with_progress's own comment on why
             // this deadline watchdog complements, rather than replaces, the
             // PID-based Cancel button `on_spawn` wires up above.
-            let (bundle_export_timed_out, bundle_export_watchdog_cancel, bundle_export_watchdog) =
-                spawn_subprocess_watchdog(child.id(), std::time::Duration::from_secs(20 * 60));
+            let (
+                bundle_export_timed_out,
+                bundle_export_watchdog_cancel,
+                bundle_export_watchdog_activity,
+                bundle_export_watchdog,
+            ) = spawn_subprocess_watchdog(child.id(), std::time::Duration::from_secs(20 * 60));
             let stdout = child
                 .stdout
                 .take()
@@ -12143,6 +12178,13 @@ Return JSON only:
                 let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
                 if let Some(payload) = line.strip_prefix("AUTOGEN_PROGRESS ") {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+                        // See export_timeline_video_with_progress's own
+                        // comment on why this resets the deadline instead of
+                        // just being informational.
+                        *bundle_export_watchdog_activity
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            std::time::Instant::now();
                         progress(
                             value["percent"].as_i64().unwrap_or(0),
                             value["stage"].as_str().unwrap_or("Exporting project"),
@@ -12159,7 +12201,10 @@ Return JSON only:
             bundle_export_watchdog_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = bundle_export_watchdog.join();
             if bundle_export_timed_out.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err("Bundle export timed out after 20 minutes and was stopped.".to_string());
+                return Err(
+                    "Bundle export stalled (no progress for 20 minutes) and was stopped."
+                        .to_string(),
+                );
             }
             let raw_stderr = stderr_thread.join().unwrap_or_default();
             if !status.success() {
@@ -14041,26 +14086,53 @@ fn kill_process_tree(pid: u32) {
 fn spawn_subprocess_watchdog(
     pid: u32,
     deadline: std::time::Duration,
-) -> (std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>) {
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<std::sync::Mutex<std::time::Instant>>,
+    std::thread::JoinHandle<()>,
+) {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     let timed_out = Arc::new(AtomicBool::new(false));
     let cancelled = Arc::new(AtomicBool::new(false));
+    // Root-cause coverage for a real export that was still legitimately
+    // progressing (165/~330 segments, 50%) getting killed at exactly the
+    // 20-minute mark on a large (112-still, 4K, 610-caption) real project —
+    // the deadline used to be measured from process START regardless of
+    // whether real work kept happening the whole time, so any project big
+    // enough to legitimately need more than 20 minutes could never finish,
+    // no matter how fast each individual segment encoded. `last_activity` is
+    // "touched" (reset to now) by the caller every time it observes real
+    // forward progress (an AUTOGEN_PROGRESS line) — the watchdog now measures
+    // time since the LAST progress update, not time since spawn, so a large
+    // project that keeps reporting progress can run indefinitely, while a
+    // genuinely stalled subprocess (the actual failure mode this exists to
+    // catch — see this function's own call sites) still gets killed after
+    // `deadline` of true silence. A caller that never touches this (the
+    // visual-plan/caption engine call sites, which don't stream per-item
+    // progress the same way) gets the exact previous behavior: a flat
+    // deadline from spawn.
+    let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
     let timed_out_writer = timed_out.clone();
     let cancelled_reader = cancelled.clone();
-    let started = std::time::Instant::now();
+    let last_activity_reader = last_activity.clone();
     let handle = std::thread::spawn(move || loop {
         if cancelled_reader.load(Ordering::SeqCst) {
             return;
         }
-        if started.elapsed() >= deadline {
+        let elapsed = last_activity_reader
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed();
+        if elapsed >= deadline {
             timed_out_writer.store(true, Ordering::SeqCst);
             kill_process_tree(pid);
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
     });
-    (timed_out, cancelled, handle)
+    (timed_out, cancelled, last_activity, handle)
 }
 
 fn run_claude_cli(prompt: &str, extra_args: &[&str]) -> Result<String, String> {

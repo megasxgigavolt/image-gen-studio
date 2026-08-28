@@ -4,10 +4,16 @@ Auto Gen Studio internal video export engine.
 Composites a timeline arrangement (stills stretched to their durations,
 an optional burned-in caption track, and the narration audio) into a single
 MP4. Uses a concat-demuxer strategy rather than one large filter_complex
-graph: each still (or gap) is first encoded to a short intermediate segment,
-then every segment is concatenated in one final pass that also muxes the
-narration audio and burns in the caption track. This keeps the ffmpeg command
-lines short and robust regardless of how many stills are on the timeline.
+graph: each still (or gap) is first encoded to a short intermediate segment —
+already carrying its own caption burn-in, at the export's real crf/preset,
+sliced to that segment's own local time window (see
+`captions_for_segment_window`) — then every segment is concatenated in one
+final pass that only muxes the narration/music audio on top; with no more
+global video filter left to apply, that final pass is a real `-c:v copy`
+stream-copy, not a re-encode. This keeps the ffmpeg command lines short and
+robust regardless of how many stills are on the timeline, and means each
+frame is only ever encoded once (captions used to burn in a second,
+whole-timeline re-encode after every segment's own intermediate encode).
 
 Reuses scene_grouping_engine's ffmpeg discovery (imageio_ffmpeg fallback,
 winget fallback) and its AUTOGEN_PROGRESS reporting convention.
@@ -38,7 +44,20 @@ from pathlib import Path
 import scene_grouping_engine as engine
 
 FPS_DEFAULT = 30
-MAX_ENCODE_WORKERS = 4
+# How many segments to encode concurrently. Was a flat 4 regardless of the
+# real machine — measured as the single biggest remaining under-utilization
+# on any 8+-core export box: the per-segment ThreadPoolExecutor (see its call
+# site in `run()`) simply never used the other cores. Scales to real core
+# count instead, leaving one core free for the OS/UI/orchestration; still
+# further gated by `min(len(segments), ...)` at the call site so a short
+# timeline never over-spawns relative to its own segment count. Safe to raise
+# because `_wait_for_memory_headroom` (below) is reactive, per-call
+# backpressure that polls real available memory before every ffmpeg
+# invocation regardless of how many workers are configured — not a static
+# budget sized for exactly 4. `os.cpu_count()` is read once at import time
+# (core count doesn't change mid-process); the `or 4` fallback only matters
+# on a platform/sandbox where it returns `None`.
+MAX_ENCODE_WORKERS = max(1, (os.cpu_count() or 4) - 1)
 
 
 def _remotion_concurrency() -> int:
@@ -324,6 +343,78 @@ def expand_join_transitions(segments: list[dict], fps: int) -> list[dict]:
     return expanded
 
 
+def assign_absolute_windows(segments: list[dict], fps: int) -> None:
+    """Assigns each segment (any kind — image/video/black/transition) its own
+    exact `_absoluteStartSeconds`/`_absoluteEndSeconds` window on the FINAL
+    exported timeline, in place — computed by walking `segments` in their
+    real concat-demuxer playback order and accumulating each one's own
+    `frames` (already finalized by `assign_frame_counts` + this module's
+    `expand_join_transitions` by the time this runs), rather than trusting
+    each segment's own `start`/`end` fields.
+
+    Those fields drift out of sync with real screen time once
+    `expand_join_transitions` reduces a segment's `frames` to make room for a
+    transition segment spliced in before it (see its own docstring) — the
+    trimmed segment's `start`/`end` stay at their pre-expansion nominal
+    values, no longer its real on-screen window, and a `"transition"`-kind
+    segment has no `start`/`end` fields at all. This cumulative walk is the
+    single source of truth every per-segment caption-window slice (see
+    `captions_for_segment_window`) is computed against, so a caption stays
+    aligned to the real concatenated output regardless of how any segment's
+    own duration got adjusted upstream. Must run AFTER both
+    `assign_frame_counts` and `expand_join_transitions` — i.e. once `frames`
+    is final for every segment, transitions included."""
+    cumulative_frame = 0
+    for segment in segments:
+        segment["_absoluteStartSeconds"] = cumulative_frame / fps
+        cumulative_frame += segment["frames"]
+        segment["_absoluteEndSeconds"] = cumulative_frame / fps
+
+
+def captions_for_segment_window(captions: list[dict], window_start: float, window_end: float) -> list[dict]:
+    """Slices the full-timeline caption list down to just the chunks
+    overlapping `[window_start, window_end)` — one segment's own portion of
+    the timeline — clipping each survivor's start/end to the window and
+    shifting every timestamp so 0 lands at `window_start`, i.e. this
+    segment's own local time base (matching every other per-segment ffmpeg
+    pass, which always renders in segment-local time).
+
+    A caption spanning a segment boundary is deliberately included, clipped,
+    in BOTH neighboring segments' own slices — each independently produces
+    the correct visible text for its own local time range, and burning the
+    same chunk into two adjacent segments produces the same visible result
+    as one continuous burn across the boundary once they're concatenated,
+    since ASS rendering only ever asks "is this text visible at this local
+    time". A transition segment's tail and head render (see
+    `_build_transition_segment`) both get this SAME sliced list for their
+    shared absolute window — burning identical text at an identical position
+    into both blended layers is what keeps a caption visually static through
+    the blend instead of fading in/out with the transition itself.
+
+    Word-level karaoke timing (`chunk["words"]`) only ever carries each
+    word's own START (a word's highlight window runs until the NEXT word's
+    start, or the chunk's own end for the last word — see
+    `_karaoke_dialogue_lines`) — shifted here by the same window offset as
+    the chunk, not filtered: `_karaoke_dialogue_lines`'s own
+    `max(word.start, clip_start)`/`min(seg_end, clip_end)` clamping already
+    collapses any word entirely outside `[start, end)` to a zero-or-negative-
+    length segment, which it already skips."""
+    sliced: list[dict] = []
+    for chunk in captions:
+        start = max(chunk["start"], window_start)
+        end = min(chunk["end"], window_end)
+        if end <= start:
+            continue
+        new_chunk = dict(chunk)
+        new_chunk["start"] = start - window_start
+        new_chunk["end"] = end - window_start
+        words = chunk.get("words")
+        if words:
+            new_chunk["words"] = [{**word, "start": word["start"] - window_start} for word in words]
+        sliced.append(new_chunk)
+    return sliced
+
+
 def strip_recipe_fade_envelope(segments: list[dict]) -> None:
     """Zeroes every clip's `fadeInFrames`/`fadeOutFrames` for the single
     baked video, in place.
@@ -411,6 +502,38 @@ MAX_SCALE_REFERENCE_DURATION = 60.0  # only bounds pathological cases; must
 # keeps most of that smoothness (extrapolating the same curve, meaningfully
 # closer to 6x's 0.17 than to 3x's 0.29) for roughly a 4x speedup.
 _ZOOMPAN_PRE_SCALE_FACTOR = 4
+
+
+def _zoompan_hq_output(width: int, height: int) -> tuple[str, str]:
+    """Root-cause fix for "1080p exports look blurry for no reason" (a real
+    user report, reproduced and isolated): zoompan's own internal resize —
+    from its per-frame crop window down to a fixed output size, via its own
+    `s=` option — uses whatever algorithm it has built in, with no `flags=`-
+    style control exposed to pick a better one the way the `scale` filter
+    has. Confirmed via a real side-by-side: a native 1080p render through
+    zoompan's own `s=1920x1080` came out meaningfully softer than simply
+    downscaling a 4K render of the IDENTICAL clip down to 1080p with
+    Lanczos afterward — and the softness persisted even at a near-lossless
+    CRF, ruling out encode compression as the cause; it's the resize itself.
+    More visible at 1080p than 4K not because zoompan behaves differently at
+    different resolutions (the crop-to-output ratio here is identical
+    either way — see `_ZOOMPAN_PRE_SCALE_FACTOR`'s own comment, always
+    exactly this constant regardless of target size), but because a lower
+    final pixel count gives the softness less real detail to hide behind.
+
+    Fix: let zoompan target twice the REAL output size (still its own,
+    unavoidable, resize — but only has to get "close", not be the final
+    word on sharpness) and follow it with an explicit
+    `scale=<real_w>:<real_h>:flags=lanczos` down to the true target — a
+    scaler actually built for sharp, high-quality resampling. Verified
+    against the same real clip: visibly restores the sharpness a proper
+    downscale of the 4K render already had. Returns `(zoompan_s_value,
+    downscale_suffix)`: `zoompan_s_value` replaces the naive
+    `f"{width}x{height}"` in a zoompan `s=` option, and `downscale_suffix`
+    is appended as one more filter stage immediately after that zoompan
+    node (before any color-filter/fade nodes, which are cheap enough to
+    run at the final, already-correct resolution)."""
+    return f"{width * 2}x{height * 2}", f",scale={width}:{height}:flags=lanczos"
 
 
 # Matches TimelineView.tsx's COLOR_FILTER_TARGETS exactly (brightness
@@ -553,10 +676,11 @@ def build_image_filter(
         ]
         cx, cy, cscale = cut_anchors[cut_index % len(cut_anchors)]
         pre_scale = max(width, height) * _ZOOMPAN_PRE_SCALE_FACTOR
+        zoompan_s, hq_downscale = _zoompan_hq_output(width, height)
         return (
             f"scale={pre_scale}:-2,zoompan=z='{cscale:.5f}':"
             f"{anchored_xy(cx, cy)}:"
-            f"d={frames}:s={width}x{height}:fps={fps}{color_node}{fade}"
+            f"d={frames}:s={zoompan_s}:fps={fps}{hq_downscale}{color_node}{fade}"
         )
     if motion in zoompan_presets:
         # zoompan crops at integer-pixel granularity in its source's coordinate
@@ -570,9 +694,10 @@ def build_image_filter(
         # `_ZOOMPAN_PRE_SCALE_FACTOR`'s own comment for the speed/smoothness
         # tradeoff behind its exact value.
         pre_scale = max(width, height) * _ZOOMPAN_PRE_SCALE_FACTOR
+        zoompan_s, hq_downscale = _zoompan_hq_output(width, height)
         return (
             f"scale={pre_scale}:-2,zoompan={zoompan_presets[motion]}:"
-            f"d={frames}:s={width}x{height}:fps={fps}{color_node}{fade}"
+            f"d={frames}:s={zoompan_s}:fps={fps}{hq_downscale}{color_node}{fade}"
         )
     # Cover-crop (not letterbox): scales up until the frame fully covers the
     # target canvas, then crops the overflow, centered. Matches the editor
@@ -799,9 +924,10 @@ def build_recipe_zoompan_filter(
     # scale/zoompan forces the real resample, exactly like build_video_filter
     # already does for a video with no recipe at all.
     fps_resample_node = f"fps={fps}," if zoompan_hold_frames is not None else ""
+    zoompan_s, hq_downscale = _zoompan_hq_output(width, height)
     return (
         f"{fps_resample_node}scale={pre_scale}:-2,zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
-        f"d={hold}:s={width}x{height}:fps={fps}{color_node}{fade}"
+        f"d={hold}:s={zoompan_s}:fps={fps}{hq_downscale}{color_node}{fade}"
     )
 
 
@@ -922,59 +1048,189 @@ def _ensure_vignette_mask(mask_dir: Path, width: int, height: int, vignette: flo
     return mask_path
 
 
+# Whether this process can actually run the GPU vignette path (see
+# `_apply_vignette_filter`'s own GPU branch) — `None` = not probed yet,
+# `False`/`True` = probed once, cached for the rest of this process. Same
+# shape as `_hw_encoder_cache`: a real (tiny) render, not just "is the
+# filter listed", since a GPU/driver can be present but still fail to
+# actually open an OpenCL device (confirmed on a real dev sandbox: worked
+# fine for `ffmpeg`'s own OpenCL filters directly, despite Chromium's own
+# separate GPU path failing in the same environment — the two are
+# independent, so this module probes its own actual dependency rather than
+# inferring from Remotion's GPU detection).
+_opencl_vignette_cache: bool | None = None
+
+
+def _detect_opencl_vignette_support() -> bool:
+    global _opencl_vignette_cache
+    if _opencl_vignette_cache is not None:
+        return _opencl_vignette_cache
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-init_hw_device", "opencl=ocl",
+                "-f", "lavfi", "-i", "color=c=red:s=64x64:d=0.1",
+                "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
+                "-filter_complex",
+                "[0:v]format=yuv420p,hwupload=derive_device=opencl[a];"
+                "[1:v]format=yuva420p,hwupload=derive_device=opencl[b];"
+                "[a][b]overlay_opencl,hwdownload,format=yuv420p[out]",
+                "-map", "[out]", "-frames:v", "1", "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=15, **_subprocess_kwargs(),
+        )
+        _opencl_vignette_cache = result.returncode == 0
+    except Exception:
+        _opencl_vignette_cache = False
+    return _opencl_vignette_cache
+
+
+def _disable_opencl_vignette() -> None:
+    """Called when a real vignette render fails with the GPU path selected
+    (the tiny probe above only proves OpenCL can open at all, not that it
+    handles this export's actual resolution/content) — permanently falls
+    back to the CPU gbrp path for the rest of this process rather than
+    re-attempting a GPU render on every subsequent vignetted clip."""
+    global _opencl_vignette_cache
+    _opencl_vignette_cache = False
+
+
 def _apply_vignette_filter(
-    vf: str, vignette: float, width: int, height: int, duration_bound: float, mask_dir: Path,
-) -> tuple[list[str], list[str]]:
+    vf: str, vignette: float, width: int, height: int, fps: int, duration_bound: float, mask_dir: Path,
+    ass_clause: str = "",
+) -> tuple[list[str], list[str], list[str]]:
     """Wraps an existing single-input `-vf` chain (as built by
     `build_recipe_zoompan_filter`) so its output also gets this recipe's own
-    vignette multiplied on top, when it has one. Returns
-    `(extra_input_args, video_output_args)`:
+    vignette multiplied on top, when it has one, and this segment's own
+    caption burn-in appended last (see `_encode_segment_to_path`'s
+    `ass_clause` — a `,ass='...':fontsdir='...'` clause, or "" when this
+    segment has no captions overlapping its window), regardless of whether a
+    vignette also applies — burned in AFTER the vignette darkens the frame,
+    same stacking order the whole-timeline final-pass burn-in used to apply
+    on top of everything. Returns `(pre_args, extra_input_args,
+    video_output_args)`:
     - When `vignette <= 0` (the common case — most clips carry no vignette at
-      all, see `MotionRecipe.vignette`'s own comment): `([], ["-vf", vf])`,
-      i.e. completely unchanged behavior.
-    - Otherwise: `extra_input_args` is a real second `-i` for a generated
-      mask file that the CALLER must splice into its own ffmpeg command's
-      input args, immediately after its one real source `-i` (so it lands at
-      input index 1 — this function's own filtergraph assumes exactly that
-      layout), and `video_output_args` switches from `-vf` to
-      `-filter_complex`/`-map` to combine the two. `-vf`'s own single-input
-      "simple filtergraph" parser rejects a second, unconnected source filter
-      — confirmed empirically: even a source-only `movie=` node with no `-i`
-      of its own errors with "expected exactly 1 input and 1 output" — so a
-      real filter_complex is unavoidable here, unlike the plain `-vf` chains
-      used everywhere else in this module.
+      all, see `MotionRecipe.vignette`'s own comment): `([], [], ["-vf",
+      vf])`, i.e. completely unchanged behavior.
+    - Otherwise: `pre_args` (GPU path only — global ffmpeg options that must
+      appear before any `-i`, e.g. `-init_hw_device`) and `extra_input_args`
+      (a real second `-i` for a generated mask file) that the CALLER must
+      splice into its own ffmpeg command — `pre_args` right after `-y`,
+      `extra_input_args` immediately after the segment's own real source
+      `-i` (so the mask lands at input index 1 — this function's own
+      filtergraph assumes exactly that layout) — and `video_output_args`
+      switches from `-vf` to `-filter_complex`/`-map` to combine the two.
+      `-vf`'s own single-input "simple filtergraph" parser rejects a second,
+      unconnected source filter — confirmed empirically: even a source-only
+      `movie=` node with no `-i` of its own errors with "expected exactly 1
+      input and 1 output" — so a real filter_complex is unavoidable here,
+      unlike the plain `-vf` chains used everywhere else in this module.
+
+    Two implementations, chosen by `_detect_opencl_vignette_support()`
+    (probed once, cached, with a CPU fallback if a real render later fails —
+    see `_disable_opencl_vignette`):
+
+    GPU path (`overlay_opencl`): root-cause coverage for "this rendering is
+    too inefficient" — measured on a real project (4K, real captured
+    content): the CPU path below ran at ~2fps; this ran at ~11-44fps
+    (6-20x), because it never pays the CPU colorspace round-trip the CPU
+    path needs for correctness (see that path's own comment) — GPU texture
+    compositing doesn't have that cost. Verified pixel-accurate against the
+    CPU path (max channel diff of a few counts out of 255, consistent with
+    ordinary 8-bit rounding, across multiple real frames and spatial points
+    including the corners, where the effect is strongest) — NOT built by
+    guessing: an early attempt without `format=gray` before `negate` and
+    without matching `fps=` on both streams produced real, visible color
+    errors, caught by that same pixel comparison before ever reaching this
+    function. `fps={fps}` on both the base and the mask/alpha stream is
+    required — without it, the static single-frame-looped mask and the
+    dynamic zoompan-driven base stream can drift out of frame-sync inside
+    `overlay_opencl` specifically (confirmed: `hwupload`/`hwdownload` alone,
+    with no overlay at all, reproduce the CPU output exactly, frame for
+    frame — so the sync requirement is specific to the two-stream overlay
+    step, not a general GPU round-trip cost).
+
+    CPU path (`blend=all_mode=multiply` in `gbrp`): `blend=all_mode=multiply`
+    runs per-PLANE, not per-color — in yuv420p that means it also multiplies
+    the chroma (U/V) planes, which are centered at 128 ("no color"), not 0.
+    The mask's own chroma is neutral 128 too (it started as a plain
+    greyscale image), so anywhere the mask darkens (keep factor < 255) this
+    pulled U/V from 128 toward 0 — 0/0 chroma isn't neutral, it's a strongly
+    saturated color, and it rendered as a solid green cast over the whole
+    vignetted region (a real user's report: "the final exported video is
+    showing in all green"). The original CSS math this mask encodes
+    (`rgba(0,0,0,a)` over an opaque color reduces to `C*(1-a)`) is a
+    per-CHANNEL RGB multiply, so doing the blend in `gbrp` (planar RGB)
+    instead of yuv420p is what it actually means: the mask's R/G/B planes
+    all carry the same grey value, so multiplying scales R, G, and B down
+    together, dimming brightness while leaving hue untouched, then
+    converting back to yuv420p for encoding. Correct, but this full-frame
+    RGB round-trip is exactly what the GPU path above avoids — kept as the
+    fallback for a machine with no usable OpenCL device, not because it's
+    otherwise preferable.
 
     The mask input is `-loop 1`-ed the same way an ordinary still image
     already is elsewhere in this module, bounded by `duration_bound` (the
     caller's own longest possible real frame count in seconds, WITH
     headroom — must cover at least as much as `vf`'s own output can ever
     produce, e.g. a join-transition tail's motion-extended frame count, not
-    just the segment's nominal duration) so `blend`'s own `shortest=1` never
+    just the segment's nominal duration) so neither path's frame-matching
+    (`blend`'s own `shortest=1`, or the GPU path's `fps=` resample) ever
     truncates the real clip early by running out of mask frames first."""
     if vignette <= 0:
-        return [], ["-vf", vf]
+        return [], [], ["-vf", vf + ass_clause]
     mask_path = _ensure_vignette_mask(mask_dir, width, height, vignette)
     extra_input_args = ["-loop", "1", "-t", f"{duration_bound:.3f}", "-i", str(mask_path)]
-    # `blend=all_mode=multiply` runs per-PLANE, not per-color — in yuv420p
-    # that means it also multiplies the chroma (U/V) planes, which are
-    # centered at 128 ("no color"), not 0. The mask's own chroma is neutral
-    # 128 too (it started as a plain greyscale image), so anywhere the mask
-    # darkens (keep factor < 255) this pulled U/V from 128 toward 0 —
-    # 0/0 chroma isn't neutral, it's a strongly saturated color, and it
-    # rendered as a solid green cast over the whole vignetted region (a real
-    # user's report: "the final exported video is showing in all green").
-    # The original CSS math this mask encodes (`rgba(0,0,0,a)` over an opaque
-    # color reduces to `C*(1-a)`) is a per-CHANNEL RGB multiply, so doing the
-    # blend in `gbrp` (planar RGB) instead of yuv420p is what it actually
-    # means: the mask's R/G/B planes all carry the same grey value, so
-    # multiplying scales R, G, and B down together, dimming brightness while
-    # leaving hue untouched, then converting back to yuv420p for encoding.
+    if _detect_opencl_vignette_support():
+        filter_complex = (
+            f"[0:v]{vf},format=yuv420p,fps={fps}[_vbase];"
+            f"[1:v]scale={width}:{height}:flags=bicubic,format=gray,negate,fps={fps}[_valpha];"
+            f"color=c=black:s={width}x{height}:d={duration_bound:.3f}:r={fps}[_vblack];"
+            f"[_vblack][_valpha]alphamerge,format=yuva420p[_vblack_a];"
+            f"[_vbase]hwupload=derive_device=opencl[_vbase_gpu];"
+            f"[_vblack_a]hwupload=derive_device=opencl[_vblack_gpu];"
+            f"[_vbase_gpu][_vblack_gpu]overlay_opencl,hwdownload,format=yuv420p{ass_clause}[_vgout]"
+        )
+        return ["-init_hw_device", "opencl=ocl"], extra_input_args, ["-filter_complex", filter_complex, "-map", "[_vgout]"]
     filter_complex = (
         f"[0:v]{vf},format=gbrp[_vgz];"
         f"[1:v]scale={width}:{height}:flags=bicubic,format=gbrp[_vgm];"
-        f"[_vgz][_vgm]blend=all_mode=multiply:shortest=1,format=yuv420p[_vgout]"
+        f"[_vgz][_vgm]blend=all_mode=multiply:shortest=1,format=yuv420p{ass_clause}[_vgout]"
     )
-    return extra_input_args, ["-filter_complex", filter_complex, "-map", "[_vgout]"]
+    return [], extra_input_args, ["-filter_complex", filter_complex, "-map", "[_vgout]"]
+
+
+def _run_segment_ffmpeg_with_vignette(
+    input_args: list[str], vf: str, vignette: float, width: int, height: int, fps: int,
+    duration_bound: float, mask_dir: Path, ass_clause: str, output_args: list[str],
+) -> None:
+    """Builds and runs one segment's ffmpeg command with this recipe's own
+    vignette (if any) applied via `_apply_vignette_filter`, retrying once on
+    the plain CPU path if the GPU path was selected but the REAL render
+    fails — the probe in `_detect_opencl_vignette_support` only proves
+    OpenCL can open at all, not that it handles this export's actual
+    resolution/content, same reasoning as the final pass's own
+    hardware-encoder retry (`_build_and_run_final_pass`'s except block).
+    `input_args` is everything between `-y` and the vignette's own
+    `extra_input_args` (i.e. this segment's real source `-i` and any flags
+    on it); `output_args` is everything after the vignette's own
+    `video_output_args` (encode flags, frame count, output path) — same
+    split every call site already had, just factored out so the retry
+    doesn't have to be duplicated at each one."""
+    used_gpu = vignette > 0 and _detect_opencl_vignette_support()
+    pre_args, vignette_inputs, video_args = _apply_vignette_filter(
+        vf, vignette, width, height, fps, duration_bound, mask_dir, ass_clause,
+    )
+    try:
+        run_ffmpeg(["-y", *pre_args, *input_args, *vignette_inputs, *video_args, *output_args])
+    except RuntimeError:
+        if not used_gpu:
+            raise
+        _disable_opencl_vignette()
+        _, vignette_inputs, video_args = _apply_vignette_filter(
+            vf, vignette, width, height, fps, duration_bound, mask_dir, ass_clause,
+        )
+        run_ffmpeg(["-y", *input_args, *vignette_inputs, *video_args, *output_args])
 
 
 def build_video_filter(
@@ -1030,6 +1286,61 @@ def _available_memory_bytes() -> int | None:
         return None
 
 
+# Estimated peak RSS of ONE concurrent 4K (3840x2160) segment encode — a
+# zoompan/vignette/caption-burn ffmpeg process, at this resolution — measured
+# on a real machine: individual `ffmpeg.exe` processes ranged ~1.9-2.8GB
+# during a live 4K export. Deliberately the higher end of that range (not an
+# average), and scaled down linearly by pixel count for a smaller export
+# resolution (1080p/720p need proportionally less), floored so this never
+# estimates an implausibly tiny footprint for a very small canvas.
+_ESTIMATED_WORKER_MEMORY_AT_4K_BYTES = 2_800_000_000
+_ESTIMATED_WORKER_MEMORY_FLOOR_BYTES = 400_000_000
+_4K_PIXELS = 3840 * 2160
+# Left un-allocated to worker slots entirely, on top of whatever the estimate
+# above already reserves per worker — the OS, this app's own UI process, and
+# the narration/music audio graph all need headroom too. Deliberately
+# separate from (larger than, and checked BEFORE any workers start rather
+# than per-call) `_wait_for_memory_headroom`'s own 1.5GB threshold below,
+# which still runs on top of this as a second line of defense.
+_MEMORY_SAFETY_MARGIN_BYTES = 2_000_000_000
+
+
+def _memory_aware_worker_cap(width: int, height: int) -> int:
+    """How many segments can plausibly run concurrently without exhausting
+    this machine's memory, estimated from real available RAM right now and
+    this export's own resolution — not just CPU core count (see
+    `MAX_ENCODE_WORKERS`'s own comment on why that alone isn't enough).
+
+    Root-cause coverage for a real crashed export on a real project (112
+    stills, 4K, 610 captions): raising worker count to match core count
+    (`MAX_ENCODE_WORKERS`) is only safe on a machine with enough RAM to
+    actually back that many concurrent 4K encodes. `_wait_for_memory_
+    headroom` alone doesn't prevent this at high concurrency — it only ever
+    asks "is there room for ONE more worker to start RIGHT NOW", a snapshot
+    check that passes fine even while every ALREADY-admitted worker's own
+    memory use keeps growing past that snapshot (confirmed on the machine
+    that crashed: 15 concurrent 4K workers, several already past 2GB each,
+    left only ~2.8GB of the machine's 32GB free at the moment it died) — by
+    the time enough of them have grown, the process is already committed to
+    more concurrent work than the system can sustain. Capping the NOMINAL
+    worker count up front, before any of them start, is what actually
+    prevents that, rather than relying solely on a reactive per-call gate.
+
+    Best-effort: `_available_memory_bytes()` can fail (a non-Windows box, or
+    an environment this can't read from) — degrades to "no additional cap
+    beyond MAX_ENCODE_WORKERS" in that case, matching every other caller of
+    `_available_memory_bytes`."""
+    available = _available_memory_bytes()
+    if available is None:
+        return MAX_ENCODE_WORKERS
+    usable = max(0, available - _MEMORY_SAFETY_MARGIN_BYTES)
+    per_worker = max(
+        _ESTIMATED_WORKER_MEMORY_FLOOR_BYTES,
+        round(_ESTIMATED_WORKER_MEMORY_AT_4K_BYTES * (width * height) / _4K_PIXELS),
+    )
+    return max(1, usable // per_worker)
+
+
 # Backpressure threshold/cap for `_wait_for_memory_headroom` — deliberately a
 # conservative, labeled ESTIMATE, not a precisely measured per-worker budget
 # (ffmpeg's own real memory use depends on resolution, filter graph, and
@@ -1082,7 +1393,11 @@ _OOM_ERROR_SUBSTRINGS = ("malloc of size", "Cannot allocate memory", "bad_alloc"
 # export already cleans up segment_paths/segments_list_path itself, so this
 # only ever needs to run on failure.
 _TRANSIENT_EXPORT_ARTIFACT_GLOBS = (
-    "seg_*.ts", "segments.txt", "captions.ass", "_vignette_mask_*.png",
+    # "seg_*.ass" (per-segment caption burn-in — see
+    # `_encode_segment_to_path`'s `segment_captions` handling) replaced the
+    # old single whole-timeline "captions.ass" once caption burn-in moved
+    # from the final pass into each segment's own encode.
+    "seg_*.ts", "seg_*.ass", "segments.txt", "_vignette_mask_*.png",
     "motion_batch_spec.json", "motion_batch_results.json", "motion_pre_*.raw.mp4",
 )
 
@@ -1462,6 +1777,32 @@ def _ensure_motion_engine_ready() -> None:
         _ensure_remotion_browser_downloaded()
 
 
+# `None` = not yet downgraded this process (still try Chromium's real
+# GPU-accelerated compositor first, same as `batch-render.mjs`'s own
+# `openBrowserWithGpuFallback` — see that function's doc comment for why
+# Remotion never asks for GPU acceleration on its own by default); a string
+# = a real launch already failed with "angle" and every subsequent call this
+# process makes should go straight to that value instead of re-attempting
+# (and re-failing) a GPU launch every single clip. Purely in-process, same
+# shape as `_hw_encoder_cache` below for the ffmpeg hardware encoder — this
+# is the equivalent cache for the OTHER "prefer GPU, fall back once, then
+# remember" decision this module makes.
+_gl_renderer_cache: str | None = None
+
+
+def _remotion_gl_arg() -> str:
+    return _gl_renderer_cache or "angle"
+
+
+def _disable_gpu_gl_renderer() -> None:
+    """Called when a real `remotion render` invocation fails with "angle"
+    still selected — permanently downgrades to "swiftshader" (Remotion's
+    documented pure-software renderer) for the rest of this process rather
+    than re-attempting a GPU launch on every subsequent clip."""
+    global _gl_renderer_cache
+    _gl_renderer_cache = "swiftshader"
+
+
 def _render_motion_graphic(
     media_path: str, source_kind: str, effect: str, settings: dict,
     frames: int, fps: int, width: int, height: int, out_path: Path,
@@ -1505,8 +1846,9 @@ def _render_motion_graphic(
     }
     props_path = out_path.with_suffix(".props.json")
     props_path.write_text(json.dumps(props), encoding="utf-8")
-    try:
-        result = subprocess.run(
+
+    def _run(gl: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
             [
                 # `--no-install` (npx's own flag, not Remotion's): never fall
                 # back to an ad-hoc registry install if `remotion` isn't
@@ -1527,6 +1869,13 @@ def _render_motion_graphic(
                 # difference between the "audio: Encoding progress" step
                 # running at all).
                 "--muted",
+                # Real GPU acceleration (Chromium's own compositor via ANGLE)
+                # when available, falling back to Remotion's documented
+                # pure-software "swiftshader" renderer once — see
+                # `_gl_renderer_cache`'s own comment; same fallback shape as
+                # `batch-render.mjs`'s `openBrowserWithGpuFallback` for the
+                # batched path this function is only a fallback for.
+                f"--gl={gl}",
                 # Caps how many browser tabs THIS one render uses internally.
                 # Segments (including motion-graphic ones) already run up to
                 # MAX_ENCODE_WORKERS at a time via the outer ThreadPoolExecutor
@@ -1543,6 +1892,18 @@ def _render_motion_graphic(
             ],
             cwd=str(MOTION_ENGINE_DIR), capture_output=True, text=True, **_subprocess_kwargs(),
         )
+
+    try:
+        gl = _remotion_gl_arg()
+        result = _run(gl)
+        if result.returncode != 0 and gl == "angle":
+            # Chromium's own real launch failed with GPU acceleration
+            # requested — not necessarily a genuine render error, could be
+            # "no usable GPU on this machine". Downgrade for the rest of
+            # this process and retry ONCE on plain software rendering before
+            # treating it as a real failure.
+            _disable_gpu_gl_renderer()
+            result = _run(_remotion_gl_arg())
         if result.returncode != 0:
             raise RuntimeError(
                 f"Motion-graphics render failed for {effect!r}: {result.stderr[-2000:]}"
@@ -1553,6 +1914,8 @@ def _render_motion_graphic(
 
 def _encode_segment_to_path(
     segment: dict, out_path: Path, width: int, height: int, fps: int,
+    crf: int = 16, preset: str = "veryfast",
+    segment_captions: list[dict] | None = None, default_style: dict | None = None,
 ) -> None:
     """Core per-kind ffmpeg invocation for an image/video/black segment,
     factored out of `encode_segment` so `_build_transition_segment` can reuse
@@ -1562,7 +1925,38 @@ def _encode_segment_to_path(
     common case, since only segments touched by `expand_join_transitions`
     ever set it explicitly. `_trimStartFrames` skips that many frames off the
     segment's own head (needed when a preceding join transition consumed
-    them) via ffmpeg's `trim` filter — cheap for the common case of 0."""
+    them) via ffmpeg's `trim` filter — cheap for the common case of 0.
+
+    `crf`/`preset` default to the OLD hardcoded near-lossless intermediate
+    values — correct for `run_bundle`'s per-clip asset export (each clip is
+    its own standalone deliverable for another editor to later re-compress,
+    not a place to apply the timeline's own YouTube-delivery CRF) and for
+    `retime_clip`'s pre-processing, neither of which pass real values.
+    `run()`'s own call site passes the manifest's real `crf`/`preset`
+    explicitly — this segment's own encode is now the ONLY generation for
+    the final baked video (see `default_style`'s own comment below), so it's
+    what actually has to honor the user's chosen quality setting.
+
+    `segment_captions` (already windowed and local-time-shifted to this
+    segment — see `captions_for_segment_window`) burns this segment's own
+    caption slice directly into its own encode, in place of the whole-
+    timeline burn-in the final pass used to do in one serial pass over the
+    entire concatenated video. This is why `crf`/`preset` must be real here:
+    the final pass no longer re-encodes at all once every segment already
+    carries its own captions (see `_final_pass_video_routing` — `None`
+    filter always takes the stream-copy path), so this is the one and only
+    place each pixel gets encoded."""
+    ass_clause = ""
+    if segment_captions:
+        # `.with_suffix(".ass")` — same sibling-file convention as
+        # `_render_motion_graphic`'s own `.props.json` — unique per segment
+        # (including a transition's own `_a.ts`/`_b.ts` tail/head paths),
+        # cleaned up alongside every other transient export artifact (see
+        # `_TRANSIENT_EXPORT_ARTIFACT_GLOBS` and `run()`'s own success-path
+        # cleanup).
+        seg_ass_path = out_path.with_suffix(".ass")
+        write_captions_ass(segment_captions, seg_ass_path, width, height, default_style or _FALLBACK_CAPTION_STYLE)
+        ass_clause = f",ass='{escape_subtitles_path(seg_ass_path)}':fontsdir='{escape_subtitles_path(_BUNDLED_FONTS_DIR)}'"
     # `duration` (seconds) only bounds the input source (loop/color generator)
     # with headroom to spare — the segment's actual output length is fixed by
     # `-frames:v`, using the cumulative-frame-accurate count `assign_frame_counts`
@@ -1606,16 +2000,15 @@ def _encode_segment_to_path(
             )
             if trim_start_frames > 0:
                 vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
-            vignette_inputs, video_args = _apply_vignette_filter(
+            _run_segment_ffmpeg_with_vignette(
+                ["-loop", "1", "-t", f"{duration + 1:.3f}", "-i", segment["path"]],
                 vf, float(segment["motionGraphicSettings"].get("vignette", 0.0) or 0.0),
-                width, height, max(duration, original_frames / fps) + 1.0, out_path.parent,
+                width, height, fps, max(duration, original_frames / fps) + 1.0, out_path.parent, ass_clause,
+                [
+                    "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
+                    "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
+                ],
             )
-            run_ffmpeg([
-                "-y", "-loop", "1", "-t", f"{duration + 1:.3f}", "-i", segment["path"],
-                *vignette_inputs, *video_args,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
-                "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
-            ])
         else:
             # "video" source — already a real, moving video stream (one
             # input frame per output frame), unlike the "image" branch's
@@ -1637,16 +2030,16 @@ def _encode_segment_to_path(
                 vf = f"tpad=stop_mode=clone:stop_duration={duration - source_duration:.3f},{vf}"
             if trim_start_frames > 0:
                 vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
-            vignette_inputs, video_args = _apply_vignette_filter(
+            _run_segment_ffmpeg_with_vignette(
+                ["-i", segment["path"]],
                 vf, float(segment["motionGraphicSettings"].get("vignette", 0.0) or 0.0),
-                width, height, max(duration, original_frames / fps) + 1.0, out_path.parent,
+                width, height, fps, max(duration, original_frames / fps) + 1.0, out_path.parent, ass_clause,
+                [
+                    "-an",
+                    "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
+                    "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
+                ],
             )
-            run_ffmpeg([
-                "-y", "-i", segment["path"],
-                *vignette_inputs, *video_args, "-an",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
-                "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
-            ])
     elif segment["kind"] in ("image", "video") and segment.get("motionGraphicEffect") and segment.get("motionGraphicSettings"):
         # AI-composed (or manually overridden) motion recipe that actually
         # needs Tier 2/4/5 (depth/story/environment/mask/glow/rotation/
@@ -1713,12 +2106,12 @@ def _encode_segment_to_path(
                 vf_parts.insert(0, f"tpad=stop_mode=clone:stop_duration={duration - source_duration:.3f}")
         if trim_start_frames > 0:
             vf_parts.insert(0, f"trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS")
-        vf = ",".join(vf_parts) if vf_parts else "null"
+        vf = (",".join(vf_parts) if vf_parts else "null") + ass_clause
         try:
             run_ffmpeg([
                 "-y", "-i", str(raw_path),
                 "-vf", vf, *(["-an"] if segment["kind"] == "video" else []),
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+                "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
                 "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
             ])
         finally:
@@ -1737,14 +2130,10 @@ def _encode_segment_to_path(
         )
         if trim_start_frames > 0:
             vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
+        vf += ass_clause
         run_ffmpeg([
             "-y", "-loop", "1", "-t", f"{duration + 1:.3f}", "-i", segment["path"],
-            # Intermediate segments are re-encoded again in the final concat
-            # pass, so a low-quality intermediate compounds into a visibly
-            # blurrier/blockier final export (double generation loss). A high
-            # CRF here keeps this first pass close to lossless — the disk
-            # cost is temporary, these files are deleted after the final pass.
-            "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+            "-vf", vf, "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
             "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
         ])
     elif segment["kind"] == "video":
@@ -1766,16 +2155,18 @@ def _encode_segment_to_path(
             vf = f"tpad=stop_mode=clone:stop_duration={duration - source_duration:.3f},{vf}"
         if trim_start_frames > 0:
             vf = f"{vf},trim=start_frame={trim_start_frames}:end_frame={original_frames},setpts=PTS-STARTPTS"
+        vf += ass_clause
         run_ffmpeg([
             "-y", "-i", segment["path"],
-            "-vf", vf, "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+            "-vf", vf, "-an", "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
             "-r", str(fps), "-frames:v", str(output_frames), str(out_path),
         ])
     else:
         run_ffmpeg([
             "-y", "-f", "lavfi", "-t", f"{duration + 1:.3f}",
             "-i", f"color=c=black:s={width}x{height}:r={fps}",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+            *(["-vf", ass_clause.lstrip(",")] if ass_clause else []),
+            "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
             "-frames:v", str(output_frames), str(out_path),
         ])
 
@@ -1834,6 +2225,8 @@ def _transition_tail_head_segments(segment: dict, fps: int) -> tuple[dict, dict]
 
 def _build_transition_segment(
     segment: dict, index: int, width: int, height: int, fps: int, work_dir: Path, out_path: Path,
+    crf: int = 16, preset: str = "veryfast",
+    segment_captions: list[dict] | None = None, default_style: dict | None = None,
 ) -> None:
     """Renders a join transition (cross-fade/slide-left/slide-right/
     zoom-blur) as an `xfade` blend of the outgoing clip's tail window and the
@@ -1848,7 +2241,15 @@ def _build_transition_segment(
     present (set by `run()`'s upfront batch pre-render — see its own call
     site), are forwarded onto the tail/head segment's `_preRenderedRawPath`
     so `_encode_segment_to_path`'s existing pre-render-reuse branch picks
-    them up instead of falling back to a fresh per-clip Remotion render."""
+    them up instead of falling back to a fresh per-clip Remotion render.
+
+    `segment_captions` (this transition's own sliced/shifted window — see
+    `captions_for_segment_window`) is burned into BOTH the tail and head
+    render identically, not just one of them or the blended result — burning
+    the same text at the same position into both layers is what keeps it
+    visually static through the xfade blend instead of fading in/out with
+    the transition itself (a caption burned into only one layer would ride
+    that layer's own alpha through the blend)."""
     tail_path = work_dir / f"seg_{index:04d}_a.ts"
     head_path = work_dir / f"seg_{index:04d}_b.ts"
     tail_segment, head_segment = _transition_tail_head_segments(segment, fps)
@@ -1856,8 +2257,8 @@ def _build_transition_segment(
         tail_segment["_preRenderedRawPath"] = segment["_preRenderedTailRawPath"]
     if segment.get("_preRenderedHeadRawPath"):
         head_segment["_preRenderedRawPath"] = segment["_preRenderedHeadRawPath"]
-    _encode_segment_to_path(tail_segment, tail_path, width, height, fps)
-    _encode_segment_to_path(head_segment, head_path, width, height, fps)
+    _encode_segment_to_path(tail_segment, tail_path, width, height, fps, crf, preset, segment_captions, default_style)
+    _encode_segment_to_path(head_segment, head_path, width, height, fps, crf, preset, segment_captions, default_style)
     transition_frames = segment["frames"]
     xfade_name = _XFADE_TRANSITION_NAMES.get(segment["transitionType"], "fade")
     transition_seconds = transition_frames / fps
@@ -1867,22 +2268,26 @@ def _build_transition_segment(
             "-filter_complex",
             f"[0:v]format=yuv420p,setsar=1[a];[1:v]format=yuv420p,setsar=1[b];"
             f"[a][b]xfade=transition={xfade_name}:duration={transition_seconds:.3f}:offset=0[outv]",
-            "-map", "[outv]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+            "-map", "[outv]", "-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p",
             "-r", str(fps), "-frames:v", str(transition_frames), str(out_path),
         ])
     finally:
         tail_path.unlink(missing_ok=True)
         head_path.unlink(missing_ok=True)
+        Path(tail_path.with_suffix(".ass")).unlink(missing_ok=True)
+        Path(head_path.with_suffix(".ass")).unlink(missing_ok=True)
 
 
 def encode_segment(
-    segment: dict, index: int, width: int, height: int, fps: int, work_dir: Path
+    segment: dict, index: int, width: int, height: int, fps: int, work_dir: Path,
+    crf: int = 16, preset: str = "veryfast",
+    captions: list[dict] | None = None, default_style: dict | None = None,
 ) -> Path:
     out_path = work_dir / f"seg_{index:04d}.ts"
     if segment["kind"] == "transition":
-        _build_transition_segment(segment, index, width, height, fps, work_dir, out_path)
+        _build_transition_segment(segment, index, width, height, fps, work_dir, out_path, crf, preset, captions, default_style)
     else:
-        _encode_segment_to_path(segment, out_path, width, height, fps)
+        _encode_segment_to_path(segment, out_path, width, height, fps, crf, preset, captions, default_style)
     return out_path
 
 
@@ -2761,7 +3166,11 @@ def _batch_render_motion_graphics(items: list[dict], public_dir: Path, work_dir:
     it finishes (see that script), which turns into `engine.report_progress`
     calls across export's 5%-10% band — without this, a timeline with
     several Tier 2/4/5 clips in a row reports nothing for the whole batch's
-    wall-clock time, reading as the export hanging."""
+    wall-clock time, reading as the export hanging. It also prints one
+    `GL_RENDERER <angle|swiftshader>` line right after Chromium actually
+    launches (see `openBrowserWithGpuFallback` there), surfaced here as a
+    one-time progress detail so a user can tell whether this export's
+    motion-graphics rendering is GPU-accelerated or fell back to software."""
     if not items:
         return {}
     _ensure_motion_engine_ready()
@@ -2800,7 +3209,20 @@ def _batch_render_motion_graphics(items: list[dict], public_dir: Path, work_dir:
 
         assert process.stdout is not None
         for line in process.stdout:
-            match = re.match(r"PROGRESS (\d+) (\d+)", line.strip())
+            stripped = line.strip()
+            # One-time confirmation of which OpenGL renderer Chromium actually
+            # launched with (see batch-render.mjs's `openBrowserWithGpuFallback`)
+            # — visible so a user watching an export, or comparing timings
+            # across machines, can tell "GPU-accelerated" from "software
+            # fallback" instead of the two looking identical from the
+            # progress bar alone, same reasoning as `_ENCODER_LABELS` below
+            # for the final pass's own hardware-encoder confirmation.
+            gl_match = re.match(r"GL_RENDERER (\S+)", stripped)
+            if gl_match:
+                label = "GPU-accelerated (angle)" if gl_match.group(1) == "angle" else "software rendering, no usable GPU found"
+                engine.report_progress(5, "Preparing export", f"Motion-graphics rendering: {label}")
+                continue
+            match = re.match(r"PROGRESS (\d+) (\d+)", stripped)
             if match:
                 done, total = int(match.group(1)), max(1, int(match.group(2)))
                 percent = 5 + round((done / total) * 5)
@@ -2843,11 +3265,26 @@ def run(manifest_path: Path, output_path: Path) -> None:
     captions = manifest.get("captions", [])
     narration_audio_path = manifest["narrationAudioPath"]
     narration_offset_seconds = max(0.0, float(manifest.get("narrationOffsetSeconds", 0.0)))
+    burn_captions = bool(manifest.get("burnCaptions", True))
+    write_srt = bool(manifest.get("writeSrt", False))
+    # Read up front (used to be parsed AFTER the segment ThreadPoolExecutor
+    # loop below had already run, when only the final pass's own re-encode
+    # honored them) — now needed before that loop starts: captions burn into
+    # each segment's own encode (see `captions_for_segment_window`'s doc
+    # comment) rather than the final pass, so each segment's own encode is
+    # the only generation that ever happens, and it has to use the real
+    # setting rather than a hardcoded intermediate placeholder.
+    crf = int(manifest.get("crf", 18))
+    preset = str(manifest.get("preset", "fast"))
+    has_captions = bool(captions) and burn_captions
+    default_style = (manifest.get("captionDefaultStyle") or _FALLBACK_CAPTION_STYLE) if has_captions else None
 
     if duration_seconds <= 0:
         raise ValueError("Timeline has no duration to export.")
 
     work_dir = manifest_path.parent
+    if write_srt and captions:
+        write_captions_srt(captions, work_dir / "captions.srt")
     try:
         segments = build_segments(stills, duration_seconds)
         if not segments:
@@ -2874,6 +3311,12 @@ def run(manifest_path: Path, output_path: Path) -> None:
         # its own separate file, where a cross-fade/slide/zoom-blur has nothing
         # meaningful to mean.
         segments = expand_join_transitions(segments, fps)
+        # Every segment's real [start, end) window on the FINAL exported
+        # timeline, used below to slice `captions` per segment (see
+        # `captions_for_segment_window`) — must run after both
+        # `assign_frame_counts` and `expand_join_transitions`, i.e. once
+        # `frames` is final for every segment (transitions included).
+        assign_absolute_windows(segments, fps)
 
         # Pre-render every motion-graphic clip this early scan can see in one
         # batched pass — see `_batch_render_motion_graphics`'s doc comment for
@@ -3004,13 +3447,31 @@ def run(manifest_path: Path, output_path: Path) -> None:
         # Each segment is an independent ffmpeg process (its own frame range,
         # nothing shared with its neighbors), so encoding them concurrently
         # instead of one-at-a-time is a straightforward, safe way to cut export
-        # wall-clock time on multi-still timelines.
-        worker_count = min(len(segments), max(1, os.cpu_count() or 1), MAX_ENCODE_WORKERS)
+        # wall-clock time on multi-still timelines — bounded by whichever of
+        # CPU count or real available memory is more restrictive (see
+        # `_memory_aware_worker_cap`'s own comment on why the CPU-only cap
+        # alone isn't safe on every machine).
+        worker_count = min(
+            len(segments), max(1, os.cpu_count() or 1), MAX_ENCODE_WORKERS,
+            _memory_aware_worker_cap(width, height),
+        )
         completed = 0
         completed_lock = threading.Lock()
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
             futures = [
-                pool.submit(encode_segment, segment, index, width, height, fps, work_dir)
+                pool.submit(
+                    encode_segment, segment, index, width, height, fps, work_dir, crf, preset,
+                    # Sliced to this segment's own real [start, end) window on
+                    # the final timeline (see `assign_absolute_windows`) — []
+                    # rather than a real slice when `has_captions` is False so
+                    # `_encode_segment_to_path` never writes a per-segment
+                    # .ass file at all, matching `burnCaptions: false`'s old
+                    # behavior of skipping caption burn-in entirely.
+                    captions_for_segment_window(
+                        captions, segment["_absoluteStartSeconds"], segment["_absoluteEndSeconds"]
+                    ) if has_captions else [],
+                    default_style,
+                )
                 for index, segment in enumerate(segments, start=1)
             ]
 
@@ -3044,19 +3505,6 @@ def run(manifest_path: Path, output_path: Path) -> None:
         narration_volume_percent = float(manifest.get("narrationVolumePercent", 100.0))
         narration_trim_start = max(0.0, float(manifest.get("narrationTrimStartSeconds", 0.0)))
         narration_trim_end = max(0.0, float(manifest.get("narrationTrimEndSeconds", 0.0)))
-        burn_captions = bool(manifest.get("burnCaptions", True))
-        write_srt = bool(manifest.get("writeSrt", False))
-        crf = int(manifest.get("crf", 18))
-        preset = str(manifest.get("preset", "fast"))
-
-        if write_srt and captions:
-            write_captions_srt(captions, work_dir / "captions.srt")
-
-        ass_path = work_dir / "captions.ass"
-        has_captions = bool(captions) and burn_captions
-        if has_captions:
-            default_style = manifest.get("captionDefaultStyle") or _FALLBACK_CAPTION_STYLE
-            write_captions_ass(captions, ass_path, width, height, default_style)
 
         engine.report_progress(72, "Rendering video", "Muxing audio and captions")
 
@@ -3132,18 +3580,23 @@ def run(manifest_path: Path, output_path: Path) -> None:
             graph_parts.append(f"{mixed_label}apad[aout]")
             final_audio_label = "[aout]"
 
-        video_filter = f"ass='{escape_subtitles_path(ass_path)}':fontsdir='{escape_subtitles_path(_BUNDLED_FONTS_DIR)}'" if has_captions else None
-        # No caption burn-in (and no other global video filter exists yet): every
-        # segment was already encoded at this export's own exact fps/pix_fmt (see
-        # `_encode_segment_to_path`'s own `-r fps`/`-pix_fmt yuv420p` on each
-        # one), so the concatenated video stream needs no further processing at
-        # all — a real `-c:v copy` here is bit-for-bit exact, not an
-        # approximation, and skips a full second full-resolution decode+encode
-        # pass over the ENTIRE video for nothing. Previously this went through
-        # `[0:v]copy[v]` in the filtergraph regardless — a no-op *filter*, but
-        # still one that forces `-c:v libx264` to fully decode and re-encode
-        # every frame right after `_encode_segment_to_path` already encoded it
-        # once, on every single export.
+        # No global video filter — captions are now burned into each
+        # segment's own encode (see the `pool.submit(encode_segment, ...)`
+        # call above and `_encode_segment_to_path`'s `segment_captions`
+        # parameter), not the whole concatenated video here, so this is
+        # always `None`: every segment was already encoded at this export's
+        # own exact fps/pix_fmt/crf/preset (see `_encode_segment_to_path`'s
+        # own `-r fps`/`-pix_fmt yuv420p`/`-crf`/`-preset` on each one), so
+        # the concatenated video stream needs no further processing at all —
+        # a real `-c:v copy` here is bit-for-bit exact, not an approximation,
+        # and skips a full second full-resolution decode+encode pass over the
+        # ENTIRE video for nothing, in every case (not just when captions are
+        # off, as before this moved). Left as a variable (rather than
+        # inlining `None` below) purely so `_final_pass_video_routing`'s own
+        # "is there a global filter" branch stays real, documented code for
+        # whenever a future global pass-level video filter is added, not
+        # dead code that quietly does nothing.
+        video_filter: str | None = None
         audio_graph_parts = graph_parts
 
         def _build_and_run_final_pass() -> None:
@@ -3224,6 +3677,13 @@ def run(manifest_path: Path, output_path: Path) -> None:
 
     for path in segment_paths:
         path.unlink(missing_ok=True)
+    # Per-segment caption .ass files (see `_encode_segment_to_path`'s
+    # `segment_captions` handling) — a sibling of each segment's own .ts,
+    # not tracked in `segment_paths` itself, so cleaned up as its own glob
+    # pass here rather than threading a second path list through the whole
+    # ThreadPoolExecutor loop above just for this.
+    for ass_leftover in work_dir.glob("seg_*.ass"):
+        ass_leftover.unlink(missing_ok=True)
     segments_list_path.unlink(missing_ok=True)
 
     print(f"Output: {output_path}", flush=True)
@@ -3280,7 +3740,10 @@ def run_bundle(manifest_path: Path, destination_dir: Path) -> None:
     clips_dir.mkdir(parents=True, exist_ok=True)
 
     engine.report_progress(5, "Preparing export", f"{len(segments)} clips to render")
-    worker_count = min(len(segments), max(1, os.cpu_count() or 1), MAX_ENCODE_WORKERS)
+    worker_count = min(
+        len(segments), max(1, os.cpu_count() or 1), MAX_ENCODE_WORKERS,
+        _memory_aware_worker_cap(width, height),
+    )
     # Pre-warms the motion-engine install ONCE, single-threaded, before the
     # pool below starts — mirrors `run()`'s own equivalent pre-warm
     # (`_batch_render_motion_graphics`, called before ITS ThreadPoolExecutor).

@@ -111,25 +111,27 @@ export function TimelineView() {
     () => exportState?.kind === "video" && !exportCollapsed,
   );
   const [exportSettings, setExportSettings] = useState<ExportSettingsRecord>({
-    // "No downscaling by default" — 2160p (4K) is the highest offered
-    // option, so a user who never touches this panel never has their
-    // export capped below whatever their source assets can support.
-    resolution: "2160p", quality: "high", captionsMode: "burned-in", includeNarration: true, includeMusic: true,
+    // 1080p — matches what most AI-generated source stills/animations
+    // actually are, so a user who never touches this panel isn't paying
+    // for 4K upscaling work with no extra real detail to show for it.
+    // 720p/4K stay one click away. Quality is always "high" — there's no
+    // user-facing quality picker (see ExportDrawer/PreferencesModal) since
+    // the app's own per-segment encode already avoids the double-generation
+    // loss a "compressed" choice used to exist to trade off against.
+    resolution: "1080p", quality: "high", captionsMode: "burned-in", includeNarration: true, includeMusic: true,
   });
   // Preferences' Export Defaults pre-fill the panel once per mount — after
   // that the user's own picks in this session take priority, so this must
   // not re-run on every settings change.
   useEffect(() => {
     void (async () => {
-      const [resolution, quality, captionsMode] = await Promise.all([
+      const [resolution, captionsMode] = await Promise.all([
         projectsClient.getAppSetting("export_default_resolution"),
-        projectsClient.getAppSetting("export_default_quality"),
         projectsClient.getAppSetting("export_default_captions"),
       ]);
       setExportSettings((current) => ({
         ...current,
         resolution: (resolution as ExportSettingsRecord["resolution"]) || current.resolution,
-        quality: (quality as ExportSettingsRecord["quality"]) || current.quality,
         captionsMode: (captionsMode as ExportSettingsRecord["captionsMode"]) || current.captionsMode,
       }));
     })();

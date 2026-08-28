@@ -285,7 +285,13 @@ def test_build_recipe_zoompan_filter_produces_a_zoompan_chain():
     vf = export_engine.build_recipe_zoompan_filter(_neutral_recipe(), 1920, 1080, 24, 3.0, 72)
     assert "zoompan=" in vf
     assert "d=72" in vf
-    assert "s=1920x1080" in vf
+    # zoompan itself targets 2x the real output size, followed by an
+    # explicit high-quality downscale to the true target — see
+    # `_zoompan_hq_output`'s own comment on why (a real, reproduced "1080p
+    # looks blurry" bug: zoompan's own internal resize has no quality
+    # control, so the real precision downscale is handed to `scale` instead).
+    assert "s=3840x2160" in vf
+    assert "scale=1920:1080:flags=lanczos" in vf
     assert "fps=24" in vf
 
 
@@ -418,6 +424,7 @@ def test_encode_segment_routes_a_simple_video_recipe_through_ffmpeg_native(tmp_p
 def test_encode_segment_applies_vignette_via_filter_complex_on_ffmpeg_native_path(tmp_path, monkeypatch):
     monkeypatch.setattr(export_engine, "_render_motion_graphic", lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not call Remotion")))
     monkeypatch.setattr(export_engine, "_ensure_vignette_mask", lambda mask_dir, width, height, vignette: mask_dir / "mask.png")
+    monkeypatch.setattr(export_engine, "_detect_opencl_vignette_support", lambda: False)
     calls = []
     monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
 
@@ -485,16 +492,19 @@ def test_vignette_mask_geometry_higher_vignette_widens_the_falloff_band():
 
 
 def test_apply_vignette_filter_returns_plain_vf_unchanged_when_no_vignette(tmp_path):
-    extra_inputs, video_args = export_engine._apply_vignette_filter("zoompan=z=1", 0.0, 1920, 1080, 4.0, tmp_path)
+    pre_args, extra_inputs, video_args = export_engine._apply_vignette_filter("zoompan=z=1", 0.0, 1920, 1080, 24, 4.0, tmp_path)
+    assert pre_args == []
     assert extra_inputs == []
     assert video_args == ["-vf", "zoompan=z=1"]
 
 
 def test_apply_vignette_filter_builds_a_second_input_and_filter_complex(tmp_path, monkeypatch):
     monkeypatch.setattr(export_engine, "_ensure_vignette_mask", lambda mask_dir, width, height, vignette: tmp_path / "mask.png")
+    monkeypatch.setattr(export_engine, "_detect_opencl_vignette_support", lambda: False)
 
-    extra_inputs, video_args = export_engine._apply_vignette_filter("zoompan=z=1", 0.3, 1920, 1080, 4.0, tmp_path)
+    pre_args, extra_inputs, video_args = export_engine._apply_vignette_filter("zoompan=z=1", 0.3, 1920, 1080, 24, 4.0, tmp_path)
 
+    assert pre_args == []
     assert extra_inputs == ["-loop", "1", "-t", "4.000", "-i", str(tmp_path / "mask.png")]
     assert video_args[0] == "-filter_complex"
     assert "[0:v]zoompan=z=1,format=gbrp[_vgz]" in video_args[1]
@@ -513,8 +523,9 @@ def test_apply_vignette_filter_blends_in_rgb_not_yuv_to_avoid_green_chroma_cast(
     # scales R/G/B together and only dims brightness, before converting back
     # to yuv420p for encoding.
     monkeypatch.setattr(export_engine, "_ensure_vignette_mask", lambda mask_dir, width, height, vignette: tmp_path / "mask.png")
+    monkeypatch.setattr(export_engine, "_detect_opencl_vignette_support", lambda: False)
 
-    _, video_args = export_engine._apply_vignette_filter("zoompan=z=1", 0.3, 1920, 1080, 4.0, tmp_path)
+    _, _, video_args = export_engine._apply_vignette_filter("zoompan=z=1", 0.3, 1920, 1080, 24, 4.0, tmp_path)
 
     filter_graph = video_args[1]
     # Both the clip and the mask must be converted to gbrp BEFORE the
@@ -525,6 +536,146 @@ def test_apply_vignette_filter_blends_in_rgb_not_yuv_to_avoid_green_chroma_cast(
     assert "[_vgz][_vgm]blend=all_mode=multiply" in blend_stage
     # Only converted back to yuv420p AFTER the blend, for the encoder.
     assert blend_stage.endswith("format=yuv420p[_vgout]")
+
+
+def test_apply_vignette_filter_appends_ass_clause_when_no_vignette(tmp_path):
+    _, _, video_args = export_engine._apply_vignette_filter(
+        "zoompan=z=1", 0.0, 1920, 1080, 24, 4.0, tmp_path, ",ass='x.ass':fontsdir='f'",
+    )
+    assert video_args == ["-vf", "zoompan=z=1,ass='x.ass':fontsdir='f'"]
+
+
+def test_apply_vignette_filter_appends_ass_clause_after_the_vignette_blend(tmp_path, monkeypatch):
+    # Captions burn in AFTER the vignette darkens the frame, right before the
+    # final output label — same stacking order the old whole-timeline
+    # final-pass burn-in used to apply on top of everything.
+    monkeypatch.setattr(export_engine, "_ensure_vignette_mask", lambda mask_dir, width, height, vignette: tmp_path / "mask.png")
+    monkeypatch.setattr(export_engine, "_detect_opencl_vignette_support", lambda: False)
+
+    _, _, video_args = export_engine._apply_vignette_filter(
+        "zoompan=z=1", 0.3, 1920, 1080, 24, 4.0, tmp_path, ",ass='x.ass':fontsdir='f'",
+    )
+
+    filter_graph = video_args[1]
+    assert filter_graph.endswith("format=yuv420p,ass='x.ass':fontsdir='f'[_vgout]")
+
+
+# --- GPU-accelerated vignette (overlay_opencl) ------------------------------
+# Root-cause coverage for "this rendering is too inefficient" / "use the same
+# strategy CapCut does": the CPU gbrp blend above is provably correct but
+# pays a full-frame RGB colorspace round-trip every frame — measured on a
+# real 4K project at ~2fps. `overlay_opencl` does the same compositing on the
+# GPU (texture blending, no CPU colorspace conversion) at 6-20x the speed,
+# verified pixel-accurate against the CPU path on real content before
+# shipping (see `_apply_vignette_filter`'s own GPU-path comment).
+
+@pytest.fixture(autouse=True)
+def _reset_opencl_vignette_cache():
+    """`_opencl_vignette_cache` is a process-lifetime cache (see
+    `_detect_opencl_vignette_support`'s own comment) — reset it around every
+    test in this module so one test's monkeypatched probe result can never
+    leak into another's, same reasoning as `_reset_hardware_encoder_cache`
+    above for the ffmpeg hardware-encoder caches."""
+    export_engine._opencl_vignette_cache = None
+    yield
+    export_engine._opencl_vignette_cache = None
+
+
+def test_apply_vignette_filter_uses_opencl_overlay_when_gpu_support_detected(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_vignette_mask", lambda mask_dir, width, height, vignette: tmp_path / "mask.png")
+    monkeypatch.setattr(export_engine, "_detect_opencl_vignette_support", lambda: True)
+
+    pre_args, extra_inputs, video_args = export_engine._apply_vignette_filter("zoompan=z=1", 0.3, 1920, 1080, 24, 4.0, tmp_path)
+
+    assert pre_args == ["-init_hw_device", "opencl=ocl"]
+    assert extra_inputs == ["-loop", "1", "-t", "4.000", "-i", str(tmp_path / "mask.png")]
+    filter_graph = video_args[1]
+    assert "hwupload=derive_device=opencl" in filter_graph
+    assert "overlay_opencl" in filter_graph
+    assert "hwdownload" in filter_graph
+    # Both streams resampled to the SAME fps — required for overlay_opencl's
+    # own frame sync between the dynamic base and the static looped mask
+    # (see the function's own comment: omitting this produced real,
+    # verified-wrong pixel output on a real render, not just a theoretical
+    # concern).
+    assert filter_graph.count("fps=24") == 2
+    # format=gbrp / blend=all_mode=multiply is the CPU-only path — must not
+    # appear when the GPU path is taken.
+    assert "gbrp" not in filter_graph
+    assert "blend=all_mode=multiply" not in filter_graph
+
+
+def test_apply_vignette_filter_gpu_path_appends_ass_clause(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_vignette_mask", lambda mask_dir, width, height, vignette: tmp_path / "mask.png")
+    monkeypatch.setattr(export_engine, "_detect_opencl_vignette_support", lambda: True)
+
+    _, _, video_args = export_engine._apply_vignette_filter(
+        "zoompan=z=1", 0.3, 1920, 1080, 24, 4.0, tmp_path, ",ass='x.ass':fontsdir='f'",
+    )
+
+    filter_graph = video_args[1]
+    assert filter_graph.endswith("format=yuv420p,ass='x.ass':fontsdir='f'[_vgout]")
+
+
+def test_opencl_vignette_support_is_probed_once_and_cached(monkeypatch):
+    calls = []
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: (calls.append(1), SimpleNamespace(returncode=0))[1])
+    assert export_engine._detect_opencl_vignette_support() is True
+    assert export_engine._detect_opencl_vignette_support() is True
+    assert len(calls) == 1  # second call reused the cached result, no new probe
+
+
+def test_opencl_vignette_support_false_when_probe_fails(monkeypatch):
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=1))
+    assert export_engine._detect_opencl_vignette_support() is False
+
+
+def test_opencl_vignette_support_false_when_probe_raises(monkeypatch):
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError("no ffmpeg")))
+    assert export_engine._detect_opencl_vignette_support() is False
+
+
+def test_run_segment_ffmpeg_with_vignette_falls_back_to_cpu_when_gpu_render_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_vignette_mask", lambda mask_dir, width, height, vignette: tmp_path / "mask.png")
+    # Set the cache directly (not a mock of the detection function itself) so
+    # `_disable_opencl_vignette`'s real effect on that SAME cache variable is
+    # actually exercised by the retry below — mocking the function itself
+    # would bypass the cache and mask exactly the bug this test is for.
+    export_engine._opencl_vignette_cache = True
+
+    calls = []
+
+    def fake_run_ffmpeg(args):
+        calls.append(args)
+        if len(calls) == 1:
+            raise RuntimeError("ffmpeg failed: OpenCL device not usable on this render")
+        # second (retry) call succeeds
+
+    monkeypatch.setattr(export_engine, "run_ffmpeg", fake_run_ffmpeg)
+
+    export_engine._run_segment_ffmpeg_with_vignette(
+        ["-i", "in.mp4"], "zoompan=z=1", 0.3, 1920, 1080, 24, 4.0, tmp_path, "", ["-o", "out.ts"],
+    )
+
+    assert len(calls) == 2
+    assert "-init_hw_device" in calls[0]  # first attempt: GPU
+    assert "-init_hw_device" not in calls[1]  # retry: real CPU fallback, not just a repeat
+    assert "gbrp" in calls[1][calls[1].index("-filter_complex") + 1]
+    # The GPU path is disabled for the REST of this process after a real
+    # render failure — not just this one retry — so a later segment doesn't
+    # keep re-attempting a doomed GPU render.
+    assert export_engine._opencl_vignette_cache is False
+
+
+def test_run_segment_ffmpeg_with_vignette_raises_a_real_error_when_cpu_path_also_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_vignette_mask", lambda mask_dir, width, height, vignette: tmp_path / "mask.png")
+    monkeypatch.setattr(export_engine, "_detect_opencl_vignette_support", lambda: False)
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: (_ for _ in ()).throw(RuntimeError("real disk-full failure")))
+
+    with pytest.raises(RuntimeError, match="real disk-full failure"):
+        export_engine._run_segment_ffmpeg_with_vignette(
+            ["-i", "in.mp4"], "zoompan=z=1", 0.3, 1920, 1080, 24, 4.0, tmp_path, "", ["-o", "out.ts"],
+        )
 
 
 def test_ensure_vignette_mask_reuses_a_cached_file_across_calls(tmp_path, monkeypatch):
@@ -1221,6 +1372,99 @@ def test_render_motion_graphic_passes_muted_and_bounded_concurrency(tmp_path, mo
     assert any(arg.startswith("--concurrency=") for arg in calls[0])
 
 
+# Root-cause coverage for "what if I use something like CapCut/Clipchamp":
+# Remotion never asked Chromium for GPU acceleration on its own
+# (`DEFAULT_OPENGL_RENDERER` in @remotion/renderer is `null`) — every render
+# fell back to software rasterization. `--gl=angle` requests Chromium's own
+# real GPU compositor; a real launch failure (no usable GPU, broken driver)
+# downgrades to Remotion's documented pure-software "swiftshader" renderer
+# once per process rather than re-attempting a doomed GPU launch per clip.
+def test_render_motion_graphic_requests_gpu_acceleration_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    calls = []
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda args, **k: (calls.append(args), SimpleNamespace(returncode=0, stderr=""))[1])
+
+    media = tmp_path / "still.png"
+    media.write_bytes(b"fake")
+    export_engine._render_motion_graphic(str(media), "image", "Manual: Push In", {}, 48, 24, 1920, 1080, tmp_path / "out.mp4")
+
+    assert "--gl=angle" in calls[0]
+    assert len(calls) == 1  # succeeded on the first (GPU) attempt — no retry
+
+
+def test_render_motion_graphic_falls_back_to_software_when_gpu_launch_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    calls = []
+
+    def fake_run(args, **k):
+        calls.append(args)
+        gl = next(a.split("=", 1)[1] for a in args if a.startswith("--gl="))
+        # Simulate a machine with no usable GPU: "angle" fails to launch,
+        # "swiftshader" (pure software) always works.
+        return SimpleNamespace(returncode=(0 if gl == "swiftshader" else 1), stderr=("" if gl == "swiftshader" else "no GPU"))
+
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+
+    media = tmp_path / "still.png"
+    media.write_bytes(b"fake")
+    export_engine._render_motion_graphic(str(media), "image", "Manual: Push In", {}, 48, 24, 1920, 1080, tmp_path / "out.mp4")
+
+    assert len(calls) == 2
+    assert "--gl=angle" in calls[0]
+    assert "--gl=swiftshader" in calls[1]
+    # Downgrade persists process-wide, so a LATER clip skips the doomed GPU
+    # attempt entirely rather than re-failing it every single time.
+    assert export_engine._gl_renderer_cache == "swiftshader"
+
+    calls.clear()
+    export_engine._render_motion_graphic(str(media), "image", "Manual: Push In", {}, 48, 24, 1920, 1080, tmp_path / "out2.mp4")
+    assert len(calls) == 1
+    assert "--gl=swiftshader" in calls[0]
+
+
+def test_render_motion_graphic_raises_a_real_error_when_both_renderers_fail(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine.subprocess, "run", lambda args, **k: SimpleNamespace(returncode=1, stderr="real failure, unrelated to GL"))
+
+    media = tmp_path / "still.png"
+    media.write_bytes(b"fake")
+    with pytest.raises(RuntimeError, match="real failure, unrelated to GL"):
+        export_engine._render_motion_graphic(str(media), "image", "Manual: Push In", {}, 48, 24, 1920, 1080, tmp_path / "out.mp4")
+
+
+def test_batch_render_motion_graphics_surfaces_the_gl_renderer_as_progress(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "_ensure_motion_engine_ready", lambda: None)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: "node")
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+
+    class FakeProcess:
+        returncode = 0
+        stdout = iter(["GL_RENDERER angle\n", "PROGRESS 1 1\n"])
+        stderr = iter([])
+
+        def wait(self):
+            pass
+
+    monkeypatch.setattr(export_engine.subprocess, "Popen", lambda *a, **k: FakeProcess())
+    (tmp_path / "motion_batch_results.json").write_text(json.dumps([{"id": "0", "ok": True}]), encoding="utf-8")
+
+    reported = []
+    monkeypatch.setattr(export_engine.engine, "report_progress", lambda pct, stage, detail: reported.append(detail))
+
+    export_engine._batch_render_motion_graphics(
+        [{"id": "0", "mediaPath": "a.png", "sourceKind": "image", "recipe": {}, "durationInFrames": 30, "fps": 30, "width": 1920, "height": 1080, "outPath": str(tmp_path / "out.mp4")}],
+        tmp_path, tmp_path,
+    )
+
+    assert any("GPU-accelerated" in detail for detail in reported)
+
+
 def test_remotion_concurrency_divides_cores_across_encode_workers(monkeypatch):
     monkeypatch.setattr(export_engine.os, "cpu_count", lambda: 16)
     assert export_engine._remotion_concurrency() == 16 // export_engine.MAX_ENCODE_WORKERS
@@ -1529,6 +1773,203 @@ def test_write_captions_ass_emits_the_corrected_margin_on_each_dialogue(tmp_path
     assert margin_v < nominal
 
 
+# --- Per-segment caption burn-in (captions_for_segment_window / crf-preset
+# threading) — coverage for moving caption burn-in out of the whole-timeline
+# final pass into each segment's own encode, so a segment's own crf/preset
+# become the only real generation instead of a near-lossless placeholder. ---
+
+def test_captions_for_segment_window_clips_and_shifts_to_local_time():
+    captions = [
+        {"start": 1.0, "end": 2.0, "text": "before"},
+        {"start": 4.5, "end": 6.5, "text": "spans the boundary"},
+        {"start": 9.0, "end": 9.5, "text": "after"},
+    ]
+    sliced = export_engine.captions_for_segment_window(captions, 5.0, 10.0)
+    assert [c["text"] for c in sliced] == ["spans the boundary", "after"]
+    assert sliced[0]["start"] == pytest.approx(0.0)  # clipped to window start, shifted
+    assert sliced[0]["end"] == pytest.approx(1.5)    # 6.5 - 5.0
+    assert sliced[1]["start"] == pytest.approx(4.0)  # 9.0 - 5.0
+    assert sliced[1]["end"] == pytest.approx(4.5)
+
+
+def test_captions_for_segment_window_excludes_non_overlapping_chunks():
+    captions = [{"start": 0.0, "end": 1.0, "text": "way before"}]
+    assert export_engine.captions_for_segment_window(captions, 5.0, 10.0) == []
+
+
+def test_captions_for_segment_window_includes_a_boundary_spanning_caption_in_both_neighbors():
+    # The same source chunk overlaps two adjacent segment windows — both
+    # slices must include it (clipped to their own window), so burning it
+    # into both segments' own encodes reproduces one continuous caption
+    # across the boundary once they're concatenated.
+    captions = [{"start": 4.0, "end": 6.0, "text": "spans"}]
+    left = export_engine.captions_for_segment_window(captions, 0.0, 5.0)
+    right = export_engine.captions_for_segment_window(captions, 5.0, 10.0)
+    assert len(left) == 1 and left[0]["start"] == pytest.approx(4.0) and left[0]["end"] == pytest.approx(5.0)
+    assert len(right) == 1 and right[0]["start"] == pytest.approx(0.0) and right[0]["end"] == pytest.approx(1.0)
+
+
+def test_captions_for_segment_window_shifts_word_level_karaoke_timing_unfiltered():
+    captions = [{
+        "start": 4.0, "end": 6.0, "text": "hello there",
+        "words": [{"start": 4.0, "text": "hello"}, {"start": 5.0, "text": "there"}],
+    }]
+    sliced = export_engine.captions_for_segment_window(captions, 5.0, 10.0)
+    assert len(sliced) == 1
+    # Every word's own start shifts by the same window offset as the chunk,
+    # unfiltered here — _karaoke_dialogue_lines' own
+    # max(word.start, clip_start)/min(seg_end, clip_end) clamping is what
+    # actually collapses the now-negative first word to a skipped segment.
+    assert [w["start"] for w in sliced[0]["words"]] == [pytest.approx(-1.0), pytest.approx(0.0)]
+
+
+def test_assign_absolute_windows_matches_cumulative_frame_position_across_kinds():
+    segments = [
+        {"kind": "image", "frames": 30},
+        {"kind": "transition", "frames": 6},
+        {"kind": "image", "frames": 24},
+    ]
+    export_engine.assign_absolute_windows(segments, fps=30)
+    assert (segments[0]["_absoluteStartSeconds"], segments[0]["_absoluteEndSeconds"]) == (0.0, 1.0)
+    assert (segments[1]["_absoluteStartSeconds"], segments[1]["_absoluteEndSeconds"]) == (1.0, 1.2)
+    assert (segments[2]["_absoluteStartSeconds"], segments[2]["_absoluteEndSeconds"]) == (1.2, 2.0)
+
+
+def test_encode_segment_to_path_burns_captions_and_honors_real_crf_preset_on_plain_image(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
+
+    segment = {
+        "kind": "image", "path": "/tmp/still.png", "start": 0.0, "end": 3.0, "frames": 72,
+        "transitionIn": "cut", "transitionOut": "cut",
+    }
+    captions = [{"start": 0.0, "end": 1.0, "text": "hi"}]
+    export_engine._encode_segment_to_path(
+        segment, tmp_path / "out.ts", 1920, 1080, 24,
+        crf=22, preset="fast", segment_captions=captions, default_style=None,
+    )
+
+    args = calls[0]
+    assert args[args.index("-crf") + 1] == "22"
+    assert args[args.index("-preset") + 1] == "fast"
+    vf = args[args.index("-vf") + 1]
+    assert ",ass='" in vf and vf.rstrip().endswith("'")
+    assert (tmp_path / "out.ass").exists()
+
+
+def test_encode_segment_to_path_writes_no_ass_file_when_no_captions_overlap(tmp_path, monkeypatch):
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: None)
+    segment = {
+        "kind": "image", "path": "/tmp/still.png", "start": 0.0, "end": 3.0, "frames": 72,
+        "transitionIn": "cut", "transitionOut": "cut",
+    }
+    export_engine._encode_segment_to_path(segment, tmp_path / "out.ts", 1920, 1080, 24)
+    assert not (tmp_path / "out.ass").exists()
+
+
+def test_encode_segment_to_path_burns_captions_on_a_black_segment(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
+    segment = {"kind": "black", "start": 0.0, "end": 1.0, "frames": 24}
+    captions = [{"start": 0.0, "end": 0.5, "text": "hi"}]
+    export_engine._encode_segment_to_path(
+        segment, tmp_path / "out.ts", 1920, 1080, 24, segment_captions=captions,
+    )
+    args = calls[0]
+    assert "-vf" in args
+    # Leading comma stripped for the black branch, which otherwise has no
+    # base -vf chain to append the clause onto.
+    assert args[args.index("-vf") + 1].startswith("ass=")
+
+
+def test_encode_segment_to_path_burns_captions_on_plain_video(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: calls.append(args))
+    segment = {
+        "kind": "video", "path": "/tmp/clip.mp4", "start": 0.0, "end": 2.0, "frames": 48,
+        "transitionIn": "cut", "transitionOut": "cut",
+    }
+    captions = [{"start": 0.0, "end": 1.0, "text": "hi"}]
+    export_engine._encode_segment_to_path(
+        segment, tmp_path / "out.ts", 1920, 1080, 24, segment_captions=captions,
+    )
+    vf = calls[0][calls[0].index("-vf") + 1]
+    assert ",ass='" in vf
+
+
+def test_build_transition_segment_burns_the_same_captions_into_both_tail_and_head(tmp_path, monkeypatch):
+    encode_calls = []
+
+    def fake_encode(segment, out_path, width, height, fps, crf=16, preset="veryfast", segment_captions=None, default_style=None):
+        encode_calls.append((crf, preset, segment_captions, default_style))
+        out_path.write_bytes(b"fake")
+
+    monkeypatch.setattr(export_engine, "_encode_segment_to_path", fake_encode)
+    monkeypatch.setattr(export_engine, "run_ffmpeg", lambda args: None)
+
+    segment_a = {"kind": "video", "path": "/tmp/a.mp4", "start": 0.0, "end": 4.0, "frames": 96, "_originalFrames": 96}
+    segment_b = {"kind": "image", "path": "/tmp/b.png", "start": 4.0, "end": 7.0, "frames": 60, "_originalFrames": 72}
+    transition = {"kind": "transition", "frames": 12, "transitionType": "cross-fade", "segmentA": segment_a, "segmentB": segment_b}
+    captions = [{"start": 0.0, "end": 0.3, "text": "hi"}]
+    style = {"fontFamily": "Rubik"}
+
+    export_engine._build_transition_segment(
+        transition, 3, 1920, 1080, 24, tmp_path, tmp_path / "seg_0003.ts",
+        crf=20, preset="medium", segment_captions=captions, default_style=style,
+    )
+
+    assert len(encode_calls) == 2
+    for crf, preset, caps, sty in encode_calls:
+        assert (crf, preset, caps, sty) == (20, "medium", captions, style)
+
+
+def test_run_burns_captions_per_segment_so_the_final_pass_stream_copies(tmp_path, monkeypatch):
+    # End-to-end coverage that captions no longer trigger a whole-timeline
+    # re-encode in the final pass: each segment burns its own caption slice
+    # (see captions_for_segment_window / _encode_segment_to_path's
+    # segment_captions parameter), so the final pass has no global video
+    # filter left and stream-copies, in every case — not just when captions
+    # happen to be off.
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({
+        "width": 1920, "height": 1080, "fps": 30, "durationSeconds": 3.0,
+        "stills": [{"imagePath": "/tmp/a.png", "start": 0.0, "end": 3.0}],
+        "narrationAudioPath": "/tmp/narration.wav",
+        "captions": [{"start": 0.5, "end": 1.5, "text": "hello"}],
+        "crf": 21, "preset": "medium",
+    }), encoding="utf-8")
+    output_path = tmp_path / "output.mp4"
+
+    encode_calls = []
+
+    def fake_encode_segment(segment, index, width, height, fps, work_dir, crf, preset, captions, default_style):
+        encode_calls.append((crf, preset, captions, default_style))
+        seg_path = work_dir / f"seg_{index:04d}.ts"
+        seg_path.write_bytes(b"x")
+        return seg_path
+
+    final_pass_calls = []
+    monkeypatch.setattr(export_engine, "encode_segment", fake_encode_segment)
+    monkeypatch.setattr(export_engine, "run_final_pass", lambda args, duration: final_pass_calls.append(args))
+
+    export_engine.run(manifest_path, output_path)
+
+    assert len(encode_calls) == 1  # the whole 3s duration is one still/segment
+    crf, preset, captions, default_style = encode_calls[0]
+    assert (crf, preset) == (21, "medium")
+    assert captions == [{"start": 0.5, "end": 1.5, "text": "hello"}]
+    assert default_style == export_engine._FALLBACK_CAPTION_STYLE
+
+    args = final_pass_calls[0]
+    # "-map 0:v" (not "[v]") and "-c:v copy" together are
+    # `_final_pass_video_routing`'s stream-copy path — no video re-encode.
+    # (A "-filter_complex" is still present for the narration audio's own
+    # volume/trim graph — unrelated to video, so not asserted against here.)
+    assert args[args.index("-map") + 1] == "0:v"
+    assert args[args.index("-c:v") + 1] == "copy"
+    assert not any(isinstance(a, str) and "ass=" in a for a in args)
+
+
 # Root-cause coverage for "the cross fade transition when rendered shows a
 # jitter on the screen as well ... I don't see it in the preview it only
 # happens in the fully rendered video". "cross-fade" used to map onto
@@ -1625,15 +2066,18 @@ def test_build_recipe_zoompan_filter_defaults_motion_frames_to_the_render_length
 
 @pytest.fixture(autouse=True)
 def _reset_hardware_encoder_cache():
-    """`_hw_encoder_cache`/`_hwaccel_decode_cache` are process-lifetime
-    caches (see `_detect_hardware_encoder`/`_detect_hwaccel_decode`'s own
-    comments on why) — reset them around every test in this module so one
-    test's monkeypatched probe result can never leak into another's."""
+    """`_hw_encoder_cache`/`_hwaccel_decode_cache`/`_gl_renderer_cache` are
+    process-lifetime caches (see `_detect_hardware_encoder`/
+    `_detect_hwaccel_decode`/`_render_motion_graphic`'s own comments on why)
+    — reset them around every test in this module so one test's monkeypatched
+    probe result can never leak into another's."""
     export_engine._hw_encoder_cache = None
     export_engine._hwaccel_decode_cache = None
+    export_engine._gl_renderer_cache = None
     yield
     export_engine._hw_encoder_cache = None
     export_engine._hwaccel_decode_cache = None
+    export_engine._gl_renderer_cache = None
 
 
 def test_detect_hardware_encoder_returns_the_first_working_candidate(monkeypatch):
@@ -1715,6 +2159,52 @@ def test_final_pass_video_routing_filters_and_encodes_when_captions_are_burned_i
     assert video_map_args == ["-map", "[v]"]
     assert video_encode_args[:2] == ["-c:v", "libx264"]
     assert video_encode_args[-2:] == ["-r", "30"]
+
+
+# --- Memory-aware worker cap (`_memory_aware_worker_cap`) -------------------
+# Root-cause coverage for a real crashed export on a real project (112
+# stills, 3840x2160, 610 captions): scaling MAX_ENCODE_WORKERS to core count
+# alone (worker-scaling change) let 15 concurrent 4K workers start on a
+# 32GB machine that could only actually sustain a handful at once — the
+# export died with only ~2.8GB free while several workers were still past
+# 2GB each. `_wait_for_memory_headroom`'s own per-call snapshot check didn't
+# prevent this (it only ever asks "is there room for ONE more worker right
+# now", not "will the ones already running keep growing past this"), so the
+# worker COUNT itself needs its own memory-derived ceiling, checked once up
+# front before any of them start.
+
+def test_memory_aware_worker_cap_allows_several_workers_with_plenty_of_ram(monkeypatch):
+    monkeypatch.setattr(export_engine, "_available_memory_bytes", lambda: 32_000_000_000)
+    cap = export_engine._memory_aware_worker_cap(3840, 2160)
+    assert cap >= 5  # (32GB - 2GB margin) / 2.8GB-per-4K-worker ~= 10
+
+
+def test_memory_aware_worker_cap_drops_to_one_never_zero_when_ram_is_critically_low(monkeypatch):
+    monkeypatch.setattr(export_engine, "_available_memory_bytes", lambda: 500_000_000)
+    assert export_engine._memory_aware_worker_cap(3840, 2160) == 1
+
+
+def test_memory_aware_worker_cap_scales_down_for_a_smaller_export_resolution(monkeypatch):
+    # 1080p is a quarter the pixels of 4K, so its estimated per-worker cost
+    # is a quarter too (floored, not literally zero) — same free RAM allows
+    # noticeably more concurrent 1080p workers than 4K ones.
+    monkeypatch.setattr(export_engine, "_available_memory_bytes", lambda: 12_000_000_000)
+    cap_4k = export_engine._memory_aware_worker_cap(3840, 2160)
+    cap_1080p = export_engine._memory_aware_worker_cap(1920, 1080)
+    assert cap_1080p > cap_4k
+
+
+def test_memory_aware_worker_cap_falls_back_to_cpu_cap_when_memory_is_unreadable(monkeypatch):
+    monkeypatch.setattr(export_engine, "_available_memory_bytes", lambda: None)
+    assert export_engine._memory_aware_worker_cap(3840, 2160) == export_engine.MAX_ENCODE_WORKERS
+
+
+def test_memory_aware_worker_cap_matches_the_real_crash_scenario(monkeypatch):
+    # The actual numbers observed on the machine that crashed: ~2.8GB free
+    # with 15 already-running 4K workers. Confirms the fix would have capped
+    # well below 15 up front rather than letting that many start.
+    monkeypatch.setattr(export_engine, "_available_memory_bytes", lambda: 2_800_000_000)
+    assert export_engine._memory_aware_worker_cap(3840, 2160) < 15
 
 
 # --- Memory-exhaustion resilience (run_ffmpeg's retry/backpressure) --------
@@ -2027,7 +2517,7 @@ def test_cleanup_transient_export_artifacts_removes_known_patterns_only(tmp_path
     (tmp_path / "seg_0001.ts").write_bytes(b"x")
     (tmp_path / "seg_0002_a.ts").write_bytes(b"x")
     (tmp_path / "segments.txt").write_text("x", encoding="utf-8")
-    (tmp_path / "captions.ass").write_text("x", encoding="utf-8")
+    (tmp_path / "seg_0001.ass").write_text("x", encoding="utf-8")  # per-segment caption burn-in
     (tmp_path / "_vignette_mask_480x270_0.300.png").write_bytes(b"x")
     keep = tmp_path / "output.mp4"  # never a transient artifact — must survive
     keep.write_bytes(b"x")
@@ -2050,7 +2540,7 @@ def test_run_cleans_up_transient_artifacts_when_the_final_pass_fails(tmp_path, m
     }), encoding="utf-8")
     output_path = tmp_path / "output.mp4"
 
-    def fake_encode_segment(segment, index, width, height, fps, work_dir):
+    def fake_encode_segment(segment, index, width, height, fps, work_dir, crf, preset, captions, default_style):
         seg_path = work_dir / f"seg_{index:04d}.ts"
         seg_path.write_bytes(b"x")
         return seg_path

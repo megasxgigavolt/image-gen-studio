@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle2, Clock, Download, FolderOpen, LoaderCircle, Minimize2, Play, Square, X } from "lucide-react";
-import type { ExportCaptionsMode, ExportQuality, ExportResolution, ExportSettingsRecord } from "../infrastructure/projects-client";
+import type { ExportCaptionsMode, ExportResolution, ExportSettingsRecord } from "../infrastructure/projects-client";
 
 type ExportResult = { kind: "success"; path: string } | { kind: "failure"; error: string };
 
@@ -9,11 +9,10 @@ const RESOLUTION_OPTIONS: { value: ExportResolution; label: string }[] = [
   { value: "1080p", label: "1080p" },
   { value: "2160p", label: "4K" },
 ];
-const QUALITY_OPTIONS: { value: ExportQuality; label: string }[] = [
-  { value: "compressed", label: "Compressed" },
-  { value: "balanced", label: "Balanced" },
-  { value: "high", label: "High" },
-];
+// No quality picker — every export always uses the app's own best-quality
+// encode (see ExportSettingsRecord.quality, hardcoded to "high") rather than
+// exposing a "compressed"/"balanced" choice that could silently trade away
+// quality a user never meant to give up.
 const CAPTIONS_MODE_OPTIONS: { value: ExportCaptionsMode; label: string }[] = [
   { value: "burned-in", label: "Burned-in" },
   { value: "srt", label: "SRT only" },
@@ -155,16 +154,6 @@ export function ExportDrawer({
                 <div className="tl-preset-grid three">
                   {RESOLUTION_OPTIONS.map(({ value, label }) => (
                     <button key={value} className={settings.resolution === value ? "tl-preset-btn active" : "tl-preset-btn"} onClick={() => onSettingsChange({ resolution: value })}>
-                      <span>{label}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="tl-inspector-group">
-                <span className="tl-inspector-label">Quality</span>
-                <div className="tl-preset-grid three">
-                  {QUALITY_OPTIONS.map(({ value, label }) => (
-                    <button key={value} className={settings.quality === value ? "tl-preset-btn active" : "tl-preset-btn"} onClick={() => onSettingsChange({ quality: value })}>
                       <span>{label}</span>
                     </button>
                   ))}

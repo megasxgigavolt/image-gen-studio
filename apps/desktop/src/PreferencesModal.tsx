@@ -1,13 +1,14 @@
 import { useEffect, useState } from "react";
 import { CheckCircle2, FolderOpen, Info, LoaderCircle, X, XCircle } from "lucide-react";
-import { projectsClient, type ExportCaptionsMode, type ExportQuality, type ExportResolution } from "./infrastructure/projects-client";
+import { projectsClient, type ExportCaptionsMode, type ExportResolution } from "./infrastructure/projects-client";
 import { useAppStore } from "./store/app-store";
 
 type TestState = "idle" | "testing" | "ok" | "failed";
 
 const RESOLUTIONS: ExportResolution[] = ["720p", "1080p", "2160p"];
 const RESOLUTION_LABELS: Record<ExportResolution, string> = { "720p": "720p", "1080p": "1080p", "2160p": "4K" };
-const QUALITIES: ExportQuality[] = ["compressed", "balanced", "high"];
+// No quality preference — every export always uses the app's own
+// best-quality encode (see ExportDrawer's own comment on why).
 const CAPTION_MODES: ExportCaptionsMode[] = ["burned-in", "srt", "both"];
 const CAPTION_MODE_LABELS: Record<ExportCaptionsMode, string> = { "burned-in": "Burned-in", srt: "SRT", both: "Both" };
 
@@ -23,9 +24,10 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
   const [appVersion, setAppVersion] = useState("");
   const [saveLocation, setSaveLocation] = useState("");
   const [autosaveInterval, setAutosaveInterval] = useState<AutosaveInterval>("30s");
-  // "No downscaling by default" — 2160p (4K) is the highest offered option.
-  const [exportResolution, setExportResolution] = useState<ExportResolution>("2160p");
-  const [exportQuality, setExportQuality] = useState<ExportQuality>("balanced");
+  // 1080p — matches what most AI-generated source stills/animations
+  // actually are (see ExportSettingsRecord's own default comment); 720p/4K
+  // stay one click away here.
+  const [exportResolution, setExportResolution] = useState<ExportResolution>("1080p");
   const [exportCaptions, setExportCaptions] = useState<ExportCaptionsMode>("burned-in");
   const [openaiConfigured, setOpenaiConfigured] = useState(false);
   const [geminiConfigured, setGeminiConfigured] = useState(false);
@@ -40,12 +42,11 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     void (async () => {
-      const [version, folder, autosave, resolution, quality, captions, testModeSetting, openaiStatus, geminiStatus] = await Promise.all([
+      const [version, folder, autosave, resolution, captions, testModeSetting, openaiStatus, geminiStatus] = await Promise.all([
         projectsClient.getApplicationVersion(),
         projectsClient.getAppSetting("download_folder"),
         projectsClient.getAppSetting("autosave_interval"),
         projectsClient.getAppSetting("export_default_resolution"),
-        projectsClient.getAppSetting("export_default_quality"),
         projectsClient.getAppSetting("export_default_captions"),
         projectsClient.getAppSetting("ai_test_mode"),
         projectsClient.getProviderKeyStatus("openai"),
@@ -55,7 +56,6 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
       setSaveLocation(folder ?? "");
       if (autosave && (AUTOSAVE_INTERVALS as string[]).includes(autosave)) setAutosaveInterval(autosave as AutosaveInterval);
       if (resolution && (RESOLUTIONS as string[]).includes(resolution)) setExportResolution(resolution as ExportResolution);
-      if (quality && (QUALITIES as string[]).includes(quality)) setExportQuality(quality as ExportQuality);
       if (captions && (CAPTION_MODES as string[]).includes(captions)) setExportCaptions(captions as ExportCaptionsMode);
       setTestMode(testModeSetting === "true");
       setOpenaiConfigured(openaiStatus.configured);
@@ -92,7 +92,6 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
         projectsClient.saveAppSetting("download_folder", saveLocation),
         projectsClient.saveAppSetting("autosave_interval", autosaveInterval),
         projectsClient.saveAppSetting("export_default_resolution", exportResolution),
-        projectsClient.saveAppSetting("export_default_quality", exportQuality),
         projectsClient.saveAppSetting("export_default_captions", exportCaptions),
         projectsClient.saveAppSetting("ai_test_mode", testMode ? "true" : "false"),
         openaiKeyDraft.trim() ? projectsClient.saveProviderKey("openai", openaiKeyDraft.trim()) : Promise.resolve(),
@@ -206,14 +205,6 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
               <div className="tl-preset-grid three">
                 {RESOLUTIONS.map((value) => (
                   <button key={value} type="button" className={exportResolution === value ? "tl-preset-btn active" : "tl-preset-btn"} onClick={() => setExportResolution(value)}><span>{RESOLUTION_LABELS[value]}</span></button>
-                ))}
-              </div>
-            </div>
-            <div className="pref-field">
-              <span className="field-heading">Default quality</span>
-              <div className="tl-preset-grid three">
-                {QUALITIES.map((value) => (
-                  <button key={value} type="button" className={exportQuality === value ? "tl-preset-btn active" : "tl-preset-btn"} onClick={() => setExportQuality(value)}><span style={{ textTransform: "capitalize" }}>{value}</span></button>
                 ))}
               </div>
             </div>

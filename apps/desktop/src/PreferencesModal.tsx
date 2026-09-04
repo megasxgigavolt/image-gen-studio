@@ -23,6 +23,7 @@ const AUTOSAVE_INTERVAL_LABELS: Record<AutosaveInterval, string> = { "30s": "30s
 export function PreferencesModal({ onClose }: { onClose: () => void }) {
   const [appVersion, setAppVersion] = useState("");
   const [saveLocation, setSaveLocation] = useState("");
+  const [geminiWatchFolder, setGeminiWatchFolder] = useState("");
   const [autosaveInterval, setAutosaveInterval] = useState<AutosaveInterval>("30s");
   // 1080p — matches what most AI-generated source stills/animations
   // actually are (see ExportSettingsRecord's own default comment); 720p/4K
@@ -42,9 +43,10 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     void (async () => {
-      const [version, folder, autosave, resolution, captions, testModeSetting, openaiStatus, geminiStatus] = await Promise.all([
+      const [version, folder, watchFolder, autosave, resolution, captions, testModeSetting, openaiStatus, geminiStatus] = await Promise.all([
         projectsClient.getApplicationVersion(),
         projectsClient.getAppSetting("download_folder"),
+        projectsClient.getAppSetting("gemini_extension_watch_folder"),
         projectsClient.getAppSetting("autosave_interval"),
         projectsClient.getAppSetting("export_default_resolution"),
         projectsClient.getAppSetting("export_default_captions"),
@@ -54,6 +56,7 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
       ]);
       setAppVersion(version);
       setSaveLocation(folder ?? "");
+      setGeminiWatchFolder(watchFolder ?? "");
       if (autosave && (AUTOSAVE_INTERVALS as string[]).includes(autosave)) setAutosaveInterval(autosave as AutosaveInterval);
       if (resolution && (RESOLUTIONS as string[]).includes(resolution)) setExportResolution(resolution as ExportResolution);
       if (captions && (CAPTION_MODES as string[]).includes(captions)) setExportCaptions(captions as ExportCaptionsMode);
@@ -67,6 +70,11 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
   async function browseSaveLocation() {
     const folder = await projectsClient.pickDownloadFolder();
     if (folder) setSaveLocation(folder);
+  }
+
+  async function browseGeminiWatchFolder() {
+    const folder = await projectsClient.pickDownloadFolder();
+    if (folder) setGeminiWatchFolder(folder);
   }
 
   async function testKey(provider: "openai" | "gemini") {
@@ -90,6 +98,7 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
     try {
       await Promise.all([
         projectsClient.saveAppSetting("download_folder", saveLocation),
+        projectsClient.saveAppSetting("gemini_extension_watch_folder", geminiWatchFolder),
         projectsClient.saveAppSetting("autosave_interval", autosaveInterval),
         projectsClient.saveAppSetting("export_default_resolution", exportResolution),
         projectsClient.saveAppSetting("export_default_captions", exportCaptions),
@@ -197,6 +206,16 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
               </div>
               {testBadge(geminiTest)}
               <small className="tl-source-hint">One Gemini key powers both image generation (Visuals) and animation (Animate/Veo) — they share the same credential in this app.</small>
+            </label>
+
+            <div className="panel-section-heading" style={{ marginTop: "18px" }}><h3>Gemini Chrome Extension</h3></div>
+            <label className="pref-field">
+              <span className="field-heading">Watch folder</span>
+              <div className="pref-path-row">
+                <input type="text" className="tl-text-input" value={geminiWatchFolder} readOnly placeholder="Not set — required to export prompts" />
+                <button type="button" className="secondary" onClick={() => void browseGeminiWatchFolder()}><FolderOpen size={14} />Browse</button>
+              </div>
+              <small className="tl-source-hint">Point this at your Chrome browser's own Downloads folder (check chrome://settings/downloads if unsure) — the extension can only save files there, not to a folder chosen per-batch. The app watches a "gemini-bulk-gen" subfolder inside it.</small>
             </label>
 
             <div className="panel-section-heading" style={{ marginTop: "18px" }}><h3>Export Defaults</h3></div>

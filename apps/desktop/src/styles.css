@@ -862,6 +862,8 @@ textarea{text-align:justify!important}
 .bulk-selection-summary{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 2px;border-bottom:1px solid var(--line);margin-bottom:10px;font-size:12px;color:var(--muted)}
 .bulk-selection-summary>div{display:flex;gap:12px;flex-shrink:0}
 .bulk-scene-list{display:grid;gap:10px;max-height:52vh;overflow:auto;padding-right:2px}
+.bulk-generation-mode-toggle{display:flex;align-items:center;gap:6px;margin-top:10px;font-size:12px;color:var(--muted);cursor:pointer;user-select:none}
+.bulk-generation-mode-toggle input{margin:0}
 .bulk-scene-row{border:1px solid var(--line);border-radius:8px;background:var(--surface-2);overflow:hidden}
 .bulk-scene-row:has(.bulk-scene-checkbox:checked){border-color:color-mix(in srgb,var(--brand) 35%,var(--line))}
 .bulk-scene-row-header{display:flex;align-items:center;gap:10px;padding:10px 12px}

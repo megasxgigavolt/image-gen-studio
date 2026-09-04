@@ -2655,6 +2655,11 @@ function ImagesView() {
   const [references, setReferences] = useState<import("./infrastructure/projects-client").InputAssetRecord[]>([]);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkInstruction, setBulkInstruction] = useState("");
+  // "csv-export" plans via Claude CLI exactly like "api" does, but writes
+  // the result to a CSV for the Gemini Chrome extension instead of
+  // generating images itself. Local UI state, not persisted — each new
+  // request starts back at the default unless the user opts in again.
+  const [bulkGenerationMode, setBulkGenerationMode] = useState<"api" | "csv-export">("api");
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null);
   const [preparingGroupIds, setPreparingGroupIds] = useState<Set<string>>(new Set());
   const [promptPrepStatus, setPromptPrepStatus] = useState<"running" | "paused" | null>(null);
@@ -3236,6 +3241,15 @@ function ImagesView() {
         } else if (result.kind === "planned") {
           setBulkProgress({ current: result.current, total: result.total, label: `Still ${result.current} of ${result.total} planned` });
           continue;
+        } else if (result.kind === "csvExported") {
+          // No image_jobs row exists for a csv-export request — nothing to
+          // hand off to the job-status UI, just stop and report where the
+          // file landed.
+          setBulkPlanStatus(null);
+          setBulkProgress(null);
+          setBulkPlanControl(videoId, "stopped");
+          addToast(`Exported to ${result.csvPath} — upload it into the Gemini Chrome extension`, "success");
+          break;
         }
         // "generationStarted" or "generationInProgress" — this request's
         // planning is done (just now, or from before this session); the
@@ -3515,7 +3529,7 @@ function ImagesView() {
     setError(null);
     try {
       await projectsClient.saveAppSetting(`system_prompt.${activeVideoId}`, systemPrompt);
-      await projectsClient.enqueueBulkGenerationRequest(activeVideoId, systemPrompt, settingsJson, bulkInstruction, orderedBulkSelection);
+      await projectsClient.enqueueBulkGenerationRequest(activeVideoId, systemPrompt, settingsJson, bulkInstruction, orderedBulkSelection, bulkGenerationMode);
       lastBulkSelection.delete(activeVideoId);
       addToast(`${orderedBulkSelection.length} still${orderedBulkSelection.length === 1 ? "" : "s"} added to the Bulk Generation queue`, "success");
       await refreshBulkQueue();
@@ -4248,11 +4262,21 @@ function ImagesView() {
               );
             })}
           </div>
+          <label className="bulk-generation-mode-toggle" title="Plans the same way, but writes the prompts to a CSV file for the Gemini Chrome extension to drive gemini.google.com with, instead of calling the Gemini API here.">
+            <input
+              type="checkbox"
+              checked={bulkGenerationMode === "csv-export"}
+              onChange={(event) => setBulkGenerationMode(event.target.checked ? "csv-export" : "api")}
+            />
+            Export for Gemini Chrome extension (CSV) instead of generating via API
+          </label>
           <button className="primary full" style={{marginTop:"10px"}} onClick={requestEnqueueBulkGeneration} disabled={!orderedBulkSelection.length || !systemPrompt.trim()}>
-            <WandSparkles size={16} />Generate Selected ({bulkSelection.size})
+            <WandSparkles size={16} />{bulkGenerationMode === "csv-export" ? `Export Selected (${bulkSelection.size})` : `Generate Selected (${bulkSelection.size})`}
           </button>
           {!systemPrompt.trim() ? (
             <p style={{fontSize:"11px",color:"#c77a26",margin:"6px 0 0",textAlign:"center"}}>Write a style directive in Global Settings above, or use Extract Style on a reference image, before generating.</p>
+          ) : bulkGenerationMode === "csv-export" ? (
+            <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans the selected stills via Claude CLI, then writes a CSV for the Gemini Chrome extension — upload it there once exported.</p>
           ) : (
             <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans and generates the selected stills in one pausable run — no separate review step. {bulkQueue.some((request) => !["completed", "failed", "cancelled"].includes(request.status)) && "A generation is already in progress — this will queue and start once it's this run's turn."}</p>
           )}

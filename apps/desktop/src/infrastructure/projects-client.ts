@@ -335,18 +335,30 @@ export type BulkGenerationRequestRecord = {
   lastError: string | null;
   createdAt: string;
   updatedAt: string;
+  /** `"csv-export"` plans via Claude CLI exactly like `"api"` does, but
+   * writes the result to a CSV for the Gemini Chrome extension instead of
+   * generating images itself — see GeminiExtensionExport / the Bulk
+   * Generation modal's mode toggle. Frozen at enqueue time like everything
+   * else about the request. */
+  generationMode: "api" | "csv-export";
 };
 
 /** What one `advanceBulkGenerationQueue` call did — drives the queue-runner
  * loop (see `runQueueRunner` in App.tsx): keep calling on `"planned"` (more
  * planning left for the active request), stop and let the existing
  * job-status UI take over on `"generationStarted"`/`"generationInProgress"`,
- * or stop entirely on `"idle"`. */
+ * stop after toasting the CSV path on `"csvExported"`, or stop entirely on
+ * `"idle"`. */
 export type BulkQueueAdvanceResultRecord =
   | { kind: "idle" }
   | { kind: "planned"; requestId: string; current: number; total: number }
   | { kind: "generationStarted"; requestId: string; imageJobId: string }
-  | { kind: "generationInProgress"; requestId: string; imageJobId: string };
+  | { kind: "generationInProgress"; requestId: string; imageJobId: string }
+  | { kind: "csvExported"; requestId: string; csvPath: string };
+
+/** `{total, imported}` counts for one `"csv-export"`-mode request's batch —
+ * see `getCsvExportProgress`. */
+export type CsvExportProgressRecord = { total: number; imported: number };
 
 export type ExportResultRecord = { path: string; fileCount: number };
 export type MotionPreset =
@@ -1362,8 +1374,9 @@ export const projectsClient = {
    * Settings/Roster can never bleed into an already-queued request. */
   async enqueueBulkGenerationRequest(
     videoId: string, styleDirective: string, baseSettingsJson: string, creativeInstruction: string, groupIds: string[],
+    generationMode: "api" | "csv-export" = "api",
   ): Promise<BulkGenerationRequestRecord> {
-    if (isTauri()) return invoke("enqueue_bulk_generation_request", { videoId, styleDirective, baseSettingsJson, creativeInstruction, groupIds });
+    if (isTauri()) return invoke("enqueue_bulk_generation_request", { videoId, styleDirective, baseSettingsJson, creativeInstruction, groupIds, generationMode });
     throw new Error("Bulk generation requires the native application.");
   },
   async listBulkGenerationRequests(videoId: string): Promise<BulkGenerationRequestRecord[]> {
@@ -1386,6 +1399,13 @@ export const projectsClient = {
   async advanceBulkGenerationQueue(videoId: string): Promise<BulkQueueAdvanceResultRecord> {
     if (isTauri()) return invoke("advance_bulk_generation_queue", { videoId });
     throw new Error("Bulk generation requires the native application.");
+  },
+  /** `{total, imported}` for a `"csv-export"`-mode request — polled the
+   * same way `listBulkGenerationRequests` already is, to show "N/M
+   * imported" next to it in the queue list. */
+  async getCsvExportProgress(requestId: string): Promise<CsvExportProgressRecord> {
+    if (isTauri()) return invoke("get_csv_export_progress", { requestId });
+    return { total: 0, imported: 0 };
   },
   async createAnimationJob(videoId: string, clipId: string, resolution: VeoResolution, prompt: string): Promise<AnimationJobRecord> {
     if (isTauri()) return invoke("create_animation_job", { videoId, clipId, resolution, prompt });

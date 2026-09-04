@@ -1,3 +1,4 @@
+use crate::csv_export;
 use crate::session_log;
 use base64::Engine;
 use chrono::Utc;
@@ -956,6 +957,48 @@ CREATE INDEX IF NOT EXISTS idx_single_still_generations_video_status ON single_s
 /// not a jarring reset to some other default.
 const MIGRATION_044: &str = r#"
 ALTER TABLE timeline_clips ADD COLUMN transition_intensity REAL NOT NULL DEFAULT 50.0;
+"#;
+
+/// Lets a bulk generation request be fulfilled by exporting its planned
+/// prompts to a CSV file (for the Gemini Chrome extension pipeline, see
+/// `csv_export.rs`) instead of calling the Gemini API — frozen at enqueue
+/// time like everything else about the request. No `CHECK` here,
+/// deliberately: matches this codebase's existing convention that an
+/// enum-like column added via `ALTER TABLE ADD COLUMN` (e.g.
+/// `image_renders.kind`) is validated in Rust, not SQL — only columns
+/// present in a table's original `CREATE TABLE` get a `CHECK(...)`.
+const MIGRATION_045: &str = r#"
+ALTER TABLE bulk_generation_requests ADD COLUMN generation_mode TEXT NOT NULL DEFAULT 'api';
+"#;
+
+/// One row per line of an exported bulk-generation CSV — the durable
+/// tracking record that lets the folder watcher (`csv_export.rs`)
+/// correlate a file the Chrome extension downloaded back to the still (and
+/// prompt) it came from, and lets a `'edit'`-kind row (a planned follow-up
+/// refinement — see `plan_bulk_visuals_batch_impl`'s `follow_up_edit`
+/// field) know which `'generate'`-kind row's render it should attach to as
+/// its parent once both have imported. `row_order` is what encodes "this
+/// edit continues the immediately-preceding chat" — no separate
+/// reattachment/retargeting logic needed, since an edit row's order is
+/// always exactly its generate row's order + 1 by construction.
+const MIGRATION_046: &str = r#"
+CREATE TABLE IF NOT EXISTS csv_export_rows (
+    id TEXT PRIMARY KEY,
+    bulk_request_id TEXT NOT NULL REFERENCES bulk_generation_requests(id),
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    group_id TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'generate',
+    row_order INTEGER NOT NULL,
+    parent_row_id TEXT REFERENCES csv_export_rows(id),
+    prompt_version_id TEXT NOT NULL REFERENCES prompt_versions(id),
+    prompt_text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'exported',
+    imported_render_id TEXT REFERENCES image_renders(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_csv_export_rows_batch_order ON csv_export_rows(bulk_request_id, row_order);
+CREATE INDEX IF NOT EXISTS idx_csv_export_rows_status ON csv_export_rows(bulk_request_id, status);
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2039,6 +2082,12 @@ pub struct BulkPlannedStill {
     pub reason: String,
     pub settings_locked: bool,
     pub prompt_locked: bool,
+    /// The `prompt_versions.id` this call just created — internal only
+    /// (never sent to the frontend). `'csv-export'`-mode planning needs it
+    /// to link a `csv_export_rows` row back to its prompt; the `'api'` path
+    /// has no use for it.
+    #[serde(skip)]
+    pub pv_id: String,
 }
 
 /// Result of planning (and immediately persisting) ONE batch of stills —
@@ -2096,6 +2145,10 @@ pub struct BulkGenerationRequest {
     pub last_error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// `"api"` (default) or `"csv-export"` — see `MIGRATION_045`'s doc
+    /// comment. Frozen at enqueue time like everything else about the
+    /// request.
+    pub generation_mode: String,
 }
 
 /// Raw `bulk_generation_requests` row, including `snapshot_json` — internal
@@ -2111,6 +2164,7 @@ struct BulkGenerationRequestRow {
     last_error: Option<String>,
     created_at: String,
     updated_at: String,
+    generation_mode: String,
 }
 
 impl BulkGenerationRequestRow {
@@ -2128,6 +2182,7 @@ impl BulkGenerationRequestRow {
             last_error: self.last_error,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            generation_mode: self.generation_mode,
         })
     }
 }
@@ -2137,6 +2192,33 @@ impl BulkGenerationRequestRow {
 /// (more planning left to do), stop and let the existing job-polling UI take
 /// over (generation just started or is already under way), or stop entirely
 /// (nothing queued for this video).
+/// `(total, imported)` counts for one `csv-export`-mode request's batch —
+/// what the Bulk Generation queue UI polls (`get_csv_export_progress`) to
+/// show "N/M imported" next to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CsvExportProgress {
+    pub total: i64,
+    pub imported: i64,
+}
+
+/// One `csv_export_rows` row still awaiting its downloaded image — the
+/// shape `csv_export::spawn_csv_import_watcher` walks per batch. Internal
+/// (never sent to the frontend, unlike `BulkGenerationRequest`).
+pub struct PendingCsvExportRow {
+    pub id: String,
+    pub video_id: String,
+    pub group_id: String,
+    pub kind: String,
+    pub parent_row_id: Option<String>,
+    pub prompt_version_id: String,
+    /// For an `'edit'`-kind row, the raw follow-up instruction (what
+    /// `import_external_render` should pass as `edit_instruction`) — for a
+    /// `'generate'`-kind row, the full assembled prompt, unused at import
+    /// time (only meaningful for the CSV/extension side).
+    pub prompt_text: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum BulkQueueAdvanceResult {
@@ -2144,6 +2226,11 @@ pub enum BulkQueueAdvanceResult {
     Planned { request_id: String, current: i64, total: i64 },
     GenerationStarted { request_id: String, image_job_id: String },
     GenerationInProgress { request_id: String, image_job_id: String },
+    /// A `'csv-export'`-mode request finished planning and its prompts were
+    /// written to `csv_path` instead of starting an `image_jobs` worker —
+    /// see `csv_export.rs`. The request reaches `'completed'` directly;
+    /// there is no generation-phase polling handoff for this outcome.
+    CsvExported { request_id: String, csv_path: String },
 }
 
 /// Result of one `analyze_motion_graphics_batch` call — see that function's
@@ -2772,6 +2859,26 @@ impl ProjectRepository {
         }
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(44, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_generation_mode: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bulk_generation_requests') WHERE name='generation_mode')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_generation_mode {
+            self.connection.execute_batch(MIGRATION_045).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(45, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        self.connection.execute_batch(MIGRATION_046).map_err(|error| error.to_string())?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(46, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -5071,7 +5178,132 @@ Return JSON only — no markdown, no explanation:
             reason: still.reason,
             settings_locked: group.settings_locked,
             prompt_locked: group.prompt_locked,
+            pv_id,
         }))
+    }
+
+    /// Inserts one `csv_export_rows` tracking row — see `MIGRATION_046`'s
+    /// doc comment. `row_order` is assigned as "one past whatever's already
+    /// recorded for this batch," which correctly resumes across multiple
+    /// `plan_bulk_visuals_batch_impl` calls (a request's planning happens
+    /// batch by batch, not all at once) without needing any in-memory
+    /// counter threaded between them.
+    /// `parent_row_id`, when given, must be a `csv_export_rows.id` (i.e. a
+    /// PRIOR call's return value) — not a `prompt_versions.id` — since it's
+    /// an FK into this same table. Returns the new row's own id so the
+    /// caller can pass it as the next call's `parent_row_id` when recording
+    /// a follow-up edit row right after its generate row.
+    fn record_csv_export_row(
+        &self,
+        bulk_request_id: &str,
+        video_id: &str,
+        group_id: &str,
+        kind: &str,
+        parent_row_id: Option<&str>,
+        prompt_version_id: &str,
+        prompt_text: &str,
+    ) -> Result<String, String> {
+        let row_order: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(row_order),-1)+1 FROM csv_export_rows WHERE bulk_request_id=?1",
+            [bulk_request_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO csv_export_rows(id,bulk_request_id,video_id,group_id,kind,row_order,parent_row_id,prompt_version_id,prompt_text,status,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'exported',?10,?10)",
+            params![id, bulk_request_id, video_id, group_id, kind, row_order, parent_row_id, prompt_version_id, prompt_text, now],
+        ).map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    /// Writes every `csv_export_rows` row for `request_id` out to
+    /// `<watch_folder>/gemini-bulk-gen/<request_id>/prompts.csv` — the file
+    /// the Chrome extension is uploaded. Requires the
+    /// `gemini_extension_watch_folder` app setting (distinct from
+    /// `download_folder` — see `csv_export.rs`'s doc comment for why) to
+    /// already be set; there's no sensible fallback the way
+    /// `logs_base_dir()` falls back to `self.projects_dir`, since this path
+    /// must sit inside whatever folder the user's actual Chrome downloads
+    /// land in.
+    pub fn export_bulk_request_to_csv(&self, request_id: &str) -> Result<PathBuf, String> {
+        let watch_folder = self
+            .get_app_setting("gemini_extension_watch_folder")?
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "Set the Gemini extension watch folder in Preferences first.".to_string())?;
+        let mut statement = self.connection.prepare(
+            "SELECT id,kind,prompt_text FROM csv_export_rows WHERE bulk_request_id=?1 ORDER BY row_order"
+        ).map_err(|e| e.to_string())?;
+        let rows: Vec<csv_export::CsvExportRow> = statement
+            .query_map([request_id], |row| {
+                Ok(csv_export::CsvExportRow { id: row.get(0)?, kind: row.get(1)?, prompt: row.get(2)? })
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        if rows.is_empty() {
+            return Err("Nothing was planned for this request — there's nothing to export.".into());
+        }
+        let batch_dir = Path::new(&watch_folder).join("gemini-bulk-gen").join(request_id);
+        csv_export::write_csv_rows(&batch_dir, &rows)
+    }
+
+    /// Every `bulk_request_id` with at least one row still waiting on its
+    /// download — what `csv_export::spawn_csv_import_watcher` polls each
+    /// tick to know which batch subfolders are worth listing.
+    pub fn bulk_requests_awaiting_csv_import(&self) -> Result<Vec<String>, String> {
+        let mut statement = self.connection
+            .prepare("SELECT DISTINCT bulk_request_id FROM csv_export_rows WHERE status='exported'")
+            .map_err(|e| e.to_string())?;
+        let ids = statement.query_map([], |row| row.get(0)).map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        Ok(ids)
+    }
+
+    /// Every still-pending row for one batch, in `row_order` — the watcher
+    /// walks these in order so a generate row's `imported_render_id` is
+    /// always resolved (or the whole batch has none left to try) before its
+    /// following edit row is considered.
+    pub fn pending_csv_export_rows(&self, bulk_request_id: &str) -> Result<Vec<PendingCsvExportRow>, String> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,video_id,group_id,kind,parent_row_id,prompt_version_id,prompt_text FROM csv_export_rows WHERE bulk_request_id=?1 AND status='exported' ORDER BY row_order"
+        ).map_err(|e| e.to_string())?;
+        let rows = statement.query_map([bulk_request_id], |row| Ok(PendingCsvExportRow {
+            id: row.get(0)?, video_id: row.get(1)?, group_id: row.get(2)?, kind: row.get(3)?,
+            parent_row_id: row.get(4)?, prompt_version_id: row.get(5)?, prompt_text: row.get(6)?,
+        })).map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    /// The `image_renders.id` an already-imported row resolved to, if any —
+    /// the watcher uses this to resolve an edit row's `parent_render_id`
+    /// once its generate row has imported.
+    pub fn csv_export_row_imported_render_id(&self, row_id: &str) -> Result<Option<String>, String> {
+        self.connection.query_row(
+            "SELECT imported_render_id FROM csv_export_rows WHERE id=?1", [row_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
+    pub fn mark_csv_export_row_imported(&self, row_id: &str, render_id: &str) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "UPDATE csv_export_rows SET status='imported',imported_render_id=?1,updated_at=?2 WHERE id=?3",
+            params![render_id, now, row_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// `(total, imported)` counts for one request's CSV batch — what the
+    /// Bulk Generation queue UI polls to show "N/M imported" next to a
+    /// `csv-export`-mode request.
+    pub fn csv_export_progress(&self, request_id: &str) -> Result<(i64, i64), String> {
+        self.connection.query_row(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE status='imported') FROM csv_export_rows WHERE bulk_request_id=?1",
+            [request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(|e| e.to_string())
     }
 
     /// Writes (overwriting) a plain-language log of every still's narration
@@ -5142,7 +5374,7 @@ Return JSON only — no markdown, no explanation:
         // the video id itself is a reasonable enough "one run" stand-in.
         self.plan_bulk_visuals_batch_impl(
             video_id, style_directive, base_settings_json, creative_instruction,
-            selected_group_ids, start_index, None, video_id,
+            selected_group_ids, start_index, None, video_id, "api",
         )
     }
 
@@ -5168,6 +5400,7 @@ Return JSON only — no markdown, no explanation:
             request.plan_index as usize,
             Some(&snapshot),
             request_id,
+            &request.generation_mode,
         )?;
         let next_index = if result.done {
             result.total_stills
@@ -5192,6 +5425,7 @@ Return JSON only — no markdown, no explanation:
         start_index: usize,
         snapshot: Option<&BulkRequestSnapshot>,
         run_key: &str,
+        generation_mode: &str,
     ) -> Result<BulkPlanBatchResult, String> {
         #[cfg(not(test))]
         let claude_cli = claude_cli_available();
@@ -5576,6 +5810,14 @@ Return JSON only — no markdown, no explanation:
              - A row with neither field: choose freely from the full list above based on the narration.\n",
             IMAGE_MEDIUM_TYPES.join("; "),
         );
+        // Only ever offered to the model in csv-export mode — the direct-API
+        // path has no consumer for it (the existing separate mask-paint Edit
+        // feature is unrelated and untouched by this).
+        let follow_up_edit_block = if generation_mode == "csv-export" {
+            "\n\nFOLLOW-UP REFINEMENT (optional, use RARELY) — this batch will be generated through a chat-style flow where a still's initial image can be followed, in the SAME conversation, by ONE immediate correction before moving on. For a still where the initial image is genuinely likely to need one specific, narrow fix (e.g. \"remove the text from the sign\", \"make the character's expression more surprised\", \"straighten the horizon\"), set \"followUpEdit\" to that short, concrete instruction. Leave \"followUpEdit\" absent or null for the large majority of stills — only use it for a correctable flaw you can specifically predict, never as a second creative pass, never for a full re-composition (that's a different still, not a follow-up), and never merely to add more detail or polish."
+        } else {
+            ""
+        };
         let prompt = format!(
             r#"You are an Educational Visual Director planning an entire video, not isolated stills.
 {story_context_block}
@@ -5704,9 +5946,11 @@ Allowed visualType values: Character Scene; Character Close-Up / Reaction; Behav
 
 REASON — required per still, written for a production log a human will read afterward, not shown to any downstream generation step: 4-8 sentences explaining, in depth, why you chose this specific userPrompt and these imageSettings. Reference the actual, concrete details that drove each decision — which words/beats in the narration produced the subject/action/environment, how the Style Directive and any MANDATORY CREATIVE RULES shaped the composition, how the Visual Director dials and Diversity & Consistency constraints (if present above) influenced this still relative to its neighbors, and — if this still carried a required or allowed Visualization Type — why the chosen medium satisfies it. Be specific to THIS still, never a generic template sentence.
 
+{follow_up_edit_block}
+
 You MUST return exactly one plan for every row in the current batch.
 OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object and NOTHING else. Do not write any introduction, restatement of the task, narration of your planning process, explanation, commentary, or markdown fences before, between, or after it. Do not describe what you are about to plan — just plan it, silently, and output only the resulting JSON. The very first character of your response must be {{ and the very last character must be }}.
-{{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content — mandatory creative rules embedded; negatives as [Avoid: ...]","reason":"in-depth explanation, see REASON above","coreVisualDevice":"2-6 words naming the concrete symbol/object this still leans on, e.g. 'dice and coin', 'gears', 'split panel: podium vs porch'"}}]}}"#,
+{{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content — mandatory creative rules embedded; negatives as [Avoid: ...]","reason":"in-depth explanation, see REASON above","coreVisualDevice":"2-6 words naming the concrete symbol/object this still leans on, e.g. 'dice and coin', 'gears', 'split panel: podium vs porch'","followUpEdit":null}}]}}"#,
             format!("{}-{}", start_index + 1, chunk_end),
             serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
             serde_json::to_string_pretty(chunk).unwrap_or_default(),
@@ -5814,8 +6058,27 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                     plan.user_prompt = existing.to_string();
                 }
             }
+            // Taken before the move below — persist_bulk_planned_still
+            // consumes `plan` and has no use for this field itself, it's
+            // only meaningful to the csv-export bookkeeping after.
+            let follow_up_edit = plan.follow_up_edit.take();
             if let Some(saved) = self.persist_bulk_planned_still(video_id, &effective_style_directive, group, row, plan)? {
                 last_ordinal = saved.ordinal;
+                if generation_mode == "csv-export" {
+                    let generate_row_id = self.record_csv_export_row(
+                        run_key, video_id, &saved.visual_plan_row_id, "generate", None, &saved.pv_id,
+                        &assemble_image_prompt(&effective_style_directive, &saved.user_prompt, &saved.image_settings),
+                    )?;
+                    if let Some(instruction) = follow_up_edit.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        let settings_json = serde_json::to_string(&saved.image_settings).unwrap_or_else(|_| "{}".into());
+                        let edit_pv = self.create_prompt_version(
+                            video_id, &saved.visual_plan_row_id, &settings_json, &effective_style_directive, instruction,
+                        )?;
+                        self.record_csv_export_row(
+                            run_key, video_id, &saved.visual_plan_row_id, "edit", Some(&generate_row_id), &edit_pv.id, instruction,
+                        )?;
+                    }
+                }
                 // Best-effort, same non-fatal convention as
                 // write_bulk_prompt_log below — a log-write failure must
                 // never fail an otherwise successful, already-persisted
@@ -6212,6 +6475,11 @@ Return JSON only — one plan object:
             reason: response.reason,
             settings_locked: group.settings_locked,
             prompt_locked: group.prompt_locked,
+            // Never persisted to prompt_versions by this single-still
+            // suggestion flow — no real id to give it, and this path never
+            // feeds into csv-export bookkeeping (the only consumer of this
+            // field) anyway.
+            pv_id: String::new(),
         })
     }
 
@@ -6873,6 +7141,58 @@ Return JSON only:
                 regeneration_reason = Some(reason);
             }
         }
+        // Cloned before the move into finalize_generated_still below — the
+        // session planning log's thumbnail column embeds this same image,
+        // see the record_generated_image call after it.
+        let thumbnail_bytes = image_bytes.clone();
+        let render = self.finalize_generated_still(
+            video_id, group_id, prompt_version_id, image_bytes, extension,
+            "generation", None, None, regeneration_reason.as_deref(),
+        )?;
+        // Best-effort — fills in the still-pending planning-log row (if
+        // any) this generation belongs to with the literal text actually
+        // sent to Gemini and a thumbnail of the result. A silent no-op if
+        // this prompt was never planned via Claude/Gemini in this session
+        // (hand-typed/edited prompt) — see record_generated_image's doc
+        // comment for why that's the correct behavior, not a bug.
+        let _ = session_log::record_generated_image(
+            &self.logs_base_dir(),
+            video_id,
+            group_id,
+            prompt,
+            Some(thumbnail_bytes),
+        );
+        Ok(render)
+    }
+
+    /// Writes generated image bytes to disk and records them as a new
+    /// `image_renders` row — the file-layout (`renders/{groupId}/
+    /// render-v{N}.{ext}`), `is_final`/pruning bookkeeping
+    /// (`insert_image_render`), and undo-history snapshot every generated
+    /// still gets, regardless of how the bytes were actually produced.
+    /// Shared by the live Gemini-API path (`generate_image_render_impl`,
+    /// above) and the CSV-export import path (`import_external_render`,
+    /// `csv_export.rs`), so the two mechanisms can never drift in what a
+    /// "generated still" leaves behind. `kind`/`parent_render_id`/
+    /// `edit_instruction` mirror `edit_image_render`'s own use of those
+    /// same three fields for a manual mask-paint edit. Deliberately NOT
+    /// shared: the API path's session-log write (its arguments — the
+    /// literal text sent to Gemini, a thumbnail — differ enough between
+    /// "just generated live" and "imported from a download" that forcing a
+    /// generic shape on it isn't worth it; each caller does its own,
+    /// best-effort, afterward).
+    fn finalize_generated_still(
+        &self,
+        video_id: &str,
+        group_id: &str,
+        prompt_version_id: &str,
+        image_bytes: Vec<u8>,
+        extension: &str,
+        kind: &str,
+        parent_render_id: Option<&str>,
+        edit_instruction: Option<&str>,
+        regeneration_reason: Option<&str>,
+    ) -> Result<ImageRender, String> {
         let channel_id: String = self
             .connection
             .query_row(
@@ -6899,10 +7219,6 @@ Return JSON only:
         let file_name = format!("render-v{}.{}", version, extension);
         let relative_path = format!("renders/{}/{}", group_id, file_name);
         let out_path = render_dir.join(&file_name);
-        // Cloned before the move into fs::write below — the session
-        // planning log's thumbnail column embeds this same image, see the
-        // record_generated_image call near the end of this function.
-        let thumbnail_bytes = image_bytes.clone();
         fs::write(&out_path, image_bytes).map_err(|e| e.to_string())?;
         let id = Uuid::new_v4().to_string();
         let render = self.insert_image_render(
@@ -6913,9 +7229,9 @@ Return JSON only:
             prompt_version_id,
             &file_name,
             &relative_path,
-            None,
-            None,
-            "generation",
+            parent_render_id,
+            edit_instruction,
+            kind,
         )?;
         self.create_snapshot(
             video_id,
@@ -6930,20 +7246,41 @@ Return JSON only:
             })
             .to_string(),
         )?;
-        // Best-effort — fills in the still-pending planning-log row (if
-        // any) this generation belongs to with the literal text actually
-        // sent to Gemini and a thumbnail of the result. A silent no-op if
-        // this prompt was never planned via Claude/Gemini in this session
-        // (hand-typed/edited prompt) — see record_generated_image's doc
-        // comment for why that's the correct behavior, not a bug.
-        let _ = session_log::record_generated_image(
-            &self.logs_base_dir(),
-            video_id,
-            group_id,
-            prompt,
-            Some(thumbnail_bytes),
-        );
         Ok(render)
+    }
+
+    /// Imports one image the Chrome extension downloaded for a
+    /// `csv_export_rows` row, called by the folder watcher
+    /// (`csv_export::spawn_csv_import_watcher`) once that row's file has
+    /// been observed stable across two consecutive polls. Validates the
+    /// row's `prompt_version_id` the same way `generate_image_render_impl`
+    /// validates its own (defense-in-depth — every `csv_export_rows` row is
+    /// guaranteed a real backing `prompt_versions` row at planning time, see
+    /// `record_csv_export_row`'s callers, so this should never actually
+    /// fail in practice).
+    pub fn import_external_render(
+        &self,
+        video_id: &str,
+        group_id: &str,
+        prompt_version_id: &str,
+        kind: &str,
+        parent_render_id: Option<&str>,
+        edit_instruction: Option<&str>,
+        image_bytes: Vec<u8>,
+        extension: &str,
+    ) -> Result<ImageRender, String> {
+        let prompt_exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM prompt_versions WHERE id = ?1 AND video_id = ?2 AND group_id = ?3)",
+            params![prompt_version_id, video_id, group_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !prompt_exists {
+            return Err("The CSV row's prompt version does not belong to this still.".into());
+        }
+        self.finalize_generated_still(
+            video_id, group_id, prompt_version_id, image_bytes, extension,
+            kind, parent_render_id, edit_instruction, None,
+        )
     }
 
     pub fn edit_image_render(
@@ -9577,12 +9914,16 @@ Return JSON only:
         base_settings_json: &str,
         creative_instruction: &str,
         group_ids: &[String],
+        generation_mode: &str,
     ) -> Result<BulkGenerationRequest, String> {
         if group_ids.is_empty() {
             return Err("No stills selected.".into());
         }
         if style_directive.trim().is_empty() {
             return Err("Style directive cannot be empty.".into());
+        }
+        if !matches!(generation_mode, "api" | "csv-export") {
+            return Err("Unknown generation mode.".into());
         }
         let snapshot = self.build_bulk_request_snapshot(video_id, style_directive, base_settings_json, creative_instruction, group_ids)?;
         let snapshot_json = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
@@ -9594,20 +9935,21 @@ Return JSON only:
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         self.connection.execute(
-            "INSERT INTO bulk_generation_requests(id,video_id,status,position,snapshot_json,plan_index,created_at,updated_at) VALUES(?1,?2,'pending',?3,?4,0,?5,?5)",
-            params![id, video_id, next_position, snapshot_json, now],
+            "INSERT INTO bulk_generation_requests(id,video_id,status,position,snapshot_json,plan_index,created_at,updated_at,generation_mode) VALUES(?1,?2,'pending',?3,?4,0,?5,?5,?6)",
+            params![id, video_id, next_position, snapshot_json, now, generation_mode],
         ).map_err(|e| e.to_string())?;
         self.get_bulk_generation_request(&id)
     }
 
     fn get_bulk_generation_request_row(&self, request_id: &str) -> Result<BulkGenerationRequestRow, String> {
         self.connection.query_row(
-            "SELECT id,video_id,status,position,snapshot_json,plan_index,image_job_id,last_error,created_at,updated_at FROM bulk_generation_requests WHERE id=?1",
+            "SELECT id,video_id,status,position,snapshot_json,plan_index,image_job_id,last_error,created_at,updated_at,generation_mode FROM bulk_generation_requests WHERE id=?1",
             [request_id],
             |row| Ok(BulkGenerationRequestRow {
                 id: row.get(0)?, video_id: row.get(1)?, status: row.get(2)?, position: row.get(3)?,
                 snapshot_json: row.get(4)?, plan_index: row.get(5)?, image_job_id: row.get(6)?,
                 last_error: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)?,
+                generation_mode: row.get(10)?,
             }),
         ).map_err(|_| "Bulk generation request was not found.".to_string())
     }
@@ -9618,12 +9960,13 @@ Return JSON only:
 
     pub fn list_bulk_generation_requests(&self, video_id: &str) -> Result<Vec<BulkGenerationRequest>, String> {
         let mut statement = self.connection.prepare(
-            "SELECT id,video_id,status,position,snapshot_json,plan_index,image_job_id,last_error,created_at,updated_at FROM bulk_generation_requests WHERE video_id=?1 ORDER BY position ASC"
+            "SELECT id,video_id,status,position,snapshot_json,plan_index,image_job_id,last_error,created_at,updated_at,generation_mode FROM bulk_generation_requests WHERE video_id=?1 ORDER BY position ASC"
         ).map_err(|e| e.to_string())?;
         let rows = statement.query_map([video_id], |row| Ok(BulkGenerationRequestRow {
             id: row.get(0)?, video_id: row.get(1)?, status: row.get(2)?, position: row.get(3)?,
             snapshot_json: row.get(4)?, plan_index: row.get(5)?, image_job_id: row.get(6)?,
             last_error: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)?,
+            generation_mode: row.get(10)?,
         })).map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
         rows.into_iter().map(|row| row.into_public()).collect()
@@ -9755,6 +10098,21 @@ Return JSON only:
             let refreshed = self.get_bulk_generation_request_row(&claimed.id)?;
             return Ok(BulkQueueAdvanceResult::Planned {
                 request_id: claimed.id, current: refreshed.plan_index, total: result.total_stills as i64,
+            });
+        }
+        if claimed.generation_mode == "csv-export" {
+            // A one-shot planning-then-write operation, not an async
+            // worker queue — no image_jobs row, straight to the request's
+            // own terminal state.
+            let csv_path = self.export_bulk_request_to_csv(&claimed.id)?;
+            let now = Utc::now().to_rfc3339();
+            self.connection.execute(
+                "UPDATE bulk_generation_requests SET status='completed',updated_at=?1 WHERE id=?2",
+                params![now, claimed.id],
+            ).map_err(|e| e.to_string())?;
+            return Ok(BulkQueueAdvanceResult::CsvExported {
+                request_id: claimed.id,
+                csv_path: csv_path.to_string_lossy().into_owned(),
             });
         }
         let snapshot: BulkRequestSnapshot = serde_json::from_str(&claimed.snapshot_json)
@@ -13270,6 +13628,14 @@ struct V2PlanStillResponse {
     /// "RECURRING SYMBOL TRACKING" prompt section.
     #[serde(alias = "core_visual_device", default)]
     core_visual_device: String,
+    /// `'csv-export'`-mode planning only (see `plan_bulk_visuals_batch_impl`'s
+    /// `generation_mode` gate): an optional follow-up refinement instruction
+    /// for this still, when the model judges one would help. `None`/absent
+    /// (the overwhelming default) means no follow-up — a still whose plan
+    /// never touches this behaves identically to today's `'api'`-mode
+    /// output. Never offered to the model outside csv-export mode.
+    #[serde(alias = "follow_up_edit", default)]
+    follow_up_edit: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -13916,6 +14282,7 @@ const V2_PLAN_FIELD_ALIAS_GROUPS: &[&[&str]] = &[
     &["imageSettings", "image_settings", "settings"],
     &["userPrompt", "user_prompt", "prompt", "scene_prompt", "image_prompt"],
     &["coreVisualDevice", "core_visual_device"],
+    &["followUpEdit", "follow_up_edit"],
 ];
 
 // serde's #[serde(alias = "...")] accepts any ONE of several spellings for a
@@ -16377,7 +16744,7 @@ mod tests {
                 image_settings: json!({}),
                 user_prompt: format!("Scene {index}"),
                 reason: String::new(),
-                core_visual_device: String::new(),
+                core_visual_device: String::new(), follow_up_edit: None,
             })
             .collect();
         let row_data: Vec<serde_json::Value> = (1..=5)
@@ -16412,7 +16779,7 @@ mod tests {
                 image_settings: json!({}),
                 user_prompt: format!("Scene {index}"),
                 reason: String::new(),
-                core_visual_device: String::new(),
+                core_visual_device: String::new(), follow_up_edit: None,
             })
             .collect();
         let row_data: Vec<serde_json::Value> = (1..=2)
@@ -16444,7 +16811,7 @@ mod tests {
             image_settings: json!({ "mood": "Hopeful" }),
             user_prompt: "A hopeful scene.".into(),
             reason: "Fits the narration.".into(),
-            core_visual_device: "lantern".into(),
+            core_visual_device: "lantern".into(), follow_up_edit: None,
         };
 
         let saved = repo.persist_bulk_planned_still(&video.id, "Cinematic style", group, &row, still)
@@ -16465,6 +16832,99 @@ mod tests {
         let educational = repo.get_educational_visual_plan(&video.id, &group.id).unwrap().unwrap();
         assert_eq!(educational.visual_intent, "Character Scene");
         assert_eq!(educational.user_prompt, "A hopeful scene.");
+        // persist_bulk_planned_still must hand back the id of the
+        // prompt_versions row it just created — csv-export bookkeeping
+        // (record_csv_export_row) has no other way to link a still's
+        // generate-row to its prompt.
+        assert_eq!(saved.pv_id, pv.id);
+    }
+
+    #[test]
+    fn record_csv_export_row_orders_sequentially_and_links_an_edit_to_its_generate_row() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|g| g.id.clone()).collect();
+        let request = repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &group_ids, "csv-export").unwrap();
+        assert_eq!(request.generation_mode, "csv-export");
+
+        let pv = repo.create_prompt_version(&video.id, &group_ids[0], "{}", "Style", "A scene.").unwrap();
+        let generate_row_id = repo.record_csv_export_row(&request.id, &video.id, &group_ids[0], "generate", None, &pv.id, "assembled prompt text").unwrap();
+        let edit_pv = repo.create_prompt_version(&video.id, &group_ids[0], "{}", "Style", "make it brighter").unwrap();
+        repo.record_csv_export_row(&request.id, &video.id, &group_ids[0], "edit", Some(&generate_row_id), &edit_pv.id, "make it brighter").unwrap();
+        // A later, unrelated row (e.g. from the next batch this request's
+        // planning processes) — its order must continue from the running
+        // count established above, not reset.
+        let pv2 = repo.create_prompt_version(&video.id, &group_ids[0], "{}", "Style", "A later scene.").unwrap();
+        repo.record_csv_export_row(&request.id, &video.id, &group_ids[0], "generate", None, &pv2.id, "assembled prompt text 2").unwrap();
+
+        let rows: Vec<(String, i64, Option<String>, String)> = repo.connection.prepare(
+            "SELECT id,row_order,parent_row_id,kind FROM csv_export_rows WHERE bulk_request_id=?1 ORDER BY row_order"
+        ).unwrap().query_map([&request.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!((rows[0].1, rows[0].3.as_str()), (0, "generate"));
+        assert_eq!((rows[1].1, rows[1].3.as_str()), (1, "edit"));
+        assert_eq!(rows[1].2.as_deref(), Some(rows[0].0.as_str()), "the edit row must link back to the generate row's id");
+        assert_eq!((rows[2].1, rows[2].3.as_str()), (2, "generate"));
+    }
+
+    #[test]
+    fn export_bulk_request_to_csv_writes_correctly_quoted_rows() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|g| g.id.clone()).collect();
+        let request = repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &group_ids, "csv-export").unwrap();
+
+        // Deliberately adversarial for RFC4180 quoting: an embedded comma
+        // and an embedded newline in the same field.
+        let pv = repo.create_prompt_version(&video.id, &group_ids[0], "{}", "Style", "A scene.").unwrap();
+        repo.record_csv_export_row(
+            &request.id, &video.id, &group_ids[0], "generate", None, &pv.id,
+            "a scene with, a comma\nand a newline",
+        ).unwrap();
+
+        let watch_folder = temp.path().join("watch");
+        repo.save_app_setting("gemini_extension_watch_folder", watch_folder.to_str().unwrap()).unwrap();
+        let csv_path = repo.export_bulk_request_to_csv(&request.id).unwrap();
+        assert_eq!(csv_path, watch_folder.join("gemini-bulk-gen").join(&request.id).join("prompts.csv"));
+
+        let mut reader = csv::Reader::from_path(&csv_path).unwrap();
+        assert_eq!(reader.headers().unwrap(), vec!["id", "kind", "prompt"]);
+        let records: Vec<csv::StringRecord> = reader.records().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(&records[0][1], "generate");
+        assert_eq!(&records[0][2], "a scene with, a comma\nand a newline");
+    }
+
+    #[test]
+    fn export_bulk_request_to_csv_requires_the_watch_folder_setting() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|g| g.id.clone()).collect();
+        let request = repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &group_ids, "csv-export").unwrap();
+        let pv = repo.create_prompt_version(&video.id, &group_ids[0], "{}", "Style", "A scene.").unwrap();
+        repo.record_csv_export_row(&request.id, &video.id, &group_ids[0], "generate", None, &pv.id, "prompt").unwrap();
+
+        let error = repo.export_bulk_request_to_csv(&request.id).unwrap_err();
+        assert!(error.contains("watch folder"), "got: {error}");
     }
 
     #[test]
@@ -16484,7 +16944,7 @@ mod tests {
         let first = V2PlanStillResponse {
             visual_plan_row_id: group.id.clone(), visual_type: "Object Focus".into(),
             image_settings: json!({ "mood": "Serene Peaceful" }), user_prompt: "Original prompt.".into(),
-            reason: String::new(), core_visual_device: String::new(),
+            reason: String::new(), core_visual_device: String::new(), follow_up_edit: None,
         };
         repo.persist_bulk_planned_still(&video.id, "Style", &group, &row, first).unwrap();
 
@@ -16496,7 +16956,7 @@ mod tests {
         let second = V2PlanStillResponse {
             visual_plan_row_id: group.id.clone(), visual_type: "Object Focus".into(),
             image_settings: json!({ "mood": "Dramatic Intense" }), user_prompt: "An updated prompt.".into(),
-            reason: String::new(), core_visual_device: String::new(),
+            reason: String::new(), core_visual_device: String::new(), follow_up_edit: None,
         };
         let saved = repo.persist_bulk_planned_still(&video.id, "Style", &group, &row, second).unwrap()
             .expect("a partially-locked still still persists a new version");
@@ -16509,7 +16969,7 @@ mod tests {
         let third = V2PlanStillResponse {
             visual_plan_row_id: group.id.clone(), visual_type: "Object Focus".into(),
             image_settings: json!({}), user_prompt: "Yet another prompt.".into(),
-            reason: String::new(), core_visual_device: String::new(),
+            reason: String::new(), core_visual_device: String::new(), follow_up_edit: None,
         };
         let result = repo.persist_bulk_planned_still(&video.id, "Style", &group, &row, third).unwrap();
         assert!(result.is_none());
@@ -16554,7 +17014,7 @@ mod tests {
             visual_plan_row_id: group0.id.clone(), visual_type: "Object Focus".into(),
             image_settings: json!({ "mood": "Hopeful", "lighting": "Golden Hour" }),
             user_prompt: "A lantern glowing in the dark.".into(),
-            reason: String::new(), core_visual_device: "lantern".into(),
+            reason: String::new(), core_visual_device: "lantern".into(), follow_up_edit: None,
         };
         repo.persist_bulk_planned_still(&video.id, "Style", group0, &row0, still).unwrap();
 
@@ -16584,7 +17044,7 @@ mod tests {
         let still = V2PlanStillResponse {
             visual_plan_row_id: group.id.clone(), visual_type: "Object Focus".into(),
             image_settings: json!({}), user_prompt: "A brass lantern casting long shadows.".into(),
-            reason: String::new(), core_visual_device: "lantern".into(),
+            reason: String::new(), core_visual_device: "lantern".into(), follow_up_edit: None,
         };
         repo.persist_bulk_planned_still(&video.id, "Style", group, &row, still).unwrap();
 
@@ -16887,14 +17347,14 @@ mod tests {
         let group_ids: Vec<String> = plan.groups.iter().map(|group| group.id.clone()).collect();
 
         repo.save_bulk_global_settings(&video.id, BulkVisualDials { visual_interpretation: Some(10), ..Default::default() }, Vec::new(), false).unwrap();
-        let first = repo.enqueue_bulk_generation_request(&video.id, "Style A", "{}", "Instruction A", &group_ids).unwrap();
+        let first = repo.enqueue_bulk_generation_request(&video.id, "Style A", "{}", "Instruction A", &group_ids, "api").unwrap();
         assert_eq!(first.status, "pending");
         assert_eq!(first.total_stills, group_ids.len() as i64);
 
         // Changed AFTER the first request was already enqueued — its frozen
         // snapshot must never observe this, no matter when its turn comes.
         repo.save_bulk_global_settings(&video.id, BulkVisualDials { visual_interpretation: Some(90), ..Default::default() }, Vec::new(), false).unwrap();
-        let second = repo.enqueue_bulk_generation_request(&video.id, "Style B", "{}", "Instruction B", &group_ids).unwrap();
+        let second = repo.enqueue_bulk_generation_request(&video.id, "Style B", "{}", "Instruction B", &group_ids, "api").unwrap();
         assert!(second.position > first.position, "later requests must queue behind earlier ones");
 
         let listed = repo.list_bulk_generation_requests(&video.id).unwrap();
@@ -16908,8 +17368,8 @@ mod tests {
         assert_eq!(second_snapshot.style_directive, "Style B");
         assert_eq!(second_snapshot.global_visual.dials.visual_interpretation, Some(90));
 
-        assert!(repo.enqueue_bulk_generation_request(&video.id, "", "{}", "", &group_ids).is_err(), "an empty style directive must be rejected");
-        assert!(repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &[]).is_err(), "an empty scope must be rejected");
+        assert!(repo.enqueue_bulk_generation_request(&video.id, "", "{}", "", &group_ids, "api").is_err(), "an empty style directive must be rejected");
+        assert!(repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &[], "api").is_err(), "an empty scope must be rejected");
     }
 
     #[test]
@@ -16926,8 +17386,8 @@ mod tests {
 
         assert!(repo.claim_next_bulk_request(&video.id).unwrap().is_none(), "an empty queue has nothing to claim");
 
-        let first = repo.enqueue_bulk_generation_request(&video.id, "Style A", "{}", "", &group_ids).unwrap();
-        let second = repo.enqueue_bulk_generation_request(&video.id, "Style B", "{}", "", &group_ids).unwrap();
+        let first = repo.enqueue_bulk_generation_request(&video.id, "Style A", "{}", "", &group_ids, "api").unwrap();
+        let second = repo.enqueue_bulk_generation_request(&video.id, "Style B", "{}", "", &group_ids, "api").unwrap();
 
         let claimed = repo.claim_next_bulk_request(&video.id).unwrap().unwrap();
         assert_eq!(claimed.id, first.id, "the lowest-position pending request must be claimed first");
@@ -16960,7 +17420,7 @@ mod tests {
         let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
         let group_ids: Vec<String> = plan.groups.iter().map(|group| group.id.clone()).collect();
 
-        let request = repo.enqueue_bulk_generation_request(&video.id, "Style A", "{}", "", &group_ids).unwrap();
+        let request = repo.enqueue_bulk_generation_request(&video.id, "Style A", "{}", "", &group_ids, "api").unwrap();
         // Still 'pending' (never claimed) — a stray finalize call (e.g. a
         // job from an unrelated, older video reusing a ready-to-recycle
         // thread) must not be able to terminate it early.
@@ -16986,9 +17446,9 @@ mod tests {
         let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
         let group_ids: Vec<String> = plan.groups.iter().map(|group| group.id.clone()).collect();
 
-        let a = repo.enqueue_bulk_generation_request(&video.id, "A", "{}", "", &group_ids).unwrap();
-        let b = repo.enqueue_bulk_generation_request(&video.id, "B", "{}", "", &group_ids).unwrap();
-        let c = repo.enqueue_bulk_generation_request(&video.id, "C", "{}", "", &group_ids).unwrap();
+        let a = repo.enqueue_bulk_generation_request(&video.id, "A", "{}", "", &group_ids, "api").unwrap();
+        let b = repo.enqueue_bulk_generation_request(&video.id, "B", "{}", "", &group_ids, "api").unwrap();
+        let c = repo.enqueue_bulk_generation_request(&video.id, "C", "{}", "", &group_ids, "api").unwrap();
         let ids = |repo: &ProjectRepository| repo.list_bulk_generation_requests(&video.id).unwrap().into_iter().map(|r| r.id).collect::<Vec<_>>();
         assert_eq!(ids(&repo), vec![a.id.clone(), b.id.clone(), c.id.clone()]);
 

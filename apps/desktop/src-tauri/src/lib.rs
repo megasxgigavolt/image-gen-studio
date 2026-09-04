@@ -1,10 +1,11 @@
+mod csv_export;
 mod projects;
 mod session_log;
 
 use base64::Engine;
 use projects::{
     AnimationJob, BulkGenerationRequest, BulkGlobalVisualSettings, BulkQueueAdvanceResult,
-    BulkSceneSettings, BulkStillSettings, BulkVisualDials, CaptionSet, Channel,
+    BulkSceneSettings, BulkStillSettings, BulkVisualDials, CaptionSet, Channel, CsvExportProgress,
     ExportJob, ExportResult, ExportSettings, ImageJob, ImageRender, ImageWorkspace, InputAsset,
     MediaLibraryAsset, ProjectRepository, ProviderKeyStatus, PromptVersion, ResumeState,
     RosterCharacter, RosterLocation, SceneCastAssignment, SingleStillGeneration, StyleAspect, Timeline,
@@ -2023,9 +2024,10 @@ fn enqueue_bulk_generation_request(
     base_settings_json: String,
     creative_instruction: String,
     group_ids: Vec<String>,
+    generation_mode: String,
 ) -> Result<BulkGenerationRequest, String> {
     with_repository(state, |repository| {
-        repository.enqueue_bulk_generation_request(&video_id, &style_directive, &base_settings_json, &creative_instruction, &group_ids)
+        repository.enqueue_bulk_generation_request(&video_id, &style_directive, &base_settings_json, &creative_instruction, &group_ids, &generation_mode)
     })
 }
 
@@ -2052,6 +2054,17 @@ fn reorder_bulk_generation_request(
     direction: String,
 ) -> Result<(), String> {
     with_repository(state, |repository| repository.reorder_bulk_generation_request(&request_id, &direction))
+}
+
+#[tauri::command]
+fn get_csv_export_progress(
+    state: State<'_, RepositoryState>,
+    request_id: String,
+) -> Result<CsvExportProgress, String> {
+    with_repository(state, |repository| {
+        let (total, imported) = repository.csv_export_progress(&request_id)?;
+        Ok(CsvExportProgress { total, imported })
+    })
 }
 
 // The frontend queue-runner's single entry point (see `runQueueRunner` in
@@ -3199,6 +3212,7 @@ pub fn run() {
                 .recover_single_still_generations()
                 .map_err(std::io::Error::other)?;
             spawn_single_still_dispatcher(data_dir.join("auto-gen-studio.db"), data_dir.join("Projects"));
+            csv_export::spawn_csv_import_watcher(data_dir.join("auto-gen-studio.db"), data_dir.join("Projects"));
             if repository
                 .get_app_setting("gemini_model")
                 .map_err(std::io::Error::other)?
@@ -3296,6 +3310,7 @@ pub fn run() {
             cancel_bulk_generation_request,
             reorder_bulk_generation_request,
             advance_bulk_generation_queue,
+            get_csv_export_progress,
             create_animation_job,
             suggest_animation_prompt,
             explain_motion_graphic_choice,

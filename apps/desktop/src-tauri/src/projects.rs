@@ -971,6 +971,50 @@ const MIGRATION_045: &str = r#"
 ALTER TABLE bulk_generation_requests ADD COLUMN generation_mode TEXT NOT NULL DEFAULT 'api';
 "#;
 
+/// Fixes a real, already-shipped-to-a-live-database problem: an earlier,
+/// since-fully-reverted attempt at this same "generate via a chat UI
+/// instead of the API" idea added `generation_mode` with
+/// `CHECK(generation_mode IN ('api','browser'))`. Reverting that attempt's
+/// *code* did nothing to a database that had already run it — SQLite bakes
+/// a CHECK constraint into the table definition permanently, and
+/// `MIGRATION_045`'s own guard (`pragma_table_info` sees the column already
+/// exists) correctly skips re-running on such a database, leaving the
+/// stale constraint in place forever. Every later insert of
+/// `generation_mode='csv-export'` then fails with a raw SQLite CHECK
+/// constraint error — confirmed as the actual, reported failure. SQLite
+/// can't `ALTER` a CHECK constraint, so this is the standard rebuild-and-
+/// swap (see `MIGRATION_034`'s doc comment for the same pattern used
+/// there), gated on detecting the stale text so it's a no-op on any
+/// database that never ran the reverted code (including every fresh
+/// install). `PRAGMA foreign_keys` is toggled off/on around the rebuild
+/// because — unlike `MIGRATION_034`'s table — this one has real incoming FK
+/// references (`image_jobs.bulk_request_id`, `csv_export_rows.bulk_request_id`)
+/// that a `DROP TABLE` under enforcement would otherwise choke on; SQLite's
+/// own documented procedure for this exact situation.
+const MIGRATION_047: &str = r#"
+PRAGMA foreign_keys=OFF;
+CREATE TABLE bulk_generation_requests_new (
+    id TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL REFERENCES videos(id),
+    status TEXT NOT NULL CHECK(status IN ('pending','planning','generating','completed','failed','cancelled')),
+    position INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    plan_index INTEGER NOT NULL DEFAULT 0,
+    image_job_id TEXT REFERENCES image_jobs(id),
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    generation_mode TEXT NOT NULL DEFAULT 'api'
+);
+INSERT INTO bulk_generation_requests_new (id,video_id,status,position,snapshot_json,plan_index,image_job_id,last_error,created_at,updated_at,generation_mode)
+SELECT id,video_id,status,position,snapshot_json,plan_index,image_job_id,last_error,created_at,updated_at,generation_mode FROM bulk_generation_requests;
+DROP TABLE bulk_generation_requests;
+ALTER TABLE bulk_generation_requests_new RENAME TO bulk_generation_requests;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bulk_generation_requests_position ON bulk_generation_requests(video_id, position);
+CREATE INDEX IF NOT EXISTS idx_bulk_generation_requests_video_status ON bulk_generation_requests(video_id, status);
+PRAGMA foreign_keys=ON;
+"#;
+
 /// One row per line of an exported bulk-generation CSV — the durable
 /// tracking record that lets the folder watcher (`csv_export.rs`)
 /// correlate a file the Chrome extension downloaded back to the still (and
@@ -2879,6 +2923,21 @@ impl ProjectRepository {
         self.connection.execute_batch(MIGRATION_046).map_err(|error| error.to_string())?;
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(46, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_stale_generation_mode_check: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='bulk_generation_requests' AND sql LIKE '%generation_mode%browser%')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if has_stale_generation_mode_check {
+            self.connection.execute_batch(MIGRATION_047).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(47, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())

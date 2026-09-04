@@ -5219,8 +5219,8 @@ Return JSON only — no markdown, no explanation:
     }
 
     /// Writes every `csv_export_rows` row for `request_id` out to
-    /// `<watch_folder>/gemini-bulk-gen/<request_id>/prompts.csv` — the file
-    /// the Chrome extension is uploaded. Requires the
+    /// `<watch_folder>/gemini-bulk-gen/<request_id>.csv` — the file the
+    /// Chrome extension is uploaded. Requires the
     /// `gemini_extension_watch_folder` app setting (distinct from
     /// `download_folder` — see `csv_export.rs`'s doc comment for why) to
     /// already be set; there's no sensible fallback the way
@@ -5245,8 +5245,11 @@ Return JSON only — no markdown, no explanation:
         if rows.is_empty() {
             return Err("Nothing was planned for this request — there's nothing to export.".into());
         }
-        let batch_dir = Path::new(&watch_folder).join("gemini-bulk-gen").join(request_id);
-        csv_export::write_csv_rows(&batch_dir, &rows)
+        // Flat filename, not prompts.csv inside a per-batch folder — see
+        // write_csv_rows's doc comment for why (the extension's popup can
+        // only learn the batch id from the uploaded file's name).
+        let csv_path = Path::new(&watch_folder).join("gemini-bulk-gen").join(format!("{request_id}.csv"));
+        csv_export::write_csv_rows(&csv_path, &rows)
     }
 
     /// Every `bulk_request_id` with at least one row still waiting on its
@@ -16898,7 +16901,7 @@ mod tests {
         let watch_folder = temp.path().join("watch");
         repo.save_app_setting("gemini_extension_watch_folder", watch_folder.to_str().unwrap()).unwrap();
         let csv_path = repo.export_bulk_request_to_csv(&request.id).unwrap();
-        assert_eq!(csv_path, watch_folder.join("gemini-bulk-gen").join(&request.id).join("prompts.csv"));
+        assert_eq!(csv_path, watch_folder.join("gemini-bulk-gen").join(format!("{}.csv", request.id)));
 
         let mut reader = csv::Reader::from_path(&csv_path).unwrap();
         assert_eq!(reader.headers().unwrap(), vec!["id", "kind", "prompt"]);

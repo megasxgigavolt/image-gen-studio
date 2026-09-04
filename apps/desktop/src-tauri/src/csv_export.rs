@@ -26,8 +26,13 @@
 //!
 //! # Folder layout
 //!
-//! `<watch_folder>/gemini-bulk-gen/<bulk_request_id>/prompts.csv` (written
-//! by export) and `<watch_folder>/gemini-bulk-gen/<bulk_request_id>/<row_id>.<ext>`
+//! `<watch_folder>/gemini-bulk-gen/<bulk_request_id>.csv` (written by
+//! export — a flat filename, not `prompts.csv` inside a per-batch folder,
+//! since a browser `<input type="file">` only ever exposes the uploaded
+//! file's *name* to the extension's popup, never its original folder path
+//! — encoding the batch id into the filename is the only way for it to
+//! learn which batch it was handed) and
+//! `<watch_folder>/gemini-bulk-gen/<bulk_request_id>/<row_id>.<ext>`
 //! (written by the extension, one file per row, named after the CSV row's
 //! `id` column — the correlation key back to `csv_export_rows`).
 
@@ -47,23 +52,32 @@ pub struct CsvExportRow {
     pub prompt: String,
 }
 
-/// Writes `rows` to `<dir>/prompts.csv` (creating `dir` if needed) with
+/// Writes `rows` to `path` (creating its parent directory if needed) with
 /// header `id,kind,prompt`. Uses the `csv` crate rather than hand-rolled
 /// string joining specifically so a prompt containing a comma, quote, or
 /// embedded newline (all real, expected content — narration-derived scene
 /// prompts are free text) round-trips correctly per RFC4180.
-pub fn write_csv_rows(dir: &Path, rows: &[CsvExportRow]) -> Result<PathBuf, String> {
-    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let path = dir.join("prompts.csv");
+///
+/// `path` is deliberately named `<bulk_request_id>.csv` by the caller
+/// (`ProjectRepository::export_bulk_request_to_csv`), not a fixed
+/// `prompts.csv` inside a per-batch folder — a browser `<input
+/// type="file">` only ever exposes the uploaded file's *name*, never its
+/// original folder path, so the extension's popup has no other way to
+/// learn which batch it was handed. Encoding the batch id directly into the
+/// filename lets it derive that from `file.name` alone.
+pub fn write_csv_rows(path: &Path, rows: &[CsvExportRow]) -> Result<PathBuf, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     let mut writer = csv::WriterBuilder::new()
-        .from_path(&path)
+        .from_path(path)
         .map_err(|e| e.to_string())?;
     writer.write_record(["id", "kind", "prompt"]).map_err(|e| e.to_string())?;
     for row in rows {
         writer.write_record([&row.id, &row.kind, &row.prompt]).map_err(|e| e.to_string())?;
     }
     writer.flush().map_err(|e| e.to_string())?;
-    Ok(path)
+    Ok(path.to_path_buf())
 }
 
 const POLL_INTERVAL: Duration = Duration::from_secs(4);

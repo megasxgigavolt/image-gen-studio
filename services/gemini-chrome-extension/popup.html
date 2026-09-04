@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Gemini Bulk Generation</title>
+  <style>
+    body { font: 13px system-ui, sans-serif; width: 320px; margin: 0; padding: 12px; color: #1a1a1a; }
+    h1 { font-size: 14px; margin: 0 0 8px; }
+    p.hint { color: #666; font-size: 11px; margin: 4px 0 10px; }
+    input[type="file"] { width: 100%; margin-bottom: 8px; }
+    button { width: 100%; padding: 8px; font-size: 13px; cursor: pointer; }
+    button:disabled { cursor: default; opacity: 0.6; }
+    #batchLabel { font-size: 11px; color: #444; margin: 6px 0; word-break: break-all; }
+    ul#rows { list-style: none; margin: 10px 0 0; padding: 0; max-height: 280px; overflow: auto; }
+    ul#rows li { display: flex; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid #eee; }
+    .status-pending { color: #999; }
+    .status-running { color: #1a73e8; font-weight: 600; }
+    .status-done { color: #188038; }
+    .status-failed { color: #c5221f; }
+  </style>
+</head>
+<body>
+  <h1>Gemini Bulk Generation</h1>
+  <p class="hint">Upload the CSV exported from Auto Gen Studio, then click Start. Keep this browser open — each row opens a chat, generates, and downloads its image.</p>
+  <input type="file" id="csvFile" accept=".csv" />
+  <div id="batchLabel"></div>
+  <button id="startButton" disabled>Start</button>
+  <ul id="rows"></ul>
+  <script src="popup.js"></script>
+</body>
+</html>

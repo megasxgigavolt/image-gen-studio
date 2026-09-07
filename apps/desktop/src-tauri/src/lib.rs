@@ -1,4 +1,4 @@
-mod csv_export;
+mod gemini_extension;
 mod projects;
 mod session_log;
 
@@ -1890,6 +1890,39 @@ fn spawn_job_workers(
 /// exits, it just sleeps and polls. `claim_next_single_still_generation`
 /// itself refuses to claim while a bulk `image_jobs` row is `'running'`
 /// anywhere, so this and Bulk Generation never hit Gemini concurrently.
+/// Records the linked `csv_export_rows` row (see
+/// `dispatch_single_still_generation_via_extension`) and polls until
+/// `gemini_extension`'s worker loop resolves it via
+/// `mark_csv_export_row_imported`/`mark_csv_export_row_failed`'s
+/// propagation, or a generous timeout elapses. Whatever this returns is
+/// only actually applied by the caller's `finish_single_still_generation`
+/// if the row is somehow STILL `'running'` at that point (its own
+/// `WHERE status='running'` guard makes every other case a harmless
+/// no-op) — so the exact success value doesn't matter once the extension
+/// path has already resolved it; only the timeout's error message needs to
+/// be real.
+fn dispatch_single_still_via_extension_and_wait(
+    repository: &ProjectRepository,
+    id: &str,
+    video_id: &str,
+    group_id: &str,
+    prompt: &PromptVersion,
+) -> Result<String, String> {
+    repository.dispatch_single_still_generation_via_extension(id, video_id, group_id, prompt)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    loop {
+        if let Ok(Some(status)) = repository.single_still_generation_status(id) {
+            if status != "running" {
+                return Ok(String::new());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("Timed out waiting for the Gemini Chrome extension — open its popup and confirm Live Connection is enabled.".to_string());
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+}
+
 fn spawn_single_still_dispatcher(database_path: std::path::PathBuf, projects_dir: std::path::PathBuf) {
     thread::spawn(move || {
         let Ok(repository) = ProjectRepository::open(&database_path, &projects_dir) else {
@@ -1907,32 +1940,38 @@ fn spawn_single_still_dispatcher(database_path: std::path::PathBuf, projects_dir
                     continue;
                 }
             };
-            let mut last_error = String::new();
-            let mut render_id = None;
-            // Same retry/backoff ladder as spawn_job_workers, minus the
-            // stopped/failed job-status checks (this queue has no
-            // pause/stop concept) and the bulk-snapshot/bulk-finalize
-            // steps, which don't apply to a manually-typed single prompt.
-            for attempt in 0..5 {
-                match repository.generate_image_render(
-                    &video_id, &group_id, &prompt.id, &prompt.system_prompt, &prompt.user_prompt, &prompt.settings_json,
-                ) {
-                    Ok(render) => {
-                        render_id = Some(render.id);
-                        break;
-                    }
-                    Err(error) => {
-                        last_error = error;
-                        if attempt < 4 {
-                            let rate_limited = last_error.contains("429")
-                                || last_error.to_ascii_lowercase().contains("resource exhausted");
-                            let delay = if rate_limited { 15 * 2_u64.pow(attempt) } else { 3 * 2_u64.pow(attempt) };
-                            thread::sleep(Duration::from_secs(delay.min(75)));
+            let via_extension = repository.get_app_setting("generation_mode_default")
+                .ok().flatten().as_deref() == Some("browser-live");
+            let result = if via_extension {
+                dispatch_single_still_via_extension_and_wait(&repository, &id, &video_id, &group_id, &prompt)
+            } else {
+                let mut last_error = String::new();
+                let mut render_id = None;
+                // Same retry/backoff ladder as spawn_job_workers, minus the
+                // stopped/failed job-status checks (this queue has no
+                // pause/stop concept) and the bulk-snapshot/bulk-finalize
+                // steps, which don't apply to a manually-typed single prompt.
+                for attempt in 0..5 {
+                    match repository.generate_image_render(
+                        &video_id, &group_id, &prompt.id, &prompt.system_prompt, &prompt.user_prompt, &prompt.settings_json,
+                    ) {
+                        Ok(render) => {
+                            render_id = Some(render.id);
+                            break;
+                        }
+                        Err(error) => {
+                            last_error = error;
+                            if attempt < 4 {
+                                let rate_limited = last_error.contains("429")
+                                    || last_error.to_ascii_lowercase().contains("resource exhausted");
+                                let delay = if rate_limited { 15 * 2_u64.pow(attempt) } else { 3 * 2_u64.pow(attempt) };
+                                thread::sleep(Duration::from_secs(delay.min(75)));
+                            }
                         }
                     }
                 }
-            }
-            let result = render_id.ok_or(last_error);
+                render_id.ok_or(last_error)
+            };
             let _ = repository.finish_single_still_generation(&id, result);
             // Same brief politeness gap between items as spawn_job_workers.
             thread::sleep(Duration::from_secs(1));
@@ -3212,7 +3251,11 @@ pub fn run() {
                 .recover_single_still_generations()
                 .map_err(std::io::Error::other)?;
             spawn_single_still_dispatcher(data_dir.join("auto-gen-studio.db"), data_dir.join("Projects"));
-            csv_export::spawn_csv_import_watcher(data_dir.join("auto-gen-studio.db"), data_dir.join("Projects"));
+            gemini_extension::spawn_gemini_extension_server(
+                data_dir.join("auto-gen-studio.db"),
+                data_dir.join("Projects"),
+                app.handle().clone(),
+            );
             if repository
                 .get_app_setting("gemini_model")
                 .map_err(std::io::Error::other)?

@@ -7,25 +7,26 @@
     body { font: 13px system-ui, sans-serif; width: 320px; margin: 0; padding: 12px; color: #1a1a1a; }
     h1 { font-size: 14px; margin: 0 0 8px; }
     p.hint { color: #666; font-size: 11px; margin: 4px 0 10px; }
-    input[type="file"] { width: 100%; margin-bottom: 8px; }
-    button { width: 100%; padding: 8px; font-size: 13px; cursor: pointer; }
+    button { width: 100%; padding: 8px; font-size: 13px; cursor: pointer; margin-top: 6px; }
+    button:first-of-type { margin-top: 0; }
     button:disabled { cursor: default; opacity: 0.6; }
-    #batchLabel { font-size: 11px; color: #444; margin: 6px 0; word-break: break-all; }
-    ul#rows { list-style: none; margin: 10px 0 0; padding: 0; max-height: 280px; overflow: auto; }
-    ul#rows li { display: flex; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid #eee; }
-    .status-pending { color: #999; }
-    .status-running { color: #1a73e8; font-weight: 600; }
-    .status-done { color: #188038; }
+    #status { display: flex; align-items: center; gap: 6px; font-size: 12px; margin: 8px 0; padding: 8px; border-radius: 6px; background: #f4f4f4; }
+    #status.connected { background: #e6f4ea; color: #188038; }
+    #status.disconnected { background: #f4f4f4; color: #666; }
+    ul#log { list-style: none; margin: 10px 0 0; padding: 0; max-height: 280px; overflow: auto; }
+    ul#log li { display: flex; justify-content: space-between; gap: 8px; padding: 4px 0; border-bottom: 1px solid #eee; font-size: 12px; }
+    .log-generate::before { content: ""; }
+    .log-edit::before { content: "↳ "; }
+    .status-ok { color: #188038; }
     .status-failed { color: #c5221f; }
   </style>
 </head>
 <body>
   <h1>Gemini Bulk Generation</h1>
-  <p class="hint">Upload the CSV exported from Auto Gen Studio, then click Start. Keep this browser open — each row opens a chat, generates, and downloads its image.</p>
-  <input type="file" id="csvFile" accept=".csv" />
-  <div id="batchLabel"></div>
-  <button id="startButton" disabled>Start</button>
-  <ul id="rows"></ul>
+  <p class="hint">Live-connects to Auto Gen Studio — no CSV upload needed. Keep this toggle on and this browser open while generating; each job opens/continues a chat, generates, and downloads its image automatically.</p>
+  <div id="status" class="disconnected">⚪ <span id="statusText">Not connected</span></div>
+  <button id="toggleButton">Enable Live Connection</button>
+  <ul id="log"></ul>
   <script src="popup.js"></script>
 </body>
 </html>

@@ -24,6 +24,10 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
   const [appVersion, setAppVersion] = useState("");
   const [saveLocation, setSaveLocation] = useState("");
   const [geminiWatchFolder, setGeminiWatchFolder] = useState("");
+  // Default for both the single-still Generate button (no per-click mode
+  // picker of its own) and the Bulk Generation modal's own checkbox (which
+  // still keeps a per-request override, just seeded from this).
+  const [generationModeDefault, setGenerationModeDefault] = useState<"api" | "browser-live">("api");
   const [autosaveInterval, setAutosaveInterval] = useState<AutosaveInterval>("30s");
   // 1080p — matches what most AI-generated source stills/animations
   // actually are (see ExportSettingsRecord's own default comment); 720p/4K
@@ -43,10 +47,11 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     void (async () => {
-      const [version, folder, watchFolder, autosave, resolution, captions, testModeSetting, openaiStatus, geminiStatus] = await Promise.all([
+      const [version, folder, watchFolder, modeDefault, autosave, resolution, captions, testModeSetting, openaiStatus, geminiStatus] = await Promise.all([
         projectsClient.getApplicationVersion(),
         projectsClient.getAppSetting("download_folder"),
         projectsClient.getAppSetting("gemini_extension_watch_folder"),
+        projectsClient.getAppSetting("generation_mode_default"),
         projectsClient.getAppSetting("autosave_interval"),
         projectsClient.getAppSetting("export_default_resolution"),
         projectsClient.getAppSetting("export_default_captions"),
@@ -57,6 +62,7 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
       setAppVersion(version);
       setSaveLocation(folder ?? "");
       setGeminiWatchFolder(watchFolder ?? "");
+      if (modeDefault === "browser-live") setGenerationModeDefault("browser-live");
       if (autosave && (AUTOSAVE_INTERVALS as string[]).includes(autosave)) setAutosaveInterval(autosave as AutosaveInterval);
       if (resolution && (RESOLUTIONS as string[]).includes(resolution)) setExportResolution(resolution as ExportResolution);
       if (captions && (CAPTION_MODES as string[]).includes(captions)) setExportCaptions(captions as ExportCaptionsMode);
@@ -99,6 +105,7 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
       await Promise.all([
         projectsClient.saveAppSetting("download_folder", saveLocation),
         projectsClient.saveAppSetting("gemini_extension_watch_folder", geminiWatchFolder),
+        projectsClient.saveAppSetting("generation_mode_default", generationModeDefault),
         projectsClient.saveAppSetting("autosave_interval", autosaveInterval),
         projectsClient.saveAppSetting("export_default_resolution", exportResolution),
         projectsClient.saveAppSetting("export_default_captions", exportCaptions),
@@ -215,8 +222,16 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
                 <input type="text" className="tl-text-input" value={geminiWatchFolder} readOnly placeholder="Not set — required to export prompts" />
                 <button type="button" className="secondary" onClick={() => void browseGeminiWatchFolder()}><FolderOpen size={14} />Browse</button>
               </div>
-              <small className="tl-source-hint">Point this at your Chrome browser's own Downloads folder (check chrome://settings/downloads if unsure) — the extension can only save files there, not to a folder chosen per-batch. The app watches a "gemini-bulk-gen" subfolder inside it.</small>
+              <small className="tl-source-hint">Point this at your Chrome browser's own Downloads folder (check chrome://settings/downloads if unsure) — the extension can only save files there, not to a folder chosen per-batch. Images land directly in this folder, no subfolder.</small>
             </label>
+            <div className="pref-field">
+              <span className="field-heading">Generate images via</span>
+              <div className="tl-preset-grid two">
+                <button type="button" className={generationModeDefault === "api" ? "tl-preset-btn active" : "tl-preset-btn"} onClick={() => setGenerationModeDefault("api")}><span>Live API</span></button>
+                <button type="button" className={generationModeDefault === "browser-live" ? "tl-preset-btn active" : "tl-preset-btn"} onClick={() => setGenerationModeDefault("browser-live")}><span>Gemini Chrome extension</span></button>
+              </div>
+              <small className="tl-source-hint">Default for the single-still Generate button (and the Bulk Generation modal's starting checkbox state). "Gemini Chrome extension" requires Live Connection enabled in the extension's popup — a still just sits waiting until it is.</small>
+            </div>
 
             <div className="panel-section-heading" style={{ marginTop: "18px" }}><h3>Export Defaults</h3></div>
             <div className="pref-field">

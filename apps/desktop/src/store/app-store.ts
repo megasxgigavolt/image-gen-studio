@@ -71,6 +71,22 @@ export type ExportState = {
   startedAt: number;
 };
 
+/** Live-connection status with the Gemini Chrome extension, plus the most
+ * recent render it imported — fed by two Tauri events the backend's
+ * `gemini_extension` worker emits ("gemini-extension-connection-changed",
+ * "gemini-extension-render-imported"), listened to once at App-root level
+ * (same "subscribed for the app's whole lifetime" idiom as `ExportState`
+ * above, see App.tsx). `lastImportEventSeq` is a monotonic counter, not a
+ * boolean — a component (e.g. ImagesView) watches it in a `useEffect` dep
+ * array specifically so a second import for the *same* video still
+ * re-triggers a refresh (a boolean flip wouldn't, if it happened to already
+ * be true). */
+export type GeminiLiveState = {
+  connected: boolean;
+  lastImportedVideoId: string | null;
+  lastImportEventSeq: number;
+};
+
 type AppState = {
   stage: AppStage;
   theme: Theme;
@@ -111,6 +127,9 @@ type AppState = {
   finishExport: (videoId: string, result: ExportUiResult | null) => void;
   clearExport: () => void;
   setExportCollapsed: (collapsed: boolean) => void;
+  geminiLiveState: GeminiLiveState;
+  setGeminiLiveConnected: (connected: boolean) => void;
+  noteGeminiRenderImported: (videoId: string) => void;
 };
 
 const cloneOriginalPlan = () =>
@@ -191,6 +210,17 @@ export const useAppStore = create<AppState>((set) => ({
     ),
   clearExport: () => set({ exportState: null, exportCollapsed: false }),
   setExportCollapsed: (collapsed) => set({ exportCollapsed: collapsed }),
+  geminiLiveState: { connected: false, lastImportedVideoId: null, lastImportEventSeq: 0 },
+  setGeminiLiveConnected: (connected) =>
+    set((state) => ({ geminiLiveState: { ...state.geminiLiveState, connected } })),
+  noteGeminiRenderImported: (videoId) =>
+    set((state) => ({
+      geminiLiveState: {
+        ...state.geminiLiveState,
+        lastImportedVideoId: videoId,
+        lastImportEventSeq: state.geminiLiveState.lastImportEventSeq + 1,
+      },
+    })),
   moveSentence: (sentenceId, targetGroupId) =>
     set((state) => {
       const sourceIndex = state.visualPlan.findIndex((group) =>

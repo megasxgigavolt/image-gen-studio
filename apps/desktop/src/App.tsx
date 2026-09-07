@@ -2619,7 +2619,7 @@ function setBulkPlanControl(videoId: string | null, value: "running" | "paused" 
 }
 
 function ImagesView() {
-  const { activeVideoId, addToast, setStage } = useAppStore();
+  const { activeVideoId, addToast, setStage, geminiLiveState } = useAppStore();
   const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
   const stillListScrollRef = useRef<HTMLElement>(null);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
@@ -2655,11 +2655,12 @@ function ImagesView() {
   const [references, setReferences] = useState<import("./infrastructure/projects-client").InputAssetRecord[]>([]);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkInstruction, setBulkInstruction] = useState("");
-  // "csv-export" plans via Claude CLI exactly like "api" does, but writes
-  // the result to a CSV for the Gemini Chrome extension instead of
-  // generating images itself. Local UI state, not persisted — each new
-  // request starts back at the default unless the user opts in again.
-  const [bulkGenerationMode, setBulkGenerationMode] = useState<"api" | "csv-export">("api");
+  // "browser-live" plans via Claude CLI exactly like "api" does, but
+  // dispatches each planned still to the connected Gemini Chrome extension
+  // over the live connection instead of generating images itself here.
+  // Local UI state, not persisted — each new request starts back at the
+  // default unless the user opts in again.
+  const [bulkGenerationMode, setBulkGenerationMode] = useState<"api" | "browser-live">("api");
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null);
   const [preparingGroupIds, setPreparingGroupIds] = useState<Set<string>>(new Set());
   const [promptPrepStatus, setPromptPrepStatus] = useState<"running" | "paused" | null>(null);
@@ -2672,6 +2673,7 @@ function ImagesView() {
   // instead of a single in-memory task.
   const [bulkPlanStatus, setBulkPlanStatus] = useState<"running" | "paused" | null>(null);
   const [bulkQueue, setBulkQueue] = useState<BulkGenerationRequestRecord[]>([]);
+  const [liveRequestProgress, setLiveRequestProgress] = useState<{ total: number; imported: number } | null>(null);
   // Collapsed by default — the merged status bar shows just a "+N queued"
   // toggle; this expands it into the compact reorder/cancel list.
   const [bulkQueueExpanded, setBulkQueueExpanded] = useState(false);
@@ -2958,6 +2960,19 @@ function ImagesView() {
     return () => window.clearInterval(timer);
   }, [activeVideoId, bulkQueue]);
 
+  // Live-refresh when the Gemini extension's worker loop imports a render
+  // for the video currently open here — independent of every poll above,
+  // all of which are gated on the frontend's own idea of "something's in
+  // flight" (an image_jobs/single_still_generations/bulkQueue status), none
+  // of which a browser-live import touches on its own. `lastImportEventSeq`
+  // is a monotonic counter (not a boolean) specifically so a second import
+  // for the same video still re-triggers this effect.
+  useEffect(() => {
+    if (!activeVideoId || geminiLiveState.lastImportedVideoId !== activeVideoId) return;
+    void refreshWorkspace();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [geminiLiveState.lastImportEventSeq]);
+
   async function refreshWorkspace() {
     if (!activeVideoId) return;
     try {
@@ -3241,14 +3256,23 @@ function ImagesView() {
         } else if (result.kind === "planned") {
           setBulkProgress({ current: result.current, total: result.total, label: `Still ${result.current} of ${result.total} planned` });
           continue;
-        } else if (result.kind === "csvExported") {
-          // No image_jobs row exists for a csv-export request — nothing to
-          // hand off to the job-status UI, just stop and report where the
-          // file landed.
+        } else if (result.kind === "liveDispatching") {
+          // No image_jobs row exists for a browser-live request — rows are
+          // being pushed one at a time to the connected Gemini extension by
+          // the backend's worker loop instead. Nothing to hand off to the
+          // job-status poll; the existing bulk-queue poll (keyed on request
+          // status, below) picks up progress from here and the request
+          // flips to 'completed' on its own once every row has imported.
           setBulkPlanStatus(null);
           setBulkProgress(null);
           setBulkPlanControl(videoId, "stopped");
-          addToast(`Exported to ${result.csvPath} — upload it into the Gemini Chrome extension`, "success");
+          // Clear any stale job from an earlier api-mode run — otherwise
+          // the merged status bar keeps showing that old job's status
+          // (e.g. a leftover "failed") instead of this request's own
+          // browser-live progress, since `job` is never touched by this
+          // branch and getLatestImageJob() isn't re-fetched here.
+          setJob(null);
+          addToast("Generating via the Gemini Chrome extension — images will appear in the Images tab as they finish", "success");
           break;
         }
         // "generationStarted" or "generationInProgress" — this request's
@@ -3281,6 +3305,16 @@ function ImagesView() {
       // already durable on the backend) — Resume just calls this again.
       setBulkPlanControl(videoId, "paused");
       setBulkPlanStatus("paused");
+      // A thrown advanceBulkGenerationQueue call (e.g. a transient IPC hiccup
+      // during a dev rebuild) can still have fully succeeded backend-side —
+      // the request may already be 'generating' even though this call never
+      // got to see that. Without clearing this, the "Starting Bulk
+      // Generation…" placeholder set above stays stuck forever, and the
+      // status bar's display logic checks bulkProgress before
+      // activeLiveRequest — so a real, correctly-progressing generation
+      // stays hidden behind a stale placeholder from the failed call that
+      // preceded it. refreshBulkQueue() below will pick up the true state.
+      setBulkProgress(null);
     } finally {
       await refreshBulkQueue();
     }
@@ -3325,7 +3359,7 @@ function ImagesView() {
       stillSections.filter((section) => section.scene).map((section, index) => [section.scene!.id, index === 0]),
     ));
     try {
-      const [pending, sceneSettings, globalVisual, stillSettings, characters, locations, assignments] = await Promise.all([
+      const [pending, sceneSettings, globalVisual, stillSettings, characters, locations, assignments, modeDefault] = await Promise.all([
         projectsClient.pendingStillIds(activeVideoId),
         projectsClient.getBulkSceneSettings(activeVideoId),
         projectsClient.getBulkGlobalSettings(activeVideoId),
@@ -3333,7 +3367,12 @@ function ImagesView() {
         projectsClient.listRosterCharacters(activeVideoId),
         projectsClient.listRosterLocations(activeVideoId),
         projectsClient.getSceneCastAssignments(activeVideoId),
+        projectsClient.getAppSetting("generation_mode_default"),
       ]);
+      // Seeded from Preferences each time the panel opens — a per-request
+      // override, not a persisted choice of its own (see bulkGenerationMode's
+      // own comment).
+      setBulkGenerationMode(modeDefault === "browser-live" ? "browser-live" : "api");
       // A still-open multi-selection from the left pane wins over both the
       // remembered edit and the default "needs generation" set — Ctrl+click
       // there is a deliberate "generate exactly these" scoping gesture, so
@@ -3714,7 +3753,33 @@ function ImagesView() {
   const previewLabel = selectedGroup?.group.label ?? "Still preview";
   const stillCount = workspace?.groups.length ?? 0;
   const pendingBulkRequests = bulkQueue.filter((request) => request.status === "pending");
+  // A browser-live request has no image_jobs row, so `job`/`bulkProgress`
+  // both go null the moment planning finishes (see runQueueRunner's
+  // liveDispatching branch) — without this, the whole merged status bar
+  // below would just disappear for the entire generating phase, even
+  // though rows are actively (or about to be) dispatched to the extension.
+  const activeLiveRequest = bulkQueue.find((request) => request.status === "generating" && request.generationMode === "browser-live");
   const imageRenders = selectedGroup?.imageRenders ?? [];
+
+  // Row-completion progress for whichever browser-live request is active —
+  // separate from the live-refresh effect above (that one refreshes the
+  // still list/images; this one just drives the "X/Y imported" status-bar
+  // text, and needs to keep polling even while the extension is
+  // disconnected, e.g. to show "0/6 imported" while awaiting connection).
+  useEffect(() => {
+    if (!activeLiveRequest) { setLiveRequestProgress(null); return; }
+    const requestId = activeLiveRequest.id;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const progress = await projectsClient.getCsvExportProgress(requestId);
+        if (!cancelled) setLiveRequestProgress(progress);
+      } catch { /* transient — next tick retries */ }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 1500);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [activeLiveRequest?.id]);
 
   useEffect(() => {
     const ids = [selectedRenderId].filter(Boolean) as string[];
@@ -3826,12 +3891,17 @@ function ImagesView() {
       setRenderUrls({});
       setSelectedRenderId(null);
       setUserPrompt("");
-      setSystemPrompt("");
       setImageSettings(defaultImageSettings);
       const loaded = await projectsClient.getImageWorkspace(activeVideoId);
       setCached(activeVideoId, loaded);
       setWorkspace(loaded);
       setSelectedGroupId(loaded.groups[0]?.group.id ?? null);
+      // The style directive is saved independently (system_prompt.{videoId}
+      // app setting) — reset_image_workflow never touches it, only
+      // prompt_versions/image_renders. Re-read it from the reloaded
+      // workspace rather than leaving the field blank; a video that never
+      // had one saved correctly falls back to empty.
+      setSystemPrompt(loaded.settings.find((s) => s.key === `system_prompt.${activeVideoId}`)?.value ?? "");
     } catch (caught) {
       setError(String(caught));
     } finally {
@@ -4005,13 +4075,22 @@ function ImagesView() {
               plus a third box below for the queue list — collapsing them
               into a single compact bar was specifically requested, since
               stacking all three ate a lot of the preview pane). */}
-          {(job || bulkProgress || pendingBulkRequests.length > 0) && (
+          {(job || bulkProgress || activeLiveRequest || pendingBulkRequests.length > 0) && (
             <div className="bulk-status-bar">
               <div className="bulk-status-top">
-                <strong>{bulkProgress ? bulkProgress.label : job ? `Bulk job: ${job.status}` : "Bulk Generation queued"}</strong>
+                <strong>
+                  {bulkProgress
+                    ? bulkProgress.label
+                    : activeLiveRequest
+                    ? geminiLiveState.connected ? "Generating via Gemini extension" : "Awaiting Gemini extension connection"
+                    : job
+                    ? `Bulk job: ${job.status}`
+                    : "Bulk Generation queued"}
+                </strong>
                 <span>
                   {bulkProgress && bulkProgress.total > 0 && `${bulkProgress.current} / ${bulkProgress.total}`}
-                  {!bulkProgress && job && `${job.completedItems}/${job.totalItems} completed${job.failedItems ? ` · ${job.failedItems} failed` : ""}`}
+                  {!bulkProgress && activeLiveRequest && liveRequestProgress && `${liveRequestProgress.imported}/${liveRequestProgress.total} imported`}
+                  {!bulkProgress && !activeLiveRequest && job && `${job.completedItems}/${job.totalItems} completed${job.failedItems ? ` · ${job.failedItems} failed` : ""}`}
                 </span>
                 {pendingBulkRequests.length > 0 && (
                   <div className="bulk-queue-popover-anchor">
@@ -4030,7 +4109,7 @@ function ImagesView() {
                       {(promptPrepStatus === "paused" || bulkPlanStatus === "paused") && <button className="secondary" onClick={() => (bulkPlanStatus ? controlBulkPlan("resume") : controlPromptPreparation("resume"))}>Resume</button>}
                       <button className="secondary" onClick={() => (bulkPlanStatus !== null ? controlBulkPlan("stop") : controlPromptPreparation("stop"))}>Stop</button>
                     </>
-                  ) : job && (
+                  ) : activeLiveRequest ? null : job && (
                     <>
                       {["queued", "running"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("pause")}>Pause</button>}
                       {job.status === "paused" && <button className="secondary" onClick={() => void controlJob("resume")}>Resume</button>}
@@ -4042,6 +4121,10 @@ function ImagesView() {
               </div>
               {bulkProgress ? (
                 bulkProgress.total > 0 ? <progress value={bulkProgress.current} max={bulkProgress.total} /> : <progress />
+              ) : activeLiveRequest ? (
+                liveRequestProgress && liveRequestProgress.total > 0
+                  ? <progress value={liveRequestProgress.imported} max={liveRequestProgress.total} />
+                  : <progress />
               ) : job ? (
                 <progress value={job.completedItems + job.failedItems} max={job.totalItems} />
               ) : null}
@@ -4262,21 +4345,24 @@ function ImagesView() {
               );
             })}
           </div>
-          <label className="bulk-generation-mode-toggle" title="Plans the same way, but writes the prompts to a CSV file for the Gemini Chrome extension to drive gemini.google.com with, instead of calling the Gemini API here.">
+          <label className="bulk-generation-mode-toggle" title="Plans the same way, but dispatches each still to the connected Gemini Chrome extension live instead of calling the Gemini API here.">
             <input
               type="checkbox"
-              checked={bulkGenerationMode === "csv-export"}
-              onChange={(event) => setBulkGenerationMode(event.target.checked ? "csv-export" : "api")}
+              checked={bulkGenerationMode === "browser-live"}
+              onChange={(event) => setBulkGenerationMode(event.target.checked ? "browser-live" : "api")}
             />
-            Export for Gemini Chrome extension (CSV) instead of generating via API
+            Generate via Gemini Chrome extension (live) instead of API
           </label>
+          {bulkGenerationMode === "browser-live" && !geminiLiveState.connected && (
+            <p style={{fontSize:"11px",color:"#c77a26",margin:"4px 0 0",textAlign:"center"}}>Not connected — open the Gemini Chrome extension and enable Live Connection first.</p>
+          )}
           <button className="primary full" style={{marginTop:"10px"}} onClick={requestEnqueueBulkGeneration} disabled={!orderedBulkSelection.length || !systemPrompt.trim()}>
-            <WandSparkles size={16} />{bulkGenerationMode === "csv-export" ? `Export Selected (${bulkSelection.size})` : `Generate Selected (${bulkSelection.size})`}
+            <WandSparkles size={16} />{`Generate Selected (${bulkSelection.size})`}
           </button>
           {!systemPrompt.trim() ? (
             <p style={{fontSize:"11px",color:"#c77a26",margin:"6px 0 0",textAlign:"center"}}>Write a style directive in Global Settings above, or use Extract Style on a reference image, before generating.</p>
-          ) : bulkGenerationMode === "csv-export" ? (
-            <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans the selected stills via Claude CLI, then writes a CSV for the Gemini Chrome extension — upload it there once exported.</p>
+          ) : bulkGenerationMode === "browser-live" ? (
+            <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans the selected stills via Claude CLI, then drives the connected Gemini Chrome extension one still at a time — images appear here as they finish.</p>
           ) : (
             <p style={{fontSize:"11px",color:"var(--muted)",margin:"6px 0 0",textAlign:"center"}}>Plans and generates the selected stills in one pausable run — no separate review step. {bulkQueue.some((request) => !["completed", "failed", "cancelled"].includes(request.status)) && "A generation is already in progress — this will queue and start once it's this run's turn."}</p>
           )}
@@ -4433,6 +4519,7 @@ export function App() {
     exportCollapsed,
     setStage,
     setExportCollapsed,
+    geminiLiveState,
   } = useAppStore();
   const [startupNotice, setStartupNotice] = useState<string | null>(null);
   // Subscribed once, for the app's whole lifetime — NOT inside TimelineView,
@@ -4456,6 +4543,36 @@ export function App() {
       }
     })();
     return () => { unlisten?.(); };
+  }, []);
+  // Same idiom as the export-progress listener above — subscribed once,
+  // for the app's whole lifetime, feeding the Zustand store (not component
+  // state) so any component, mounted or not, can react. See
+  // GeminiLiveState's doc comment in app-store.ts.
+  useEffect(() => {
+    let unlistenConnection: (() => void) | undefined;
+    let unlistenImported: (() => void) | undefined;
+    (async () => {
+      try {
+        unlistenConnection = await listen<{ connected: boolean }>(
+          "gemini-extension-connection-changed",
+          ({ payload }) => useAppStore.getState().setGeminiLiveConnected(payload.connected),
+        );
+        unlistenImported = await listen<{ videoId: string; groupId: string; renderId: string; isFinal: boolean }>(
+          "gemini-extension-render-imported",
+          ({ payload }) => {
+            useAppStore.getState().noteGeminiRenderImported(payload.videoId);
+            // Fires regardless of which tab/video is currently active — the
+            // per-video live-refresh (ImagesView) only fires when it's
+            // mounted and looking at the matching video; this toast is what
+            // surfaces the same event everywhere else.
+            useAppStore.getState().addToast("An image from the Gemini Chrome extension is ready", "success");
+          },
+        );
+      } catch {
+        // Browser preview has no native event bridge.
+      }
+    })();
+    return () => { unlistenConnection?.(); unlistenImported?.(); };
   }, []);
   useEffect(() => document.documentElement.setAttribute("data-theme", theme), [theme]);
   // Proportional UI scaling: keep the exact same layout/proportions on every screen,
@@ -4522,6 +4639,14 @@ export function App() {
           exportState={exportState}
           onExpand={() => { setStage("timeline"); setExportCollapsed(false); }}
         />
+      )}
+      {stage !== "home" && (
+        <div
+          className={`gemini-live-badge ${geminiLiveState.connected ? "gemini-live-badge-connected" : "gemini-live-badge-disconnected"}`}
+          title={geminiLiveState.connected ? "Gemini Chrome extension connected" : "Gemini Chrome extension not connected — open its popup and enable Live Connection"}
+        >
+          {geminiLiveState.connected ? "🟢 Gemini extension connected" : "⚪ Gemini extension not connected"}
+        </div>
       )}
       <ToastDisplay />
     </div>

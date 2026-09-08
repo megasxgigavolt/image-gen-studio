@@ -2621,6 +2621,15 @@ function setBulkPlanControl(videoId: string | null, value: "running" | "paused" 
 function ImagesView() {
   const { activeVideoId, addToast, setStage, geminiLiveState } = useAppStore();
   const [workspace, setWorkspace] = useState<ImageWorkspaceRecord | null>(null);
+  // Guards against overlapping refreshWorkspace() calls resolving out of
+  // order — e.g. two browser-live imports landing a few hundred ms apart
+  // (the worker loop can emit several render-imported events in one tick)
+  // each fire their own refreshWorkspace(), and a slower-to-resolve older
+  // request completing AFTER a faster newer one would silently overwrite
+  // the newest data with a stale snapshot, making the latest imported
+  // still look like it "never appeared." Only the response matching the
+  // most recently issued request is applied.
+  const refreshWorkspaceSeqRef = useRef(0);
   const stillListScrollRef = useRef<HTMLElement>(null);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
   const [multiSelectedGroupIds, setMultiSelectedGroupIds] = useState<Set<string>>(new Set());
@@ -2658,8 +2667,10 @@ function ImagesView() {
   // "browser-live" plans via Claude CLI exactly like "api" does, but
   // dispatches each planned still to the connected Gemini Chrome extension
   // over the live connection instead of generating images itself here.
-  // Local UI state, not persisted — each new request starts back at the
-  // default unless the user opts in again.
+  // No per-request override anymore (that checkbox was removed from this
+  // panel) — this always just reflects Preferences' generation_mode_default,
+  // re-read fresh each time the panel opens, so switching it means going to
+  // Preferences, not toggling it here.
   const [bulkGenerationMode, setBulkGenerationMode] = useState<"api" | "browser-live">("api");
   const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number; label: string } | null>(null);
   const [preparingGroupIds, setPreparingGroupIds] = useState<Set<string>>(new Set());
@@ -2975,15 +2986,17 @@ function ImagesView() {
 
   async function refreshWorkspace() {
     if (!activeVideoId) return;
+    const seq = ++refreshWorkspaceSeqRef.current;
     try {
       const loaded = await projectsClient.getImageWorkspace(activeVideoId);
+      if (refreshWorkspaceSeqRef.current !== seq) return; // superseded by a newer refresh — drop this stale result
       setCached(activeVideoId, loaded);
       setWorkspace(loaded);
       const selected = loaded.groups.find((group) => group.group.id === selectedGroupId);
       const newest = selected?.imageRenders[0];
       if (newest) setSelectedRenderId(newest.id);
     } catch (caught) {
-      setError(String(caught));
+      if (refreshWorkspaceSeqRef.current === seq) setError(String(caught));
     }
   }
 
@@ -3369,9 +3382,9 @@ function ImagesView() {
         projectsClient.getSceneCastAssignments(activeVideoId),
         projectsClient.getAppSetting("generation_mode_default"),
       ]);
-      // Seeded from Preferences each time the panel opens — a per-request
-      // override, not a persisted choice of its own (see bulkGenerationMode's
-      // own comment).
+      // Read fresh from Preferences each time the panel opens — see
+      // bulkGenerationMode's own comment for why there's no in-panel
+      // override anymore.
       setBulkGenerationMode(modeDefault === "browser-live" ? "browser-live" : "api");
       // A still-open multi-selection from the left pane wins over both the
       // remembered edit and the default "needs generation" set — Ctrl+click
@@ -4345,14 +4358,6 @@ function ImagesView() {
               );
             })}
           </div>
-          <label className="bulk-generation-mode-toggle" title="Plans the same way, but dispatches each still to the connected Gemini Chrome extension live instead of calling the Gemini API here.">
-            <input
-              type="checkbox"
-              checked={bulkGenerationMode === "browser-live"}
-              onChange={(event) => setBulkGenerationMode(event.target.checked ? "browser-live" : "api")}
-            />
-            Generate via Gemini Chrome extension (live) instead of API
-          </label>
           {bulkGenerationMode === "browser-live" && !geminiLiveState.connected && (
             <p style={{fontSize:"11px",color:"#c77a26",margin:"4px 0 0",textAlign:"center"}}>Not connected — open the Gemini Chrome extension and enable Live Connection first.</p>
           )}

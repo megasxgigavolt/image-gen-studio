@@ -51,7 +51,7 @@ use crate::projects::{PendingCsvExportRow, ProjectRepository};
 use std::collections::HashMap;
 use std::fs;
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -211,7 +211,7 @@ fn worker_tick(
     };
     if let Some((row_id, ok, reason)) = pending_ack {
         if !ok {
-            let _ = repository.mark_csv_export_row_failed(&row_id, reason.as_deref());
+            let _ = repository.record_extension_row_failure(&row_id, reason.as_deref());
         }
     }
 
@@ -250,6 +250,10 @@ fn worker_tick(
     if connected && in_flight.is_none() {
         if let Ok(Some(next_row)) = repository.next_dispatchable_extension_row() {
             let prompt = dispatch_prompt_text(&next_row);
+            // Best-effort — a lookup failure just means the extension
+            // treats this as a first attempt (its own default), which is
+            // never worse than what already happens today.
+            let attempt = repository.extension_row_attempt_count(&next_row.id).unwrap_or(0);
             let message = serde_json::json!({
                 "type": "job",
                 "id": next_row.id,
@@ -257,12 +261,18 @@ fn worker_tick(
                 "prompt": prompt,
                 "sourceImagePath": next_row.source_image_path,
                 "maskImagePath": next_row.mask_image_path,
+                "attempt": attempt,
             })
             .to_string();
             let mut guard = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(sender) = &guard.sender {
                 if sender.send(message).is_ok() {
                     guard.in_flight_row_id = Some(next_row.id.clone());
+                    // Durable counterpart to in_flight_row_id above — see
+                    // next_dispatchable_extension_row's doc comment for why
+                    // the in-memory guard alone isn't enough (it's wiped on
+                    // every reconnect, including a routine one).
+                    let _ = repository.mark_extension_row_dispatched(&next_row.id);
                 }
             }
         }
@@ -339,6 +349,7 @@ fn import_one_row_if_ready(
     match result {
         Ok(render) => {
             let _ = repository.mark_csv_export_row_imported(&row.id, &render.id);
+            rename_for_readability(repository, row, path, extension);
             observed_sizes.remove(path);
             Some(render)
         }
@@ -346,5 +357,63 @@ fn import_one_row_if_ready(
         // retried next tick — no special handling needed, same as a row
         // whose file simply hasn't appeared yet.
         Err(_) => None,
+    }
+}
+
+/// Strips characters Windows (and most other filesystems) disallow in a
+/// filename, collapses runs of whitespace, and trims trailing dots/spaces
+/// (Windows silently drops these from whatever name you actually give it,
+/// so leaving them in would make the visible name not match what a
+/// directory listing shows). Falls back to a generic label rather than
+/// producing an empty filename if the title turns out to be nothing but
+/// disallowed characters.
+fn sanitize_for_filename(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if r#"\/:*?"<>|"#.contains(c) || c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim_end_matches(['.', ' ']).trim();
+    if trimmed.is_empty() { "video".to_string() } else { trimmed.to_string() }
+}
+
+/// Renames a just-imported row's downloaded file from `<row-id>.<ext>` to
+/// `<video title> still <N>.<ext>` — purely cosmetic, so it's fully
+/// best-effort: the app already links everything by database id and never
+/// re-reads this filename for anything, it's only here so a human browsing
+/// the flat watch folder can tell which downloaded file is which still
+/// without cross-referencing row ids against the database. Any failure
+/// (title/ordinal lookup, a filesystem error) just leaves the original
+/// `<row-id>.<ext>` name in place — never a reason to fail the import
+/// itself, which has already succeeded by the time this runs.
+fn rename_for_readability(repository: &ProjectRepository, row: &PendingCsvExportRow, path: &Path, extension: &str) {
+    let Ok((title, ordinal)) = repository.video_title_and_group_ordinal(&row.video_id, &row.group_id) else { return };
+    let base = format!("{} still {}", sanitize_for_filename(&title), ordinal);
+    let mut target = path.with_file_name(format!("{base}.{extension}"));
+    if target.exists() {
+        // Another file already claims the plain name — this folder is
+        // never pruned, so an earlier run's output for the same still
+        // (same video title, same ordinal) is routinely still sitting
+        // here, not just a same-tick re-generation. Disambiguate with a
+        // slice of this row's own globally-unique id rather than silently
+        // overwriting whatever's already there.
+        let suffix = &row.id[..row.id.len().min(8)];
+        target = path.with_file_name(format!("{base} ({suffix}).{extension}"));
+    }
+    // A file Chrome just finished writing is a common target for a brief
+    // real-time-antivirus/indexer lock on Windows — confirmed live that a
+    // single rename attempt right after import can lose to that race and
+    // silently leave the file under its raw `<row-id>.<ext>` name forever
+    // (nothing else ever retries it, since the row is already `'imported'`
+    // and drops out of every future tick's pending-row scan). A handful of
+    // short-spaced retries is cheap insurance against a lock that, by its
+    // nature, only lasts a moment.
+    for attempt in 0..5 {
+        if fs::rename(path, &target).is_ok() {
+            return;
+        }
+        if attempt < 4 {
+            thread::sleep(Duration::from_millis(150));
+        }
     }
 }

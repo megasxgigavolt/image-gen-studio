@@ -176,7 +176,7 @@ async function attachFiles(tabId, paths) {
 // prompt with real (CDP) text input, wait for Gemini's own send button to
 // report enabled, click it for real, then hand back to content.js to
 // detect and extract the resulting image.
-async function runRowViaDebugger(tabId, prompt, sourceImagePath, maskImagePath) {
+async function runRowViaDebugger(tabId, prompt, sourceImagePath, maskImagePath, attempt = 0) {
   await ensureDebuggerAttached(tabId);
 
   if (sourceImagePath) {
@@ -188,7 +188,7 @@ async function runRowViaDebugger(tabId, prompt, sourceImagePath, maskImagePath) 
     }
   }
 
-  const prep = await sendToContent(tabId, { type: "prepareRow" });
+  const prep = await sendToContent(tabId, { type: "prepareRow", attempt });
   if (!prep.ok) return prep;
   if (!prep.composerRect) return { ok: false, reason: "composer not found" };
   await clickAt(tabId, prep.composerRect);
@@ -198,17 +198,22 @@ async function runRowViaDebugger(tabId, prompt, sourceImagePath, maskImagePath) 
   // that Quill's internal model never registers (stays "ql-blank" even though
   // the DOM shows text), so the send button never reports enabled. A short
   // settle delay before typing, and another after, costs nothing on the rows
-  // that were already going to work.
-  await sleep(250);
+  // that were already going to work. `attempt` widens this on a retry (see
+  // content.js's own attempt-scaled wait timeouts for the same reasoning) —
+  // confirmed live that a still failing this once is meaningfully likely to
+  // fail it again at the exact same fixed budget rather than clearing on
+  // pure luck, so a retry gets strictly more room, not just another try at
+  // the same one.
+  await sleep(250 + attempt * 250);
   await typeText(tabId, prompt);
-  await sleep(300);
+  await sleep(300 + attempt * 300);
 
-  const enabled = await sendToContent(tabId, { type: "waitSendEnabled" });
+  const enabled = await sendToContent(tabId, { type: "waitSendEnabled", attempt });
   if (!enabled.ok) return enabled;
   if (!enabled.sendButtonRect) return { ok: false, reason: "send button not found" };
   await clickAt(tabId, enabled.sendButtonRect);
 
-  return sendToContent(tabId, { type: "waitForImage" });
+  return sendToContent(tabId, { type: "waitForImage", attempt });
 }
 
 function downloadDataUrl(dataUrl, mimeType, rowId) {
@@ -280,13 +285,24 @@ async function runJob(job) {
     if (needsFreshTab) {
       if (activeTabId !== null) {
         // Starting a new still's chat — the previous tab's chain (its
-        // generate job plus any edit jobs) is fully done with.
+        // generate job plus any edit jobs) is fully done with. AWAITED
+        // (was previously fire-and-forget): letting the new tab's
+        // navigation start while Chrome is still tearing down the old
+        // tab's debugger session/process starves the new page's own
+        // script execution right as it needs to hydrate and register
+        // Quill's send-button-enable logic — confirmed live as two
+        // consecutive "timeout: send-button-enabled" failures opening
+        // fresh tabs back-to-back with no gap between them.
         await detachDebugger(activeTabId);
-        chrome.tabs.remove(activeTabId).catch(() => {});
+        await chrome.tabs.remove(activeTabId).catch(() => {});
+        // Small buffer on top of the awaited remove — the callback firing
+        // only means Chrome accepted the removal, not that the closed
+        // tab's renderer process has fully released CPU/memory yet.
+        await sleep(300);
       }
       activeTabId = await openFreshChatTab();
     }
-    const response = await runRowViaDebugger(activeTabId, job.prompt, job.sourceImagePath, job.maskImagePath);
+    const response = await runRowViaDebugger(activeTabId, job.prompt, job.sourceImagePath, job.maskImagePath, job.attempt || 0);
     if (!response.ok) return response;
     const downloaded = await downloadDataUrl(response.dataUrl, response.mimeType, job.id);
     return downloaded ? { ok: true } : { ok: false, reason: "download failed" };

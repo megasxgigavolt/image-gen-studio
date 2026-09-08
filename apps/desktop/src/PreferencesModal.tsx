@@ -230,7 +230,7 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
                 <button type="button" className={generationModeDefault === "api" ? "tl-preset-btn active" : "tl-preset-btn"} onClick={() => setGenerationModeDefault("api")}><span>Live API</span></button>
                 <button type="button" className={generationModeDefault === "browser-live" ? "tl-preset-btn active" : "tl-preset-btn"} onClick={() => setGenerationModeDefault("browser-live")}><span>Gemini Chrome extension</span></button>
               </div>
-              <small className="tl-source-hint">Default for the single-still Generate button (and the Bulk Generation modal's starting checkbox state). "Gemini Chrome extension" requires Live Connection enabled in the extension's popup — a still just sits waiting until it is.</small>
+              <small className="tl-source-hint">Controls both the single-still Generate button and Bulk Generation — there's no separate per-run toggle for it anymore, this is the one place to switch modes. "Gemini Chrome extension" requires Live Connection enabled in the extension's popup — a still just sits waiting until it is.</small>
             </div>
 
             <div className="panel-section-heading" style={{ marginTop: "18px" }}><h3>Export Defaults</h3></div>

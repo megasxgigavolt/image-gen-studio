@@ -17,6 +17,33 @@
   DetailPrint "=========================================================="
   DetailPrint " "
 
+  ; ── Gemini Chrome Extension: optional ────────────────────────────────────
+  ; Tauri's own resource-copying step (see tauri.conf.json's bundle.resources)
+  ; already unconditionally copied it to $INSTDIR\gemini-chrome-extension
+  ; before this hook ever runs — this is purely an install-time choice about
+  ; whether to KEEP those files on disk or remove them again, since not every
+  ; user runs the Chrome-extension-based live-generation feature. Asked here,
+  ; first, before the long unattended dependency setup below, so it's one
+  ; quick click rather than something to notice mid-wait. Not published on
+  ; the Chrome Web Store (it drives Gemini's own web UI via chrome.debugger,
+  ; which the Web Store's review process doesn't allow) — it has to stay a
+  ; manually-loaded "unpacked" extension either way, hence the Load-unpacked
+  ; instructions in the "yes" branch below.
+  MessageBox MB_YESNO "Install the Gemini Chrome Extension?$\r$\n$\r$\nThis adds an optional browser-driven way to bulk-generate images through your own Gemini account in Chrome, instead of the built-in API path. You can skip this now and add it later by reinstalling.$\r$\n$\r$\nInstall it?" IDYES ags_ext_keep IDNO ags_ext_skip
+
+  ags_ext_skip:
+    RMDir /r "$INSTDIR\gemini-chrome-extension"
+    Goto ags_ext_done
+
+  ags_ext_keep:
+    DetailPrint "Gemini Chrome Extension installed to:"
+    DetailPrint "  $INSTDIR\gemini-chrome-extension"
+    DetailPrint "To load it: open chrome://extensions, enable Developer mode,"
+    DetailPrint "click 'Load unpacked', and select that folder."
+    DetailPrint " "
+
+  ags_ext_done:
+
   ; ── Write the FFmpeg helper (pure Python, no $ tokens) ────────────────────
   FileOpen $R8 "$TEMP\ags_ffmpeg.py" w
   FileWrite $R8 'import imageio_ffmpeg, shutil, os, winreg$\n'

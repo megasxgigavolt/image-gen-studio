@@ -1048,7 +1048,7 @@ CREATE INDEX IF NOT EXISTS idx_csv_export_rows_status ON csv_export_rows(bulk_re
 /// Adds `reason` (nullable) to `csv_export_rows` — a row the extension
 /// explicitly reports failing previously just went to `status='failed'`
 /// with no record of why, making a failed live-generation batch a total
-/// black box from the database side. `mark_csv_export_row_failed` now
+/// black box from the database side. `record_extension_row_failure` now
 /// stores the extension's own `result.reason` here.
 const MIGRATION_048: &str = r#"
 ALTER TABLE csv_export_rows ADD COLUMN reason TEXT;
@@ -1111,6 +1111,52 @@ const MIGRATION_050: &str = r#"
 ALTER TABLE csv_export_rows ADD COLUMN known_parent_render_id TEXT REFERENCES image_renders(id);
 ALTER TABLE csv_export_rows ADD COLUMN source_image_path TEXT;
 ALTER TABLE csv_export_rows ADD COLUMN mask_image_path TEXT;
+"#;
+
+/// Adds `attempt_count` — confirmed live that a browser-live row can fail
+/// for a purely transient reason (`"timeout: send-button-enabled"` from a
+/// tab that just happened to hydrate slowly, `"receiving end does not
+/// exist"` from a content script that hadn't finished injecting yet) that
+/// has nothing to do with the still itself and would very likely succeed
+/// on a plain retry. Before this, ANY reported failure — transient or
+/// not — permanently marked the row `'failed'` and left that still
+/// missing from the batch with no automatic recovery. See
+/// `record_extension_row_result`, which now retries a bounded number of
+/// times (tracked here) before giving up for good.
+const MIGRATION_051: &str = r#"
+ALTER TABLE csv_export_rows ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// Adds `dispatched_at` — confirmed live that the in-memory-only
+/// `in_flight_row_id` guard (`LiveStateInner`, gemini_extension.rs) is not
+/// enough on its own: it gets wiped to `None` on every WebSocket
+/// disconnect, but the extension's MV3 service worker can be killed and
+/// automatically reconnect (via its own alarm) at ANY time — including
+/// while a job it already started is still genuinely running in a browser
+/// tab. The very next worker tick after a reconnect then saw "nothing in
+/// flight" and redispatched the SAME still-`'exported'` row, producing a
+/// second, fully independent generation for the same still (confirmed
+/// live: two different downloaded files with different content, one of
+/// which — whichever lost the race to be renamed/imported first — was
+/// permanently orphaned). `dispatched_at` is a durable, DB-backed record
+/// of "this row was already sent" that survives a reconnect, so
+/// `next_dispatchable_extension_row` can refuse to re-offer a row that was
+/// dispatched too recently to plausibly have been abandoned, instead of
+/// trusting in-memory state that a routine reconnect can silently erase.
+const MIGRATION_052: &str = r#"
+ALTER TABLE csv_export_rows ADD COLUMN dispatched_at TEXT;
+"#;
+
+/// Adds `claude_session_id` — lets `plan_bulk_visuals_batch_for_request`
+/// keep ONE ongoing Claude CLI conversation alive across every chunk of a
+/// request's planning run (each chunk used to be a fresh, fully stateless
+/// `claude` process re-explaining the whole style directive/rules/roster
+/// from scratch — see `run_claude_cli_with_session`'s doc comment). Lives
+/// on the request row (not e.g. a separate table) since a session belongs
+/// to exactly one request's planning run for exactly as long as that run
+/// lasts — nothing else ever needs to look it up independently.
+const MIGRATION_053: &str = r#"
+ALTER TABLE bulk_generation_requests ADD COLUMN claude_session_id TEXT;
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1593,6 +1639,42 @@ const COMPOSITE_ID_TABLES: &[&str] = &["visual_plan_sentences", "visual_plan_gro
 
 fn composite_id_suffix(value: &str) -> &str {
     value.rsplit_once("::").map(|(_, suffix)| suffix).unwrap_or(value)
+}
+
+/// How long a dispatched browser-live extension row is left alone before
+/// `next_dispatchable_extension_row` will consider re-offering it, absent
+/// any explicit ack — see that function's doc comment. Comfortably above
+/// the worst realistic legitimate single-job duration (fresh-tab open,
+/// compose, Gemini's own generation time, `waitForImage`'s own 100s
+/// ceiling) so this only ever fires for a row that's actually been
+/// abandoned (e.g. a dropped connection whose ack never arrived), not one
+/// still genuinely in progress.
+const EXTENSION_ROW_REDISPATCH_GRACE: chrono::Duration = chrono::Duration::minutes(5);
+
+/// Maximum total attempts (the original dispatch plus automatic retries)
+/// a browser-live extension row gets before `record_extension_row_failure`
+/// gives up and marks it permanently `'failed'`. 3 — enough to ride out
+/// ordinary page/timing jitter without silently retrying forever against
+/// a still that's genuinely broken for some other reason.
+const MAX_EXTENSION_ROW_ATTEMPTS: i64 = 3;
+
+/// Whether a browser-live extension row's failure `reason` looks like
+/// transient jitter worth retrying, rather than a definitive failure to
+/// give up on immediately. Deliberately NOT retried: `"signed-out"`
+/// (retrying won't fix a logged-out browser — needs the user to sign back
+/// in) and `"stopped"` (the user explicitly hit Stop; retrying would defy
+/// that). Everything else confirmed live so far — `"timeout: ..."`,
+/// `"receiving end does not exist"`, `"attach failed: ..."`,
+/// `"download failed"` — is exactly the class of page/network/timing
+/// jitter a plain retry with a fresh tab is likely to clear on its own.
+fn is_retryable_extension_failure(reason: Option<&str>) -> bool {
+    match reason {
+        Some(reason) => {
+            let lower = reason.to_lowercase();
+            !(lower.contains("signed-out") || lower.contains("stopped"))
+        }
+        None => true,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2277,6 +2359,10 @@ struct BulkGenerationRequestRow {
     created_at: String,
     updated_at: String,
     generation_mode: String,
+    /// Internal-only — see `MIGRATION_053`'s doc comment. Deliberately not
+    /// carried into `BulkGenerationRequest` (the wire type); the frontend
+    /// has no use for it.
+    claude_session_id: Option<String>,
 }
 
 impl BulkGenerationRequestRow {
@@ -3071,6 +3157,51 @@ impl ProjectRepository {
         }
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(50, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_attempt_count: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('csv_export_rows') WHERE name='attempt_count')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_attempt_count {
+            self.connection.execute_batch(MIGRATION_051).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(51, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_dispatched_at: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('csv_export_rows') WHERE name='dispatched_at')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_dispatched_at {
+            self.connection.execute_batch(MIGRATION_052).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(52, ?1)",
+            [Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+        let has_claude_session_id: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('bulk_generation_requests') WHERE name='claude_session_id')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !has_claude_session_id {
+            self.connection.execute_batch(MIGRATION_053).map_err(|error| error.to_string())?;
+        }
+        self.connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(53, ?1)",
             [Utc::now().to_rfc3339()],
         ).map_err(|error| error.to_string())?;
         Ok(())
@@ -5538,18 +5669,39 @@ Return JSON only — no markdown, no explanation:
     /// still sat untouched until every remaining scene finished planning
     /// too — pointless waiting when its row was already sitting there
     /// `'exported'` and ready to go.
+    ///
+    /// `r.dispatched_at IS NULL OR r.dispatched_at < cutoff` guards against
+    /// a real, confirmed-live duplicate-generation bug: the in-memory
+    /// `in_flight_row_id` guard alone isn't enough, since it gets wiped on
+    /// every WebSocket disconnect — including a routine one, since the
+    /// extension's MV3 service worker can be killed and auto-reconnect at
+    /// any time, possibly while a job it already started is still actually
+    /// running in a browser tab. Without this, the very next tick after
+    /// such a reconnect would see "nothing in flight" (a stale read of
+    /// memory that just got reset) and redispatch the SAME still-`'exported'`
+    /// row, producing a second independent generation — confirmed live via
+    /// two differently-hashed downloaded files for the same still, one of
+    /// which was never imported at all. `EXTENSION_ROW_REDISPATCH_GRACE`
+    /// comfortably exceeds every legitimate single-job duration
+    /// (tab-open + compose + Gemini's own generation + `waitForImage`'s own
+    /// 100s ceiling), so only a row that's genuinely been abandoned this
+    /// long becomes eligible again — this is deliberately a fallback safety
+    /// net for a silently-dropped ack, not the primary recovery path
+    /// (`record_extension_row_failure`'s retry already handles an EXPLICIT
+    /// failure ack immediately, by clearing this same column).
     pub fn next_dispatchable_extension_row(&self) -> Result<Option<PendingCsvExportRow>, String> {
+        let cutoff = (Utc::now() - EXTENSION_ROW_REDISPATCH_GRACE).to_rfc3339();
         self.connection.query_row(
             "SELECT r.id,r.bulk_request_id,r.single_still_generation_id,r.video_id,r.group_id,r.kind,r.parent_row_id,r.prompt_version_id,r.prompt_text,r.known_parent_render_id,r.source_image_path,r.mask_image_path
              FROM csv_export_rows r
              LEFT JOIN bulk_generation_requests b ON b.id = r.bulk_request_id
-             WHERE r.status='exported' AND (
+             WHERE r.status='exported' AND (r.dispatched_at IS NULL OR r.dispatched_at < ?1) AND (
                  r.single_still_generation_id IS NOT NULL
                  OR (b.generation_mode='browser-live' AND b.status IN ('planning','generating'))
              )
              ORDER BY COALESCE(b.created_at, r.created_at), r.row_order
              LIMIT 1",
-            [],
+            [&cutoff],
             |row| Ok(PendingCsvExportRow {
                 id: row.get(0)?, bulk_request_id: row.get(1)?, single_still_generation_id: row.get(2)?,
                 video_id: row.get(3)?, group_id: row.get(4)?, kind: row.get(5)?,
@@ -5557,6 +5709,32 @@ Return JSON only — no markdown, no explanation:
                 known_parent_render_id: row.get(9)?, source_image_path: row.get(10)?, mask_image_path: row.get(11)?,
             }),
         ).optional().map_err(|e| e.to_string())
+    }
+
+    /// How many times this row has already been retried (0 on its first
+    /// dispatch) — sent along with the job so the extension can widen its
+    /// own wait timeouts on a retry instead of hitting the exact same
+    /// fixed ceiling every time. Confirmed live: a still that fails
+    /// `waitSendEnabled` once is meaningfully likely to fail it again at
+    /// the same threshold rather than clearing on pure luck, so giving a
+    /// retry strictly more time (not just another try at the same time
+    /// budget) is worth the small extra wall-clock cost on a still that's
+    /// genuinely just slow.
+    pub fn extension_row_attempt_count(&self, row_id: &str) -> Result<i64, String> {
+        self.connection.query_row(
+            "SELECT attempt_count FROM csv_export_rows WHERE id=?1", [row_id], |row| row.get(0),
+        ).map_err(|e| e.to_string())
+    }
+
+    /// Stamps a row as just-dispatched — see `next_dispatchable_extension_row`'s
+    /// doc comment for why this durable timestamp exists alongside (not
+    /// instead of) the in-memory `in_flight_row_id` guard.
+    pub fn mark_extension_row_dispatched(&self, row_id: &str) -> Result<(), String> {
+        self.connection.execute(
+            "UPDATE csv_export_rows SET dispatched_at=?1 WHERE id=?2",
+            params![Utc::now().to_rfc3339(), row_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// The `image_renders.id` an already-imported row resolved to, if any —
@@ -5589,24 +5767,62 @@ Return JSON only — no markdown, no explanation:
         Ok(())
     }
 
-    /// Marks a row the extension explicitly reported failing (its `result`
-    /// message had `ok:false`) — distinct from simply never appearing,
-    /// which is what a silently-dropped download still looks like. Without
-    /// this, a definitively-failed row would stay `'exported'` forever and
-    /// `next_dispatchable_extension_row` would keep re-offering it forever.
-    /// `reason` is the extension's own `result.reason` string (e.g.
-    /// "timeout", "signed-out") — stored so a failed live-generation batch
-    /// isn't a total black box from the database side.
+    /// Handles a row the extension explicitly reported failing (its
+    /// `result` message had `ok:false`) — distinct from simply never
+    /// appearing, which is what a silently-dropped download still looks
+    /// like. Confirmed live that most observed failures
+    /// (`"timeout: send-button-enabled"` from a tab that hydrated a bit
+    /// slowly, `"receiving end does not exist"` from a content script that
+    /// hadn't finished injecting yet) are transient page/timing jitter
+    /// with nothing to do with the still itself — a plain retry with a
+    /// fresh tab is very likely to just work. Before this, ANY reported
+    /// failure permanently marked the row `'failed'` and left that still
+    /// silently missing from the batch forever, with no automatic
+    /// recovery — this is the "fallback logic" that was missing.
     ///
-    /// `WHERE status='exported'` is deliberate and load-bearing: confirmed
-    /// live that a late/stale `ok:false` ack can arrive for a row the
-    /// file-scan already imported successfully moments earlier (e.g. after
-    /// a connection drop caused the same row to be re-dispatched) — without
-    /// this guard, that late ack overwrote a row already correctly linked
-    /// to a real generated image back to `'failed'`, silently hiding a
-    /// still that actually has a perfectly good render.
-    pub fn mark_csv_export_row_failed(&self, row_id: &str, reason: Option<&str>) -> Result<(), String> {
+    /// So: a failure that looks retryable (see `is_retryable_extension_failure`)
+    /// and hasn't already used up its attempts gets reset back to
+    /// `'exported'` (with `attempt_count` bumped) instead of failed —
+    /// `next_dispatchable_extension_row` naturally re-offers it on a later
+    /// tick, same as any other pending row, no special-casing needed there.
+    /// Only once attempts are exhausted, or the failure looks definitive
+    /// (signed out, user-cancelled), does this fall through to actually
+    /// marking the row `'failed'`.
+    ///
+    /// `WHERE status='exported'` on every branch is deliberate and
+    /// load-bearing: confirmed live that a late/stale `ok:false` ack can
+    /// arrive for a row the file-scan already imported successfully
+    /// moments earlier (e.g. after a connection drop caused the same row
+    /// to be re-dispatched) — without this guard, that late ack could
+    /// overwrite a row already correctly linked to a real generated image.
+    pub fn record_extension_row_failure(&self, row_id: &str, reason: Option<&str>) -> Result<(), String> {
         let now = Utc::now().to_rfc3339();
+        let attempt_count: Option<i64> = self.connection.query_row(
+            "SELECT attempt_count FROM csv_export_rows WHERE id=?1 AND status='exported'",
+            [row_id],
+            |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        // Already resolved by something else (imported, or a previous ack
+        // already handled this row) — nothing left to do here.
+        let Some(attempt_count) = attempt_count else { return Ok(()) };
+
+        if is_retryable_extension_failure(reason) && attempt_count + 1 < MAX_EXTENSION_ROW_ATTEMPTS {
+            // dispatched_at is cleared here (not just left to expire on its
+            // own) because this is a CONFIRMED failure — the extension
+            // explicitly told us this attempt ended, so there's no
+            // ambiguity about whether a browser tab might still be
+            // working on it the way there is after a silent disconnect.
+            // Immediate re-eligibility is correct and desired here; the
+            // grace period in next_dispatchable_extension_row exists
+            // specifically for the case where no such confirmation ever
+            // arrives.
+            self.connection.execute(
+                "UPDATE csv_export_rows SET status='exported',reason=?1,attempt_count=attempt_count+1,dispatched_at=NULL,updated_at=?2 WHERE id=?3 AND status='exported'",
+                params![reason, now, row_id],
+            ).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+
         self.connection.execute(
             "UPDATE csv_export_rows SET status='failed',reason=?1,updated_at=?2 WHERE id=?3 AND status='exported'",
             params![reason, now, row_id],
@@ -5730,7 +5946,7 @@ Return JSON only — no markdown, no explanation:
         // the video id itself is a reasonable enough "one run" stand-in.
         self.plan_bulk_visuals_batch_impl(
             video_id, style_directive, base_settings_json, creative_instruction,
-            selected_group_ids, start_index, None, video_id, "api",
+            selected_group_ids, start_index, None, video_id, "api", None,
         )
     }
 
@@ -5757,6 +5973,7 @@ Return JSON only — no markdown, no explanation:
             Some(&snapshot),
             request_id,
             &request.generation_mode,
+            request.claude_session_id.as_deref(),
         )?;
         let next_index = if result.done {
             result.total_stills
@@ -5782,6 +5999,7 @@ Return JSON only — no markdown, no explanation:
         snapshot: Option<&BulkRequestSnapshot>,
         run_key: &str,
         generation_mode: &str,
+        claude_session_id: Option<&str>,
     ) -> Result<BulkPlanBatchResult, String> {
         #[cfg(not(test))]
         let claude_cli = claude_cli_available();
@@ -6166,6 +6384,27 @@ Return JSON only — no markdown, no explanation:
              - A row with neither field: choose freely from the full list above based on the narration.\n",
             IMAGE_MEDIUM_TYPES.join("; "),
         );
+        // Once an earlier chunk of THIS SAME request has already established
+        // a resumable Claude CLI session (see run_claude_cli_with_session),
+        // this and every later chunk continues that one ongoing conversation
+        // instead of a fresh stateless process — the model already retains
+        // everything it planned in earlier turns, so re-serializing the full
+        // "previously planned" recap into every new prompt is redundant (and,
+        // for a long video, an ever-growing one). Only trimmed for Claude
+        // specifically: Gemini has no session/continuity mechanism at all and
+        // always needs the real thing, and a request's very FIRST chunk (no
+        // session established yet) also always needs it, since there's no
+        // prior turn yet to have retained anything. `prior_context` (the Rust
+        // data, not this text) is still computed unconditionally above — it's
+        // also used later for the cross-batch visualType run-length check,
+        // independent of what actually got sent to the model.
+        let resuming_claude_session = claude_cli && claude_session_id.is_some();
+        let prior_context_text = if resuming_claude_session {
+            "(You already have full visibility into every previously planned still in this video from earlier turns in this same conversation — this is not being recapped again.)".to_string()
+        } else {
+            serde_json::to_string_pretty(&prior_context).unwrap_or_default()
+        };
+        let video_history_block = if resuming_claude_session { String::new() } else { video_history_block };
         let prompt = format!(
             r#"You are an Educational Visual Director planning an entire video, not isolated stills.
 {story_context_block}
@@ -6298,18 +6537,52 @@ You MUST return exactly one plan for every row in the current batch.
 OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object and NOTHING else. Do not write any introduction, restatement of the task, narration of your planning process, explanation, commentary, or markdown fences before, between, or after it. Do not describe what you are about to plan — just plan it, silently, and output only the resulting JSON. The very first character of your response must be {{ and the very last character must be }}.
 {{"plans":[{{"visualPlanRowId":"exact row id","visualType":"...","imageSettings":{{...}},"userPrompt":"scene content — mandatory creative rules embedded; negatives as [Avoid: ...]","reason":"in-depth explanation, see REASON above","coreVisualDevice":"2-6 words naming the concrete symbol/object this still leans on, e.g. 'dice and coin', 'gears', 'split panel: podium vs porch'"}}]}}"#,
             format!("{}-{}", start_index + 1, chunk_end),
-            serde_json::to_string_pretty(&prior_context).unwrap_or_default(),
+            prior_context_text,
             serde_json::to_string_pretty(chunk).unwrap_or_default(),
         );
+        // Persists whatever session id Claude just returned onto the request
+        // row (a no-op for the legacy, non-request-backed plan_bulk_visuals_batch
+        // caller, where `snapshot` is None) so the NEXT chunk call can pass it
+        // back in as `claude_session_id` and continue this exact conversation
+        // instead of starting fresh.
+        let persist_session = |session_id: &Option<String>| {
+            if let (Some(sid), Some(_)) = (session_id, snapshot) {
+                let _ = self.set_bulk_request_claude_session(run_key, sid);
+            }
+        };
         let response = if claude_cli {
-            match request_claude_cli_v2_plan(&prompt) {
-                Ok(response) => response,
-                Err(claude_error) => match gemini_auth.as_ref() {
-                    Some(auth) => request_gemini_v2_plan(auth, &prompt).map_err(|gemini_error| {
-                        format!("Claude CLI: {claude_error} | Gemini fallback also failed: {gemini_error}")
-                    })?,
-                    None => return Err(format!("Claude CLI: {claude_error}")),
-                },
+            match request_claude_cli_v2_plan(&prompt, claude_session_id) {
+                Ok((response, session_id)) => {
+                    persist_session(&session_id);
+                    response
+                }
+                Err(claude_error) => {
+                    // A `--resume` attempt specifically can fail if the
+                    // session expired or was cleared externally — worth one
+                    // fresh-session retry (still Claude, just without
+                    // --resume) before falling all the way back to Gemini,
+                    // since staying on Claude is preferable when it's just
+                    // this one session that went stale, not Claude itself
+                    // being unavailable. Not attempted when this was already
+                    // a fresh attempt (claude_session_id was None) — retrying
+                    // the identical call would just fail the same way.
+                    let fresh_retry = claude_session_id
+                        .is_some()
+                        .then(|| request_claude_cli_v2_plan(&prompt, None).ok())
+                        .flatten();
+                    match fresh_retry {
+                        Some((response, session_id)) => {
+                            persist_session(&session_id);
+                            response
+                        }
+                        None => match gemini_auth.as_ref() {
+                            Some(auth) => request_gemini_v2_plan(auth, &prompt).map_err(|gemini_error| {
+                                format!("Claude CLI: {claude_error} | Gemini fallback also failed: {gemini_error}")
+                            })?,
+                            None => return Err(format!("Claude CLI: {claude_error}")),
+                        },
+                    }
+                }
             }
         } else {
             request_gemini_v2_plan(gemini_auth.as_ref().unwrap(), &prompt)?
@@ -7633,6 +7906,26 @@ Return JSON only:
                 created_at: row.get(14)?, subject_x: row.get(15)?, subject_y: row.get(16)?,
             }),
         ).map_err(|_| "Source image version was not found.".to_string())
+    }
+
+    /// Used only to build a human-readable filename for a just-imported
+    /// browser-live render (see `gemini_extension.rs`'s post-import
+    /// rename) — `(video title, still ordinal)`, the same ordinal already
+    /// shown to the user as "Still N" everywhere else in the UI.
+    ///
+    /// `csv_export_rows.group_id` (like `image_renders.group_id`/
+    /// `prompt_versions.group_id`) stores the bare suffix (e.g. `"g1"`),
+    /// but `visual_plan_groups.id` stores it namespaced as
+    /// `{video_id}::current::{suffix}` (see `composite_id_suffix`'s doc
+    /// comment) — has to be reconstructed here or this always misses.
+    pub fn video_title_and_group_ordinal(&self, video_id: &str, group_id: &str) -> Result<(String, i64), String> {
+        let composite_group_id = format!("{video_id}::current::{group_id}");
+        self.connection.query_row(
+            "SELECT v.title, g.ordinal FROM videos v, visual_plan_groups g \
+             WHERE v.id=?1 AND g.id=?2 AND g.video_id=?1",
+            [video_id, composite_group_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).map_err(|err| err.to_string())
     }
 
     pub fn edit_image_render(
@@ -10389,13 +10682,13 @@ Return JSON only:
 
     fn get_bulk_generation_request_row(&self, request_id: &str) -> Result<BulkGenerationRequestRow, String> {
         self.connection.query_row(
-            "SELECT id,video_id,status,position,snapshot_json,plan_index,image_job_id,last_error,created_at,updated_at,generation_mode FROM bulk_generation_requests WHERE id=?1",
+            "SELECT id,video_id,status,position,snapshot_json,plan_index,image_job_id,last_error,created_at,updated_at,generation_mode,claude_session_id FROM bulk_generation_requests WHERE id=?1",
             [request_id],
             |row| Ok(BulkGenerationRequestRow {
                 id: row.get(0)?, video_id: row.get(1)?, status: row.get(2)?, position: row.get(3)?,
                 snapshot_json: row.get(4)?, plan_index: row.get(5)?, image_job_id: row.get(6)?,
                 last_error: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)?,
-                generation_mode: row.get(10)?,
+                generation_mode: row.get(10)?, claude_session_id: row.get(11)?,
             }),
         ).map_err(|_| "Bulk generation request was not found.".to_string())
     }
@@ -10406,36 +10699,78 @@ Return JSON only:
 
     pub fn list_bulk_generation_requests(&self, video_id: &str) -> Result<Vec<BulkGenerationRequest>, String> {
         let mut statement = self.connection.prepare(
-            "SELECT id,video_id,status,position,snapshot_json,plan_index,image_job_id,last_error,created_at,updated_at,generation_mode FROM bulk_generation_requests WHERE video_id=?1 ORDER BY position ASC"
+            "SELECT id,video_id,status,position,snapshot_json,plan_index,image_job_id,last_error,created_at,updated_at,generation_mode,claude_session_id FROM bulk_generation_requests WHERE video_id=?1 ORDER BY position ASC"
         ).map_err(|e| e.to_string())?;
         let rows = statement.query_map([video_id], |row| Ok(BulkGenerationRequestRow {
             id: row.get(0)?, video_id: row.get(1)?, status: row.get(2)?, position: row.get(3)?,
             snapshot_json: row.get(4)?, plan_index: row.get(5)?, image_job_id: row.get(6)?,
             last_error: row.get(7)?, created_at: row.get(8)?, updated_at: row.get(9)?,
-            generation_mode: row.get(10)?,
+            generation_mode: row.get(10)?, claude_session_id: row.get(11)?,
         })).map_err(|e| e.to_string())?
             .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
         rows.into_iter().map(|row| row.into_public()).collect()
     }
 
-    /// Removes a request that hasn't started yet. Requests that are already
-    /// planning/generating/terminal can't be cancelled this way — stopping
-    /// an in-flight one goes through the existing job controls
-    /// (`control_image_job`) on its linked `image_job_id` instead.
-    /// Removes a request that hasn't reached the generation phase yet —
-    /// covers both a `pending` request still waiting its turn and the one
-    /// currently `planning` (this is what the frontend's "Stop" control
-    /// during the planning phase calls). Once a request is `generating` it
-    /// has its own `image_job_id`; stopping it goes through the existing
+    /// Persists the Claude CLI session id a chunk's planning call just
+    /// established or continued — see `MIGRATION_053`'s doc comment. A
+    /// no-op if the request has moved on (e.g. cancelled) is fine here:
+    /// this is purely an optimization hint for the NEXT chunk, never
+    /// something correctness depends on.
+    fn set_bulk_request_claude_session(&self, request_id: &str, session_id: &str) -> Result<(), String> {
+        self.connection.execute(
+            "UPDATE bulk_generation_requests SET claude_session_id=?1 WHERE id=?2",
+            params![session_id, request_id],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Stops a request that hasn't reached the generation phase yet — covers
+    /// both a `pending` request still waiting its turn and one currently
+    /// `planning` (this is what the frontend's "Stop" control during the
+    /// planning phase calls). Once a request is `generating` it has its own
+    /// `image_job_id`; stopping it goes through the existing
     /// `control_image_job`("stop") on that job instead, which the worker
     /// thread's finalize hook (see `spawn_job_workers`) turns into this
     /// request ending up `cancelled` automatically.
+    ///
+    /// A `pending` request is genuinely untouched by anything else (planning
+    /// hasn't started, nothing can reference it yet) so it's safe to
+    /// actually delete — it just vanishes from the queue, matching the old
+    /// behavior. A `planning` request is NOT safe to delete: confirmed live
+    /// that planning runs across several separate async calls from the
+    /// frontend (one AI planning chunk per call), so an earlier chunk's
+    /// call can still be actively inserting `prompt_versions`/
+    /// `csv_export_rows` rows that reference this request's id at the exact
+    /// moment Stop is clicked — a plain `DELETE` here raced against that in
+    /// one of two bad ways: either it ran first and the in-flight chunk's
+    /// next insert then failed with `FOREIGN KEY constraint failed` (its
+    /// parent row had just vanished), or a child row already existed and
+    /// blocked the delete itself with the very same error — silently
+    /// leaving Stop with no effect at all while surfacing a cryptic
+    /// database error either way. Marking it `'cancelled'` instead (the
+    /// same terminal status the generating-phase path already uses, see
+    /// `finalize_bulk_request`) leaves the row and its children fully
+    /// intact no matter how an in-flight chunk's inserts interleave with
+    /// this — there is no delete left to race against. The frontend's own
+    /// control-flow guard (`bulkPlanControlByVideo`) already stops it from
+    /// requesting any FURTHER planning chunk once this resolves; whatever
+    /// chunk was already in flight when Stop was clicked simply finishes
+    /// (same as how the generating-phase Stop doesn't instantly kill an
+    /// in-flight image render either).
     pub fn cancel_bulk_generation_request(&self, request_id: &str) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
         let deleted = self.connection.execute(
-            "DELETE FROM bulk_generation_requests WHERE id=?1 AND status IN ('pending','planning')",
+            "DELETE FROM bulk_generation_requests WHERE id=?1 AND status='pending'",
             [request_id],
         ).map_err(|e| e.to_string())?;
-        if deleted == 0 {
+        if deleted > 0 {
+            return Ok(());
+        }
+        let updated = self.connection.execute(
+            "UPDATE bulk_generation_requests SET status='cancelled',updated_at=?1 WHERE id=?2 AND status='planning'",
+            params![now, request_id],
+        ).map_err(|e| e.to_string())?;
+        if updated == 0 {
             return Err("Only a request that hasn't started generating yet can be cancelled this way.".into());
         }
         Ok(())
@@ -10866,7 +11201,7 @@ Return JSON only:
     /// picks it up exactly like a bulk-planned row. Returns immediately;
     /// the caller (`spawn_single_still_dispatcher`) polls
     /// `single_still_generation_status` for `mark_csv_export_row_imported`/
-    /// `mark_csv_export_row_failed`'s propagation to resolve it.
+    /// `record_extension_row_failure`'s propagation to resolve it.
     pub fn dispatch_single_still_generation_via_extension(
         &self,
         id: &str,
@@ -10883,7 +11218,7 @@ Return JSON only:
     /// What `spawn_single_still_dispatcher` polls after
     /// `dispatch_single_still_generation_via_extension` — resolves once the
     /// linked `csv_export_rows` row imports or fails (see the propagation
-    /// in `mark_csv_export_row_imported`/`mark_csv_export_row_failed`).
+    /// in `mark_csv_export_row_imported`/`record_extension_row_failure`).
     pub fn single_still_generation_status(&self, id: &str) -> Result<Option<String>, String> {
         self.connection.query_row(
             "SELECT status FROM single_still_generations WHERE id=?1", [id], |row| row.get(0),
@@ -15049,6 +15384,80 @@ fn run_claude_cli(prompt: &str, extra_args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// Like `run_claude_cli`, but for the one call site (`request_claude_cli_v2_plan`,
+/// bulk visual planning) that wants an ONE ongoing Claude conversation
+/// spanning every chunk of a single request's planning run, instead of a
+/// fresh, fully stateless process per chunk. Every OTHER Claude CLI call
+/// site in this file (directive extraction, character description, etc.)
+/// keeps using the plain `run_claude_cli` unchanged — a one-off call has
+/// no reason to leave a resumable session sitting on disk.
+///
+/// `resume_session_id: None` starts a new session (deliberately omits
+/// `--no-session-persistence`, unlike `run_claude_cli`, so Claude Code
+/// actually saves it and it CAN be resumed); `Some(id)` continues that
+/// exact session via `--resume` instead. Returns `(response_text,
+/// session_id)` — `session_id` comes straight from Claude Code's own JSON
+/// envelope (present on every response regardless of mode) and is what
+/// the caller persists (`bulk_generation_requests.claude_session_id`) to
+/// pass back in as `resume_session_id` on the next chunk.
+#[cfg(not(test))]
+fn run_claude_cli_with_session(
+    prompt: &str,
+    extra_args: &[&str],
+    resume_session_id: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    let mut command = Command::new("claude");
+    command
+        .arg("-p").arg(prompt)
+        .arg("--output-format").arg("json")
+        .arg("--model").arg("sonnet");
+    if let Some(session_id) = resume_session_id {
+        command.arg("--resume").arg(session_id);
+    }
+    command
+        .args(extra_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let output = run_subprocess_with_deadline(
+        command,
+        std::time::Duration::from_secs(180),
+        "Claude CLI timed out after 180s — it may be stalled (e.g. a usage limit, or a conflicting Claude Code session on this machine). Try again, or add a Gemini API key in Settings as a fallback.",
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Claude CLI exited with an error: {}", stderr.trim()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let payload: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|_| {
+        format!("Claude CLI returned non-JSON output: {}", stdout.chars().take(500).collect::<String>())
+    })?;
+    if payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Err(format!(
+            "Claude CLI reported an error: {}",
+            payload.get("result").and_then(|v| v.as_str()).unwrap_or("unknown error")
+        ));
+    }
+    let text = payload.get("result").and_then(|v| v.as_str())
+        .map(str::trim).filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "Claude CLI returned no text.".to_string())?;
+    let session_id = payload.get("session_id").and_then(|v| v.as_str()).map(str::to_string);
+    Ok((text, session_id))
+}
+
+#[cfg(test)]
+fn run_claude_cli_with_session(
+    prompt: &str,
+    extra_args: &[&str],
+    resume_session_id: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    let _ = (prompt, extra_args, resume_session_id);
+    Err("Claude CLI is not available in tests.".to_string())
+}
+
 /// Claude CLI plan request for `plan_bulk_visuals`. Worth spending `--effort
 /// high` on specifically — visual planning is a real creative/compositional
 /// judgment call across dozens of stills, not a quick lookup, and it draws
@@ -15057,10 +15466,16 @@ fn run_claude_cli(prompt: &str, extra_args: &[&str]) -> Result<String, String> {
 /// text rather than requesting a JSON-schema-constrained reply — matches how
 /// Gemini is parsed here too, and avoids needing a JSON-schema generator for
 /// `V2PlanChunkResponse` on the Rust side.
-fn request_claude_cli_v2_plan(prompt: &str) -> Result<V2PlanChunkResponse, String> {
-    let text = run_claude_cli(prompt, &["--effort", "high"])?;
-    normalize_bulk_plan_response(extract_json_from_text(&text))
-        .map_err(|e| e.replace("Gemini", "Claude CLI"))
+///
+/// `resume_session_id` (see `run_claude_cli_with_session`) lets this chunk
+/// continue an earlier chunk's conversation instead of starting fully
+/// fresh; the returned session id (present either way) is what the caller
+/// persists for the NEXT chunk to resume in turn.
+fn request_claude_cli_v2_plan(prompt: &str, resume_session_id: Option<&str>) -> Result<(V2PlanChunkResponse, Option<String>), String> {
+    let (text, session_id) = run_claude_cli_with_session(prompt, &["--effort", "high"], resume_session_id)?;
+    let parsed = normalize_bulk_plan_response(extract_json_from_text(&text))
+        .map_err(|e| e.replace("Gemini", "Claude CLI"))?;
+    Ok((parsed, session_id))
 }
 
 /// Claude CLI request for `extract_image_settings_from_directive`, routed
@@ -17388,6 +17803,103 @@ mod tests {
     }
 
     #[test]
+    fn a_recently_dispatched_row_is_not_re_offered_until_the_grace_period_elapses() {
+        // Reproduces the real duplicate-generation bug: the in-memory
+        // in_flight_row_id guard alone isn't enough, since it's wiped on
+        // every WebSocket reconnect (routine for an MV3 service worker)
+        // even while a job it already started may still be running in a
+        // browser tab. mark_extension_row_dispatched's durable timestamp is
+        // what next_dispatchable_extension_row must now also respect.
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|g| g.id.clone()).collect();
+        let request = repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &group_ids, "browser-live").unwrap();
+        repo.connection.execute("UPDATE bulk_generation_requests SET status='generating' WHERE id=?1", [&request.id]).unwrap();
+        let pv = repo.create_prompt_version(&video.id, &group_ids[0], "{}", "Style", "A scene.").unwrap();
+        let row_id = repo.record_csv_export_row(&request.id, &video.id, &group_ids[0], "generate", None, &pv.id, "prompt").unwrap();
+
+        // Freshly dispatched — must not be offered again (simulating a
+        // reconnect wiping the in-memory guard moments later, with the
+        // job still plausibly running in a browser tab).
+        repo.mark_extension_row_dispatched(&row_id).unwrap();
+        assert!(repo.next_dispatchable_extension_row().unwrap().is_none(), "a just-dispatched row must not be re-offered");
+
+        // Simulate the grace period having elapsed — now it's fair game
+        // again (the row's own dispatch is presumed abandoned).
+        let stale = (Utc::now() - EXTENSION_ROW_REDISPATCH_GRACE - chrono::Duration::seconds(1)).to_rfc3339();
+        repo.connection.execute("UPDATE csv_export_rows SET dispatched_at=?1 WHERE id=?2", params![stale, &row_id]).unwrap();
+        let next = repo.next_dispatchable_extension_row().unwrap().expect("a long-stale dispatch must become eligible again");
+        assert_eq!(next.id, row_id);
+
+        // An explicit failure ack (not just silence) clears dispatched_at
+        // immediately — no reason to wait out the grace period when the
+        // extension positively confirmed the attempt already ended.
+        repo.mark_extension_row_dispatched(&row_id).unwrap();
+        repo.record_extension_row_failure(&row_id, Some("timeout: send-button-enabled")).unwrap();
+        let next = repo.next_dispatchable_extension_row().unwrap().expect("a confirmed-failed row must be immediately re-offered");
+        assert_eq!(next.id, row_id);
+    }
+
+    #[test]
+    fn record_extension_row_failure_retries_transient_failures_before_giving_up() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|g| g.id.clone()).collect();
+        let request = repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &group_ids, "browser-live").unwrap();
+        repo.connection.execute("UPDATE bulk_generation_requests SET status='generating' WHERE id=?1", [&request.id]).unwrap();
+        let pv = repo.create_prompt_version(&video.id, &group_ids[0], "{}", "Style", "A scene.").unwrap();
+        let row_id = repo.record_csv_export_row(&request.id, &video.id, &group_ids[0], "generate", None, &pv.id, "prompt").unwrap();
+
+        let status_and_attempts = |repo: &ProjectRepository| -> (String, i64) {
+            repo.connection.query_row(
+                "SELECT status, attempt_count FROM csv_export_rows WHERE id=?1", [&row_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap()
+        };
+
+        // A transient-looking failure resets the row back to 'exported'
+        // (so it's naturally re-offered) rather than failing it outright,
+        // and bumps attempt_count.
+        repo.record_extension_row_failure(&row_id, Some("timeout: send-button-enabled (waited 10000ms)")).unwrap();
+        assert_eq!(status_and_attempts(&repo), ("exported".to_string(), 1));
+        let redispatched = repo.next_dispatchable_extension_row().unwrap().expect("a retried row must be re-offered");
+        assert_eq!(redispatched.id, row_id);
+
+        // A second transient failure retries again (2 total attempts used).
+        repo.record_extension_row_failure(&row_id, Some("receiving end does not exist")).unwrap();
+        assert_eq!(status_and_attempts(&repo), ("exported".to_string(), 2));
+
+        // A third failure has now exhausted MAX_EXTENSION_ROW_ATTEMPTS (3)
+        // — this time it's permanently marked 'failed', not retried again.
+        repo.record_extension_row_failure(&row_id, Some("timeout: response-image (waited 100000ms)")).unwrap();
+        assert_eq!(status_and_attempts(&repo).0, "failed");
+        assert!(repo.next_dispatchable_extension_row().unwrap().is_none(), "a permanently failed row must not be re-offered");
+
+        // A separate row that fails for a definitive (non-retryable)
+        // reason skips straight to 'failed' on the very first attempt.
+        let pv2 = repo.create_prompt_version(&video.id, &group_ids[0], "{}", "Style", "Another scene.").unwrap();
+        let row2_id = repo.record_csv_export_row(&request.id, &video.id, &group_ids[0], "generate", None, &pv2.id, "prompt 2").unwrap();
+        repo.record_extension_row_failure(&row2_id, Some("signed-out")).unwrap();
+        let (row2_status, row2_attempts): (String, i64) = repo.connection.query_row(
+            "SELECT status, attempt_count FROM csv_export_rows WHERE id=?1", [&row2_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!((row2_status.as_str(), row2_attempts), ("failed", 0));
+    }
+
+    #[test]
     fn persist_bulk_planned_still_respects_locked_fields_and_skips_fully_locked() {
         let (temp, repo) = repository();
         let channel = repo.create_channel("Channel", None).unwrap();
@@ -17890,6 +18402,44 @@ mod tests {
     }
 
     #[test]
+    fn claude_session_id_round_trips_through_a_bulk_request() {
+        // Reproduces the plumbing plan_bulk_visuals_batch_for_request relies
+        // on to keep one ongoing Claude CLI conversation across every chunk
+        // of a request's planning run (see run_claude_cli_with_session's doc
+        // comment) — the CLI call itself isn't exercised in tests
+        // (claude_cli is forced false, see plan_bulk_visuals_batch_impl's
+        // #[cfg(test)] branch), but the durable storage it depends on is.
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|g| g.id.clone()).collect();
+        let request = repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &group_ids, "api").unwrap();
+
+        // Freshly enqueued — no session established yet.
+        assert_eq!(repo.get_bulk_generation_request_row(&request.id).unwrap().claude_session_id, None);
+
+        repo.set_bulk_request_claude_session(&request.id, "session-abc-123").unwrap();
+        assert_eq!(
+            repo.get_bulk_generation_request_row(&request.id).unwrap().claude_session_id.as_deref(),
+            Some("session-abc-123"),
+        );
+
+        // A later chunk's session id (Claude Code can rotate it on resume)
+        // simply overwrites the earlier one — always the latest, never
+        // accumulated.
+        repo.set_bulk_request_claude_session(&request.id, "session-xyz-789").unwrap();
+        assert_eq!(
+            repo.get_bulk_generation_request_row(&request.id).unwrap().claude_session_id.as_deref(),
+            Some("session-xyz-789"),
+        );
+    }
+
+    #[test]
     fn cancel_and_reorder_bulk_generation_requests() {
         let (temp, repo) = repository();
         let channel = repo.create_channel("Channel", None).unwrap();
@@ -17924,12 +18474,52 @@ mod tests {
         // but it CAN still be cancelled while merely `planning` (this is
         // what the frontend's "Stop" button during the planning phase
         // calls); only a `generating` request (its own image job already
-        // running) is excluded from this path.
+        // running) is excluded from this path. Unlike a still-`pending`
+        // request, this does NOT remove the row — it's marked `'cancelled'`
+        // instead (see `cancel_bulk_generation_request`'s doc comment for
+        // why a hard delete here is unsafe: an in-flight planning chunk can
+        // still be actively inserting rows that reference this id).
         let claimed = repo.claim_next_bulk_request(&video.id).unwrap().unwrap();
         assert_eq!(claimed.id, c.id);
         assert!(repo.reorder_bulk_generation_request(&c.id, "down").is_err());
         repo.cancel_bulk_generation_request(&c.id).unwrap();
-        assert_eq!(ids(&repo), vec![b.id.clone()]);
+        assert_eq!(repo.get_bulk_generation_request(&c.id).unwrap().status, "cancelled");
+        assert_eq!(ids(&repo), vec![c.id.clone(), b.id.clone()]);
+    }
+
+    #[test]
+    fn cancelling_a_planning_request_with_already_recorded_rows_does_not_hit_a_foreign_key_error() {
+        // Reproduces the real "FOREIGN KEY constraint failed" the frontend's
+        // Stop button used to raise: clicking it during the planning phase
+        // used to hard-DELETE the bulk_generation_requests row, which throws
+        // that exact error once any csv_export_rows/prompt_versions already
+        // reference it — and it happened often, since planning records the
+        // first still's rows almost immediately.
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|g| g.id.clone()).collect();
+        let request = repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &group_ids, "browser-live").unwrap();
+        repo.claim_next_bulk_request(&video.id).unwrap().unwrap();
+
+        // A still has already been planned and recorded for this request —
+        // exactly the state a real in-flight planning chunk leaves behind.
+        let pv = repo.create_prompt_version(&video.id, &group_ids[0], "{}", "Style", "A scene.").unwrap();
+        repo.record_csv_export_row(&request.id, &video.id, &group_ids[0], "generate", None, &pv.id, "prompt").unwrap();
+
+        // Must succeed without an FK error, and must NOT delete the row or
+        // its already-recorded children — only mark it cancelled.
+        repo.cancel_bulk_generation_request(&request.id).unwrap();
+        assert_eq!(repo.get_bulk_generation_request(&request.id).unwrap().status, "cancelled");
+        let row_count: i64 = repo.connection.query_row(
+            "SELECT COUNT(*) FROM csv_export_rows WHERE bulk_request_id=?1", [&request.id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(row_count, 1, "the already-recorded row must survive cancellation, not be orphaned or deleted");
     }
 
     fn scene_tagged_group(ordinal: i64, scene_id: Option<&str>) -> PlanGroup {

@@ -10476,6 +10476,15 @@ Return JSON only:
                 let auth = self.gemini_auth()?;
                 request_gemini_text(&auth, r#"Reply with exactly this JSON: {"ok": true}"#).map(|_| ())
             }
+            "claude" => {
+                self.get_provider_key("claude")?.filter(|value| !value.trim().is_empty())
+                    .ok_or("No Claude CLI token is saved.")?;
+                // Deliberately the plain, stateless run_claude_cli here (not
+                // run_claude_cli_with_session) — a Preferences "Test" click
+                // should just confirm the token actually authenticates, not
+                // leave a resumable session sitting on disk behind it.
+                run_claude_cli(r#"Reply with exactly this JSON: {"ok": true}"#, &[]).map(|_| ())
+            }
             _ => Err(format!("Unknown provider: {provider}")),
         }
     }
@@ -15328,6 +15337,23 @@ fn spawn_subprocess_watchdog(
     (timed_out, cancelled, last_activity, handle)
 }
 
+/// The user's own long-lived Claude Code OAuth token, if they've saved one
+/// in Preferences (AI Providers → "Claude CLI") — set as
+/// `CLAUDE_CODE_OAUTH_TOKEN` on every `claude` invocation below when
+/// present, so the app can drive Claude CLI non-interactively on a machine
+/// with no browser to complete `/login` (see the official docs' "Generate
+/// a long-lived token" section — this is what `claude setup-token` mints).
+/// On a machine that's already logged in normally, this key is simply
+/// never saved, so nothing changes: `claude` falls through to its own
+/// ambient `/login` credential exactly as before. A free function (not a
+/// `ProjectRepository` method) since it's a pure OS-keyring lookup with no
+/// need for a DB handle, matching the fact that `run_claude_cli`/
+/// `run_claude_cli_with_session` are themselves free functions.
+#[cfg(not(test))]
+fn claude_oauth_token() -> Option<String> {
+    Entry::new("auto-gen-studio", "claude").ok()?.get_password().ok()
+}
+
 fn run_claude_cli(prompt: &str, extra_args: &[&str]) -> Result<String, String> {
     #[cfg(test)]
     {
@@ -15346,6 +15372,9 @@ fn run_claude_cli(prompt: &str, extra_args: &[&str]) -> Result<String, String> {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(token) = claude_oauth_token() {
+            command.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+        }
         #[cfg(windows)]
         command.creation_flags(0x08000000);
         // `Command::output()` (used here previously) blocks indefinitely if the
@@ -15419,6 +15448,9 @@ fn run_claude_cli_with_session(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(token) = claude_oauth_token() {
+        command.env("CLAUDE_CODE_OAUTH_TOKEN", token);
+    }
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     let output = run_subprocess_with_deadline(

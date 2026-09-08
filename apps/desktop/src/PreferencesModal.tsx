@@ -36,10 +36,13 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
   const [exportCaptions, setExportCaptions] = useState<ExportCaptionsMode>("burned-in");
   const [openaiConfigured, setOpenaiConfigured] = useState(false);
   const [geminiConfigured, setGeminiConfigured] = useState(false);
+  const [claudeConfigured, setClaudeConfigured] = useState(false);
   const [openaiKeyDraft, setOpenaiKeyDraft] = useState("");
   const [geminiKeyDraft, setGeminiKeyDraft] = useState("");
+  const [claudeKeyDraft, setClaudeKeyDraft] = useState("");
   const [openaiTest, setOpenaiTest] = useState<TestState>("idle");
   const [geminiTest, setGeminiTest] = useState<TestState>("idle");
+  const [claudeTest, setClaudeTest] = useState<TestState>("idle");
   const [testMode, setTestMode] = useState(false);
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -47,7 +50,7 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     void (async () => {
-      const [version, folder, watchFolder, modeDefault, autosave, resolution, captions, testModeSetting, openaiStatus, geminiStatus] = await Promise.all([
+      const [version, folder, watchFolder, modeDefault, autosave, resolution, captions, testModeSetting, openaiStatus, geminiStatus, claudeStatus] = await Promise.all([
         projectsClient.getApplicationVersion(),
         projectsClient.getAppSetting("download_folder"),
         projectsClient.getAppSetting("gemini_extension_watch_folder"),
@@ -58,6 +61,7 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
         projectsClient.getAppSetting("ai_test_mode"),
         projectsClient.getProviderKeyStatus("openai"),
         projectsClient.getProviderKeyStatus("gemini"),
+        projectsClient.getProviderKeyStatus("claude"),
       ]);
       setAppVersion(version);
       setSaveLocation(folder ?? "");
@@ -69,6 +73,7 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
       setTestMode(testModeSetting === "true");
       setOpenaiConfigured(openaiStatus.configured);
       setGeminiConfigured(geminiStatus.configured);
+      setClaudeConfigured(claudeStatus.configured);
       setLoading(false);
     })();
   }, []);
@@ -83,17 +88,20 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
     if (folder) setGeminiWatchFolder(folder);
   }
 
-  async function testKey(provider: "openai" | "gemini") {
-    const setTest = provider === "openai" ? setOpenaiTest : setGeminiTest;
+  async function testKey(provider: "openai" | "gemini" | "claude") {
+    const setTest = provider === "openai" ? setOpenaiTest : provider === "gemini" ? setGeminiTest : setClaudeTest;
     setTest("testing");
     try {
       // A freshly typed, unsaved key can't be tested until it's saved — the
       // native call reads from the OS keyring, not this draft state.
       if (provider === "openai" && openaiKeyDraft.trim()) await projectsClient.saveProviderKey("openai", openaiKeyDraft.trim());
       if (provider === "gemini" && geminiKeyDraft.trim()) await projectsClient.saveProviderKey("gemini", geminiKeyDraft.trim());
+      if (provider === "claude" && claudeKeyDraft.trim()) await projectsClient.saveProviderKey("claude", claudeKeyDraft.trim());
       await projectsClient.testProviderKey(provider);
       setTest("ok");
-      if (provider === "openai") setOpenaiConfigured(true); else setGeminiConfigured(true);
+      if (provider === "openai") setOpenaiConfigured(true);
+      else if (provider === "gemini") setGeminiConfigured(true);
+      else setClaudeConfigured(true);
     } catch {
       setTest("failed");
     }
@@ -112,6 +120,7 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
         projectsClient.saveAppSetting("ai_test_mode", testMode ? "true" : "false"),
         openaiKeyDraft.trim() ? projectsClient.saveProviderKey("openai", openaiKeyDraft.trim()) : Promise.resolve(),
         geminiKeyDraft.trim() ? projectsClient.saveProviderKey("gemini", geminiKeyDraft.trim()) : Promise.resolve(),
+        claudeKeyDraft.trim() ? projectsClient.saveProviderKey("claude", claudeKeyDraft.trim()) : Promise.resolve(),
       ]);
       addToast("Preferences saved", "success", 2000);
       onClose();
@@ -213,6 +222,21 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
               </div>
               {testBadge(geminiTest)}
               <small className="tl-source-hint">One Gemini key powers both image generation (Visuals) and animation (Animate/Veo) — they share the same credential in this app.</small>
+            </label>
+            <label className="pref-field">
+              <span className="field-heading">Bulk Gen planning (Claude CLI)</span>
+              <div className="pref-path-row">
+                <input
+                  type="password"
+                  className="tl-text-input"
+                  value={claudeKeyDraft}
+                  onChange={(event) => setClaudeKeyDraft(event.target.value)}
+                  placeholder={claudeConfigured ? "•••••••••••••••• (saved)" : "sk-ant-oat…"}
+                />
+                <button type="button" className="secondary" onClick={() => void testKey("claude")} disabled={claudeTest === "testing" || (!claudeConfigured && !claudeKeyDraft.trim())}>Test</button>
+              </div>
+              {testBadge(claudeTest)}
+              <small className="tl-source-hint">Optional — only needed on a machine with no browser to run <code>claude</code>'s normal interactive login. Generate one by running <code>claude setup-token</code> anywhere you can log in, then paste the printed token here. Leave this empty on a machine that's already logged in normally; Bulk Gen planning already prefers Claude CLI (falling back to Gemini) either way.</small>
             </label>
 
             <div className="panel-section-heading" style={{ marginTop: "18px" }}><h3>Gemini Chrome Extension</h3></div>

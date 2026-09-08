@@ -898,15 +898,15 @@ export const projectsClient = {
     if (isTauri()) return invoke("get_app_setting", { key });
     return localStorage.getItem(`${STORAGE_KEY}.setting.${key}`);
   },
-  async saveProviderKey(provider: "openai" | "gemini", apiKey: string): Promise<void> {
+  async saveProviderKey(provider: "openai" | "gemini" | "claude", apiKey: string): Promise<void> {
     if (isTauri()) return invoke("save_provider_key", { provider, apiKey });
     localStorage.setItem(`${STORAGE_KEY}.key-status.${provider}`, apiKey ? "configured" : "");
   },
-  async getProviderKeyStatus(provider: "openai" | "gemini"): Promise<ProviderKeyStatusRecord> {
+  async getProviderKeyStatus(provider: "openai" | "gemini" | "claude"): Promise<ProviderKeyStatusRecord> {
     if (isTauri()) return invoke("get_provider_key_status", { provider });
     return { provider, configured: localStorage.getItem(`${STORAGE_KEY}.key-status.${provider}`) === "configured" };
   },
-  async testProviderKey(provider: "openai" | "gemini"): Promise<void> {
+  async testProviderKey(provider: "openai" | "gemini" | "claude"): Promise<void> {
     if (isTauri()) return invoke("test_provider_key", { provider });
     throw new Error("Testing a provider key requires the native application.");
   },

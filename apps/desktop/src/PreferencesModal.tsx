@@ -102,8 +102,12 @@ export function PreferencesModal({ onClose }: { onClose: () => void }) {
       if (provider === "openai") setOpenaiConfigured(true);
       else if (provider === "gemini") setGeminiConfigured(true);
       else setClaudeConfigured(true);
-    } catch {
+    } catch (error) {
       setTest("failed");
+      // The badge alone only ever said "Failed" — real reason (a wrong key,
+      // an expired Claude CLI token, the CLI not being on PATH, etc.)
+      // Was silently discarded, making a failure undiagnosable from the UI.
+      addToast(`${provider} test failed: ${String(error)}`, "error");
     }
   }
 

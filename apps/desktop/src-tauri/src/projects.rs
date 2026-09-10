@@ -6927,6 +6927,7 @@ OUTPUT FORMAT — NON-NEGOTIABLE: your entire response must be ONE JSON object a
                 command,
                 std::time::Duration::from_secs(600),
                 "Motion graphics analysis timed out after 600s.",
+                None,
             )?;
             if !output.status.success() {
                 return Err(format!("Motion graphics analysis failed. {}", String::from_utf8_lossy(&output.stderr).trim()));
@@ -12867,6 +12868,7 @@ Return JSON only:
                 command,
                 std::time::Duration::from_secs(180),
                 "Could not determine narration duration: the video export engine timed out after 180s.",
+                None,
             )?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -12935,6 +12937,7 @@ Return JSON only:
                 command,
                 std::time::Duration::from_secs(180),
                 "Could not detect the image's subject: the video export engine timed out after 180s.",
+                None,
             )?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -12997,6 +13000,7 @@ Return JSON only:
                 command,
                 std::time::Duration::from_secs(180),
                 "Could not adjust the animation's duration: the video export engine timed out after 180s.",
+                None,
             )?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -13047,6 +13051,7 @@ Return JSON only:
                 command,
                 std::time::Duration::from_secs(180),
                 "Could not remove background noise: the video export engine timed out after 180s.",
+                None,
             )?;
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -15221,13 +15226,32 @@ fn normalize_bulk_plan_response(cleaned: &str) -> Result<V2PlanChunkResponse, St
 /// larger than the OS pipe buffer would deadlock the child against an unread
 /// pipe well before the deadline ever got a chance to fire.
 #[cfg(not(test))]
+/// `stdin_data`, when `Some`, is written to the child's stdin (which the
+/// caller must have set to `Stdio::piped()`) on its OWN thread, running
+/// concurrently with the stdout/stderr reader threads below rather than as
+/// one blocking write before them — a prompt large enough to need stdin in
+/// the first place (see `run_claude_cli`'s doc comment on why) is also
+/// large enough to risk deadlocking against the child's own stdout/stderr
+/// buffers filling up if written and drained sequentially instead. Every
+/// pre-existing caller passes `None` and is completely unaffected (no
+/// `.stdin()` call of their own to begin with, so this never touches their
+/// child's stdin at all).
 fn run_subprocess_with_deadline(
     mut command: Command,
     deadline: std::time::Duration,
     timeout_message: &str,
+    stdin_data: Option<String>,
 ) -> Result<std::process::Output, String> {
-    use std::io::Read;
+    use std::io::{Read, Write};
     let mut child = command.spawn().map_err(|e| format!("Could not start the process: {e}"))?;
+    let stdin_writer = stdin_data.map(|data| {
+        let mut stdin_pipe = child.stdin.take().expect("stdin was piped when stdin_data is Some");
+        std::thread::spawn(move || {
+            let _ = stdin_pipe.write_all(data.as_bytes());
+            // stdin_pipe drops here, closing the pipe (EOF) so the child
+            // knows the prompt is complete.
+        })
+    });
     let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
     let stdout_reader = std::thread::spawn(move || { let mut buf = Vec::new(); let _ = stdout_pipe.read_to_end(&mut buf); buf });
@@ -15242,6 +15266,7 @@ fn run_subprocess_with_deadline(
                     let _ = child.wait();
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
+                    if let Some(writer) = stdin_writer { let _ = writer.join(); }
                     return Err(timeout_message.to_string());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -15251,6 +15276,7 @@ fn run_subprocess_with_deadline(
     };
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
+    if let Some(writer) = stdin_writer { let _ = writer.join(); }
     Ok(std::process::Output { status, stdout, stderr })
 }
 
@@ -15364,12 +15390,20 @@ fn run_claude_cli(prompt: &str, extra_args: &[&str]) -> Result<String, String> {
     {
         let mut command = Command::new("claude");
         command
-            .arg("-p").arg(prompt)
+            // The prompt is delivered over stdin (below), not as a `-p`
+            // argument — confirmed live: a bulk-planning prompt (the whole
+            // rules/roster/prior-context template) is easily large enough
+            // to exceed Windows' hard cap on total command-line length,
+            // surfacing as an opaque "os error 206" (filename or extension
+            // too long) that had nothing to do with the prompt's actual
+            // content. `claude -p` (bare, no value) reads the prompt from
+            // stdin instead — confirmed live this works identically.
+            .arg("-p")
             .arg("--output-format").arg("json")
             .arg("--no-session-persistence")
             .arg("--model").arg("sonnet")
             .args(extra_args)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(token) = claude_oauth_token() {
@@ -15391,6 +15425,7 @@ fn run_claude_cli(prompt: &str, extra_args: &[&str]) -> Result<String, String> {
             command,
             std::time::Duration::from_secs(180),
             "Claude CLI timed out after 180s — it may be stalled (e.g. a usage limit, or a conflicting Claude Code session on this machine). Try again, or add a Gemini API key in Settings as a fallback.",
+            Some(prompt.to_string()),
         )?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -15437,7 +15472,14 @@ fn run_claude_cli_with_session(
 ) -> Result<(String, Option<String>), String> {
     let mut command = Command::new("claude");
     command
-        .arg("-p").arg(prompt)
+        // Prompt goes over stdin (below), not as a `-p` argument — a bulk
+        // planning prompt (the full rules/roster/prior-context template)
+        // is easily large enough to exceed Windows' hard cap on total
+        // command-line length, which confirmed live as an opaque
+        // "os error 206" (filename or extension too long) that had
+        // nothing to do with the prompt's actual content. See
+        // `run_claude_cli`'s matching comment.
+        .arg("-p")
         .arg("--output-format").arg("json")
         .arg("--model").arg("sonnet");
     if let Some(session_id) = resume_session_id {
@@ -15445,7 +15487,7 @@ fn run_claude_cli_with_session(
     }
     command
         .args(extra_args)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(token) = claude_oauth_token() {
@@ -15457,6 +15499,7 @@ fn run_claude_cli_with_session(
         command,
         std::time::Duration::from_secs(180),
         "Claude CLI timed out after 180s — it may be stalled (e.g. a usage limit, or a conflicting Claude Code session on this machine). Try again, or add a Gemini API key in Settings as a fallback.",
+        Some(prompt.to_string()),
     )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

@@ -17,25 +17,48 @@
   DetailPrint "=========================================================="
   DetailPrint " "
 
-  ; ── Gemini Chrome Extension: optional ────────────────────────────────────
+  ; ── Gemini Chrome Extension: optional, asked ONCE ────────────────────────
   ; Tauri's own resource-copying step (see tauri.conf.json's bundle.resources)
   ; already unconditionally copied it to $INSTDIR\gemini-chrome-extension
   ; before this hook ever runs — this is purely an install-time choice about
   ; whether to KEEP those files on disk or remove them again, since not every
-  ; user runs the Chrome-extension-based live-generation feature. Asked here,
-  ; first, before the long unattended dependency setup below, so it's one
-  ; quick click rather than something to notice mid-wait. Not published on
-  ; the Chrome Web Store (it drives Gemini's own web UI via chrome.debugger,
-  ; which the Web Store's review process doesn't allow) — it has to stay a
-  ; manually-loaded "unpacked" extension either way, hence the Load-unpacked
-  ; instructions in the "yes" branch below.
-  MessageBox MB_YESNO "Install the Gemini Chrome Extension?$\r$\n$\r$\nThis adds an optional browser-driven way to bulk-generate images through your own Gemini account in Chrome, instead of the built-in API path. You can skip this now and add it later by reinstalling.$\r$\n$\r$\nInstall it?" IDYES ags_ext_keep IDNO ags_ext_skip
+  ; user runs the Chrome-extension-based live-generation feature. Not
+  ; published on the Chrome Web Store (it drives Gemini's own web UI via
+  ; chrome.debugger, which the Web Store's review process doesn't allow) —
+  ; it has to stay a manually-loaded "unpacked" extension either way, hence
+  ; the Load-unpacked instructions in the "yes" branch below.
+  ;
+  ; The choice is remembered in a marker file at $INSTDIR\.gemini-ext-choice,
+  ; which — unlike $INSTDIR\gemini-chrome-extension itself — nothing else
+  ; ever deletes or recreates, so it survives every future update. Without
+  ; this, the auto-updater's own silent/passive reinstall (which runs this
+  ; exact hook again on every single version bump, not just the very first
+  ; install) reasked this every time — confirmed live as a real, repeated
+  ; annoyance, not a one-time install question the way it was designed to
+  ; be. Now a later update just silently reapplies whatever was chosen the
+  ; first time.
+  IfFileExists "$INSTDIR\.gemini-ext-choice" ags_ext_choice_remembered ags_ext_ask
+
+  ags_ext_choice_remembered:
+    FileOpen $4 "$INSTDIR\.gemini-ext-choice" r
+    FileRead $4 $5
+    FileClose $4
+    StrCmp $5 "no" ags_ext_skip ags_ext_keep
+
+  ags_ext_ask:
+    MessageBox MB_YESNO "Install the Gemini Chrome Extension?$\r$\n$\r$\nThis adds an optional browser-driven way to bulk-generate images through your own Gemini account in Chrome, instead of the built-in API path. You can skip this now and add it later by reinstalling.$\r$\n$\r$\nInstall it?" IDYES ags_ext_keep IDNO ags_ext_skip
 
   ags_ext_skip:
+    FileOpen $4 "$INSTDIR\.gemini-ext-choice" w
+    FileWrite $4 "no"
+    FileClose $4
     RMDir /r "$INSTDIR\gemini-chrome-extension"
     Goto ags_ext_done
 
   ags_ext_keep:
+    FileOpen $4 "$INSTDIR\.gemini-ext-choice" w
+    FileWrite $4 "yes"
+    FileClose $4
     DetailPrint "Gemini Chrome Extension installed to:"
     DetailPrint "  $INSTDIR\gemini-chrome-extension"
     DetailPrint "To load it: open chrome://extensions, enable Developer mode,"

@@ -1273,6 +1273,43 @@ def test_ensure_remotion_browser_downloaded_succeeds_quietly(tmp_path, monkeypat
     export_engine._ensure_remotion_browser_downloaded()  # no exception == success
 
 
+def test_ensure_remotion_browser_downloaded_skips_the_subprocess_once_verified(tmp_path, monkeypatch):
+    # Confirmed live as a real, repeated annoyance: this used to spawn a
+    # whole Node process on EVERY export just to ask Remotion "is the
+    # browser already there?" — a question whose answer never changes once
+    # true. A sentinel (mirroring _motion_engine_installed's own
+    # .installed-lockfile-hash pattern) should make every call after the
+    # first one skip the subprocess entirely.
+    monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
+    monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")
+    browser_dir = tmp_path / "node_modules" / ".remotion" / "chrome-headless-shell"
+
+    def fake_run(*_a, **_k):
+        # Simulates what a real `ensureBrowser()` success actually leaves
+        # behind on disk, since this mock never really invokes Node/Remotion.
+        calls.append(1)
+        browser_dir.mkdir(parents=True, exist_ok=True)
+        (browser_dir / "chrome-headless-shell.exe").write_bytes(b"fake")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    calls = []
+    monkeypatch.setattr(export_engine.subprocess, "run", fake_run)
+    export_engine._ensure_remotion_browser_downloaded()
+    assert len(calls) == 1, "the first call must actually verify (subprocess runs once)"
+
+    export_engine._ensure_remotion_browser_downloaded()
+    assert len(calls) == 1, "a second call must be a no-op once verified — no new subprocess"
+
+    # If the actual browser directory disappears again (manually cleared,
+    # a corrupted partial state) despite the sentinel still being there,
+    # the real directory wins — this must NOT blindly trust a stale
+    # sentinel and skip re-verifying.
+    import shutil
+    shutil.rmtree(browser_dir)
+    export_engine._ensure_remotion_browser_downloaded()
+    assert len(calls) == 2, "a missing browser dir must force a real re-check even with a stale sentinel"
+
+
 def test_ensure_remotion_browser_downloaded_raises_a_clear_actionable_error(tmp_path, monkeypatch):
     monkeypatch.setattr(export_engine, "MOTION_ENGINE_DIR", tmp_path)
     monkeypatch.setattr(export_engine, "_resolve_node_bin", lambda name: f"/fake/{name}")

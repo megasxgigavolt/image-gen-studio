@@ -245,6 +245,13 @@ fn worker_tick(
             observed_sizes.retain(|path, _| path.exists());
         }
     }
+    // Deliberately AFTER the file-import scan above, not before: a row
+    // whose file already landed (just not yet picked up this exact tick)
+    // must get the chance to import — and drop out of 'exported' entirely
+    // — before this ever gets to judge it as abandoned. Only a row still
+    // genuinely 'exported' at this point, with no file to show for it and
+    // no ack ever received, is a real candidate.
+    let _ = repository.abandon_stale_dispatched_rows();
     let _ = repository.finalize_browser_live_requests_with_no_pending_rows();
 
     if connected && in_flight.is_none() {

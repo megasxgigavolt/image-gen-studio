@@ -30,6 +30,19 @@ let socket = null;
 // in live mode) so an `edit` job can reuse the immediately-preceding
 // `generate` job's tab.
 let activeTabId = null;
+// The Promise for whatever job is currently running, or null when idle —
+// see handleIncomingJob's doc comment for why this exists: the app can
+// decide a dispatched row has been abandoned (no ack within its own grace
+// period) and push a REPLACEMENT job for the same still while this
+// extension is still genuinely, slowly working on the original. Without
+// tracking this, a second `onmessage` event would call runJob() again
+// concurrently with the first still in flight — both sharing the same
+// `activeTabId`/`chrome.debugger` state — confirmed live as the cause of
+// both skipped stills (one job's tab-teardown ripping the tab out from
+// under the other mid-wait) and duplicate downloads (both jobs' Gemini
+// tabs independently finishing and each downloading a real image for the
+// same still).
+let activeJobPromise = null;
 
 async function setConnected(connected) {
   await chrome.storage.local.set({ [CONNECTED_KEY]: connected });
@@ -326,6 +339,23 @@ function connect() {
   }
   socket.onopen = () => {
     void setConnected(true);
+    // If the service worker itself was killed and restarted (not just a
+    // socket drop), `activeTabId` resets to null even though a real tab
+    // from the PREVIOUS instance may still be sitting there mid-generation
+    // — this JS context has no way to track or cancel it anymore, so left
+    // alone it can finish and download a real image with nothing left to
+    // report the result, showing up as an unexplained duplicate. Since
+    // this extension is the only thing that ever opens gemini.google.com
+    // tabs for this purpose, closing every one of them on a fresh connect
+    // (when we're not already tracking one) is the only way to actually
+    // reclaim an orphan like that rather than leaving it to run loose.
+    if (activeTabId === null) {
+      chrome.tabs.query({ url: "https://gemini.google.com/*" }, (tabs) => {
+        for (const tab of tabs) {
+          if (tab.id !== undefined && tab.id !== activeTabId) chrome.tabs.remove(tab.id).catch(() => {});
+        }
+      });
+    }
   };
   socket.onclose = () => {
     void setConnected(false);
@@ -343,12 +373,41 @@ function connect() {
       return;
     }
     if (job?.type !== "job") return;
-    void appendLog({ id: job.id, kind: job.kind, status: "running" }).then(async () => {
-      const result = await runJob(job);
-      await appendLog({ id: job.id, kind: job.kind, status: result.ok ? "ok" : "failed", reason: result.reason });
-      sendResult(job.id, result);
-    });
+    void handleIncomingJob(job);
   };
+}
+
+// Serializes every incoming job through activeJobPromise — never starts a
+// new one while a previous one is still genuinely running. If one IS still
+// running when a new job arrives (the app gave up on it after its own
+// grace period elapsed, not knowing whether the extension was actually
+// still working on it), this actively cancels it first via the same
+// `cancelRow` mechanism the Stop button already uses, then waits for that
+// cancellation to actually land, before ever touching `activeTabId` for
+// the new job. See activeJobPromise's own doc comment for what this fixes.
+async function handleIncomingJob(job) {
+  if (activeJobPromise) {
+    if (activeTabId !== null) {
+      await sendToContent(activeTabId, { type: "cancelRow" }).catch(() => {});
+    }
+    await activeJobPromise.catch(() => {});
+  }
+  const promise = (async () => {
+    await appendLog({ id: job.id, kind: job.kind, status: "running" });
+    const result = await runJob(job);
+    await appendLog({ id: job.id, kind: job.kind, status: result.ok ? "ok" : "failed", reason: result.reason });
+    sendResult(job.id, result);
+  })();
+  activeJobPromise = promise;
+  try {
+    await promise;
+  } finally {
+    // Only clear the slot if nothing newer has already claimed it (a
+    // pathological case where this job itself somehow got superseded
+    // again before finishing its own cleanup) — avoids one job's finally
+    // block clobbering a different, already-in-flight job's tracking.
+    if (activeJobPromise === promise) activeJobPromise = null;
+  }
 }
 
 function disconnect() {

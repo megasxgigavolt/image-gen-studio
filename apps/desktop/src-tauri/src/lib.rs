@@ -2087,6 +2087,14 @@ fn cancel_bulk_generation_request(
 }
 
 #[tauri::command]
+fn resume_browser_live_request(
+    state: State<'_, RepositoryState>,
+    request_id: String,
+) -> Result<(), String> {
+    with_repository(state, |repository| repository.resume_browser_live_request(&request_id))
+}
+
+#[tauri::command]
 fn reorder_bulk_generation_request(
     state: State<'_, RepositoryState>,
     request_id: String,
@@ -3351,6 +3359,7 @@ pub fn run() {
             enqueue_bulk_generation_request,
             list_bulk_generation_requests,
             cancel_bulk_generation_request,
+            resume_browser_live_request,
             reorder_bulk_generation_request,
             advance_bulk_generation_queue,
             get_csv_export_progress,

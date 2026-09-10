@@ -1642,21 +1642,29 @@ fn composite_id_suffix(value: &str) -> &str {
 }
 
 /// How long a dispatched browser-live extension row is left alone before
-/// `next_dispatchable_extension_row` will consider re-offering it, absent
-/// any explicit ack — see that function's doc comment. Comfortably above
-/// the worst realistic legitimate single-job duration (fresh-tab open,
-/// compose, Gemini's own generation time, `waitForImage`'s own 100s
-/// ceiling) so this only ever fires for a row that's actually been
-/// abandoned (e.g. a dropped connection whose ack never arrived), not one
-/// still genuinely in progress.
-const EXTENSION_ROW_REDISPATCH_GRACE: chrono::Duration = chrono::Duration::minutes(5);
+/// it's treated as abandoned (see `abandon_stale_dispatched_rows`), absent
+/// any explicit ack. Widened from an earlier 5 minutes: `content.js`'s own
+/// per-attempt wait timeouts scale up +50% per retry (see its
+/// `scaledTimeout`), so a LATE attempt's `waitForImage` ceiling alone can
+/// already reach 200s+ before adding tab-open/compose/settle overhead on
+/// top — 5 minutes was close enough to that worst case to risk firing on a
+/// job that was actually still genuinely in progress, not dead. 10 minutes
+/// stays comfortably above the worst realistic legitimate single-attempt
+/// duration at the highest retry level, so this only ever fires for a row
+/// that's truly been abandoned (e.g. a dropped connection whose ack never
+/// arrived, or the extension itself got stuck).
+const EXTENSION_ROW_REDISPATCH_GRACE: chrono::Duration = chrono::Duration::minutes(10);
 
 /// Maximum total attempts (the original dispatch plus automatic retries)
-/// a browser-live extension row gets before `record_extension_row_failure`
-/// gives up and marks it permanently `'failed'`. 3 — enough to ride out
-/// ordinary page/timing jitter without silently retrying forever against
-/// a still that's genuinely broken for some other reason.
-const MAX_EXTENSION_ROW_ATTEMPTS: i64 = 3;
+/// a browser-live extension row gets before it's given up on and marked
+/// permanently `'failed'` — shared by both `record_extension_row_failure`
+/// (an explicit failure ack) and `abandon_stale_dispatched_rows` (no ack
+/// ever arrived) so there is exactly ONE retry budget per row regardless
+/// of which path detects the problem; enough to ride out ordinary
+/// page/timing jitter — and now the confirmed-live case of a browser tab
+/// that was just running long, not dead — without silently retrying
+/// forever against a still that's genuinely broken for some other reason.
+const MAX_EXTENSION_ROW_ATTEMPTS: i64 = 5;
 
 /// Whether a browser-live extension row's failure `reason` looks like
 /// transient jitter worth retrying, rather than a definitive failure to
@@ -5737,6 +5745,43 @@ Return JSON only — no markdown, no explanation:
         Ok(())
     }
 
+    /// Runs every worker tick, before dispatching anything — treats a row
+    /// whose `dispatched_at` is past `EXTENSION_ROW_REDISPATCH_GRACE` with
+    /// no ack ever received as an implicit failure, routed through the
+    /// EXACT same `record_extension_row_failure` budget check a real ack
+    /// would use (reason: a synthetic, clearly-labeled string). This is
+    /// what closes a real duplicate-generation gap confirmed live:
+    /// `next_dispatchable_extension_row` used to just silently re-offer a
+    /// stale row once its grace period passed, with no attempt-count
+    /// bookkeeping at all — meaning a row that kept narrowly missing the
+    /// grace window (a browser tab that was slow, not dead) could be
+    /// redispatched over and over with NO bound, and — since nothing told
+    /// the extension the app had given up on the earlier dispatch — the
+    /// ORIGINAL, still-genuinely-running attempt could finish successfully
+    /// at the same time as a later redispatch's attempt, producing two
+    /// real downloaded images for one still. Now every redispatch (silent
+    /// or acked) draws from the same bounded budget, and giving up for
+    /// good is a real, visible `'failed'` state instead of an invisible
+    /// infinite loop.
+    pub fn abandon_stale_dispatched_rows(&self) -> Result<(), String> {
+        let cutoff = (Utc::now() - EXTENSION_ROW_REDISPATCH_GRACE).to_rfc3339();
+        let stale_ids: Vec<String> = {
+            let mut statement = self.connection.prepare(
+                "SELECT id FROM csv_export_rows WHERE status='exported' AND dispatched_at IS NOT NULL AND dispatched_at < ?1"
+            ).map_err(|e| e.to_string())?;
+            let ids = statement.query_map([&cutoff], |row| row.get(0)).map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+            ids
+        };
+        for id in stale_ids {
+            self.record_extension_row_failure(
+                &id,
+                Some("no acknowledgment received from the extension within the grace period (it may have disconnected, or the browser tab stalled)"),
+            )?;
+        }
+        Ok(())
+    }
+
     /// The `image_renders.id` an already-imported row resolved to, if any —
     /// the worker loop uses this to resolve an edit row's `parent_render_id`
     /// once its generate row has imported.
@@ -7582,7 +7627,7 @@ Return JSON only:
         let auth = self.gemini_auth()?;
         let model = self
             .get_app_setting("gemini_model")?
-            .unwrap_or_else(|| "gemini-3.1-flash-image".into());
+            .unwrap_or_else(|| "gemini-3.8-flash-image".into());
         let plan = self.get_visual_plan(video_id).ok();
         let scene_id = plan.as_ref()
             .and_then(|plan| plan.groups.iter().find(|g| g.id == group_id))
@@ -7988,7 +8033,7 @@ Return JSON only:
         let auth = self.gemini_auth()?;
         let model = self
             .get_app_setting("gemini_model")?
-            .unwrap_or_else(|| "gemini-3.1-flash-image".into());
+            .unwrap_or_else(|| "gemini-3.8-flash-image".into());
         let (image_bytes, extension) = request_gemini_image_with_source(
             &auth,
             &model,
@@ -8162,7 +8207,7 @@ Return JSON only:
         let auth = self.gemini_auth()?;
         let model = self
             .get_app_setting("gemini_model")?
-            .unwrap_or_else(|| "gemini-3.1-flash-image".into());
+            .unwrap_or_else(|| "gemini-3.8-flash-image".into());
         let (image_bytes, extension) = request_gemini_image_with_source(
             &auth,
             &model,
@@ -10780,8 +10825,62 @@ Return JSON only:
             "UPDATE bulk_generation_requests SET status='cancelled',updated_at=?1 WHERE id=?2 AND status='planning'",
             params![now, request_id],
         ).map_err(|e| e.to_string())?;
+        if updated > 0 {
+            return Ok(());
+        }
+        // A `'generating'` API-mode request has its own `image_job_id` and
+        // is stopped through the existing `control_image_job`("stop") path
+        // instead — but a `'browser-live'`-mode request has no image job at
+        // all, so without this branch there was genuinely NO way to stop
+        // one once it started generating: confirmed live as a real gap
+        // behind the "pause generation" ask (e.g. the extension
+        // disconnecting, or Gemini itself rate-limiting, mid-batch — the
+        // only recourse today is to just let every remaining still burn
+        // through its own retry budget and fail on its own). Marking it
+        // `'cancelled'` here is enough on its own to actually stop new
+        // dispatches: `next_dispatchable_extension_row` only ever offers a
+        // row whose parent request is `'planning'`/`'generating'`, so nothing
+        // more is dispatched the very next worker tick. Whatever rows
+        // already imported stay imported; `resume_browser_live_request`
+        // (below) is the other half of this — picking the same request
+        // back up once whatever was wrong is fixed.
+        let updated = self.connection.execute(
+            "UPDATE bulk_generation_requests SET status='cancelled',updated_at=?1 WHERE id=?2 AND status='generating' AND generation_mode='browser-live'",
+            params![now, request_id],
+        ).map_err(|e| e.to_string())?;
         if updated == 0 {
-            return Err("Only a request that hasn't started generating yet can be cancelled this way.".into());
+            return Err("Only a request that hasn't started generating yet (or is generating via the Gemini Chrome extension) can be cancelled this way.".into());
+        }
+        Ok(())
+    }
+
+    /// The other half of stopping a `'browser-live'` request mid-generation
+    /// (see `cancel_bulk_generation_request`'s doc comment) — picks a
+    /// request back up after the user paused it (or it was auto-paused)
+    /// and whatever was actually wrong (extension disconnected, Gemini
+    /// rate limit, etc.) has been fixed. Only valid for a `'cancelled'`
+    /// `'browser-live'` request that still has at least one row waiting to
+    /// be dispatched — resuming one that's already fully done (every row
+    /// `'imported'` or permanently `'failed'`) would just flip it back to
+    /// `'generating'` forever with nothing left for the worker loop to
+    /// ever do, since nothing else would move it to a terminal status
+    /// again on its own.
+    pub fn resume_browser_live_request(&self, request_id: &str) -> Result<(), String> {
+        let now = Utc::now().to_rfc3339();
+        let has_pending_rows: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM csv_export_rows WHERE bulk_request_id=?1 AND status='exported')",
+            [request_id],
+            |row| row.get(0),
+        ).map_err(|e| e.to_string())?;
+        if !has_pending_rows {
+            return Err("This request has nothing left to resume — every still already finished or failed for good.".into());
+        }
+        let updated = self.connection.execute(
+            "UPDATE bulk_generation_requests SET status='generating',updated_at=?1 WHERE id=?2 AND status='cancelled' AND generation_mode='browser-live'",
+            params![now, request_id],
+        ).map_err(|e| e.to_string())?;
+        if updated == 0 {
+            return Err("Only a paused Gemini-Chrome-extension request can be resumed this way.".into());
         }
         Ok(())
     }
@@ -17922,6 +18021,79 @@ mod tests {
     }
 
     #[test]
+    fn abandon_stale_dispatched_rows_draws_from_the_same_budget_as_an_explicit_failure() {
+        // Reproduces the real duplicate-generation bug this closes: before
+        // this, a silently-abandoned dispatch (grace period elapsed, no ack
+        // ever arrived) had NO attempt-count bookkeeping at all — it could
+        // be redispatched indefinitely, and since nothing told the
+        // extension to give up on the earlier attempt, that original
+        // attempt could still finish and download successfully AT THE SAME
+        // TIME as a later redispatch, producing two real images for one
+        // still. Now a stale dispatch draws from the exact same
+        // MAX_EXTENSION_ROW_ATTEMPTS budget an explicit failure ack does.
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|g| g.id.clone()).collect();
+        let request = repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &group_ids, "browser-live").unwrap();
+        repo.connection.execute("UPDATE bulk_generation_requests SET status='generating' WHERE id=?1", [&request.id]).unwrap();
+        let pv = repo.create_prompt_version(&video.id, &group_ids[0], "{}", "Style", "A scene.").unwrap();
+        let row_id = repo.record_csv_export_row(&request.id, &video.id, &group_ids[0], "generate", None, &pv.id, "prompt").unwrap();
+
+        let status_and_attempts = |repo: &ProjectRepository| -> (String, i64) {
+            repo.connection.query_row(
+                "SELECT status, attempt_count FROM csv_export_rows WHERE id=?1", [&row_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap()
+        };
+        let make_stale = |repo: &ProjectRepository| {
+            let stale = (Utc::now() - EXTENSION_ROW_REDISPATCH_GRACE - chrono::Duration::seconds(1)).to_rfc3339();
+            repo.connection.execute("UPDATE csv_export_rows SET dispatched_at=?1 WHERE id=?2", params![stale, &row_id]).unwrap();
+        };
+
+        // A dispatch that's NOT yet stale is left completely alone.
+        repo.mark_extension_row_dispatched(&row_id).unwrap();
+        repo.abandon_stale_dispatched_rows().unwrap();
+        assert_eq!(status_and_attempts(&repo), ("exported".to_string(), 0), "a recent dispatch must not be touched");
+
+        // Five consecutive stale (never-acked) dispatches: the first four
+        // must retry (reset to 'exported', attempt_count climbing), the
+        // fifth must exhaust the shared budget and fail for good — the
+        // exact same MAX_EXTENSION_ROW_ATTEMPTS=5 ceiling
+        // record_extension_row_failure_retries_transient_failures_before_giving_up
+        // verifies for an explicit ack.
+        for expected_attempts in 1..=4 {
+            make_stale(&repo);
+            repo.abandon_stale_dispatched_rows().unwrap();
+            assert_eq!(status_and_attempts(&repo), ("exported".to_string(), expected_attempts));
+        }
+        make_stale(&repo);
+        repo.abandon_stale_dispatched_rows().unwrap();
+        assert_eq!(status_and_attempts(&repo).0, "failed", "the budget is shared — a 5th stale dispatch must give up for good");
+
+        // A row that already succeeded must never be touched, no matter
+        // how stale its dispatched_at looks — it's not 'exported' anymore.
+        let pv2 = repo.create_prompt_version(&video.id, &group_ids[0], "{}", "Style", "Another scene.").unwrap();
+        let row2_id = repo.record_csv_export_row(&request.id, &video.id, &group_ids[0], "generate", None, &pv2.id, "prompt 2").unwrap();
+        repo.mark_extension_row_dispatched(&row2_id).unwrap();
+        let stale = (Utc::now() - EXTENSION_ROW_REDISPATCH_GRACE - chrono::Duration::seconds(1)).to_rfc3339();
+        repo.connection.execute("UPDATE csv_export_rows SET dispatched_at=?1 WHERE id=?2", params![stale, &row2_id]).unwrap();
+        let render = repo.import_external_render(&video.id, &group_ids[0], &pv2.id, "generation", None, None, b"fake-image-bytes".to_vec(), "jpeg").unwrap();
+        repo.mark_csv_export_row_imported(&row2_id, &render.id).unwrap();
+        repo.abandon_stale_dispatched_rows().unwrap();
+        let (row2_status, _): (String, i64) = repo.connection.query_row(
+            "SELECT status, attempt_count FROM csv_export_rows WHERE id=?1", [&row2_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(row2_status, "imported", "an already-imported row must never be reset or failed");
+    }
+
+    #[test]
     fn record_extension_row_failure_retries_transient_failures_before_giving_up() {
         let (temp, repo) = repository();
         let channel = repo.create_channel("Channel", None).unwrap();
@@ -17956,9 +18128,18 @@ mod tests {
         repo.record_extension_row_failure(&row_id, Some("receiving end does not exist")).unwrap();
         assert_eq!(status_and_attempts(&repo), ("exported".to_string(), 2));
 
-        // A third failure has now exhausted MAX_EXTENSION_ROW_ATTEMPTS (3)
-        // — this time it's permanently marked 'failed', not retried again.
+        // Two more transient failures (3, then 4 attempts used) still retry —
+        // MAX_EXTENSION_ROW_ATTEMPTS is 5, giving genuine page/timing jitter
+        // real room before giving up (see its own doc comment for why this
+        // was widened from 3).
         repo.record_extension_row_failure(&row_id, Some("timeout: response-image (waited 100000ms)")).unwrap();
+        assert_eq!(status_and_attempts(&repo), ("exported".to_string(), 3));
+        repo.record_extension_row_failure(&row_id, Some("download failed")).unwrap();
+        assert_eq!(status_and_attempts(&repo), ("exported".to_string(), 4));
+
+        // A fifth failure has now exhausted MAX_EXTENSION_ROW_ATTEMPTS (5)
+        // — this time it's permanently marked 'failed', not retried again.
+        repo.record_extension_row_failure(&row_id, Some("timeout: response-image (waited 200000ms)")).unwrap();
         assert_eq!(status_and_attempts(&repo).0, "failed");
         assert!(repo.next_dispatchable_extension_row().unwrap().is_none(), "a permanently failed row must not be re-offered");
 
@@ -18512,6 +18693,55 @@ mod tests {
             repo.get_bulk_generation_request_row(&request.id).unwrap().claude_session_id.as_deref(),
             Some("session-xyz-789"),
         );
+    }
+
+    #[test]
+    fn pausing_and_resuming_a_generating_browser_live_request() {
+        // Reproduces a real gap behind the "pause generation" ask: a
+        // 'browser-live' request has no image_job_id at all (unlike an
+        // 'api'-mode one), so once it reaches 'generating' there was
+        // genuinely no way for the user to stop it — e.g. if the extension
+        // disconnects or Gemini itself starts rate-limiting mid-batch, the
+        // only thing that happened was every remaining still quietly
+        // burning through its own retry budget on its own.
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Video").unwrap();
+        let audio = temp.path().join("voice.wav");
+        fs::write(&audio, b"audio").unwrap();
+        repo.save_video_inputs(&video.id, "First scene.", 4).unwrap();
+        repo.import_asset(&video.id, &audio, "audio").unwrap();
+        let plan = repo.generate_visual_plan(&video.id, temp.path()).unwrap();
+        let group_ids: Vec<String> = plan.groups.iter().map(|g| g.id.clone()).collect();
+        let request = repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &group_ids, "browser-live").unwrap();
+        repo.connection.execute("UPDATE bulk_generation_requests SET status='generating' WHERE id=?1", [&request.id]).unwrap();
+        let pv = repo.create_prompt_version(&video.id, &group_ids[0], "{}", "Style", "A scene.").unwrap();
+        let row_id = repo.record_csv_export_row(&request.id, &video.id, &group_ids[0], "generate", None, &pv.id, "prompt").unwrap();
+
+        // An API-mode 'generating' request is still correctly excluded —
+        // that one really does go through control_image_job instead.
+        let api_request = repo.enqueue_bulk_generation_request(&video.id, "Style", "{}", "", &group_ids, "api").unwrap();
+        repo.connection.execute("UPDATE bulk_generation_requests SET status='generating' WHERE id=?1", [&api_request.id]).unwrap();
+        assert!(repo.cancel_bulk_generation_request(&api_request.id).is_err(), "an api-mode generating request must not be cancellable this way");
+
+        // Cancelling the browser-live request while it's genuinely
+        // generating now works, and actually stops further dispatch.
+        repo.cancel_bulk_generation_request(&request.id).unwrap();
+        assert_eq!(repo.get_bulk_generation_request(&request.id).unwrap().status, "cancelled");
+        assert!(repo.next_dispatchable_extension_row().unwrap().is_none(), "a paused request's row must not be dispatched");
+
+        // Resuming picks it back up — the still-pending row becomes
+        // dispatchable again, with no data lost.
+        repo.resume_browser_live_request(&request.id).unwrap();
+        assert_eq!(repo.get_bulk_generation_request(&request.id).unwrap().status, "generating");
+        let next = repo.next_dispatchable_extension_row().unwrap().expect("the row must be dispatchable again after resuming");
+        assert_eq!(next.id, row_id);
+
+        // Once every row is actually done, there's nothing left to resume.
+        let render = repo.import_external_render(&video.id, &group_ids[0], &pv.id, "generation", None, None, b"fake".to_vec(), "jpeg").unwrap();
+        repo.mark_csv_export_row_imported(&row_id, &render.id).unwrap();
+        repo.cancel_bulk_generation_request(&request.id).unwrap();
+        assert!(repo.resume_browser_live_request(&request.id).is_err(), "a request with nothing left pending must refuse to resume");
     }
 
     #[test]

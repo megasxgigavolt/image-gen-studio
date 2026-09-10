@@ -1671,7 +1671,23 @@ def _ensure_remotion_browser_downloaded() -> None:
     no indication of what actually went wrong or how to fix it. Calling this
     proactively (from `_ensure_motion_engine_ready`, i.e. before the first
     render *and* self-healingly on every subsequent one) turns a silent or
-    partial download failure into one clear, actionable error instead."""
+    partial download failure into one clear, actionable error instead.
+
+    Short-circuited by a sentinel file once verified — confirmed live as a
+    real, repeated annoyance: `_ensure_motion_engine_ready` runs before
+    EVERY render, which used to mean spawning a whole Node process (start
+    up, `require('@remotion/renderer')`, run its own already-downloaded
+    check) on every single export, even though the actual answer ("yes,
+    it's there") never changes once true. Mirrors
+    `_motion_engine_installed`'s own `.installed-lockfile-hash` sentinel
+    pattern for the npm-install half of this same setup step. If the
+    browser download is ever genuinely missing again (a user manually
+    cleared it, a corrupted partial state) the sentinel and the real
+    directory can disagree — checked below, not just trusted blindly."""
+    sentinel = MOTION_ENGINE_DIR / "node_modules" / ".remotion-browser-verified"
+    browser_dir = MOTION_ENGINE_DIR / "node_modules" / ".remotion" / "chrome-headless-shell"
+    if sentinel.exists() and browser_dir.is_dir() and any(browser_dir.iterdir()):
+        return
     result = subprocess.run(
         [
             _resolve_node_bin("node"), "-e",
@@ -1689,6 +1705,8 @@ def _ensure_remotion_browser_downloaded() -> None:
             "network) — try the export again; if it keeps happening, check your "
             "internet connection and antivirus settings, or reinstall Auto Gen Studio."
         )
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.write_text("verified", encoding="utf-8")
 
 
 def _ensure_motion_engine_ready() -> None:

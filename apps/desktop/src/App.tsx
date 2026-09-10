@@ -2880,15 +2880,33 @@ function ImagesView() {
         }
         // Durable, backend-owned queue (see enqueueBulkGeneration/
         // runQueueRunner) — replaces the old single `bulk_plan.{videoId}`
-        // app-setting cursor entirely. Any request left `pending` or
-        // `planning` from before the app closed just resumes on its own:
+        // app-setting cursor entirely. A request left `pending`/`planning`/
+        // `generating` from a recent app restart resumes on its own here —
         // `advanceBulkGenerationQueue` is safe to call unconditionally
-        // (reports "idle" if there's nothing to do), so this always
-        // reflects the queue's true state rather than requiring a manual
-        // Resume click for a run that was merely interrupted by a restart.
+        // (reports "idle" if there's nothing to do).
+        //
+        // Deliberately gated on RECENCY (`updatedAt` within the last 15
+        // minutes), not just presence — confirmed live as a real "bulk
+        // generation started on its own" bug: a request that got stuck
+        // in-progress (a crash mid-planning, or a planning call that
+        // errored out in a way the frontend never got to call Cancel for)
+        // stays in the queue table indefinitely, and this effect re-runs
+        // on every single visit to this video's Images tab. Auto-resuming
+        // unconditionally meant reopening a video days later — with zero
+        // intent to generate anything — could silently kick off a
+        // planning/generation run the user has long since forgotten about
+        // and never asked for just now. A genuinely-interrupted run (app
+        // closed moments ago mid-task) is still resumed with no manual
+        // Resume click needed; anything older just sits visibly in the
+        // queue list for the user to resume or cancel deliberately.
         const queue = await projectsClient.listBulkGenerationRequests(activeVideoId);
         setBulkQueue(queue);
-        if (queue.some((request) => ["pending", "planning", "generating"].includes(request.status))) {
+        const RECENT_AUTO_RESUME_WINDOW_MS = 15 * 60 * 1000;
+        const recentlyActive = queue.some((request) =>
+          ["pending", "planning", "generating"].includes(request.status)
+          && Date.now() - new Date(request.updatedAt).getTime() < RECENT_AUTO_RESUME_WINDOW_MS
+        );
+        if (recentlyActive) {
           void runQueueRunner();
         }
       } catch (caught) {
@@ -3600,6 +3618,16 @@ function ImagesView() {
     }
   }
 
+  async function resumeLiveRequest(requestId: string) {
+    try {
+      await projectsClient.resumeBrowserLiveRequest(requestId);
+      await refreshBulkQueue();
+      void runQueueRunner();
+    } catch (caught) {
+      setError(String(caught));
+    }
+  }
+
   async function reorderQueuedRequest(requestId: string, direction: "up" | "down") {
     try {
       await projectsClient.reorderBulkGenerationRequest(requestId, direction);
@@ -3772,6 +3800,12 @@ function ImagesView() {
   // below would just disappear for the entire generating phase, even
   // though rows are actively (or about to be) dispatched to the extension.
   const activeLiveRequest = bulkQueue.find((request) => request.status === "generating" && request.generationMode === "browser-live");
+  // A browser-live request the user (or an unrecoverable-looking run of
+  // failures) paused mid-generation — see cancelBulkGenerationRequest's own
+  // doc comment. Surfaced as a Resume affordance rather than just
+  // vanishing, since a paused request still has real, un-dispatched work
+  // waiting (unlike a definitively completed/failed one).
+  const pausedLiveRequest = bulkQueue.find((request) => request.status === "cancelled" && request.generationMode === "browser-live");
   const imageRenders = selectedGroup?.imageRenders ?? [];
 
   // Row-completion progress for whichever browser-live request is active —
@@ -4088,7 +4122,7 @@ function ImagesView() {
               plus a third box below for the queue list — collapsing them
               into a single compact bar was specifically requested, since
               stacking all three ate a lot of the preview pane). */}
-          {(job || bulkProgress || activeLiveRequest || pendingBulkRequests.length > 0) && (
+          {(job || bulkProgress || activeLiveRequest || pausedLiveRequest || pendingBulkRequests.length > 0) && (
             <div className="bulk-status-bar">
               <div className="bulk-status-top">
                 <strong>
@@ -4096,6 +4130,8 @@ function ImagesView() {
                     ? bulkProgress.label
                     : activeLiveRequest
                     ? geminiLiveState.connected ? "Generating via Gemini extension" : "Awaiting Gemini extension connection"
+                    : pausedLiveRequest
+                    ? "Gemini extension generation paused"
                     : job
                     ? `Bulk job: ${job.status}`
                     : "Bulk Generation queued"}
@@ -4122,7 +4158,11 @@ function ImagesView() {
                       {(promptPrepStatus === "paused" || bulkPlanStatus === "paused") && <button className="secondary" onClick={() => (bulkPlanStatus ? controlBulkPlan("resume") : controlPromptPreparation("resume"))}>Resume</button>}
                       <button className="secondary" onClick={() => (bulkPlanStatus !== null ? controlBulkPlan("stop") : controlPromptPreparation("stop"))}>Stop</button>
                     </>
-                  ) : activeLiveRequest ? null : job && (
+                  ) : activeLiveRequest ? (
+                    <button className="secondary" onClick={() => void cancelQueuedRequest(activeLiveRequest.id)}>Pause</button>
+                  ) : pausedLiveRequest ? (
+                    <button className="secondary" onClick={() => void resumeLiveRequest(pausedLiveRequest.id)}>Resume</button>
+                  ) : job && (
                     <>
                       {["queued", "running"].includes(job.status) && <button className="secondary" onClick={() => void controlJob("pause")}>Pause</button>}
                       {job.status === "paused" && <button className="secondary" onClick={() => void controlJob("resume")}>Resume</button>}

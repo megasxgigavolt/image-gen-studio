@@ -1386,11 +1386,22 @@ export const projectsClient = {
     if (isTauri()) return invoke("list_bulk_generation_requests", { videoId });
     return [];
   },
-  /** Only a request that hasn't started yet (`status === "pending"`) can be
-   * cancelled this way — an active one is stopped via `controlImageJob` on
-   * its `imageJobId` instead. */
+  /** Also handles pausing an active `"browser-live"` request mid-generation
+   * (marks it `"cancelled"`, which stops any further dispatch to the
+   * extension without losing whatever's already imported) — see
+   * `resumeBrowserLiveRequest` to pick it back up. An `"api"`-mode request
+   * that's actively generating still isn't cancellable this way; that one
+   * goes through `controlImageJob` on its own `imageJobId` instead. */
   async cancelBulkGenerationRequest(requestId: string): Promise<void> {
     if (isTauri()) return invoke("cancel_bulk_generation_request", { requestId });
+    throw new Error("Bulk generation requires the native application.");
+  },
+  /** Resumes a `"browser-live"` request previously paused via
+   * `cancelBulkGenerationRequest` while it still has stills waiting to be
+   * dispatched — e.g. after reconnecting the Gemini Chrome extension, or
+   * once a Gemini-side rate limit has cleared. */
+  async resumeBrowserLiveRequest(requestId: string): Promise<void> {
+    if (isTauri()) return invoke("resume_browser_live_request", { requestId });
     throw new Error("Bulk generation requires the native application.");
   },
   async reorderBulkGenerationRequest(requestId: string, direction: "up" | "down"): Promise<void> {

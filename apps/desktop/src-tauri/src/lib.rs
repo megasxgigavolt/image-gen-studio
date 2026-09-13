@@ -7,7 +7,7 @@ use projects::{
     AnimationJob, BulkGenerationRequest, BulkGlobalVisualSettings, BulkQueueAdvanceResult,
     BulkSceneSettings, BulkStillSettings, BulkVisualDials, CaptionSet, Channel, CsvExportProgress,
     ExportJob, ExportResult, ExportSettings, ImageJob, ImageRender, ImageWorkspace, InputAsset,
-    MediaLibraryAsset, ProjectRepository, ProviderKeyStatus, PromptVersion, ResumeState,
+    MediaLibraryAsset, ProjectImportResult, ProjectRepository, ProviderKeyStatus, PromptVersion, ResumeState,
     RosterCharacter, RosterLocation, SceneCastAssignment, SingleStillGeneration, StyleAspect, Timeline,
     Video, VideoAsset, VideoInputs, VideoProgress, VisualPlan,
 };
@@ -922,7 +922,7 @@ async fn import_project_bundle(
     app: tauri::AppHandle,
     state: State<'_, RepositoryState>,
     channel_id: String,
-) -> Result<Option<Video>, String> {
+) -> Result<Option<ProjectImportResult>, String> {
     let Some(path) = app
         .dialog()
         .file()

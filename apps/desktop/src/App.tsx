@@ -608,6 +608,16 @@ function HomeView() {
       const result = await projectsClient.exportProjectBundle(video.id);
       if (!result) return; // user cancelled the save dialog
       addToast(`Saved project bundle: ${result.path}`, "success");
+      if (result.skippedFiles && result.skippedFiles.length > 0) {
+        // A file this project referenced vanished (mid-generation, an old
+        // version being superseded) between the export scan and the actual
+        // write — rather than failing the whole export, it's just left out
+        // and reported here so the user knows which still(s) to check.
+        addToast(
+          `${result.skippedFiles.length} file${result.skippedFiles.length === 1 ? "" : "s"} could not be included (in use at the time) — re-export later if ${result.skippedFiles.length === 1 ? "it's" : "they're"} still missing.`,
+          "info",
+        );
+      }
     } catch (caught) {
       setError(String(caught));
     } finally {
@@ -623,8 +633,9 @@ function HomeView() {
     setError(null);
     setImportingProject(true);
     try {
-      const video = await projectsClient.importProjectBundle(selectedChannelId);
-      if (!video) return; // user cancelled the file picker
+      const result = await projectsClient.importProjectBundle(selectedChannelId);
+      if (!result) return; // user cancelled the file picker
+      const { video, missingAssets } = result;
       await loadWorkspace();
       const channel = channels.find((candidate) => candidate.id === video.channelId);
       if (channel) {
@@ -632,6 +643,15 @@ function HomeView() {
         setStage(video.stage);
       }
       addToast(`Imported "${video.title}"`, "success");
+      if (missingAssets.length > 0) {
+        // The bundle's manifest listed these but didn't actually have them —
+        // import still proceeded with everything else rather than losing
+        // the whole project over it (see ExportResult.skippedFiles).
+        addToast(
+          `${missingAssets.length} image${missingAssets.length === 1 ? "" : "s"} from the bundle could not be found and will need to be regenerated.`,
+          "info",
+        );
+      }
     } catch (caught) {
       setError(String(caught));
     } finally {

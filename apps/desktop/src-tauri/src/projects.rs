@@ -1685,11 +1685,32 @@ fn is_retryable_extension_failure(reason: Option<&str>) -> bool {
     }
 }
 
+/// `import_project_bundle`'s return: the imported video, plus any asset the
+/// manifest listed that the archive no longer actually had bytes for (see
+/// `export_project_bundle`'s `skipped_files` doc comment for how a bundle
+/// can legitimately end up this way, and older bundles made before that fix
+/// may still be missing an asset with no `skipped_files` record of it at
+/// all). One missing render shouldn't cost the user the rest of a project,
+/// so import proceeds without it rather than aborting outright.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectImportResult {
+    pub video: Video,
+    pub missing_assets: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportResult {
     pub path: String,
     pub file_count: usize,
+    /// Assets `export_project_bundle` found on disk when it started but
+    /// could no longer read by the time it got to them (a still finishing
+    /// generation, an old version being pruned, mid-export) — omitted from
+    /// the manifest rather than aborting the whole export. Always empty for
+    /// `export_latest_stills`, which doesn't have this race.
+    #[serde(default)]
+    pub skipped_files: Vec<String>,
 }
 
 /// User-facing export choices for the single-file video export — everything
@@ -8359,6 +8380,7 @@ Return JSON only:
         Ok(ExportResult {
             path: destination.display().to_string(),
             file_count: files.len(),
+            skipped_files: Vec::new(),
         })
     }
 
@@ -8374,11 +8396,47 @@ Return JSON only:
             ).map_err(|_| "Video was not found.".to_string())?;
         let inputs = self.get_video_inputs(video_id)?;
         let root = self.projects_dir.join(&channel_id).join(video_id);
-        let mut relative_files = Vec::new();
-        collect_relative_files(&root, &root, &mut relative_files)?;
+        let mut candidate_files = Vec::new();
+        collect_relative_files(&root, &root, &mut candidate_files)?;
         let mut tables = std::collections::BTreeMap::new();
         for table in PROJECT_TABLES {
             tables.insert((*table).to_string(), self.dump_table_rows(table, video_id)?);
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let file = fs::File::create(destination).map_err(|e| e.to_string())?;
+        let mut zip = ZipWriter::new(file);
+        // Assets are streamed in first, one at a time (never all held in
+        // memory together — a real project's renders/animations/media
+        // library can run into the hundreds of MB), with manifest.json
+        // written last so it can be built from what *actually* made it into
+        // the archive. Export runs on its own background connection while
+        // the rest of the app keeps mutating this same project folder (a
+        // still finishing generation, an older version being superseded) —
+        // a file `collect_relative_files` saw a moment ago can legitimately
+        // be gone by the time we get to it. Previously that aborted the
+        // whole export via `?`, leaving a half-written, unfinished — but
+        // still present on disk — archive behind (surfaced as a confusing
+        // "os error 2" toast even though "the file was generated"), and
+        // that file's absence then only became clear as a much more
+        // confusing "Bundle asset is missing" import error later. Now it's
+        // just skipped and reported back in `skipped_files` instead.
+        let mut embedded_files = Vec::new();
+        let mut skipped_files = Vec::new();
+        for relative in &candidate_files {
+            match fs::read(root.join(relative)) {
+                Ok(bytes) => {
+                    zip.start_file(format!("assets/{relative}"), SimpleFileOptions::default())
+                        .map_err(|e| e.to_string())?;
+                    std::io::Write::write_all(&mut zip, &bytes).map_err(|e| e.to_string())?;
+                    embedded_files.push(relative.clone());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    skipped_files.push(relative.clone());
+                }
+                Err(error) => return Err(error.to_string()),
+            }
         }
         let manifest = ProjectBundleManifest {
             format: "auto-gen-studio-project".into(),
@@ -8390,33 +8448,20 @@ Return JSON only:
             progress,
             script_text: inputs.script_text,
             pacing_seconds: inputs.pacing_seconds,
-            files: relative_files.clone(),
+            files: embedded_files.clone(),
             video_id: video_id.to_string(),
             channel_id,
             tables,
         };
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let file = fs::File::create(destination).map_err(|e| e.to_string())?;
-        let mut zip = ZipWriter::new(file);
         zip.start_file("manifest.json", SimpleFileOptions::default())
             .map_err(|e| e.to_string())?;
         std::io::Write::write_all(&mut zip, &serde_json::to_vec_pretty(&manifest).unwrap())
             .map_err(|e| e.to_string())?;
-        for relative in &relative_files {
-            zip.start_file(format!("assets/{relative}"), SimpleFileOptions::default())
-                .map_err(|e| e.to_string())?;
-            std::io::Write::write_all(
-                &mut zip,
-                &fs::read(root.join(relative)).map_err(|e| e.to_string())?,
-            )
-            .map_err(|e| e.to_string())?;
-        }
         zip.finish().map_err(|e| e.to_string())?;
         Ok(ExportResult {
             path: destination.display().to_string(),
-            file_count: relative_files.len() + 1,
+            file_count: embedded_files.len() + 1,
+            skipped_files,
         })
     }
 
@@ -8424,7 +8469,7 @@ Return JSON only:
     /// importing, exactly like "+ New video" — rather than spawning a new
     /// channel of its own. A project bundle is just a video; it doesn't
     /// need a home of its own any more than any other video does.
-    pub fn import_project_bundle(&self, source: &Path, channel_id: &str) -> Result<Video, String> {
+    pub fn import_project_bundle(&self, source: &Path, channel_id: &str) -> Result<ProjectImportResult, String> {
         let file = fs::File::open(source)
             .map_err(|_| "Project bundle could not be opened.".to_string())?;
         let mut archive = ZipArchive::new(file)
@@ -8439,11 +8484,17 @@ Return JSON only:
         if manifest.format != "auto-gen-studio-project" || !(1..=2).contains(&manifest.version) {
             return Err("Unsupported project bundle format.".into());
         }
+        // A path failing `validate_bundle_path` is a safety problem (it could
+        // escape the target directory) and still aborts the whole import —
+        // but an entry that's simply absent from the archive is just data
+        // loss for that one asset, not a reason to refuse everything else in
+        // the bundle. See `ProjectImportResult::missing_assets`.
+        let mut missing_assets = Vec::new();
         for path in &manifest.files {
             validate_bundle_path(path)?;
-            archive
-                .by_name(&format!("assets/{path}"))
-                .map_err(|_| format!("Bundle asset is missing: {path}"))?;
+            if archive.by_name(&format!("assets/{path}")).is_err() {
+                missing_assets.push(path.clone());
+            }
         }
         // create_video validates channel_id itself ("Channel was not found."
         // if it's missing or trashed) — no separate check needed here.
@@ -8451,6 +8502,9 @@ Return JSON only:
         let target = self.projects_dir.join(channel_id).join(&video.id);
         let result = (|| {
             for path in &manifest.files {
+                if missing_assets.contains(path) {
+                    continue;
+                }
                 let mut entry = archive
                     .by_name(&format!("assets/{path}"))
                     .map_err(|e| e.to_string())?;
@@ -8493,7 +8547,7 @@ Return JSON only:
         let mut video = video;
         video.stage = manifest.stage.clone();
         video.progress = manifest.progress;
-        Ok(video)
+        Ok(ProjectImportResult { video, missing_assets })
     }
 
     /// Reads every column of every row in `table` for `video_id`, as a
@@ -19560,9 +19614,11 @@ mod tests {
         // someone picks, exactly like "+ New video" — never a channel of
         // its own.
         let destination_channel = repo.create_channel("Friend's Channel", None).unwrap();
-        let imported = repo
+        let import_result = repo
             .import_project_bundle(&bundle, &destination_channel.id)
             .unwrap();
+        assert!(import_result.missing_assets.is_empty());
+        let imported = import_result.video;
         assert_ne!(imported.id, video.id);
         assert_eq!(imported.channel_id, destination_channel.id);
         assert_eq!(repo.list_channels(false).unwrap().len(), 2);
@@ -19578,6 +19634,74 @@ mod tests {
             .join(imported.id)
             .join("renders/sample.png")
             .exists());
+    }
+
+    /// Regression test for a real production bug report: exporting a
+    /// project could throw "os error 2 — the system cannot find the file
+    /// specified" yet still leave a `.agsproj` file behind, and importing
+    /// that file then failed outright with "Bundle asset is missing" —
+    /// losing the entire project over one render whose file had vanished
+    /// between the export's directory scan and the moment it tried to read
+    /// it. `export_project_bundle` itself is now race-proof (its manifest
+    /// only ever lists what actually made it into the archive), but an
+    /// already-damaged bundle — this one, or any other bundle a manifest
+    /// happens to overstate — should still recover everything else rather
+    /// than refusing to import at all.
+    #[test]
+    fn importing_a_bundle_with_one_missing_asset_still_recovers_everything_else() {
+        let (temp, repo) = repository();
+        let channel = repo.create_channel("Source Channel", None).unwrap();
+        let video = repo.create_video(&channel.id, "Source Video").unwrap();
+        repo.save_video_inputs(&video.id, "Portable script.", 8).unwrap();
+        let asset_dir = temp.path().join("Projects").join(&channel.id).join(&video.id).join("renders");
+        fs::create_dir_all(&asset_dir).unwrap();
+        fs::write(asset_dir.join("keep.png"), b"keep-me").unwrap();
+        fs::write(asset_dir.join("lose.png"), b"lose-me").unwrap();
+        let bundle = temp.path().join("project.agsproj");
+        repo.export_project_bundle(&video.id, &bundle).unwrap();
+
+        // Simulate exactly what a raced/interrupted export (or any other
+        // damaged bundle) looks like: rewrite the zip with one asset's
+        // entry dropped, while its path stays listed in manifest.json's
+        // `files` — a real export can no longer produce this itself (see
+        // `export_project_bundle`), but an already-damaged bundle like the
+        // one behind this bug report still needs to import cleanly.
+        let damaged = temp.path().join("damaged.agsproj");
+        {
+            let mut source = ZipArchive::new(fs::File::open(&bundle).unwrap()).unwrap();
+            let manifest_bytes = {
+                let mut entry = source.by_name("manifest.json").unwrap();
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut buf).unwrap();
+                buf
+            };
+            let keep_bytes = {
+                let mut entry = source.by_name("assets/renders/keep.png").unwrap();
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut buf).unwrap();
+                buf
+            };
+            let mut zip = ZipWriter::new(fs::File::create(&damaged).unwrap());
+            zip.start_file("manifest.json", SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, &manifest_bytes).unwrap();
+            zip.start_file("assets/renders/keep.png", SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, &keep_bytes).unwrap();
+            // "assets/renders/lose.png" deliberately omitted, even though
+            // manifest.json (copied verbatim from the real export) still
+            // lists it.
+            zip.finish().unwrap();
+        }
+
+        let destination_channel = repo.create_channel("Friend's Channel", None).unwrap();
+        let result = repo.import_project_bundle(&damaged, &destination_channel.id).unwrap();
+        assert_eq!(result.missing_assets, vec!["renders/lose.png".to_string()]);
+        assert_eq!(
+            repo.get_video_inputs(&result.video.id).unwrap().script_text,
+            "Portable script."
+        );
+        let target = temp.path().join("Projects").join(&result.video.channel_id).join(&result.video.id);
+        assert!(target.join("renders/keep.png").exists());
+        assert!(!target.join("renders/lose.png").exists());
     }
 
     /// The shallow v1 bundle only ever round-tripped the raw script — a
@@ -19641,7 +19765,9 @@ mod tests {
         // Imported back into the very same channel it came from — this is
         // the no-collision case that matters most, since ids from the
         // export are already live in this exact database.
-        let imported = repo.import_project_bundle(&bundle, &channel.id).unwrap();
+        let import_result = repo.import_project_bundle(&bundle, &channel.id).unwrap();
+        assert!(import_result.missing_assets.is_empty());
+        let imported = import_result.video;
         assert_ne!(imported.id, video.id);
         assert_eq!(imported.channel_id, channel.id);
         assert_eq!(repo.list_channels(false).unwrap().len(), 1);
@@ -19701,7 +19827,7 @@ mod tests {
         // Re-importing the exact same bundle a second time (e.g. the friend
         // downloads it twice, or it's imported back on the machine that
         // exported it) must not collide on any primary key.
-        let second_import = repo.import_project_bundle(&bundle, &channel.id).unwrap();
+        let second_import = repo.import_project_bundle(&bundle, &channel.id).unwrap().video;
         assert_ne!(second_import.id, imported.id);
         assert_ne!(second_import.id, video.id);
         assert_eq!(repo.get_visual_plan(&second_import.id).unwrap().groups.len(), plan.groups.len());
@@ -19767,7 +19893,9 @@ mod tests {
 
         let bundle = temp.path().join("collision-test.agsproj");
         repo.export_project_bundle(&video.id, &bundle).unwrap();
-        let imported = repo.import_project_bundle(&bundle, &channel.id).unwrap();
+        let import_result = repo.import_project_bundle(&bundle, &channel.id).unwrap();
+        assert!(import_result.missing_assets.is_empty());
+        let imported = import_result.video;
 
         let imported_plan = repo.get_visual_plan(&imported.id).unwrap();
         assert_eq!(imported_plan.groups.len(), 12);

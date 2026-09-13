@@ -363,7 +363,14 @@ export type BulkQueueAdvanceResultRecord =
  * see `getCsvExportProgress`. */
 export type CsvExportProgressRecord = { total: number; imported: number };
 
-export type ExportResultRecord = { path: string; fileCount: number };
+export type ExportResultRecord = { path: string; fileCount: number; skippedFiles?: string[] };
+
+/** `importProjectBundle`'s result — the imported video, plus any asset the
+ * bundle's manifest listed that couldn't actually be found inside it (see
+ * `ExportResult.skippedFiles`'s doc comment on the Rust side for how that
+ * can happen). Import proceeds without a missing asset rather than failing
+ * outright, so this is reported rather than thrown. */
+export type ProjectImportResultRecord = { video: VideoRecord; missingAssets: string[] };
 export type MotionPreset =
   | "none"
   | "zoom-in"
@@ -1015,7 +1022,7 @@ export const projectsClient = {
     if (isTauri()) return invoke("export_project_bundle", { videoId });
     throw new Error("Export requires the native application.");
   },
-  async importProjectBundle(channelId: string): Promise<VideoRecord | null> {
+  async importProjectBundle(channelId: string): Promise<ProjectImportResultRecord | null> {
     if (isTauri()) return invoke("import_project_bundle", { channelId });
     throw new Error("Import requires the native application.");
   },
